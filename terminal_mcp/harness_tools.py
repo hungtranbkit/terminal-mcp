@@ -27,6 +27,7 @@ against, with a content hash, before anything is allowed to write anywhere.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from . import harness_policy as policy
@@ -34,14 +35,46 @@ from . import harness_scheduler as sched
 from . import harness_state as state
 from .harness_context import ContextAssembler
 from .harness_engine import HarnessEngine
+from .harness_runner import TerminalAgentRunner
 from .harness_store import HarnessStore
+
+#: Where an agent's structured answer is written. Outside any repository on
+#: purpose: an artifact inside the worktree would show up as an untracked file
+#: in the diff the Evaluator is about to judge.
+DEFAULT_ARTIFACTS_ROOT = "~/.local/state/terminal-mcp/harness/artifacts"
+
+
+def build_engine(store: HarnessStore, *, ops: Any = None, router: Any = None,
+                 repo_root: str | None = None,
+                 artifacts_root: str | None = None) -> HarnessEngine:
+    """The engine the server drives, with a REAL runner when one is possible.
+
+    `ops` is the controller (or the local terminal service) -- anything with
+    the SessionOps shape. Given one, the engine can actually reach agents:
+    `terminal_harness_step` will pick or spawn a session, send the prompt
+    through the same guarded transport the queue uses, and resolve the answer
+    from the artifact on a later step.
+
+    Without one, the engine is still useful and still honest: it plans,
+    freezes contracts and runs declared checks, and any stage that genuinely
+    needs a model says so rather than pretending. That is the difference
+    between a degraded surface and a lying one.
+    """
+    runner = None
+    if ops is not None:
+        runner = TerminalAgentRunner(
+            ops, store, router=router,
+            artifacts_root=Path(artifacts_root or DEFAULT_ARTIFACTS_ROOT).expanduser())
+    return HarnessEngine(store, runner=runner, repo_root=repo_root,
+                         assembler=ContextAssembler(store, repo_root=repo_root))
 
 
 def register_harness_tools(server: Any, store: HarnessStore, *,
-                           engine: HarnessEngine | None = None) -> dict[str, Any]:
+                           engine: HarnessEngine | None = None,
+                           ops: Any = None, router: Any = None) -> dict[str, Any]:
     """Register the surface. Returns the handlers for the compact `turn` map."""
 
-    harness = engine or HarnessEngine(store, assembler=ContextAssembler(store))
+    harness = engine or build_engine(store, ops=ops, router=router)
 
     @server.tool()
     def terminal_harness_start(task_id: str, prompt: str, title: str = "",
@@ -81,8 +114,17 @@ def register_harness_tools(server: Any, store: HarnessStore, *,
         will say so rather than pretending to have run.
         """
         outcome = harness.step(run_id)
+        dispatch = store.open_dispatch_for(run_id)
         return {"outcome": outcome.to_dict(),
-                "run": store.require_run(run_id).to_dict()}
+                "run": store.require_run(run_id).to_dict(),
+                # What is in flight, if anything. A caller that sees
+                # `pending` knows to come back rather than to step again --
+                # stepping a pending stage only re-reads a pane.
+                "awaiting": ({"dispatch_id": dispatch["id"], "role": dispatch["role"],
+                              "state": dispatch["state"],
+                              "session": dispatch["session_id"],
+                              "iteration": dispatch["iteration"]}
+                             if dispatch else None)}
 
     @server.tool()
     def terminal_harness_status(run_id: str | None = None,

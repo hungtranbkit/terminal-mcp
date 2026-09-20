@@ -5090,7 +5090,13 @@ def build_mcp(service: TerminalService | None = None,
     # has no scheduler thread of its own.
     from .harness_store import HarnessStore as _HarnessStore
     harness_handlers = register_harness_tools(
-        server, _HarnessStore(queue.store.path))
+        server, _HarnessStore(queue.store.path),
+        # The REAL runner: the same controller every other subsystem routes
+        # through, and the same router whose candidate list is already
+        # assembled and cached. Passing them is what makes
+        # `terminal_harness_step` able to reach an actual agent rather than
+        # only plan and run checks.
+        ops=controller, router=task_router)
 
     # ------------------------------------------------------------------
     # P0.2 Event Bus. Publish/claim/ack only -- NOTHING here starts an

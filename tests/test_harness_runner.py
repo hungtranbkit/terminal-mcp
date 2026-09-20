@@ -825,3 +825,65 @@ def test_a_prompt_left_in_the_composer_is_held_and_never_resent(store, artifacts
 def test_acceptance_checking_is_on_by_default(store, artifacts):
     assert TerminalAgentRunner(FakeOps([]), store,
                                artifacts_root=artifacts).require_acceptance is True
+
+
+def test_a_trust_prompt_on_a_fresh_worktree_asks_a_human_once(store, artifacts, repo):
+    """Observed live: Claude Code asks "Is this a project you trust?" the
+    first time it opens a directory, and a fresh git worktree is always a new
+    directory. Polling will never answer it and respawning asks it again."""
+    ops = FakeOps([])
+    runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts,
+                                 spawn_settle_seconds=0.0)
+    engine = HarnessEngine(store, runner=runner, repo_root=str(repo),
+                           check_runner=lambda cmds, cwd=None, **kw: [
+                               CheckResult(command=c, exit_code=0, output="ok")
+                               for c in cmds])
+    run, _ = engine.start(task_id="TRUST-1", prompt="build it", title="Build",
+                          project_id="pilot", acceptance=["it builds"],
+                          checks=["true"], changed_paths=["src"])
+    engine.step(run.id)   # -> PLAN_READY
+    engine.step(run.id)   # -> BUILDING (iteration opened)
+    engine.step(run.id)   # spawns the session, sends nothing yet
+    assert ops.created, "a session was spawned"
+    for session in ops.sessions.values():
+        session.state = "WAITING_INPUT"        # the trust dialog
+
+    outcome = engine.step(run.id)
+
+    assert outcome.to_stage == state.BLOCKED
+    assert outcome.action == "permission_required"
+    decisions = store.list_decisions(status="open", run_id=run.id)
+    assert [d["reason"] for d in decisions] == [policy.PERMISSION_REQUIRED]
+    assert "trust" in decisions[0]["question"]
+    assert store.require_run(run.id).infra_failure_count == 0, \
+        "a human blocker must not burn the infrastructure retry budget"
+    assert len(ops.created) == 1, "respawning would ask the same human again"
+
+
+# ---------------------------------------------------------------------------
+# the server path
+# ---------------------------------------------------------------------------
+
+def test_the_server_engine_gets_a_real_runner_when_ops_are_available(store, tmp_path):
+    """The wiring that turns terminal_harness_step from a planner into
+    something that can reach an actual agent."""
+    from terminal_mcp.harness_tools import build_engine
+
+    engine = build_engine(store, ops=FakeOps([]), artifacts_root=tmp_path)
+    assert isinstance(engine.runner, TerminalAgentRunner)
+    assert engine.runner.ops is not None
+
+
+def test_without_ops_the_engine_is_degraded_but_never_lies(store):
+    """It still plans, freezes contracts and runs declared checks. A stage
+    that genuinely needs a model says so rather than pretending."""
+    from terminal_mcp.harness_engine import HarnessError
+    from terminal_mcp.harness_tools import build_engine
+
+    engine = build_engine(store)
+    assert engine.runner is None
+    run, _ = engine.start(task_id="NOOPS-1", prompt="rewrite the auth flow",
+                          title="Auth", project_id="pilot")
+    with pytest.raises(HarnessError) as excinfo:
+        engine.step(run.id)
+    assert "no AgentRunner is configured" in str(excinfo.value)

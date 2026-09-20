@@ -110,6 +110,10 @@ class AgentResult:
     dispatch_id: str | None = None
     artifact_path: str | None = None
     session_reused: bool = False
+    #: The blocker is a person, not the fleet. Retrying spawns another session
+    #: that asks the same question, so this goes straight to the human list
+    #: instead of through the infra-failure counter.
+    needs_permission: bool = False
     #: True only on the send that actually went out. A poll of work already
     #: dispatched sets it False, which is what stops one LLM call being
     #: charged once per observation.
@@ -509,6 +513,8 @@ class HarnessEngine:
         if result.pending:
             return self._awaiting(run, policy.PLANNER, result, 0)
         if result.infra_failure:
+            if result.needs_permission:
+                return self.record_permission_blocker(run.id, result.error or "")
             return self.record_infra_failure(run.id, result.error or "planner failed")
         try:
             contract = self._contract_from_payload(run, result.payload, acceptance, checks)
@@ -633,6 +639,8 @@ class HarnessEngine:
         if result.commit:
             self.store.patch_run(run.id, result_commit=result.commit)
         if result.infra_failure:
+            if result.needs_permission:
+                return self.record_permission_blocker(run.id, result.error or "")
             return self.record_infra_failure(run.id, result.error or "builder failed")
 
         # A checkpoint after EVERY build, not only before a rollover. The
@@ -763,6 +771,8 @@ class HarnessEngine:
         if result.pending:
             return self._awaiting(run, policy.EVALUATOR, result, iteration)
         if result.infra_failure:
+            if result.needs_permission:
+                return self.record_permission_blocker(run.id, result.error or "")
             return self.record_infra_failure(run.id, result.error or "evaluator failed")
         try:
             evaluation = parse_verdict(
@@ -931,6 +941,26 @@ class HarnessEngine:
     # =====================================================================
     # interruption, checkpoints and session replacement
     # =====================================================================
+    def record_permission_blocker(self, run_id: str, error: str) -> StepOutcome:
+        """Something only a person can unblock. Asked once, not retried.
+
+        Distinct from an infra failure because the infra counter assumes
+        retrying might work: three attempts, then escalate. Here the first
+        attempt already established that a human is being waited on, and the
+        second would spawn another session that waits on the same human.
+        """
+        run = self.store.require_run(run_id)
+        self.store.patch_run(run_id, last_error=error)
+        run = self.store.require_run(run_id)
+        self.store.open_decision(
+            reason=policy.PERMISSION_REQUIRED, run_id=run.id, task_id=run.task_id,
+            project_id=run.project_id,
+            question=f"{run.title or run.task_id}: {error}",
+            detail={"error": error, "worktree": run.worktree_path,
+                    "session": run.builder_session_id})
+        return self._to(run, state.BLOCKED, action="permission_required",
+                        reason=error, detail={"error": error})
+
     def record_infra_failure(self, run_id: str, error: str) -> StepOutcome:
         """The machinery broke; the work did not.
 

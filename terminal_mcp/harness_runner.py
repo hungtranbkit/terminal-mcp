@@ -575,6 +575,28 @@ class TerminalAgentRunner:
             return AgentResult(infra_failure=True, session_id=session,
                                error=f"spawned session never came up: {health.get('reason')}")
         age = _age_seconds(dispatch.get("created_at"))
+        if health.get("awaiting_human") and age >= self.spawn_settle_seconds:
+            # A SETUP BLOCKER, NOT A STALL.
+            #
+            # A spawned session asking a human something before it has been
+            # given any work is not slow -- it is waiting for a person, and no
+            # amount of further polling will change that. Observed live:
+            # Claude Code asks "Is this a project you trust?" the first time
+            # it opens a directory, and a fresh git worktree is always a new
+            # directory. Waiting it out burns the stall timeout and reports
+            # the wrong cause; retrying spawns another session that asks the
+            # same question.
+            #
+            # So it is named for what it is. The engine turns this into a
+            # PERMISSION_REQUIRED decision, which is on the closed human list
+            # precisely because deterministic code cannot answer it.
+            reason = (f"the spawned session is waiting on a human before any work "
+                      f"was sent (most likely a workspace-trust prompt for "
+                      f"{dispatch.get('worktree_path') or 'its working directory'})")
+            self.store.update_dispatch(dispatch["id"], state="failed", error=reason,
+                                       last_observed_at=iso_now())
+            return AgentResult(infra_failure=True, session_id=session, error=reason,
+                               needs_permission=True)
         if age < self.spawn_settle_seconds or health.get("awaiting_human"):
             self.store.update_dispatch(dispatch["id"], last_observed_at=iso_now())
             return AgentResult(pending=True, dispatch_id=dispatch["id"],
