@@ -81,10 +81,6 @@ _STAGE_TO_QUEUE_STATUS: dict[str, str] = {
 }
 
 
-class HarnessUnavailable(RuntimeError):
-    """This deployment has no harness wired. Raised, never silently ignored."""
-
-
 def _clean(values: Sequence[str] | None) -> tuple[str, ...]:
     if not values:
         return ()
