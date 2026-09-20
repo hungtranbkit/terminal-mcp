@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -641,25 +642,100 @@ def test_the_prompt_is_included_verbatim_and_first():
 @pytest.mark.skipif(not os.environ.get("HARNESS_REAL_SESSION"),
                     reason="set HARNESS_REAL_SESSION=1 to drive a real tmux session")
 def test_real_session_smoke(tmp_path):
-    """One real session, one real send, one real artifact read back.
+    """One real session, opened in a real Harness worktree, really trusted.
 
-    Kept out of the default run because it opens a tmux session on this
-    machine. It is the only test in this file that touches anything real, and
-    it is the one that proves the fakes above are shaped correctly.
+    Kept out of the default run because it opens a tmux session and writes a
+    Claude Code config entry on this machine. It is the only test in this
+    file that touches anything real, and it is the one that proves the fakes
+    above are shaped correctly.
+
+    THE CONSTRUCTION MATTERS, AND THE PREVIOUS ONE WAS WRONG. This built a
+    bare `ControllerService()`, which is a PRIVATE per-call registry with no
+    node in it -- every spawn it attempted failed NO_ELIGIBLE_NODE, and the
+    test passed anyway because it accepted `pending OR infra_failure`. It was
+    asserting that something happened, not that the right thing did.
+
+    A local TerminalService satisfies the whole SessionOps slice by itself
+    (status/tail/send_text/list_sessions/create_session), which is what the
+    single-node path actually is. Using it means a failure here is a failure
+    of the runner rather than of the rig.
     """
-    from terminal_mcp.controller import ControllerService
+    from terminal_mcp.config import load_config
+    from terminal_mcp.core import TerminalService
+    from terminal_mcp.harness_trust import WorkspaceTrust, default_worktree_roots
 
-    controller = ControllerService()
-    store = HarnessStore(tmp_path / "queue.db")
-    runner = TerminalAgentRunner(controller, store, artifacts_root=tmp_path / "artifacts",
-                                 default_runtime="claude")
-    run = _run(store, task_id="SMOKE-1")
-    result = runner.run(role=policy.BUILDER, prompt=FakePrompt("say hello"), run=run,
-                        tier="economy", session_id=None, iteration=1)
-    assert result.pending or result.infra_failure
-    dispatch = store.latest_dispatch(run.id, iteration=1, role=policy.BUILDER)
-    assert dispatch is not None
-    assert dispatch["idempotency_key"].startswith("harness:")
+    config = load_config()
+    roots = default_worktree_roots(config.session_lifecycle.allowed_cwd_roots)
+    if not roots:
+        pytest.skip("no allowed_cwd_roots configured: nowhere a worktree may live")
+
+    repo = Path(__file__).resolve().parent.parent
+    worktree = Path(roots[0]) / "harness" / "REAL-SMOKE"
+    branch = "harness/real-smoke"
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "worktree", "add", "--force", "-B", branch,
+                    str(worktree), "HEAD"], cwd=repo, capture_output=True, check=True)
+    try:
+        store = HarnessStore(tmp_path / "queue.db")
+        run = _run(store, task_id="REAL-SMOKE")
+        store.patch_run(run.id, worktree_path=str(worktree), branch=branch)
+        # RE-READ. patch_run returns the updated row; reusing the object from
+        # create_run means the spawn gets cwd=None and lands in the workspace
+        # root -- which is ALREADY trusted, so the trust assertion below would
+        # pass while proving nothing. That is exactly what happened the first
+        # time this smoke was run by hand.
+        run = store.require_run(run.id)
+
+        trust = WorkspaceTrust(store=store, worktree_roots=roots)
+        assert trust.is_trusted(worktree) is False, "a fresh worktree starts untrusted"
+
+        ops = TerminalService(config)
+        runner = TerminalAgentRunner(ops, store, artifacts_root=tmp_path / "artifacts",
+                                     default_runtime="claude", trust=trust)
+        result = runner.run(role=policy.BUILDER, prompt=FakePrompt("say hello"),
+                            run=run, tier="economy", session_id=None, iteration=1)
+
+        # The spawn SUCCEEDED -- not "pending or infra_failure", which is the
+        # assertion that let an empty registry look like a pass.
+        assert result.infra_failure is False, result.error
+        assert result.pending is True
+        assert getattr(result, "needs_permission", False) is False, \
+            "a trusted worktree must not stop on a workspace-trust prompt"
+
+        dispatch = store.latest_dispatch(run.id, iteration=1, role=policy.BUILDER)
+        assert dispatch is not None
+        assert dispatch["idempotency_key"].startswith("harness:")
+        assert dispatch["session_id"], "a real session was opened"
+        assert dispatch["worktree_path"] == str(worktree)
+        assert trust.is_trusted(worktree) is True, \
+            "the runner registered trust before opening the directory"
+        try:
+            assert _pane_has_no_trust_dialog(dispatch["session_id"])
+        finally:
+            subprocess.run(["tmux", "kill-session", "-t", dispatch["session_id"]],
+                           capture_output=True)
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", str(worktree)],
+                       cwd=repo, capture_output=True)
+        subprocess.run(["git", "branch", "-D", branch], cwd=repo, capture_output=True)
+
+
+def _pane_has_no_trust_dialog(session: str) -> bool:
+    """The blocker, checked where it actually appears.
+
+    Claude Code paints "Do you trust the files in this folder?" into the
+    pane. Reading the pane is the only way to assert its ABSENCE -- the
+    runner cannot tell "settled at a prompt" from "settled on a question"
+    until the settle timeout, which is the whole reason this was expensive.
+    """
+    import time
+
+    time.sleep(8)  # let Claude Code paint its first frame
+    pane = subprocess.run(["tmux", "capture-pane", "-p", "-t", session],
+                          capture_output=True, text=True).stdout.lower()
+    for phrase in ("do you trust", "trust the files", "is this a project you trust"):
+        assert phrase not in pane, f"workspace-trust dialog appeared: {phrase!r}"
+    return True
 
 
 def test_an_artifact_carrying_this_dispatchs_nonce_completes_it_alone(store, artifacts):

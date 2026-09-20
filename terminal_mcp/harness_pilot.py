@@ -36,6 +36,7 @@ the Human Decision Queue without ever opening a run.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import subprocess
@@ -372,6 +373,11 @@ class Pilot:
         # worktree the agent cannot cd into is a worktree no agent can work in.
         self.worktree_root = str(Path(repo_root).resolve().parent
                                  / ".terminal-mcp-worktrees" / "harness")
+        #: Set by a caller that wants Harness worktrees trusted before a
+        #: session opens them (see harness_trust). None keeps the previous
+        #: behaviour: the session asks, and the run stops on
+        #: PERMISSION_REQUIRED.
+        self.trust: Any = None
         self._worktrees: list[tuple[str, str]] = []
         self.outcomes: list[TaskOutcome] = []
         self.human_queue: list[dict[str, Any]] = []
@@ -553,13 +559,23 @@ class Pilot:
         return path, branch
 
     def cleanup_worktrees(self) -> list[str]:
-        """The pilot leaves the pilot repository as it found it."""
+        """The pilot leaves the pilot repository as it found it.
+
+        Including the Claude Code config. A worktree is named after its task,
+        so the same path recurs the next time that task runs -- and a trust
+        entry left behind would pre-approve whatever appears there next,
+        including a directory somebody made by hand. Revoked AFTER the
+        directory is gone, because `revoke` refuses a path that still exists.
+        """
         removed = []
         for path, branch in self._worktrees:
             subprocess.run(["git", "worktree", "remove", "--force", path],
                            cwd=self.repo_root, capture_output=True, text=True, timeout=120)
             subprocess.run(["git", "branch", "-D", branch],
                            cwd=self.repo_root, capture_output=True, text=True, timeout=120)
+            if self.trust is not None:
+                with contextlib.suppress(Exception):
+                    self.trust.revoke(path, source="pilot-cleanup")
             removed.append(path)
         self._worktrees = []
         return removed

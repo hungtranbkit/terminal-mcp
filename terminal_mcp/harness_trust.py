@@ -72,6 +72,7 @@ PROJECTS_KEY = "projects"
 #: directory trusted" is answerable from the record rather than by inference.
 TRUST_REGISTERED = "TRUST_REGISTERED"
 TRUST_REFUSED = "TRUST_REFUSED"
+TRUST_REVOKED = "TRUST_REVOKED"
 
 
 def default_config_path() -> Path:
@@ -95,11 +96,13 @@ NOT_HARNESS_OWNED = "not_harness_owned"
 NO_STORE = "no_store"
 CONFIG_CORRUPT = "config_corrupt"
 CONFIG_UNWRITABLE = "config_unwritable"
+#: revoke() only: the directory is still there, so this is not a cleanup.
+STILL_EXISTS = "still_exists"
 
 REFUSAL_REASONS: tuple[str, ...] = (
     NOT_ABSOLUTE, NOT_A_DIRECTORY, OUTSIDE_APPROVED_ROOTS, IS_A_ROOT_ITSELF,
     NOT_A_GIT_WORKTREE, NOT_HARNESS_OWNED, NO_STORE, CONFIG_CORRUPT,
-    CONFIG_UNWRITABLE,
+    CONFIG_UNWRITABLE, STILL_EXISTS,
 )
 
 
@@ -351,6 +354,100 @@ class WorkspaceTrust:
         self._audit(decision)
         return decision
 
+    def revoke(self, path: str | os.PathLike[str], *, run_id: str | None = None,
+               source: str = "harness") -> TrustDecision:
+        """Remove the trust entry for a worktree that no longer exists.
+
+        WHY THIS IS NOT OPTIONAL TIDYING. Harness worktrees are named after
+        their task, so the same path recurs every time that task runs. Left
+        behind, an entry granted to a directory that has since been deleted
+        silently pre-approves whatever appears at that path next -- including
+        a directory a person made by hand. Trust must not outlive the thing
+        it was granted for.
+
+        Deliberately REFUSES to revoke a path that still exists: this is a
+        cleanup for a removed worktree, not a general "untrust" verb, and a
+        caller that wants the latter is asking for something this module does
+        not do. Only paths under an approved root are touched at all, so it
+        can never remove a person's own entry.
+        """
+        resolved = _real(path)
+        checks: dict[str, Any] = {"given": str(path), "resolved": resolved,
+                                  "approved_roots": list(self.worktree_roots)}
+        matched = next((root for root in self.worktree_roots
+                        if _is_strictly_under(resolved, root)), None)
+        checks["root_match"] = matched
+        if matched is None:
+            decision = TrustDecision(path=resolved, granted=False,
+                                     reason=OUTSIDE_APPROVED_ROOTS, run_id=run_id,
+                                     source=source, checks=checks)
+            self._audit(decision, event=TRUST_REVOKED)
+            return decision
+        if os.path.isdir(resolved):
+            decision = TrustDecision(path=resolved, granted=False,
+                                     reason=STILL_EXISTS, run_id=run_id,
+                                     source=source, checks=checks)
+            self._audit(decision, event=TRUST_REVOKED)
+            return decision
+
+        config, error, backup = self._read_config()
+        if error is not None:
+            decision = TrustDecision(path=resolved, granted=False, reason=error,
+                                     run_id=run_id, source=source,
+                                     backup_path=backup, checks=checks)
+            self._audit(decision, event=TRUST_REVOKED)
+            return decision
+        if resolved not in (config.get(PROJECTS_KEY) or {}):
+            decision = TrustDecision(path=resolved, granted=True, reason="not_present",
+                                     already=True, run_id=run_id, source=source,
+                                     checks=checks)
+            self._audit(decision, event=TRUST_REVOKED)
+            return decision
+
+        try:
+            backup = self._remove_entry(resolved)
+        except OSError as exc:
+            decision = TrustDecision(path=resolved, granted=False,
+                                     reason=CONFIG_UNWRITABLE, run_id=run_id,
+                                     source=source, backup_path=backup,
+                                     checks={**checks, "error": str(exc)})
+            self._audit(decision, event=TRUST_REVOKED)
+            return decision
+        decision = TrustDecision(path=resolved, granted=True, reason="revoked",
+                                 run_id=run_id, source=source, backup_path=backup,
+                                 checks=checks)
+        self._audit(decision, event=TRUST_REVOKED)
+        return decision
+
+    def _remove_entry(self, resolved: str) -> str | None:
+        """Drop one projects entry, under the same lock and atomicity as a write."""
+        with file_lock(self.config_path):
+            backup = self._backup()
+            existing = json.loads(self.config_path.read_text(encoding="utf-8"))
+            if not isinstance(existing, dict):
+                raise OSError("config is not a JSON object")
+            projects = existing.get(PROJECTS_KEY)
+            if isinstance(projects, dict):
+                projects.pop(resolved, None)
+                existing[PROJECTS_KEY] = projects
+            directory = self.config_path.parent
+            handle, tmp = tempfile.mkstemp(dir=str(directory),
+                                           prefix=f".{self.config_path.name}.",
+                                           suffix=".tmp")
+            try:
+                with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                    json.dump(existing, stream, indent=2, sort_keys=False)
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, self.config_path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+                raise
+        return backup
+
     # =====================================================================
     # the file
     # =====================================================================
@@ -451,7 +548,7 @@ class WorkspaceTrust:
     # =====================================================================
     # the record
     # =====================================================================
-    def _audit(self, decision: TrustDecision) -> None:
+    def _audit(self, decision: TrustDecision, *, event: str | None = None) -> None:
         """TRUST_REGISTERED / TRUST_REFUSED, on the run's own event log.
 
         Written against the run when there is one, because "why did this
@@ -461,7 +558,8 @@ class WorkspaceTrust:
         synthetic run to hang an event on would put a row in harness_runs
         that never executed anything.
         """
-        event = TRUST_REGISTERED if decision.granted else TRUST_REFUSED
+        if event is None:
+            event = TRUST_REGISTERED if decision.granted else TRUST_REFUSED
         if self.audit is not None:
             try:
                 self.audit(event, decision.to_dict())

@@ -580,3 +580,110 @@ def test_a_harness_worktree_under_the_derived_root_is_accepted(
 def test_an_empty_declaration_yields_no_roots_and_trusts_nothing():
     assert trust.default_worktree_roots([]) == ()
     assert trust.default_worktree_roots(["", "   "]) == ()
+
+
+# ---------------------------------------------------------------------------
+# trust must not outlive the worktree it was granted for
+# ---------------------------------------------------------------------------
+
+def test_revoking_a_removed_worktree_drops_its_entry(config, store, repo, worktree_root):
+    """Harness worktrees are named after their task, so the same path recurs
+    every time that task runs. An entry left behind pre-approves whatever
+    appears at that path next."""
+    path = _worktree(repo, worktree_root)
+    run = _run_owning(store, path)
+    service = _trust(config, store, worktree_root)
+    service.register(path, run_id=run.id)
+    assert service.is_trusted(path) is True
+
+    subprocess.run(["git", "worktree", "remove", "--force", str(path)],
+                   cwd=repo, capture_output=True, check=True)
+    decision = service.revoke(path, run_id=run.id)
+
+    assert decision.granted is True and decision.reason == "revoked"
+    assert os.path.realpath(path) not in json.loads(config.read_text())["projects"]
+
+
+def test_a_path_that_still_exists_is_not_revoked(config, store, repo, worktree_root):
+    """This is cleanup for a removed worktree, not a general untrust verb."""
+    path = _worktree(repo, worktree_root)
+    run = _run_owning(store, path)
+    service = _trust(config, store, worktree_root)
+    service.register(path, run_id=run.id)
+
+    decision = service.revoke(path, run_id=run.id)
+
+    assert decision.granted is False
+    assert decision.reason == trust.STILL_EXISTS
+    assert service.is_trusted(path) is True, "still trusted; nothing was touched"
+
+
+def test_revoke_will_not_touch_a_path_outside_the_approved_roots(
+        config, store, worktree_root, tmp_path):
+    """It can never remove a person's own entry, even by mistake."""
+    service = _trust(config, store, worktree_root)
+    before = json.loads(config.read_text())["projects"]
+
+    decision = service.revoke(tmp_path / "somebody-elses-deleted-dir")
+
+    assert decision.granted is False
+    assert decision.reason == trust.OUTSIDE_APPROVED_ROOTS
+    assert json.loads(config.read_text())["projects"] == before
+
+
+def test_revoking_what_was_never_trusted_is_not_an_error(
+        config, store, worktree_root):
+    decision = _trust(config, store, worktree_root).revoke(worktree_root / "GONE")
+    assert decision.granted is True and decision.already is True
+    assert decision.reason == "not_present"
+
+
+def test_revoke_preserves_every_other_entry(config, store, repo, worktree_root):
+    path = _worktree(repo, worktree_root)
+    run = _run_owning(store, path)
+    service = _trust(config, store, worktree_root)
+    service.register(path, run_id=run.id)
+    subprocess.run(["git", "worktree", "remove", "--force", str(path)],
+                   cwd=repo, capture_output=True, check=True)
+
+    service.revoke(path, run_id=run.id)
+
+    after = json.loads(config.read_text())
+    assert after["hasCompletedOnboarding"] is True
+    assert after["projects"]["/home/someone/private-work"]["allowedTools"] == ["Bash(ls)"]
+
+
+def test_a_revocation_is_audited(config, store, repo, worktree_root):
+    path = _worktree(repo, worktree_root)
+    run = _run_owning(store, path)
+    service = _trust(config, store, worktree_root)
+    service.register(path, run_id=run.id)
+    subprocess.run(["git", "worktree", "remove", "--force", str(path)],
+                   cwd=repo, capture_output=True, check=True)
+
+    service.revoke(path, run_id=run.id, source="pilot-cleanup")
+
+    events = [e for e in store.events(run.id) if e["event_type"] == trust.TRUST_REVOKED]
+    assert len(events) == 1
+    assert events[0]["metadata"]["path"] == os.path.realpath(path)
+    assert events[0]["actor"] == "pilot-cleanup"
+
+
+def test_the_same_path_can_be_trusted_again_after_a_revoke(
+        config, store, repo, worktree_root):
+    """The recurrence this exists for: task T runs, is cleaned up, runs again."""
+    path = _worktree(repo, worktree_root)
+    run = _run_owning(store, path)
+    service = _trust(config, store, worktree_root)
+    service.register(path, run_id=run.id)
+    subprocess.run(["git", "worktree", "remove", "--force", str(path)],
+                   cwd=repo, capture_output=True, check=True)
+    service.revoke(path, run_id=run.id)
+    assert service.is_trusted(path) is False
+
+    again = _worktree(repo, worktree_root)
+    run2 = _run_owning(store, again, task_id="T-1-again")
+    decision = service.register(again, run_id=run2.id)
+
+    assert decision.granted is True
+    assert decision.already is False, "the fresh worktree earned trust on its own"
