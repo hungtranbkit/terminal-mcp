@@ -110,6 +110,17 @@ TURN_HANDLER_ACTIONS: dict[str, str] = {
     "project_start": "project_start",
     "task_status": "task_status",
     "task_batch_status": "task_batch_status",
+    # TMCP-HARNESS-001. The harness is reachable ONLY from here. There is
+    # deliberately no standalone harness_* tool: a second surface would be a
+    # second place for "may this write the task status" to be decided, and
+    # the entire feature is about that question having one answer. Every
+    # value below is the same HarnessService method the dashboard routes
+    # call, so the one-tool path is never weaker than any other.
+    "harness_start": "harness_start",
+    "harness_status": "harness_status",
+    "harness_resume": "harness_resume",
+    "harness_cancel": "harness_cancel",
+    "harness_review": "harness_review",
     # Browser gateway (TMCP-BROWSER-GATEWAY-001). The browser has to be
     # reachable from the ONE-tool ChatGPT surface, or ChatGPT would need a
     # second control plane to use it -- which is the exact thing this
@@ -162,6 +173,12 @@ TURN_ACTION_ALIASES: dict[str, str] = {
     "stale_sessions": "cleanup_candidates",
     "auto": "route_start",
     "route": "route_start",
+    # Short spellings for the harness. `harness` alone reads the status,
+    # because asking about a run is overwhelmingly the common case and a
+    # bare noun should never be the one that STARTS something.
+    "harness": "harness_status",
+    "harness_runs": "harness_status",
+    "review": "harness_review",
     "start_task": "start",
     "dispatch": "start",
     "run": "start",
@@ -213,6 +230,17 @@ AGENT_ARGS: dict[str, frozenset[str]] = {
     "project_reconcile_team": frozenset({"project_id"}),
     "project_start": frozenset({"project_id", "prompt", "title", "capabilities", "approval",
                                   "agent_id", "priority", "metadata", "request_key", "target"}),
+    # TMCP-HARNESS-001. `task_id` is the positional for every one of these:
+    # a harness action is always ABOUT a task, and a run id is the optional
+    # narrower way to name the same thing.
+    "harness_start": frozenset({"task_id", "prompt", "title", "project_id", "acceptance",
+                                  "checks", "changed_paths", "mode", "write_authority",
+                                  "node_id", "actor", "steps"}),
+    "harness_status": frozenset({"run_id", "task_id", "project_id", "limit"}),
+    "harness_resume": frozenset({"run_id", "task_id", "actor", "steps"}),
+    "harness_cancel": frozenset({"run_id", "task_id", "reason", "actor"}),
+    "harness_review": frozenset({"run_id", "task_id", "project_id", "decision_id",
+                                   "resolution", "approve_merge", "actor"}),
 }
 
 #: Arguments without which the action cannot mean anything. Checked here so
@@ -233,6 +261,11 @@ AGENT_REQUIRED: dict[str, tuple[str, ...]] = {
     "project_advance": ("project_id",),
     "project_reconcile_team": ("project_id",),
     "project_start": ("project_id", "prompt"),
+    # Only harness_start is required to name a task. status/resume/cancel/
+    # review all accept EITHER a run_id or a task_id, which a fixed
+    # positional list cannot express -- HarnessService refuses the empty
+    # case itself, with a message that names both ways to fix it.
+    "harness_start": ("task_id",),
 }
 
 _BLOCKED_ERRORS = {
@@ -1015,6 +1048,13 @@ class CompactTerminalTools:
                 extra.setdefault("metadata", metadata)
             if request_key and "request_key" in allowed:
                 extra.setdefault("request_key", request_key)
+            # `task_id` is a turn-level parameter already (task_status uses
+            # it), so an action that takes one reads it from there rather
+            # than making the caller repeat it inside `args`. Same rule as
+            # title/metadata/request_key above: forwarded only where the
+            # action actually declares it.
+            if task_id and "task_id" in allowed:
+                extra.setdefault("task_id", task_id)
             missing = sorted(key for key in AGENT_REQUIRED.get(action, ()) if not extra.get(key))
             if missing:
                 return {"status": "FAILED", "error": "MISSING_ARGS", "action": action,
@@ -1026,7 +1066,12 @@ class CompactTerminalTools:
                        ("task_id", "session", "node_id", "routing_state", "routing_outcome",
                         "routing_reason", "score", "task_state", "dispatched", "poll",
                         "agent_id", "skills", "project_id", "phase", "agent_role",
-                        "pm_agent_id", "agent_selection_reason")
+                        "pm_agent_id", "agent_selection_reason",
+                        # TMCP-HARNESS-001: the few scalars a caller acts on
+                        # without reading the whole report. `created` is the
+                        # exactly-once answer and `resumed_to` is the proof a
+                        # resume continued rather than restarted.
+                        "run_id", "stage", "created", "resumed_from", "resumed_to")
                        if isinstance(result, dict) and key in result}}
 
         if action == "route_start":

@@ -20,6 +20,7 @@ import pytest
 from terminal_mcp.compact_tools import (TURN_ACTION_ALIASES, TURN_ACTIONS,
                                         TURN_HANDLER_ACTIONS, TURN_PANE_ACTIONS,
                                         CompactTerminalTools)
+from terminal_mcp.config import load_config
 from terminal_mcp.run_journal import RunJournalStore
 
 
@@ -310,3 +311,101 @@ def test_the_advertised_turn_schema_exposes_every_routed_argument():
                      "title", "priority", "metadata", "request_key",
                      "task_id", "task_ids"):
         assert argument in schema, f"terminal_turn must declare {argument}"
+
+
+# ---------------------------------------------------------------------------
+# TMCP-HARNESS-001: the harness is reachable HERE, and only here.
+#
+# The feature's whole claim is that "what is this task doing" has one answer.
+# A standalone harness_* tool beside these actions would be a second place to
+# decide whether a run may write a task status, which is the defect pointed
+# the other way -- so "there is no standalone tool" is itself a test.
+# ---------------------------------------------------------------------------
+
+HARNESS_ACTIONS = ("harness_start", "harness_status", "harness_resume",
+                   "harness_cancel", "harness_review")
+
+
+def test_every_harness_action_is_routable():
+    for action in HARNESS_ACTIONS:
+        assert action in TURN_ACTIONS
+        assert action in TURN_HANDLER_ACTIONS
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest.mark.anyio
+async def test_the_harness_lives_on_the_one_tool_surface_and_nowhere_else():
+    """No standalone harness tool. If one is ever added, this fails loudly.
+
+    Asserted against the server's REAL advertised tool list, not against the
+    module's attributes: a tool that exists only as a registered closure
+    would be invisible to the second check and is exactly what this forbids.
+    """
+    from terminal_mcp.core import TerminalService
+    from terminal_mcp.mcp_app import build_mcp
+
+    server = build_mcp(TerminalService(load_config()), default_optional_services=False)
+    names = {tool.name for tool in await server.list_tools()}
+
+    assert names, "the tool list must actually be populated for this to mean anything"
+    assert "terminal_turn" in names, "the one-tool surface itself must be there"
+    assert [name for name in names if "harness" in name.lower()] == [], \
+        "the harness is a terminal_turn action, never a tool of its own"
+
+
+@pytest.mark.parametrize("action", HARNESS_ACTIONS)
+def test_a_harness_action_routes_to_its_injected_service_method(action):
+    recorder = Recorder({"status": "OK"})
+    tools = CompactTerminalTools(terminal=None, controller=FakeController())
+    tools.handlers[action] = recorder
+
+    tools.turn(action=action, task_id="T-1", args={})
+
+    assert len(recorder.calls) == 1, f"{action} did not reach its handler"
+    _args, kwargs = recorder.calls[0]
+    assert kwargs.get("task_id") == "T-1", \
+        "the turn-level task_id is forwarded, not silently dropped"
+
+
+def test_an_unwired_harness_action_refuses_honestly():
+    tools = CompactTerminalTools(terminal=None, controller=FakeController())
+    result = tools.turn(action="harness_status", args={})
+    assert result["status"] == "FAILED"
+    assert result["error"] == "ACTION_UNAVAILABLE"
+
+
+def test_harness_start_names_the_argument_it_is_missing():
+    recorder = Recorder()
+    tools = CompactTerminalTools(terminal=None, controller=FakeController())
+    tools.handlers["harness_start"] = recorder
+
+    result = tools.turn(action="harness_start", args={})
+
+    assert result["status"] == "FAILED"
+    assert result["error"] == "MISSING_ARGS" and result["missing"] == ["task_id"]
+    assert recorder.calls == [], "a refusal never reaches the service"
+
+
+def test_a_typo_in_harness_args_is_refused_by_name():
+    """A typo that appears to succeed is how a caller comes to believe it set
+    something it did not -- write_authority above all."""
+    recorder = Recorder()
+    tools = CompactTerminalTools(terminal=None, controller=FakeController())
+    tools.handlers["harness_start"] = recorder
+
+    result = tools.turn(action="harness_start", task_id="T-1",
+                        args={"write_authorty": "autonomous"})
+
+    assert result["status"] == "FAILED"
+    assert result["error"] == "UNKNOWN_ARGS"
+    assert result["unknown"] == ["write_authorty"]
+    assert recorder.calls == []
+
+
+def test_the_bare_noun_reads_rather_than_starts():
+    """`harness` must never be the spelling that STARTS work."""
+    assert TURN_ACTION_ALIASES["harness"] == "harness_status"

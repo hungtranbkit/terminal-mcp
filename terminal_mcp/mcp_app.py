@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 
 from mcp.server.mcpserver import MCPServer
 
@@ -23,6 +24,7 @@ from .integration_service import IntegrationService
 from .integration_store import publish_handoff_for_completed_task
 from .dor_gate import check_definition_of_ready
 from .git_isolation_service import GitIsolationService
+from .harness_service import HarnessService
 from .node_models import node_to_dict as _node_to_dict
 from . import orchestration_policy
 from .notes_service import NotesService
@@ -100,7 +102,8 @@ def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_sessio
                      project_advance, project_reconcile_team, project_start,
                      browser_status, browser_verify, browser_screenshot,
                      browser_run_task, browser_stop, dispatch_tick,
-                     follow_task) -> dict[str, Any]:
+                     follow_task, harness_start, harness_status, harness_resume,
+                     harness_cancel, harness_review) -> dict[str, Any]:
     """The implementations terminal_turn's non-pane actions route to.
 
     Keyword-only and exhaustive on purpose: every key in
@@ -151,6 +154,17 @@ def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_sessio
         "browser_screenshot": browser_screenshot,
         "browser_run_task": browser_run_task,
         "browser_stop": browser_stop,
+        # TMCP-HARNESS-001. Deliberately NOT registered as standalone tools:
+        # these five are the only way to reach the harness, and a second
+        # surface would be a second place to decide whether a run may write
+        # a task status. Every value is a HarnessService method -- the same
+        # object the dashboard routes read -- so the one-tool path and the
+        # UI can never disagree about a run.
+        "harness_start": harness_start,
+        "harness_status": harness_status,
+        "harness_resume": harness_resume,
+        "harness_cancel": harness_cancel,
+        "harness_review": harness_review,
         # Not actions of their own (see compact_tools.START_HANDLER_KEYS):
         # the two steps `action="start"` (and a long_task send) compose so one
         # client call both persists the task AND gets it actually running,
@@ -5961,6 +5975,27 @@ def build_mcp(service: TerminalService | None = None,
             "document": ui_workflow.policy_document(),
         }
 
+    # TMCP-HARNESS-001. One HarnessService per build, sharing the QUEUE's own
+    # store -- the harness tables live in that same database (see the
+    # migration ladder in queue_store), so a second connection to a second
+    # file would be exactly the second source of truth this feature removes.
+    #
+    # `runner` is deliberately None. Nothing on this server can reach a model
+    # through the harness yet: start/status/resume/cancel/review all work,
+    # planning is deterministic, and the moment a Builder would be needed the
+    # engine refuses and `_drive` reports that refusal as a result. A harness
+    # that could spend tokens before anyone has wired an AgentRunner would be
+    # a harness nobody chose to turn on.
+    harness = HarnessService(
+        queue=queue,
+        # The janitor's configured roots are the only declared "repositories
+        # this server may touch" in the config. Reusing that list means the
+        # harness inherits an operator's existing answer rather than asking
+        # the same question again under a new key.
+        repo_root=next(iter(terminal.config.worktree_janitor.repo_roots), None),
+        runner=None,
+        owner=f"mcp-{os.getpid()}")
+
     # One-tool surface wiring (see compact_tools.TURN_HANDLER_ACTIONS): the
     # discovery/lifecycle/queue actions terminal_turn routes are bound to the
     # SAME functions registered as standalone tools above, never to
@@ -6003,6 +6038,11 @@ def build_mcp(service: TerminalService | None = None,
         browser_stop=browser_handlers.get("browser_stop"),
         dispatch_tick=lambda session: queue_engine.tick(session).to_dict(),
         follow_task=_started_task_follower.follow,
+        harness_start=harness.start,
+        harness_status=harness.status,
+        harness_resume=harness.resume,
+        harness_cancel=harness.cancel,
+        harness_review=harness.review,
     ))
 
     return server

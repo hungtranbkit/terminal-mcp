@@ -251,12 +251,10 @@ class HarnessService:
         except Exception as exc:  # noqa: BLE001 -- surfaced, never swallowed
             return {"status": "FAILED", "error": "START_FAILED", "detail": str(exc)}
 
-        outcomes: list[dict[str, Any]] = []
-        if steps > 0:
-            outcomes = [outcome.to_dict()
-                        for outcome in engine.drive(run.id, max_steps=int(steps))]
+        outcomes, drive_error = self._drive(engine, run.id, steps)
         return {
             "status": "OK",
+            "drive_error": drive_error,
             # `created=False` is the exactly-once answer: a repeated
             # harness_start for the same task definition returns the SAME
             # run rather than opening a second one.
@@ -265,6 +263,30 @@ class HarnessService:
             "definition_source": definition.get("source", "caller"),
             "steps": outcomes,
         }
+
+    def _drive(self, engine: HarnessEngine, run_id: str, steps: int
+               ) -> tuple[list[dict[str, Any]], str | None]:
+        """Step the engine, and report a refusal as a RESULT rather than raise.
+
+        The case this exists for is the ordinary one on a server with no
+        AgentRunner wired: planning is deterministic and succeeds, then the
+        Builder cannot be reached. That is a true and useful answer -- the
+        run exists, it got as far as PLAN_READY, and here is precisely what
+        stopped it -- whereas a traceback out of an MCP tool tells a caller
+        only that something went wrong somewhere.
+
+        Every step taken before the refusal is still returned, because they
+        really happened and are already on the record.
+        """
+        if steps <= 0:
+            return [], None
+        outcomes: list[dict[str, Any]] = []
+        try:
+            for outcome in engine.drive(run_id, max_steps=int(steps)):
+                outcomes.append(outcome.to_dict())
+        except Exception as exc:  # noqa: BLE001 -- reported, never swallowed
+            return outcomes, f"{type(exc).__name__}: {exc}"
+        return outcomes, None
 
     def _definition_for(self, task_id: str) -> dict[str, Any]:
         """The task's own durable definition, if this task_id is a real task.
@@ -442,13 +464,17 @@ class HarnessService:
                 metadata={"checkpoint": (checkpoint or {}).get("id"),
                           "iteration": run.current_iteration})
         else:
+            # Reachable only from INIT: a run that has taken no step has
+            # nothing to continue. Say so, and say what does move it, rather
+            # than leaving a caller to guess that "not resumable" means "not
+            # started" here and "already finished" elsewhere.
             return {"status": "FAILED", "error": "NOT_RESUMABLE",
-                    "stage": run.stage, "run_id": run.id}
+                    "stage": run.stage, "run_id": run.id,
+                    "detail": f"a run at {run.stage} has taken no step yet; there is "
+                              f"nothing to continue. Drive it with harness_start "
+                              f"(steps=N) instead."}
 
-        outcomes: list[dict[str, Any]] = []
-        if steps > 0:
-            outcomes = [item.to_dict()
-                        for item in engine.drive(run.id, max_steps=int(steps))]
+        outcomes, drive_error = self._drive(engine, run.id, steps)
         current = self.store.require_run(run.id)
         return {
             "status": "OK",
@@ -465,6 +491,7 @@ class HarnessService:
             "worktree_path": current.worktree_path,
             "branch": current.branch,
             "steps": outcomes,
+            "drive_error": drive_error,
             "run": current.to_dict(),
         }
 
