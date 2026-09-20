@@ -39,6 +39,7 @@ from urllib.parse import urlparse
 
 import anyio
 from mcp.server.mcpserver import MCPServer
+from . import dashboard_nav
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import WebSocketRoute
@@ -201,6 +202,20 @@ def _origin_allowed(request: Request, allowed_origins: tuple[str, ...]) -> bool:
     return origin_value in same_origin or origin_value in allowed_origins
 
 
+def _app_page(html: str, active: str,
+              breadcrumbs: tuple[tuple[str, str | None], ...] = ()) -> str:
+    """The /app surface, through the SAME shared nav shell the fleet
+    dashboard uses -- with its OWN destination list.
+
+    These pages sit behind a session cookie; /dashboard/* sits behind
+    Cloudflare Access. One menu spanning both would offer every /app user a
+    row of links they cannot open, so the two surfaces share the component
+    and the stylesheet and differ only in where they can go. See
+    dashboard_nav.APP_NAV.
+    """
+    return dashboard_nav.apply(html, dashboard_nav.APP_NAV, active, breadcrumbs)
+
+
 def register_webauth_dashboard(server: MCPServer, terminal: TerminalService, webauth: WebAuthStore,
                                supervisor: SupervisorService | None = None,
                                supervisor_v2: SupervisorV2Service | None = None,
@@ -321,7 +336,7 @@ def register_webauth_dashboard(server: MCPServer, terminal: TerminalService, web
             return blocked
         if user.must_change_password:
             return RedirectResponse("/app/password", status_code=303)
-        return HTMLResponse(APP_DASHBOARD_HTML, headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
+        return HTMLResponse(_app_page(APP_DASHBOARD_HTML, "app-home"), headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
 
     @server.custom_route("/app/sessions", methods=["GET"], include_in_schema=False)
     async def app_sessions_admin_page(request: Request):
@@ -333,7 +348,7 @@ def register_webauth_dashboard(server: MCPServer, terminal: TerminalService, web
             return blocked
         if user.must_change_password:
             return RedirectResponse("/app/password", status_code=303)
-        return HTMLResponse(APP_SESSIONS_ADMIN_HTML, headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
+        return HTMLResponse(_app_page(APP_SESSIONS_ADMIN_HTML, "app-sessions"), headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
 
     @server.custom_route("/app/password", methods=["GET"], include_in_schema=False)
     async def app_password_page(request: Request):
@@ -344,7 +359,9 @@ def register_webauth_dashboard(server: MCPServer, terminal: TerminalService, web
         blocked, user = _require_session_page(request)
         if blocked is not None:
             return blocked
-        return HTMLResponse(_password_form_html(user.username, forced=user.must_change_password),
+        return HTMLResponse(_app_page(_password_form_html(user.username,
+                                                  forced=user.must_change_password),
+                              "app-password"),
                             headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/app/password", methods=["POST"], include_in_schema=False)
@@ -675,7 +692,7 @@ def register_webauth_dashboard(server: MCPServer, terminal: TerminalService, web
             return blocked
         if user.must_change_password:
             return RedirectResponse("/app/password", status_code=303)
-        return HTMLResponse(APP_WEBTERM_HTML, headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
+        return HTMLResponse(_app_page(APP_WEBTERM_HTML, "app-terminal"), headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
 
     async def app_terminal_ws(websocket: WebSocket) -> None:
         if not _origin_allowed(websocket, terminal.config.dashboard.allowed_origins):

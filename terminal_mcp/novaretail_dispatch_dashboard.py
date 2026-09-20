@@ -2,6 +2,7 @@
 from __future__ import annotations
 import json, subprocess
 from pathlib import Path
+from . import dashboard_nav
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 
@@ -41,7 +42,9 @@ def register(server, read_guard, mutation_guard, run_service=None):
  @server.custom_route('/dashboard/ops/novaretail-dispatch',methods=['GET'],include_in_schema=False)
  @server.custom_route('/ops/novaretail-dispatch',methods=['GET'],include_in_schema=False)
  async def page(request:Request):
-  blocked,_=read_guard(request); return blocked or HTMLResponse(HTML)
+  blocked,_=read_guard(request)
+  return blocked or HTMLResponse(
+      dashboard_nav.apply(HTML, dashboard_nav.DASHBOARD_NAV, 'novaretail-dispatch'))
  @server.custom_route('/dashboard/api/ops/novaretail-dispatch',methods=['GET'],include_in_schema=False)
  async def api(request:Request):
   blocked,_=read_guard(request); recent=events(); classification=(recent[0].get('worker_classification') if recent else None) or []; by_session={x.get('session'):x for x in classification if isinstance(x,dict)}

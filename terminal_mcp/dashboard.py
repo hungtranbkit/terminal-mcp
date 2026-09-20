@@ -24,6 +24,8 @@ from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
 from . import lan_discovery, network_bind, remote_connect, tunnel_diagnostics
+from html import escape as html_escape
+from . import dashboard_nav
 from .cf_access import verify_access_assertion
 from .agent_availability import available_agent_types
 from .access_policy import filter_record, policy_table, role_for_identity
@@ -100,6 +102,42 @@ def _requirements_doc_path() -> Path:
     module lives one level deeper, in terminal_mcp/, so parents[1] is
     the repo root either way)."""
     return Path(__file__).resolve().parents[1] / "docs" / "REQUIREMENTS.md"
+
+
+REQUIREMENTS_PAGE_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Requirements &middot; Terminal MCP</title>
+<style>
+  body { margin:0; background:#0a1020; color:#e6ecf8;
+         font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .req-wrap { padding:16px 12px 40px; }
+  .req-wrap h1 { font-size:15px; margin:0 0 12px; }
+  pre { margin:0; padding:14px; overflow:auto; background:#0d1424; border:1px solid #1f2a44;
+        border-radius:8px; font-size:12px; line-height:1.55; white-space:pre-wrap;
+        word-break:break-word; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+</style></head>
+<body>
+<div class="req-wrap">
+  <h1>Requirements / Feature Matrix</h1>
+  <pre>__REQUIREMENTS__</pre>
+</div>
+</body></html>
+"""
+
+
+def _nav_page(html: str, active: str,
+              breadcrumbs: tuple[tuple[str, str | None], ...] = ()) -> str:
+    """Every full dashboard page, served through the ONE shared nav shell.
+
+    The pages here are independent module-level HTML constants, so before this
+    each one carried whatever header its author wrote -- usually none, which
+    is why several screens could only be left with the browser's Back button.
+    This is the single place that changes: a page says which entry is active
+    and, when it has one, its own breadcrumb trail. It never describes the
+    menu, so the menu can never go stale on one page and not another.
+    """
+    return dashboard_nav.apply(html, dashboard_nav.DASHBOARD_NAV, active, breadcrumbs)
 
 
 def _read_requirements_doc() -> str:
@@ -13309,7 +13347,14 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             text = await anyio.to_thread.run_sync(_read_requirements_doc)
         except OSError as exc:
             return JSONResponse({"error": "REQUIREMENTS_DOC_UNREADABLE", "detail": str(exc)}, status_code=500)
-        return PlainTextResponse(text, headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
+        # Wrapped in the shared shell rather than returned as a bare text
+        # dump. The doc itself is unchanged and still escaped rather than
+        # rendered (no new dependency, no injection surface) -- what changes
+        # is that an operator who opens this can now leave it without the
+        # browser's Back button, which is the whole complaint this addresses.
+        page = _nav_page(REQUIREMENTS_PAGE_HTML.replace("__REQUIREMENTS__", html_escape(text)),
+                         "requirements")
+        return HTMLResponse(page, headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
 
     @server.custom_route("/dashboard", methods=["GET"], include_in_schema=False)
     async def dashboard(request: Request) -> HTMLResponse | JSONResponse:
@@ -13317,7 +13362,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if blocked is not None:
             return blocked
         return HTMLResponse(
-            DASHBOARD_HTML,
+            _nav_page(DASHBOARD_HTML, "home"),
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
         )
 
@@ -13331,7 +13376,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if blocked is not None:
             return blocked
         return HTMLResponse(
-            SESSIONS_ADMIN_HTML,
+            _nav_page(SESSIONS_ADMIN_HTML, "sessions"),
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
         )
 
@@ -13345,7 +13390,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if blocked is not None:
             return blocked
         return HTMLResponse(
-            NODES_ADMIN_HTML,
+            _nav_page(NODES_ADMIN_HTML, "nodes"),
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
         )
 
@@ -13388,7 +13433,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         blocked, _identity = _read_guard(request)
         if blocked is not None:
             return blocked
-        return HTMLResponse(FLEET_HTML,
+        return HTMLResponse(_nav_page(FLEET_HTML, "fleet"),
                             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
 
     def _role(identity) -> str:
@@ -13409,7 +13454,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         blocked, _identity = _read_guard(request)
         if blocked is not None:
             return blocked
-        return HTMLResponse(AUDIT_HTML, headers={"Cache-Control": "no-store",
+        return HTMLResponse(_nav_page(AUDIT_HTML, "audit"), headers={"Cache-Control": "no-store",
                                                  "X-Frame-Options": "DENY"})
 
     @server.custom_route("/dashboard/api/audit", methods=["GET"], include_in_schema=False)
@@ -14098,7 +14143,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         blocked, _identity = _read_guard(request)
         if blocked is not None:
             return blocked
-        return HTMLResponse(WORK_HTML, headers={"Cache-Control": "no-store",
+        return HTMLResponse(_nav_page(WORK_HTML, "work"), headers={"Cache-Control": "no-store",
                                                 "X-Frame-Options": "DENY"})
 
     @server.custom_route("/dashboard/api/deployment", methods=["GET"],
@@ -14182,7 +14227,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if blocked is not None:
             return blocked
         return HTMLResponse(
-            TERMINAL_WALL_HTML,
+            _nav_page(TERMINAL_WALL_HTML, "terminal-wall"),
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
         )
 
@@ -14244,7 +14289,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if blocked is not None:
             return blocked
         return HTMLResponse(
-            AI_USAGE_HTML,
+            _nav_page(AI_USAGE_HTML, "ai-usage"),
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
         )
 
@@ -14421,7 +14466,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         blocked, _identity = _read_guard(request)
         if blocked is not None:
             return blocked
-        return HTMLResponse(PROJECTS_HTML, headers={"Cache-Control": "no-store",
+        return HTMLResponse(_nav_page(PROJECTS_HTML, "projects"), headers={"Cache-Control": "no-store",
                                                     "X-Frame-Options": "DENY"})
 
     def _projects_or_none():
@@ -14565,7 +14610,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if blocked is not None:
             return blocked
         return HTMLResponse(
-            AGENTS_HTML,
+            _nav_page(AGENTS_HTML, "agents"),
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
         )
 
@@ -14617,7 +14662,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if blocked is not None:
             return blocked
         return HTMLResponse(
-            GLOBAL_TASKS_HTML,
+            _nav_page(GLOBAL_TASKS_HTML, "tasks"),
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
         )
 
@@ -14633,7 +14678,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if blocked is not None:
             return blocked
         return HTMLResponse(
-            BACKLOG_HTML,
+            _nav_page(BACKLOG_HTML, "backlog"),
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
         )
 
@@ -14658,7 +14703,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if unauthorised is not None:
             return unauthorised
         return HTMLResponse(
-            NOTES_HTML,
+            _nav_page(NOTES_HTML, "notes"),
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
         )
 
@@ -16973,7 +17018,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if blocked is not None:
             return blocked
         return HTMLResponse(
-            WEBTERM_HTML,
+            _nav_page(WEBTERM_HTML, "terminal"),
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
         )
 

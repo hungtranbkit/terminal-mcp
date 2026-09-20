@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from . import dashboard_nav
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 
@@ -146,7 +147,8 @@ def register(server, read_guard, mutation_guard, config_path: Path = CONFIG):
     @server.custom_route("/dashboard/ops/dispatch-settings", methods=["GET"], include_in_schema=False)
     async def page(request: Request):
         blocked, _ = read_guard(request)
-        return blocked or HTMLResponse(HTML)
+        return blocked or HTMLResponse(
+            dashboard_nav.apply(HTML, dashboard_nav.DASHBOARD_NAV, "dispatch-settings"))
 
     @server.custom_route("/dashboard/api/ops/dispatch-settings", methods=["GET"], include_in_schema=False)
     async def api(request: Request):
