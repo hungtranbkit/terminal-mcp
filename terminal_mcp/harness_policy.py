@@ -27,7 +27,7 @@ the keys.
 
 THE HUMAN DECISION LIST IS CLOSED
 
-Seven reasons, and a failing test is not one of them. Anything not on this
+Nine reasons, and a failing test is not one of them. Anything not on this
 list is the machine's problem to solve, which is what makes REVISING the
 default response to a FAIL instead of a queue of humans reading test output.
 """
@@ -80,6 +80,13 @@ MAY_SELF_APPROVE_MERGE: dict[str, bool] = {SHADOW: False, SUPERVISED: False, AUT
 
 # -- human decision queue -----------------------------------------------------
 MISSING_CREDENTIAL = "missing_credential"
+#: An INPUT the machine is not allowed to invent: an approved design asset, a
+#: licensed file, a real measurement. Distinct from missing_credential because
+#: no amount of access would produce it -- somebody has to hand it over. It is
+#: on the list precisely so that a task needing one is routed to a human
+#: BEFORE a Builder is paid to iterate against a bar it cannot reach, and so
+#: that "generate a plausible substitute" is never the cheap way out.
+MISSING_HUMAN_INPUT = "missing_human_input"
 PERMISSION_REQUIRED = "permission_required"
 DESTRUCTIVE_ACTION = "destructive_action"
 LEGAL_OR_DATA = "legal_license_or_data"
@@ -89,9 +96,9 @@ REPEATED_INFRA_FAILURE = "repeated_infra_failure"
 CONTRADICTORY_ARCHITECTURE = "contradictory_architecture"
 
 HUMAN_DECISION_REASONS: tuple[str, ...] = (
-    MISSING_CREDENTIAL, PERMISSION_REQUIRED, DESTRUCTIVE_ACTION, LEGAL_OR_DATA,
-    AMBIGUOUS_PRODUCT, MAX_ITERATIONS_REACHED, REPEATED_INFRA_FAILURE,
-    CONTRADICTORY_ARCHITECTURE,
+    MISSING_CREDENTIAL, MISSING_HUMAN_INPUT, PERMISSION_REQUIRED,
+    DESTRUCTIVE_ACTION, LEGAL_OR_DATA, AMBIGUOUS_PRODUCT,
+    MAX_ITERATIONS_REACHED, REPEATED_INFRA_FAILURE, CONTRADICTORY_ARCHITECTURE,
 )
 
 #: How many consecutive infrastructure failures on one run stop being an

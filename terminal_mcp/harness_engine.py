@@ -50,7 +50,9 @@ and a red test is not on it.
 from __future__ import annotations
 
 import json
+import re
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol, Sequence
@@ -161,6 +163,122 @@ def run_checks(commands: Sequence[str], *, cwd: str | None,
     return results
 
 
+#: Shell constructs that make a line a command even though the first word is
+#: not a program on PATH.
+_SHELL_BUILTINS = frozenset({
+    "true", "false", "test", "echo", "cd", "export", "source", ".", "set",
+    "exit", "read", "eval", "exec", "[",
+})
+
+
+def partition_checks(checks: Sequence[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """(commands, prose). Which declared checks can actually be RUN.
+
+    WHY THIS EXISTS, AND WHY IT IS NOT IN harness_policy
+
+    The evaluator-skip is sound for one reason only: a declared check's exit
+    status is not a matter of opinion. That reasoning collapses the moment a
+    "check" is a phrase rather than a command. Real task files are full of
+    them -- "typecheck", "component tests", "fixture validation" -- and every
+    one of those would be handed to a shell, exit 127, and be recorded as a
+    product failure of code that is fine.
+
+    So a check counts as a check only if its first word resolves to a program
+    on this machine or is a shell builtin. Everything else is a MANUAL check:
+    still written into the contract, still shown to the Builder and the
+    Evaluator, but never used as grounds to skip a Planner or an Evaluator.
+
+    It lives here and not in harness_policy because it asks the filesystem
+    what exists, and `mode_for`/`planner_required` are pure -- they have to
+    give the same answer on the controller and on the node that will run the
+    work, and `shutil.which` does not.
+    """
+    commands: list[str] = []
+    prose: list[str] = []
+    for raw in checks:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        # A pipeline, a redirect or a chain is a shell line by construction.
+        if any(token in text for token in ("|", "&&", "||", ";", ">", "<", "$(")):
+            commands.append(text)
+            continue
+        try:
+            parts = shlex.split(text)
+        except ValueError:
+            prose.append(text)
+            continue
+        if not parts:
+            prose.append(text)
+            continue
+        program = parts[0]
+        if program in _SHELL_BUILTINS or shutil.which(program):
+            commands.append(text)
+        else:
+            prose.append(text)
+    return tuple(commands), tuple(prose)
+
+
+#: Literals a criterion can name that a command's OUTPUT can be checked
+#: against: version strings and content hashes. Deliberately only these two --
+#: they are unambiguous, and a looser matcher would start reporting prose
+#: mismatches, which is guessing.
+_VERSION_LITERAL = re.compile(r"\bv?\d+(?:\.\d+)*(?:\.x|\.\*)?\b")
+_HASH_LITERAL = re.compile(r"\b[0-9a-f]{32,64}\b")
+
+
+def _literals(text: str) -> tuple[tuple[str, str], ...]:
+    found: list[tuple[str, str]] = []
+    for match in _HASH_LITERAL.finditer(text.lower()):
+        found.append(("hash", match.group()))
+    for match in _VERSION_LITERAL.finditer(text.lower()):
+        token = match.group()
+        # A bare integer is not a version claim; "16px" and "3 items" would
+        # otherwise every one of them look like one.
+        if "." in token or token.startswith("v"):
+            found.append(("version", token))
+    return tuple(found)
+
+
+def uncorroborated_criteria(contract: "ExecutionContract",
+                            results: Sequence[CheckResult]) -> tuple[str, ...]:
+    """Criteria whose declared checks passed WITHOUT deciding them.
+
+    WHY A GREEN CHECK IS NOT ALWAYS A PASS
+
+    The evaluator-skip rests on the exit status being the answer. `node -v`
+    exits 0 on every version ever released, so a criterion reading "node -v
+    reports v24.x" is not decided by it -- and a run that records that
+    criterion as passing has put a false statement into the audit trail, which
+    is worse than having spent the money on an evaluator.
+
+    The test is narrow and mechanical: when a criterion names a version or a
+    hash, that literal must appear in the output of the checks that ran. When
+    it names neither, this says nothing -- the check is accepted as the
+    evidence, which is the documented LIGHT/STANDARD bargain. Narrow on
+    purpose: an escalation rule that fires on prose would escalate everything
+    and quietly restore the cost of an evaluator on every task.
+    """
+    output = "\n".join(r.output for r in results).lower()
+    stale: list[str] = []
+    for kind, text in contract.criteria():
+        claims = _literals(text)
+        if not claims:
+            continue
+        satisfied = False
+        for claim_kind, literal in claims:
+            if claim_kind == "hash":
+                satisfied = satisfied or literal in output
+                continue
+            prefix = literal.rstrip("*").rstrip(".x").rstrip(".")
+            satisfied = satisfied or any(
+                token.startswith(prefix)
+                for token in re.split(r"[\s,;:()\[\]]+", output))
+        if not satisfied:
+            stale.append(criterion_id(kind, text))
+    return tuple(stale)
+
+
 @dataclass
 class StepOutcome:
     """What one `step()` did. Returned rather than logged-and-swallowed so a
@@ -214,6 +332,8 @@ class HarnessEngine:
               requested_mode: str | None = None,
               write_authority: str = policy.SHADOW,
               node_id: str | None = None,
+              inherit_builder_session: str | None = None,
+              inherit_from_task: str | None = None,
               actor: str | None = None) -> tuple[Any, bool]:
         """(run, created). Idempotent on the task DEFINITION.
 
@@ -222,6 +342,10 @@ class HarnessEngine:
         than the triage chose, never less, and a de-escalation request is
         recorded in `reasons` rather than silently dropped.
         """
+        # Prose is separated from commands BEFORE the triage sees them, so a
+        # task whose "checks" are labels is correctly treated as a task with
+        # no checks -- which is precisely the case that needs a Planner.
+        commands, prose = partition_checks(checks)
         overrides = self.store.resolve_policy_overrides(project_id=project_id,
                                                         task_id=task_id)
         effective_mode = requested_mode or overrides.get("mode")
@@ -229,7 +353,7 @@ class HarnessEngine:
         run_policy = policy.policy_for(
             f"{title}\n{prompt}", changed_paths=changed_paths,
             requested_mode=effective_mode, write_authority=authority,
-            acceptance=acceptance, checks=checks)
+            acceptance=acceptance, checks=commands)
         if overrides.get("max_iterations"):
             run_policy = policy.HarnessPolicy(
                 **{**run_policy.to_dict(),
@@ -240,7 +364,7 @@ class HarnessEngine:
         cost = policy.cost_policy_for(run_policy.mode)
         digest = definition_hash(project_id=project_id or "", task_id=task_id,
                                  mode=run_policy.mode, prompt=prompt,
-                                 acceptance=acceptance, checks=checks)
+                                 acceptance=acceptance, checks=commands)
         run, created = self.store.create_run(
             task_id=task_id, prompt=prompt, title=title, project_id=project_id,
             run_policy=run_policy, cost=cost,
@@ -253,8 +377,21 @@ class HarnessEngine:
             # never runtime state.
             self.store.patch_run(run.id, policy={
                 **run.policy, "declared_acceptance": list(acceptance),
-                "declared_checks": list(checks),
-                "changed_paths": list(changed_paths)})
+                "declared_checks": list(commands),
+                "declared_manual_checks": list(prose),
+                "changed_paths": list(changed_paths),
+                "session_inherited_from": inherit_from_task})
+            if inherit_builder_session:
+                # The scheduler decided this task lands on a lane's existing
+                # session. Recorded on the run BEFORE any prompt is built, so
+                # `_builder_prompt` reads it as a fact rather than being told.
+                self.store.patch_run(run.id, builder_session_id=inherit_builder_session)
+                self.store.record_event(
+                    run.id, event_type="BUILDER_SESSION_INHERITED",
+                    actor=inherit_builder_session,
+                    reason=f"same lane as {inherit_from_task}",
+                    metadata={"from_task": inherit_from_task,
+                              "session": inherit_builder_session})
             run = self.store.require_run(run.id)
         return run, created
 
@@ -372,6 +509,7 @@ class HarnessEngine:
             scope=run.title or run.prompt,
             functional_acceptance=acceptance,
             required_checks=checks,
+            manual_checks=run.policy.get("declared_manual_checks") or (),
             affected_areas=run.policy.get("changed_paths") or (),
             planner_agent=None)
 
@@ -404,7 +542,8 @@ class HarnessEngine:
             required_checks=tuple(data.get("required_checks") or ())
                             + tuple(c for c in checks
                                     if c not in (data.get("required_checks") or ())),
-            manual_checks=data.get("manual_checks"),
+            manual_checks=tuple(data.get("manual_checks") or ())
+                          + tuple(run.policy.get("declared_manual_checks") or ()),
             dev_command=data.get("dev_command"),
             test_command=data.get("test_command"),
             build_command=data.get("build_command"))
@@ -487,6 +626,14 @@ class HarnessEngine:
         occupancy is about to be replaced, and handing it a delta would put
         the delta in the session that is about to be thrown away.
         """
+        inherited = run.policy.get("session_inherited_from")
+        if (iteration == 1 and previous is None and run.builder_session_id and inherited):
+            # Cross-task reuse: this session built the task next door in the
+            # same lane, so it already holds these modules. Only the contract
+            # is new, and the contract is small.
+            return self.assembler.adjacent_task_prompt(
+                contract=contract, previous_task_id=str(inherited)), True
+
         reusable = (previous is not None
                     and run.builder_session_id is not None
                     and checkpoint is not None
@@ -531,6 +678,25 @@ class HarnessEngine:
                                 detail={"failed_checks": [r.command for r in failed_checks]})
 
         independent, why = policy.evaluator_required(run.mode)
+        stale = uncorroborated_criteria(contract, results)
+        if stale and not independent:
+            # The checks are green but do not decide these criteria. This is
+            # the one case where a cheap mode buys an Evaluator call: not
+            # because the mode changed, but because the evidence it was going
+            # to rely on turned out not to be evidence for this criterion.
+            independent, why = True, (
+                f"declared checks passed but do not decide {len(stale)} criterion(s): "
+                f"{', '.join(stale)}")
+            self.store.bump_efficiency(run.id, decision=f"evaluator escalation: {why}")
+            if self.runner is None:
+                self.store.open_decision(
+                    reason=policy.AMBIGUOUS_PRODUCT, run_id=run.id, task_id=run.task_id,
+                    project_id=run.project_id,
+                    question=f"{run.title or run.task_id}: {why}. What command decides them?",
+                    detail={"uncorroborated": list(stale),
+                            "checks": [r.to_dict() for r in results]})
+                return self._to(run, state.BLOCKED, action="uncorroborated_criteria",
+                                reason=why, detail={"uncorroborated": list(stale)})
         if not independent:
             evaluation = self._verdict_from_checks(contract, iteration, results)
             self.store.bump_efficiency(run.id, evaluator_skipped=1,
