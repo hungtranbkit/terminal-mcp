@@ -39,3 +39,44 @@ def available_agent_types(launch_commands: tuple[tuple[str, str], ...]) -> tuple
         if resolve_launcher(launcher) is not None:
             available.append(agent_type)
     return tuple(available)
+
+
+def agent_type_evidence(launch_commands: tuple[tuple[str, str], ...]) -> dict[str, dict[str, str]]:
+    """The SAME answer, plus WHY -- `{agent_type: {available, launcher, detail}}`.
+
+    "hp-linux does not offer claude" and "hp-linux offers claude" are both
+    answers an operator can act on. "hp-linux's agent_types is
+    ["shell"]" is neither: it does not say whether the launcher is
+    unconfigured, misnamed, or installed somewhere this process's PATH cannot
+    see -- which is by far the most common cause, because a systemd user unit
+    does not inherit a login shell's PATH and therefore often cannot see
+    `~/.local/bin`.
+
+    Reporting the resolved absolute path when it IS found is the other half:
+    it is the difference between believing a capability and being able to
+    check it. Never executes the launcher -- see this module's own docstring
+    and capability_probe.py for why detection stays `shutil.which`.
+    """
+    evidence: dict[str, dict[str, str]] = {
+        "shell": {"available": True, "launcher": "", "detail": "every node can host a plain shell"},
+    }
+    for agent_type, launcher in launch_commands:
+        if agent_type == "shell":
+            continue
+        if not launcher:
+            evidence[agent_type] = {
+                "available": False, "launcher": "",
+                "detail": f"no launcher is configured for {agent_type!r} in "
+                          f"session_lifecycle.launch_commands"}
+            continue
+        resolved = resolve_launcher(launcher)
+        if resolved is None:
+            evidence[agent_type] = {
+                "available": False, "launcher": launcher,
+                "detail": f"launcher {launcher!r} does not resolve on this node's effective PATH; "
+                          f"install it, or give the service a PATH that includes it (a systemd "
+                          f"user unit does not inherit a login shell's PATH)"}
+            continue
+        evidence[agent_type] = {"available": True, "launcher": launcher,
+                                "detail": f"resolved to {resolved}"}
+    return evidence

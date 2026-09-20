@@ -60,6 +60,14 @@ from .task_profile import TaskProfile
 
 _LOGGER = logging.getLogger(__name__)
 
+#: A live probe is only worth doing if there is real time to do it in; below
+#: this the router ranks on durable state instead of spending the dispatch
+#: phase's clock.
+MIN_PROBE_SECONDS = 0.2
+#: No single candidate probe may take more than this, however much budget is
+#: left -- three fast probes tell a router more than one slow one.
+MAX_PROBE_SECONDS = 2.0
+
 #: Outcomes of one routing attempt. Deliberately a small, closed vocabulary --
 #: every one of these is shown to a human, so a new one is a UI decision, not
 #: an implementation detail.
@@ -154,6 +162,13 @@ class TaskRouter:
         self._deadline: float | None = None
         self._cache: tuple[float, list[SessionCandidate]] | None = None
         self._cache_ttl_seconds = 2.0
+        # The last fleet snapshot that actually came back, kept separately
+        # from the TTL cache above. When a fresh collect is refused by its own
+        # budget or comes back empty because every node timed out, routing on
+        # a snapshot from thirty seconds ago and saying so beats routing on
+        # nothing at all -- an empty candidate list is indistinguishable from
+        # "the fleet is empty" and defers every task in the queue.
+        self._last_snapshot: tuple[float, list[SessionCandidate]] | None = None
         # One routing decision at a time in this process. The store's
         # BEGIN IMMEDIATE already makes the CLAIM safe across processes; this
         # only stops one process from spending N concurrent fleet listings to
@@ -189,35 +204,78 @@ class TaskRouter:
 
     # -- candidate collection ----------------------------------------------
 
-    def candidates(self, *, refresh: bool = False) -> list[SessionCandidate]:
+    @property
+    def snapshot_budget_seconds(self) -> float:
+        """How long ONE routing decision may spend looking at the fleet.
+
+        Deliberately a fraction of the whole dispatch budget, not all of it.
+        Found live on hp-linux (2026-09-20): project_start returned in 12.5s
+        having burned its entire 12s budget on a serial fleet listing, so
+        `dispatch_ticks` was 0 and the task came back TASK_ACCEPTED/QUEUED
+        rather than started. Looking at the fleet is a means; starting the
+        task is the end, and the end gets most of the clock."""
+        return float(self._policy_value("snapshot_budget_seconds", 4.0))
+
+    @property
+    def stale_snapshot_max_age_seconds(self) -> float:
+        """How old a fallback fleet snapshot may be before it is not evidence.
+
+        Routing on a minute-old view risks picking a session that has since
+        gone busy -- which the live probe in `rank` re-checks before we commit,
+        and which `bind_task_to_session` refuses outright if another task got
+        there first. Routing on NO view risks deferring the entire queue
+        because one node was slow, which nothing downstream corrects."""
+        return float(self._policy_value("stale_snapshot_max_age_seconds", 60.0))
+
+    def candidates(self, *, refresh: bool = False,
+                   budget_seconds: float | None = None) -> list[SessionCandidate]:
         """Every session in the fleet, described in routing terms.
 
         Cached for a couple of seconds. A rescue cycle routing eight backlog
         tasks must not perform eight identical fleet listings, and two seconds
         is short enough that a session going busy is noticed on the next cycle
         while the live probe in `rank` re-verifies whichever one we actually
-        pick anyway."""
+        pick anyway.
+
+        `budget_seconds` bounds the underlying fleet fan-out. When the fresh
+        collect comes back empty AND a recent snapshot exists, the snapshot
+        wins: see stale_snapshot_max_age_seconds."""
         if not refresh and self._cache is not None:
             cached_at, rows = self._cache
             if self.clock() - cached_at < self._cache_ttl_seconds:
                 return rows
-        rows = self._collect()
-        self._cache = (self.clock(), rows)
+        rows = self._collect(budget_seconds=budget_seconds)
+        now = self.clock()
+        if not rows and self._last_snapshot is not None:
+            taken_at, previous = self._last_snapshot
+            if previous and now - taken_at < self.stale_snapshot_max_age_seconds:
+                _LOGGER.warning(
+                    "task-router: fleet listing returned nothing; routing on the "
+                    "%.1fs-old snapshot of %d session(s) instead of deferring everything",
+                    now - taken_at, len(previous))
+                self._cache = (now, previous)
+                return previous
+        self._cache = (now, rows)
+        if rows:
+            self._last_snapshot = (now, rows)
         return rows
 
     def invalidate(self) -> None:
         self._cache = None
 
-    def _collect(self) -> list[SessionCandidate]:
+    def _collect(self, *, budget_seconds: float | None = None) -> list[SessionCandidate]:
         if self.controller is None:
             return []
         try:
-            listing = self.controller.terminal_list_sessions()
+            listing = self._list_sessions_bounded(budget_seconds)
         except Exception:  # noqa: BLE001 -- a fleet listing glitch must defer, never crash the loop
             _LOGGER.exception("task-router: fleet session listing failed")
             return []
         nodes = {}
         try:
+            # terminal_list_sessions has already evaluated node health under the
+            # same budget; this call is served from NodeHealthService's own
+            # probe cache and costs no further network round trips.
             nodes = {node.id: node for node in self.controller.list_nodes()}
         except Exception:  # noqa: BLE001
             _LOGGER.exception("task-router: node listing failed; scoring without node health")
@@ -230,8 +288,11 @@ class TaskRouter:
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("task-router: session registry read failed")
 
-        load = self._lane_load()
-        claims = self._session_claims()
+        # ONE durable read for both derived views. These were two calls to
+        # list_all_lanes(), which walks every lane and every task in it; on a
+        # fleet with 78 sessions that is the same full scan performed twice
+        # for one routing decision.
+        load, claims = self._lane_load_and_claims()
         local_node_id = getattr(self.controller, "local_node_id", None)
 
         candidates: list[SessionCandidate] = []
@@ -289,36 +350,59 @@ class TaskRouter:
             return candidate
         return SessionCandidate(**{**candidate.__dict__, "worktree_exists": exists})
 
-    def _lane_load(self) -> dict[str, tuple[int, int]]:
-        """session -> (active, queued), from the durable queue only."""
-        load: dict[str, tuple[int, int]] = {}
+    def _list_sessions_bounded(self, budget_seconds: float | None) -> dict[str, Any]:
+        """The fleet listing, passing a budget through when the controller
+        understands one. A controller old enough not to (a test double, an
+        older embedded build) still works exactly as it did."""
+        if budget_seconds is None:
+            return self.controller.terminal_list_sessions()
         try:
-            lanes = self.store.list_all_lanes()
-        except Exception:  # noqa: BLE001
-            _LOGGER.exception("task-router: lane load read failed")
-            return load
-        for lane in lanes:
-            active = sum(1 for task in lane.get("tasks", [])
-                         if task["status"] in QueueStore._ACTIVE_STATUSES)
-            queued = sum(1 for task in lane.get("tasks", []) if task["status"] == QUEUED)
-            load[lane["session"]] = (active, queued)
-        return load
+            return self.controller.terminal_list_sessions(budget_seconds=budget_seconds)
+        except TypeError:
+            return self.controller.terminal_list_sessions()
 
-    def _session_claims(self) -> dict[str, str]:
-        """session -> task_id currently holding it, so a claimed session is
-        never offered to a second task."""
+    def _lane_load_and_claims(self) -> tuple[dict[str, tuple[int, int]], dict[str, str]]:
+        """session -> (active, queued), and session -> task_id holding it.
+
+        ONE pass over the durable lanes for both. They were separate reads of
+        the same full scan, which on a real fleet is the most expensive purely
+        local thing a routing decision does.
+
+        A claimed session is never offered to a second task -- that is the
+        cheap, read-side half of the double-dispatch guard whose authoritative
+        half is `bind_task_to_session`'s own BEGIN IMMEDIATE.
+        """
+        load: dict[str, tuple[int, int]] = {}
         claims: dict[str, str] = {}
         try:
             lanes = self.store.list_all_lanes()
         except Exception:  # noqa: BLE001
-            return claims
+            _LOGGER.exception("task-router: lane load read failed")
+            return load, claims
         for lane in lanes:
-            for task in lane.get("tasks", []):
+            tasks = lane.get("tasks", [])
+            active = queued = 0
+            for task in tasks:
+                status = task["status"]
+                if status in QueueStore._ACTIVE_STATUSES:
+                    active += 1
+                elif status == QUEUED:
+                    queued += 1
                 held = task.get("execution_session")
                 if (held and task.get("routing_state") in (BOUND, SPAWNED)
-                        and task.get("status") not in TERMINAL_STATUSES):
+                        and status not in TERMINAL_STATUSES):
                     claims[held] = task["id"]
-        return claims
+            load[lane["session"]] = (active, queued)
+        return load, claims
+
+    def _lane_load(self) -> dict[str, tuple[int, int]]:
+        """session -> (active, queued), from the durable queue only."""
+        return self._lane_load_and_claims()[0]
+
+    def _session_claims(self) -> dict[str, str]:
+        """session -> task_id currently holding it, so a claimed session is
+        never offered to a second task."""
+        return self._lane_load_and_claims()[1]
 
     def _probe(self, candidate: SessionCandidate) -> SessionCandidate:
         """Re-read one candidate's live state before we commit to it.
@@ -330,7 +414,7 @@ class TaskRouter:
         if self.controller is None:
             return candidate
         try:
-            status = self.controller.terminal_status(candidate.session)
+            status = self._status_bounded(candidate.session)
         except Exception:  # noqa: BLE001 -- an unreadable session is not a usable one
             return SessionCandidate(**{**candidate.__dict__,
                                        "state": "UNKNOWN", "state_probed": True,
@@ -361,6 +445,27 @@ class TaskRouter:
                     updates["dirty"] = bool(git["dirty"])
         refreshed = SessionCandidate(**{**candidate.__dict__, **updates})
         return self._with_worktree(refreshed)
+
+    def _status_bounded(self, session: str) -> dict[str, Any]:
+        """One live status read, inside whatever is left of the route budget.
+
+        `terminal_status` is unbounded: it resolves the session across the
+        fleet and then waits on a node with no ceiling of its own. Three of
+        those is how a probe_limit of 3 ate a 12s budget. The controller
+        already has a bounded form for exactly this reason (the wait/resume
+        tools use it); the router now uses it too, and falls back to the plain
+        call only for a controller that does not offer one."""
+        bounded = getattr(self.controller, "terminal_status_bounded", None)
+        if bounded is None or self._deadline is None:
+            return self.controller.terminal_status(session)
+        remaining = self._deadline - self.clock()
+        if remaining <= MIN_PROBE_SECONDS:
+            # No time left to verify: report it as unverifiable rather than
+            # spending budget the dispatch phase needs. An unprobed candidate
+            # is ranked on its durable state, which is what happens for every
+            # candidate past probe_limit anyway.
+            return {"error": "STATUS_PROBE_TIMEOUT", "session": session}
+        return bounded(session, min(MAX_PROBE_SECONDS, remaining))
 
     # -- routing -----------------------------------------------------------
 
@@ -422,13 +527,22 @@ class TaskRouter:
         budget = float(self._policy_value("dispatch_budget_seconds", 12.0))
         route_deadline = self.clock() + budget
         self._deadline = route_deadline
-        match = sm.rank(profile, self.candidates(), probe=self._probe,
+        # The fleet snapshot gets a SLICE of the budget, never all of it.
+        # Whatever it does not use is left for ranking and, crucially, for the
+        # dispatch ticks that actually start the task.
+        snapshot_budget = max(0.5, min(self.snapshot_budget_seconds, budget * 0.5))
+        snapshot_started = self.clock()
+        fleet = self.candidates(budget_seconds=snapshot_budget)
+        snapshot_seconds = self.clock() - snapshot_started
+        match = sm.rank(profile, fleet, probe=self._probe,
                         probe_limit=int(self._policy_value("probe_limit", 3)),
                         deadline=lambda: self.clock() >= route_deadline)
         evidence: dict[str, Any] = {
             "profile": profile.as_dict(),
             "decided_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "candidates_considered": match.considered,
+            "fleet_snapshot_seconds": round(snapshot_seconds, 3),
+            "fleet_snapshot_budget_seconds": round(snapshot_budget, 3),
             **match.as_dict(),
         }
 

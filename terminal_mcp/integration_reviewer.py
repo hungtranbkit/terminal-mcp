@@ -20,7 +20,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any
 
-from .coordinator import SENSITIVE_PROMPT_PATTERNS
+from .coordinator import SENSITIVE_CONTENT_PATTERNS
 from .integration_store import Handoff
 
 READY = "READY"
@@ -106,7 +106,13 @@ class IntegrationReviewGate:
     evidence-collection failure -- depth only changes how MUCH is
     checked, never whether an unreadable check is treated as passing."""
 
-    def __init__(self, *, sensitive_patterns: tuple = SENSITIVE_PROMPT_PATTERNS) -> None:
+    def __init__(self, *, sensitive_patterns: tuple = SENSITIVE_CONTENT_PATTERNS) -> None:
+        # CONTENT patterns, not the prompt screen. This gate reads a real
+        # DIFF, where a bare `API_KEY = "sk-..."` is the finding itself and
+        # there is no verb to look for. The prompt screen went action-shaped
+        # in 2026-09 because in a task DESCRIPTION the same words are ordinary
+        # vocabulary -- a distinction that only exists because these two gates
+        # read different kinds of text. See coordinator.py.
         self.sensitive_patterns = sensitive_patterns
 
     def review(self, handoff: Handoff, pipeline: dict[str, Any]) -> IntegrationReviewDecision:
