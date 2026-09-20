@@ -5410,7 +5410,7 @@ controller can distinguish upgraded nodes. The focused security suites pass,
 but fleet-wide require_headers=true remains a rollout gate and is not claimed
 VERIFIED until every active node sends timestamp/nonce headers. Endpoint
 scheme/public-transport hardening and central audit aggregation remain open;
-per-node audit evidence is still the current source.
+per-node audit evidence is still the current source. Commercial execution safety also defaults codex_yolo to false; the approvals/sandbox bypass is now an explicit trusted-environment opt-in only.
 
 ### Phase 1 — Controller decoupling
 

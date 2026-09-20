@@ -150,8 +150,8 @@ session_lifecycle:
   launch_commands:
     claude: claude
     codex: codex
-  # Codex 0.153.4 audited flag; set false to restore approval/sandbox mode.
-  codex_yolo: true
+  # Least-privilege default. Set true only as an explicit trusted-environment opt-in.
+  codex_yolo: false
   create_ready_timeout_seconds: 6
   default_grant_mode: none
 

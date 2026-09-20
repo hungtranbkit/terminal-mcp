@@ -611,7 +611,7 @@ class SessionLifecycleConfig:
     resume_capable_agent_types: tuple[str, ...] = ("claude",)
     # Codex CLI's current, audited YOLO flag. Shared by create and
     # registry-reopen; never assembled by individual callers.
-    codex_yolo: bool = True
+    codex_yolo: bool = False
     create_ready_timeout_seconds: float = 5.0
     default_grant_mode: str = "none"
 
