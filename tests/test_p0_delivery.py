@@ -298,3 +298,41 @@ def test_stale_idempotency_claim_is_reclaimed_not_stuck_forever(tmp_path):
         connection.execute("UPDATE idempotent_sends SET created_at = ? WHERE idempotency_key = ?",
                            (old, "stale-key"))
     assert audit.claim_idempotency_key("stale-key", stale_after_seconds=30) is False
+
+
+def test_generic_shell_enter_is_confirmation_even_without_redraw(tmux_session_factory, tmp_path, monkeypatch):
+    """A silent shell command must not become false DELIVERY_UNKNOWN.
+
+    Generic shells do not have a raw-mode composer that can swallow Enter.
+    Once the existing mid-send identity/command guard has proved the same
+    shell still owns the pane, delivery of Enter is the acceptance boundary.
+    """
+    session = tmux_session_factory("test-delivery-silent-shell", "bash")
+    time.sleep(0.2)
+    service = _service(tmp_path)
+    original_capture = service.tmux.capture_lines
+
+    # Preserve the real pre-send capture until text has been written, then
+    # simulate the live failure shape: no visible redraw during verification.
+    state = {"text_sent": False}
+    original_send_text = service.tmux.send_text
+
+    def marking_send_text(target: str, text: str, press_enter: bool):
+        original_send_text(target, text, press_enter)
+        state["text_sent"] = True
+
+    frozen = original_capture(session, 200)
+
+    def frozen_capture(target: str, lines: int):
+        if state["text_sent"]:
+            return list(frozen)
+        return original_capture(target, lines)
+
+    monkeypatch.setattr(service.tmux, "send_text", marking_send_text)
+    monkeypatch.setattr(service.tmux, "capture_lines", frozen_capture)
+
+    result = service.terminal_send_text(session, "sleep 0.1", press_enter=True)
+
+    assert result["delivery_state"] == "SUBMIT_CONFIRMED"
+    assert result["enter_sent"] is True
+    assert "SHELL_ENTER_DELIVERED" in result["evidence"]

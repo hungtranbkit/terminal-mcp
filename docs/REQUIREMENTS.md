@@ -337,6 +337,18 @@ sessions bringing up dell-5530/m910/macbook — see `docs/multi-node.md`).
 
 ## 5. Reliable prompt submission
 
+**Generic-shell silent-command confirmation (2026-09-20): VERIFIED locally.**
+After the existing pre-Enter session identity, pane PID and foreground-command
+revalidation proves that the same interactive shell still owns the pane, a
+successful Enter delivery is itself submission confirmation for the generic
+shell adapter. This is intentionally NOT applied to Claude/Codex/raw-mode
+composers, which can swallow Enter and still require adapter/redraw evidence.
+The change removes false `DELIVERY_UNKNOWN` for silent shell commands whose
+pane is byte-identical throughout the short verification window, while keeping
+all existing mid-send identity/takeover blocks. Regression:
+`tests/test_p0_delivery.py::test_generic_shell_enter_is_confirmation_even_without_redraw`.
+
+
 **MANDATORY RULE (2026-09-14): a prompt is DELIVERED only when BOTH (1) the
 send receipt's `delivery_state` is `SUBMIT_CONFIRMED` AND (2) a separate
 post-submit observation shows the target actually took it.** Anything short

@@ -11,7 +11,7 @@ from typing import Any
 
 from . import composer, submit_flow
 from .adapters import (DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_STALLED, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_TEXT_SENT,
-                       DELIVERY_UNKNOWN, TARGET_WAITING, _sent_text_echoed,
+                       DELIVERY_UNKNOWN, TARGET_WAITING, SHELL_COMMANDS, _sent_text_echoed,
                        enter_is_safe_after_command_change, select_adapter,
                        to_legacy_submit_status)
 from .audit import AuditStore
@@ -2046,6 +2046,24 @@ class TerminalService:
             result["delivery_state"] = DELIVERY_UNKNOWN
             result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
             result["submit_reason"] = "could not capture a pre-submit baseline to verify against"
+            return result
+
+        # A real interactive shell is different from an Ink/raw-mode agent:
+        # once the pre-Enter identity/foreground-command guard above proves
+        # the same shell still owns the pane, a successful tmux Enter write is
+        # itself the shell's acceptance boundary. A silent foreground command
+        # (pytest piped to tail, sleep, a compiler, etc.) can leave the pane
+        # byte-identical for the whole short verification window; requiring a
+        # redraw therefore produced false DELIVERY_UNKNOWN even though the
+        # command was already running. Do NOT generalise this to Claude/Codex:
+        # those composers can swallow Enter and still need redraw/adapter
+        # evidence and recovery.
+        if (adapter.name == "generic"
+                and Path(command_before).name.lower().removesuffix(".exe") in SHELL_COMMANDS):
+            result["delivery_state"] = DELIVERY_SUBMIT_CONFIRMED
+            result["submit_status"] = to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED)
+            result["submit_reason"] = "confirmed by guarded shell Enter delivery"
+            result.setdefault("evidence", []).append("SHELL_ENTER_DELIVERED")
             return result
 
         # `adapter` was already selected from command_before, above -- reused
