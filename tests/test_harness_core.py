@@ -31,7 +31,7 @@ from terminal_mcp.harness_contract import (ExecutionContract,
                                            MalformedVerdict, criterion_id,
                                            definition_hash, parse_verdict)
 from terminal_mcp.harness_engine import (AgentResult, CheckResult, HarnessEngine,
-                                         run_checks)
+                                         partition_checks, run_checks)
 from terminal_mcp.harness_schema import HARNESS_SCHEMA_VERSION, HARNESS_TABLES
 from terminal_mcp.harness_store import HarnessStore, LeaseNotHeld, RunNotFound
 from terminal_mcp.queue_store import QueueStore
@@ -853,3 +853,53 @@ def test_definition_hash_is_stable_and_scoped():
                                     prompt="p", acceptance=["a"], checks=["c"])
     assert first != definition_hash(project_id="P", task_id="T", mode="critical",
                                     prompt="p", acceptance=["a"], checks=["c"])
+
+
+def test_a_prose_label_is_not_a_check(tmp_path):
+    """"typecheck" handed to a shell exits 127, and a run would record that as
+    a product failure of code that is fine. The evaluator-skip is sound only
+    because an exit status is not an opinion, and a phrase has no exit status."""
+    commands, prose = partition_checks(
+        ["node -v", "typecheck", "component tests", "sha256sum board.png",
+         "fixture validation", "node -v | grep -q '^v24'"])
+    assert commands == ("node -v", "sha256sum board.png", "node -v | grep -q '^v24'")
+    assert prose == ("typecheck", "component tests", "fixture validation")
+
+
+def test_a_task_whose_checks_are_all_prose_gets_a_planner(store, repo):
+    """The cheap path is declined, not faked, when the definition cannot
+    carry a decidable bar."""
+    runner = ScriptedRunner([
+        AgentResult(payload={"scope": "build the base components",
+                             "functional_acceptance": ["buttons render"],
+                             "required_checks": ["true"]}, agent="planner-agent")])
+    engine = _engine(store, repo, runner)
+    run, _ = engine.start(task_id="MOB-3", prompt="build base UI components",
+                          title="Base components", project_id="demo",
+                          acceptance=["buttons cards badges rows meet design rules"],
+                          checks=["component tests"], changed_paths=["src"])
+    engine.step(run.id)
+
+    assert runner.roles() == [policy.PLANNER]
+    contract = store.get_contract(run.id)
+    assert "component tests" in contract.manual_checks
+    assert "component tests" not in contract.required_checks
+    assert store.efficiency(run.id)["planner_skipped"] == 0
+
+
+def test_prose_checks_never_reach_the_shell(store, repo):
+    seen: list[list[str]] = []
+
+    def recording_checks(commands, *, cwd=None, **kwargs):
+        seen.append(list(commands))
+        return passing_checks(commands)
+
+    engine = _engine(store, repo, checks=recording_checks)
+    run, _ = engine.start(task_id="MIX-1", prompt="pad the header", title="Header",
+                          project_id="demo", acceptance=["the header has 16px padding"],
+                          checks=["true", "component tests"], changed_paths=["src"])
+    engine.drive(run.id)
+
+    assert seen, "the engine must actually have run the runnable check"
+    for batch in seen:
+        assert "component tests" not in batch

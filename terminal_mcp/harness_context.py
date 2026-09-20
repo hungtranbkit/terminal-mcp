@@ -484,6 +484,36 @@ class ContextAssembler:
                 lines.append(f"# Re-run the {label} check when done\n{command}")
         return Prompt(role=policy.BUILDER, text="\n\n".join(lines), delta=True)
 
+    def adjacent_task_prompt(self, *, contract: ExecutionContract,
+                             previous_task_id: str,
+                             pack_key: str | None = None) -> Prompt:
+        """The NEXT contract, handed to a session that already has the lane loaded.
+
+        This is the cross-task cousin of `revision_prompt`, and it saves the
+        same thing for a different reason. A revision omits the context
+        because the session just built against it; this omits the context
+        because the session built the task NEXT DOOR -- same lane, same
+        modules, same toolchain, already read. What is genuinely new is the
+        contract, and the contract is small.
+
+        It is marked `delta` because that is what it is: everything the
+        session does not already have. Sending the pack again here would be
+        paying a second time for files that have not changed since the
+        session read them, which is the single most common way a "fresh start
+        per task" design becomes expensive.
+        """
+        lines = [
+            f"Next task in this lane. You already have this lane's modules and "
+            f"toolchain loaded from {previous_task_id}; nothing about them has "
+            f"changed, so they are not repeated below.",
+            _render_contract(contract),
+            "Work only inside this contract's scope. If it needs files you have "
+            "not opened in this session, open them -- do not assume the previous "
+            "task's files are the same ones.",
+        ]
+        return Prompt(role=policy.BUILDER, text="\n\n".join(lines), delta=True,
+                      pack_key=pack_key, cache_hit=True)
+
     def evaluator_prompt(self, *, contract: ExecutionContract, iteration: int,
                          result_commit: str | None = None,
                          diff_summary: str | None = None,
@@ -661,4 +691,49 @@ def naive_baseline(*, full_prompt_tokens: int, iterations: int,
             "builder_calls": max(1, iterations), "builder_tokens": builder_total,
             "evaluator_calls": max(1, iterations), "evaluator_tokens": evaluator_total,
             "pm_poll_calls": polls, "pm_poll_tokens": pm_total,
+        })
+
+
+def naive_parallel_baseline(*, tasks: int, full_prompt_tokens: int,
+                            iterations_per_task: int = 1,
+                            wall_clock_seconds: float = 0.0,
+                            coordination_calls_per_task: int = 1) -> NaiveBaseline:
+    """The "just run everything at once" shape, costed.
+
+    Parallel execution does not reduce the number of LLM calls -- it makes
+    them happen at the same time. What it DOES change is the two things this
+    design saves on, and it changes both for the worse:
+
+      * no session is reused across tasks, so every task pays a full context
+        load rather than inheriting a lane's warm session;
+      * concurrent work needs coordinating, and the coordinator in the shape
+        being replaced was a model, asked once per task at minimum and on a
+        timer beyond that.
+
+    So the parallel baseline is the sequential one plus a coordination call
+    per task, with no cache credit anywhere. The honest comparison is against
+    THIS rather than against a hypothetical perfect parallel scheduler,
+    because this is the shape that actually existed.
+    """
+    sequential = naive_baseline(full_prompt_tokens=full_prompt_tokens,
+                                iterations=iterations_per_task,
+                                run_seconds=0.0)
+    per_task_calls = sequential.llm_calls + coordination_calls_per_task
+    per_task_tokens = (sequential.prompt_tokens_estimate
+                       + coordination_calls_per_task * NAIVE_PM_PROMPT_TOKENS)
+    polls = int(max(0.0, wall_clock_seconds) // NAIVE_PM_POLL_SECONDS)
+    return NaiveBaseline(
+        llm_calls=tasks * per_task_calls + polls,
+        prompt_tokens_estimate=tasks * per_task_tokens + polls * NAIVE_PM_PROMPT_TOKENS,
+        detail={
+            "tasks": tasks,
+            "per_task_calls": per_task_calls,
+            "per_task_tokens": per_task_tokens,
+            "planner_calls": tasks,
+            "builder_calls": tasks * iterations_per_task,
+            "evaluator_calls": tasks * iterations_per_task,
+            "coordination_calls": tasks * coordination_calls_per_task,
+            "pm_poll_calls": polls,
+            "context_loads": tasks * iterations_per_task,
+            "cache_reuse": 0,
         })
