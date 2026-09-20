@@ -929,3 +929,16 @@ def test_prose_checks_never_reach_the_shell(store, repo):
     assert seen, "the engine must actually have run the runnable check"
     for batch in seen:
         assert "component tests" not in batch
+
+
+def test_a_cached_pack_reports_the_same_project_as_a_fresh_one(store, repo):
+    """project_id identifies the ASKER, not the content, so it is not part of
+    the cached body -- and must therefore be passed back in on a hit."""
+    assembler = ctx.ContextAssembler(store, repo_root=repo)
+    fresh, hit_first = assembler.build_pack(project_id="urbanflow",
+                                            modules=["src/header.css"])
+    cached, hit_second = assembler.build_pack(project_id="urbanflow",
+                                              modules=["src/header.css"])
+    assert (hit_first, hit_second) == (False, True)
+    assert cached.project_id == fresh.project_id == "urbanflow"
+    assert cached.render() == fresh.render()
