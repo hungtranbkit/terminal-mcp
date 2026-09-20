@@ -229,17 +229,41 @@ class LocalNodeClient:
         return node_profile.inventory(tuple(roles))
 
     def repo_evidence(self, cwd: str) -> dict[str, Any]:
-        """Git metadata for a path on THIS host (controller == node here)."""
+        """Git metadata for a path on THIS host (controller == node here).
+
+        SHAPE PARITY WITH THE REMOTE AGENT. The node agent's own
+        /v1/repo-evidence answers `exists`/`readable`/`repo_valid`, and a
+        missing path there is PATH_NOT_FOUND. This returned only
+        REPO_EVIDENCE_FAILED, so the same absent directory read as "not a
+        git repository" locally and "path does not exist" remotely -- and a
+        fleet-wide comparison across both client types produced two
+        different reasons for one situation. Observed live: probing the
+        fleet for /home/dell/workspace/urbanflow rejected hp-linux as
+        `not_a_repo` when the honest answer was that the path is not there.
+
+        The git fields are unchanged for every existing caller; `exists`,
+        `readable` and `repo_valid` are added beside them.
+        """
+        import os
+
         from .coordinator import RepoEvidenceError, git_repo_evidence
 
+        exists = os.path.exists(cwd)
+        readable = exists and os.access(cwd, os.R_OK | os.X_OK)
         try:
             evidence = git_repo_evidence(cwd)
         except RepoEvidenceError as exc:
-            return {"error": "REPO_EVIDENCE_FAILED", "detail": str(exc)}
+            return {"cwd": cwd, "error": "REPO_EVIDENCE_FAILED", "detail": str(exc),
+                    "exists": exists, "readable": readable,
+                    # Only a path that IS there and readable can be judged
+                    # "not a repository". Otherwise the repo question was
+                    # never reached, and answering it would be a guess.
+                    "repo_valid": False if readable else None}
         return {"cwd": cwd, "branch": evidence.branch, "head": evidence.head,
                 "clean": evidence.clean, "status_lines": list(evidence.status_lines),
                 "has_upstream": evidence.has_upstream,
-                "ahead": evidence.ahead, "behind": evidence.behind}
+                "ahead": evidence.ahead, "behind": evidence.behind,
+                "exists": exists, "readable": readable, "repo_valid": True}
 
     def repo_op(self, op: str, path: str, params: dict[str, Any]) -> dict[str, Any]:
         """Read-only repo introspection on THIS host (controller == node).
