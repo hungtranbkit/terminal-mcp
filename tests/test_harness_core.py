@@ -681,7 +681,10 @@ def test_three_infra_failures_become_a_human_question(store, repo):
     assert policy.REPEATED_INFRA_FAILURE in reasons
 
 
-def test_the_iteration_cap_is_the_only_verdict_path_to_a_human(store, repo):
+def test_an_identical_repeat_failure_stops_before_the_cap(store, repo):
+    """Two iterations that failed the same criteria on the same evidence are
+    not converging, and the third will not either. Waiting for the cap costs
+    a full build-and-evaluate round per remaining iteration to learn nothing."""
     engine = _engine(store, repo, checks=failing_checks)
     run, _ = engine.start(task_id="MOB-7", prompt="x", title="x", project_id="demo",
                           acceptance=["a"], checks=["npm test"], changed_paths=["src"])
@@ -689,10 +692,33 @@ def test_the_iteration_cap_is_the_only_verdict_path_to_a_human(store, repo):
     final = store.require_run(run.id)
 
     assert final.stage == state.BLOCKED
-    assert final.current_iteration == final.max_iterations
+    assert final.current_iteration == 2 < final.max_iterations
     decisions = store.list_decisions(run_id=run.id)
     assert [d["reason"] for d in decisions] == [policy.MAX_ITERATIONS_REACHED]
-    assert "converge" in decisions[0]["question"]
+    assert "identically" in decisions[0]["question"]
+    assert "outside what the Builder can change" in decisions[0]["question"]
+
+
+def test_a_failure_that_moves_keeps_its_remaining_iterations(store, repo):
+    """The same criteria failing for a DIFFERENT reason is progress, and
+    stopping on it would abandon a run that was moving."""
+    attempt = {"n": 0}
+
+    def drifting(commands, *, cwd=None, **kwargs):
+        attempt["n"] += 1
+        return [CheckResult(command=c, exit_code=1,
+                            output=f"AssertionError: attempt {attempt['n']}")
+                for c in commands]
+
+    engine = _engine(store, repo, checks=drifting)
+    run, _ = engine.start(task_id="MOB-7b", prompt="x", title="x", project_id="demo",
+                          acceptance=["a"], checks=["npm test"], changed_paths=["src"])
+    engine.drive(run.id, max_steps=40)
+    final = store.require_run(run.id)
+
+    assert final.stage == state.BLOCKED
+    assert final.current_iteration == final.max_iterations
+    assert "converge" in store.list_decisions(run_id=run.id)[0]["question"]
 
 
 def test_shadow_authority_writes_nothing_outside_the_harness_tables(store, repo):

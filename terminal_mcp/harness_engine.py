@@ -233,9 +233,13 @@ def _literals(text: str) -> tuple[tuple[str, str], ...]:
         found.append(("hash", match.group()))
     for match in _VERSION_LITERAL.finditer(text.lower()):
         token = match.group()
-        # A bare integer is not a version claim; "16px" and "3 items" would
-        # otherwise every one of them look like one.
-        if "." in token or token.startswith("v"):
+        # A DOTTED form only. "v1" in "all V1 screens" is a product name, and
+        # treating it as a version claim makes every such criterion look
+        # uncorroborated -- which costs an Evaluator call on each one, which
+        # is the cost this whole mechanism exists to avoid paying blindly.
+        # Missing a bare "v26" is the safe direction to be wrong in: the
+        # declared-check bargain still applies, and nothing false is recorded.
+        if "." in token:
             found.append(("version", token))
     return tuple(found)
 
@@ -821,27 +825,72 @@ class HarnessEngine:
             info["budget_action"] = budget
         if iteration >= run.max_iterations:
             return self._block_max_iterations(run, detail=info)
+        if self._repeating_itself(run, evaluation, iteration):
+            # NON-CONVERGENCE, CAUGHT EARLY. Two iterations that failed the
+            # same criteria on the same evidence are not converging, and the
+            # third will not either: the Builder changed something and the
+            # verdict did not move, which means the obstacle is outside what
+            # the Builder can reach. Waiting for the iteration cap to notice
+            # costs a full build-and-evaluate round per remaining iteration
+            # to learn nothing.
+            info["non_convergence"] = "two iterations failed identically"
+            self.store.bump_efficiency(
+                run.id, decision="stopped early: two identical failed verdicts")
+            return self._block_max_iterations(run, detail=info, repeated=True)
         return self._to(run, state.REVISING, action=action, llm_called=llm_called,
                         reason=f"{len(evaluation.failed_criteria)} criteria failed; "
                                f"revising without human involvement", detail=info)
 
-    def _block_max_iterations(self, run: Any, detail: dict[str, Any] | None = None
-                              ) -> StepOutcome:
+    def _repeating_itself(self, run: Any, evaluation: EvaluationResult,
+                          iteration: int) -> bool:
+        """Did this iteration fail in exactly the way the last one did?
+
+        Compared on the failed criteria AND their evidence, because the same
+        criteria failing for a different reason IS progress, and stopping on
+        that would abandon a run that was moving.
+        """
+        if iteration < 2:
+            return False
+        previous = self.store.latest_evaluation(run.id, iteration - 1)
+        if not previous or previous.get("result") != state.FAIL:
+            return False
+
+        def signature(entries: Any) -> tuple:
+            return tuple(sorted(
+                (str(entry.get("criterion_id")), str(entry.get("evidence")))
+                for entry in entries if entry.get("result") != state.PASS))
+
+        return (signature(previous.get("criteria") or ())
+                == signature(c.to_dict() for c in evaluation.failed_criteria))
+
+    def _block_max_iterations(self, run: Any, detail: dict[str, Any] | None = None,
+                              *, repeated: bool = False) -> StepOutcome:
         """The ONE path from a verdict to a human, and it is not about the code.
 
-        Reaching the iteration cap says the loop is not converging, which is a
-        fact about the run. The question put to the human is therefore about
-        the definition, not about the test output.
+        The loop is not converging, which is a fact about the run rather than
+        a verdict about the work. The question put to the human is therefore
+        about the definition -- and when the failure repeated verbatim, the
+        question says so, because "it failed the same way twice" points at
+        something outside the Builder's reach far more sharply than "it used
+        up its iterations".
         """
+        if repeated:
+            question = (f"{run.title or run.task_id}: iteration {run.current_iteration} "
+                        f"failed identically to the one before it -- the obstacle is "
+                        f"outside what the Builder can change. Is the contract wrong, "
+                        f"or does the environment need changing?")
+            reason = "two consecutive identical failed verdicts"
+        else:
+            question = (f"{run.title or run.task_id}: {run.max_iterations} iterations did "
+                        f"not converge. Is the contract wrong, or is the work bigger "
+                        f"than the task?")
+            reason = f"{run.max_iterations} iterations without a pass"
         self.store.open_decision(
             reason=policy.MAX_ITERATIONS_REACHED, run_id=run.id, task_id=run.task_id,
-            project_id=run.project_id,
-            question=f"{run.title or run.task_id}: {run.max_iterations} iterations did not "
-                     f"converge. Is the contract wrong, or is the work bigger than the task?",
-            detail=detail or {})
-        return self._to(run, state.BLOCKED, action="max_iterations",
-                        reason=f"{run.max_iterations} iterations without a pass",
-                        detail=detail or {})
+            project_id=run.project_id, question=question, detail=detail or {})
+        return self._to(run, state.BLOCKED,
+                        action="non_convergence" if repeated else "max_iterations",
+                        reason=reason, detail=detail or {})
 
     # =====================================================================
     # interruption, checkpoints and session replacement
