@@ -605,3 +605,27 @@ def test_a_server_with_no_runner_cannot_spend_a_token(queue_store, repo):
                             steps=12)
 
     assert service.store.efficiency(started["run"]["id"])["llm_calls"] == 0
+
+
+def test_a_queued_task_is_never_dragged_forward_by_a_supervised_run(queue_store, repo):
+    """The common real case, and the one where forcing would be worst.
+
+    A task sits QUEUED until the coordinator and the dispatch path move it.
+    A SUPERVISED run advances through its OWN stages meanwhile, and every
+    projection the queue's table refuses is recorded rather than forced --
+    the harness owns the decision layer, the queue owns dispatch, and
+    neither overrides the other silently.
+    """
+    task_id = _task(queue_store)
+    service = _service(queue_store, repo)
+
+    service.start(task_id=task_id, acceptance=["a"], checks=["npm test"],
+                  write_authority=policy.SUPERVISED, steps=24)
+
+    assert queue_store.get_task(task_id).status == qs.QUEUED
+    refused = [entry["reason"] for entry in service.skipped_projections]
+    assert any("queue refuses QUEUED -> RUNNING" in reason for reason in refused), refused
+    assert any("merge gate owns it" in reason for reason in refused), refused
+    # And the run still got where it was going, in its own state machine.
+    assert service.store.require_run(
+        service.store.run_for_task(task_id).id).stage == state.MERGE_READY
