@@ -1078,3 +1078,66 @@ def test_re_dispatching_the_same_run_re_asserts_trust_cheaply(store, artifacts):
                tier="balanced", session_id=None, iteration=2)
 
     assert len(trust.calls) == 2, "asked per dispatch; the trust layer dedupes"
+
+
+# ---------------------------------------------------------------------------
+# a session that is GONE is not an error, and must not read as alive
+# ---------------------------------------------------------------------------
+
+class GoneOps(FakeOps):
+    """terminal_status for a killed session: no error, UNKNOWN, exists=False.
+
+    Copied from a real observation, not invented -- `tmux kill-session`
+    followed by terminal_status returns exactly this shape, because being
+    asked about a session that does not exist is a legitimate question with
+    a definite answer rather than a failure.
+    """
+
+    def terminal_status(self, session):
+        return {"session": session, "exists": False, "allowed": True,
+                "state": "UNKNOWN", "input_required": False,
+                "reason": "session does not exist", "last_output": ""}
+
+
+def test_a_killed_session_is_not_alive(store, artifacts):
+    """The defect: health() checked only `error`, so a destroyed session read
+    as ALIVE and a spawned Builder sat in awaiting_session until the stall
+    timeout instead of failing over at once."""
+    broker = SessionBroker(GoneOps([]), store)
+    health = broker.health("harness-builder-gone")
+    assert health["alive"] is False
+    assert health["unreachable"] is True
+    assert "does not exist" in health["reason"]
+
+
+def test_a_spawned_session_that_is_killed_fails_over_immediately(store, artifacts):
+    ops = FakeOps([FakeSession("harness-claude-a")])
+    runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
+    run = _run(store, worktree="/tmp/wt/GONE-1")
+    runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run, tier="balanced",
+               session_id=None, iteration=1)
+    dispatch = store.open_dispatch_for(run.id)
+    store.update_dispatch(dispatch["id"], state="awaiting_session")
+
+    # The session is destroyed between one step and the next.
+    runner.ops = GoneOps([])
+    runner.broker.ops = GoneOps([])
+    result = runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
+                        tier="balanced", session_id=None, iteration=1)
+
+    assert result.infra_failure is True
+    assert "never came up" in (result.error or "") or "does not exist" in (result.error or "")
+    assert result.pending is not True
+
+
+def test_a_live_pane_reporting_UNKNOWN_is_still_alive(store, artifacts):
+    """UNKNOWN is also what a live pane reports when its activity cannot be
+    classified. Treating that as death would abandon sessions that are working."""
+    class UnclassifiableOps(FakeOps):
+        def terminal_status(self, session):
+            return {"session": session, "exists": True, "allowed": True,
+                    "state": "UNKNOWN", "input_required": False,
+                    "reason": "activity age is 3s", "last_output": ""}
+
+    broker = SessionBroker(UnclassifiableOps([]), store)
+    assert broker.health("harness-claude-a")["alive"] is True

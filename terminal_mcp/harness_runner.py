@@ -208,6 +208,24 @@ class SessionBroker:
         if error:
             return {"alive": False, "reason": str(error),
                     "unreachable": error in SESSION_UNREACHABLE_ERRORS}
+        # A SESSION THAT IS GONE IS NOT AN ERROR, AND SAYS SO EXPLICITLY.
+        #
+        # `terminal_status` answers a killed session with error=None,
+        # state="UNKNOWN" and exists=False -- being asked about a session
+        # that does not exist is a legitimate question with a definite
+        # answer, not a failure. Checking only `error` therefore read a
+        # killed session as ALIVE, and a Builder whose tmux session was
+        # destroyed sat in `awaiting_session` until the stall timeout
+        # instead of failing over immediately. Found by killing a real
+        # session and watching the engine not notice.
+        #
+        # `exists` is checked rather than `state == "UNKNOWN"` because
+        # UNKNOWN is also what a live pane reports when its activity cannot
+        # be classified (see status.py) -- treating that as death would
+        # abandon sessions that are working.
+        if status.get("exists") is False:
+            return {"alive": False, "unreachable": True,
+                    "reason": str(status.get("reason") or "session does not exist")}
         state = str(status.get("state") or "").upper()
         return {"alive": True, "state": state,
                 "busy": state in BUSY_STATES,
