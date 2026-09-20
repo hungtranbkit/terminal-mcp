@@ -37,6 +37,14 @@ from terminal_mcp.harness_store import HarnessStore, LeaseNotHeld, RunNotFound
 from terminal_mcp.queue_store import QueueStore
 
 
+# Every test here that names `node` or `npm` in a declared check is asserting
+# about the harness, not about the host -- so the toolchain it names is
+# materialised for it (see `declared_toolchain` in conftest). Without this the
+# module's result depends on which machine runs it, which is how ten of these
+# went red on a failover that changed no engine code.
+pytestmark = pytest.mark.usefixtures("declared_toolchain")
+
+
 # ---------------------------------------------------------------------------
 # fixtures
 # ---------------------------------------------------------------------------

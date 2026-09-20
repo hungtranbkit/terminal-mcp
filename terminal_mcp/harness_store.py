@@ -368,6 +368,37 @@ class HarnessStore:
             row = connection.execute(sql, args).fetchone()
         return HarnessRun.from_row(row) if row else None
 
+    def runs_for_tasks(self, task_ids: Sequence[str]) -> dict[str, HarnessRun]:
+        """The latest run per task, for a whole board, in ONE query.
+
+        The Global Task board renders a harness projection on every card, and
+        the obvious way to do that -- `run_for_task` in a loop -- is one
+        SELECT per card on a view that refreshes on a timer. This exists so
+        the board reads the runs the same way it reads the tasks: in bulk.
+
+        Latest wins per task: a task that has been run more than once shows
+        its current attempt, never an arbitrary earlier one. Tasks with no
+        run are simply absent from the mapping rather than present with a
+        null, so a caller cannot mistake "never harnessed" for "harnessed and
+        in no stage".
+        """
+        ids = [str(task_id) for task_id in task_ids if task_id]
+        if not ids:
+            return {}
+        latest: dict[str, HarnessRun] = {}
+        with self._connection() as connection:
+            # Chunked to stay under SQLite's variable limit on a large board.
+            for start in range(0, len(ids), 400):
+                chunk = ids[start:start + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = connection.execute(
+                    f"SELECT * FROM harness_runs WHERE task_id IN ({placeholders}) "
+                    "ORDER BY created_at ASC", chunk).fetchall()
+                for row in rows:
+                    run = HarnessRun.from_row(row)
+                    latest[run.task_id] = run  # ascending: the last write wins
+        return latest
+
     def list_runs(self, *, project_id: str | None = None, status: str | None = None,
                   stage: str | None = None, limit: int = 200) -> list[HarnessRun]:
         sql = "SELECT * FROM harness_runs WHERE 1=1"
