@@ -60,13 +60,88 @@ NEEDS_REWORK = "NEEDS_REWORK"
 NEEDS_HUMAN = "NEEDS_HUMAN"
 ALL_DECISIONS = (READY, BLOCKED, NEEDS_REWORK, NEEDS_HUMAN)
 
-# Reused as-is from supervisor2.py's own ATTENTION_STOP_PATTERNS (task
-# instruction: "Reuse Supervisor v2 Phase 1 claim/decision/... thay vì
-# viết lại") -- the same content-based safety screen (credentials,
-# destructive shell commands, confirmation prompts) already proven in
-# production there, applied here to a task's own PROMPT before it is
-# ever dispatched, rather than to a pane's output after the fact.
+# Adapted from supervisor2.py's own ATTENTION_STOP_PATTERNS -- the same
+# content-based safety screen (credentials, destructive shell commands,
+# confirmation prompts) already proven in production there, applied here to a
+# task's own PROMPT before it is ever dispatched rather than to a pane's
+# output after the fact.
+#
+# WHY THESE ARE ACTION-SHAPED AND NOT BARE NOUNS
+#
+# The list those patterns came from screens PANE OUTPUT, where a bare
+# "token" or "secret" on screen really is a credential being shown. A task
+# PROMPT is a different kind of text: it is a person describing work, and the
+# same words are ordinary vocabulary in it. Found live: a benign project smoke
+# task was held at PRECHECK/NEEDS_HUMAN because its description contained the
+# word "token" -- as in token rotation, the feature being worked on. `\bsecret\b`,
+# `credential` and `api[_ -]?key` had the identical failure, and a gate that
+# fires on the subject matter of the work rather than on what the work DOES
+# trains an operator to approve everything without reading, which is strictly
+# worse than not gating at all.
+#
+# So each pattern below requires an ACTION: a verb that would disclose a
+# credential, or a command that would destroy or publish something. Naming a
+# credential is not gated; printing, committing, uploading or hardcoding one
+# is. Mentioning main is not gated; pushing or merging to it is. Nothing that
+# was gated for a real reason stopped being gated -- see
+# tests/test_coordinator_sensitive_patterns.py, which pins both halves.
+# An optional `SOME_PREFIX_` so GITHUB_TOKEN / OPENAI_API_KEY read as the
+# credential nouns they are -- `\b` never fires inside a SCREAMING_SNAKE name
+# because `_` is a word character.
+_CREDENTIAL_NOUN = (r"(?:(?:[A-Za-z0-9]+[_\-])?"
+                    r"(?:passwords?|pass-?phrases?|api[_\- ]?keys?|access[_\- ]?keys?|"
+                    r"secrets?|credentials?|tokens?|private[_\- ]?keys?)"
+                    r"|\.env\b|id_rsa|id_ed25519)")
+_DISCLOSE_VERB = (r"(?:prints?|echo(?:es|ing)?|cat|reveal(?:s|ing)?|dump(?:s|ing)?|"
+                  r"expos(?:e|es|ing)|leak(?:s|ing)?|exfiltrat\w+|upload(?:s|ing)?|"
+                  r"paste(?:s|ing)?|post(?:s|ing)?|publish(?:es|ing)?|"
+                  r"hard-?cod(?:e|es|ing|ed)|commit(?:s|ting)?|send(?:s|ing)?)"
+                  )
+
 SENSITIVE_PROMPT_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        # -- credential DISCLOSURE, not credential vocabulary ---------------
+        r"enter (?:your |the )?password",
+        rf"\b{_DISCLOSE_VERB}\b[^.\n]{{0,60}}{_CREDENTIAL_NOUN}",
+        rf"{_CREDENTIAL_NOUN}[^.\n]{{0,40}}\b(?:in|into|to) (?:the )?"
+        rf"(?:repo|repository|source|code|git|chat|slack|email|gist|pastebin|issue|ticket)\b",
+        # -- destructive filesystem/VCS COMMANDS ----------------------------
+        r"\brm\s+-[a-z]*r[a-z]*f|\brm\s+-[a-z]*f[a-z]*r",
+        r"force[ -]push|\bpush\b[^\n]{0,30}--force|\bgit\s+push\b[^\n]{0,30}\s-f\b",
+        r"\breset\s+--hard\b",
+        r"\bgit\s+clean\b",
+        r"drop\s+(?:table|database)\b",
+        r"\btruncate\s+table\b",
+        r"\bmkfs(?:\.\w+)?\b",
+        r"\bdd\s+if=",
+        r"\bchmod\s+(?:-R\s+)?777\b",
+        # A command INVOCATION, not the word in prose. "Do not use sudo for
+        # this" and "the build must not need sudo access" are statements about
+        # privilege, not requests to use it, and gating them is the same
+        # false-positive class as gating the word "token".
+        r"(?:^|[\s;&|`$(])sudo\s+(?!for\b|to\b|in\b|on\b|is\b|was\b|here\b|at\b|and\b"
+        r"|or\b|if\b|when\b|unless\b|because\b|since\b|anywhere\b|access\b|rights\b"
+        r"|permission|privilege|password|prompt|would|will\b|can\b|may\b)-?[a-z]",
+        # -- publishing to the protected branch -----------------------------
+        r"\bpush\s+(?:to\s+|into\s+|origin\s+)?(?:main|master)\b",
+        r"\bmerge\s+(?:to\s+|into\s+|onto\s+)(?:main|master)\b",
+        r"\bdeploy\s+to\s+(?:prod|production)\b",
+    )
+)
+
+#: The NOUN-BASED screen, for scanning CONTENT rather than a request.
+#:
+#: These are the patterns the prompt screen above used to be, kept because
+#: they were right for a different job. A diff, a pane's output or a file
+#: being merged is CONTENT: a bare `API_KEY = "sk-..."` in it is the finding
+#: itself, and there is no verb to look for. A task prompt is a person
+#: DESCRIBING work, where the same words are ordinary vocabulary -- which is
+#: why the two lists had to stop being one list.
+#:
+#: integration_reviewer.py scans a real diff with these. Nothing that was
+#: blocked before this split stopped being blocked.
+SENSITIVE_CONTENT_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
         r"enter (your |the )?password",
@@ -74,6 +149,8 @@ SENSITIVE_PROMPT_PATTERNS = tuple(
         r"credential",
         r"\bsecret\b",
         r"\btoken\b",
+        r"private[_ -]?key",
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
         r"force[ -]push",
         r"\brm -rf\b",
         r"drop (table|database)",

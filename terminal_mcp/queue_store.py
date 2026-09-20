@@ -3387,6 +3387,78 @@ class QueueStore:
             connection.close()
         return self.get_task(task_id)
 
+    #: Appended to `migration_history` by record_pm_decision. A PM entry is a
+    #: RUNTIME handoff (this task lost the session it was running on and the PM
+    #: decided what to do about it), never an ownership migration -- the lane,
+    #: the agent, the project and the skills are all untouched. Both kinds live
+    #: in one append-only column on purpose: "everything that ever moved this
+    #: task" has to be answerable from one place.
+    PM_MIGRATION_KIND = "pm_recovery"
+
+    def record_pm_decision(self, task_id: str, *, decision: str, reason: str,
+                           actor: str = "pm", released_session: str | None = None,
+                           released_node_id: str | None = None,
+                           evidence: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Append ONE PM decision to this task's durable handoff history.
+
+        Writes history, not state. Releasing the runtime binding and re-routing
+        are separate, already-atomic operations (release_execution_binding,
+        bind_task_to_session); this records WHY the PM did them, so a task that
+        moved between sessions overnight can be explained from the row rather
+        than from a log file that has since rotated.
+
+        Never raises for a missing task: the PM sweeps a list it read a moment
+        ago, and a task that has been deleted since is not an error worth
+        aborting the sweep for."""
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                return {"error": "TASK_NOT_FOUND", "task_id": task_id}
+            history = _parse_json_dict_list(row["migration_history"])
+            entry = {
+                "kind": self.PM_MIGRATION_KIND,
+                "decision": decision,
+                "reason": reason,
+                "actor": actor,
+                "from": released_session,
+                "from_node_id": released_node_id,
+                "to": None,
+                "time": iso_now(),
+            }
+            if evidence:
+                entry["evidence"] = evidence
+            history.append(entry)
+            connection.execute(
+                "UPDATE queue_tasks SET migration_history = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(history), iso_now(), task_id))
+            self._record_event_locked(
+                connection, session=row["session"], task_id=task_id,
+                event_type="TASK_PM_DECISION", reason=reason,
+                metadata={"decision": decision, "actor": actor,
+                          "released_session": released_session})
+            updated = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+        return {**QueueTask.from_row(updated).to_dict(), "pm_decision": decision}
+
+    def runtime_bound_tasks(self, *, limit: int = 200) -> list[QueueTask]:
+        """Every non-terminal task currently HOLDING a runtime.
+
+        The PM's input set. Deliberately wider than bound_unstarted_tasks:
+        that one answers "what did a time-boxed route leave half-finished",
+        this one answers "what is currently depending on a session existing",
+        which includes tasks that reached RUNNING on a node that has since
+        gone away. Pure durable state, so a controller that just restarted
+        re-derives the identical list."""
+        placeholders = ",".join("?" for _ in TERMINAL_STATUSES)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM queue_tasks WHERE routing_state IN (?, ?) "
+                f"AND execution_session IS NOT NULL "
+                f"AND status NOT IN ({placeholders}) "
+                f"ORDER BY priority DESC, updated_at ASC LIMIT ?",
+                (BOUND, SPAWNED, *TERMINAL_STATUSES, limit),
+            ).fetchall()
+        return [QueueTask.from_row(row) for row in rows]
+
     def assignment_history(self, task_id: str) -> dict[str, Any]:
         """item 10's own `task_assignment_history` tool -- the task's
         full migration_history plus its own never-changing

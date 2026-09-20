@@ -134,11 +134,58 @@ enable/disable → create), and a detail view with the phase pipeline, agent
 team, upcoming phases, and phase history with handoffs. Global Tasks cards
 gained a project chip beside the existing agent and skill chips.
 
+Project detail also carries a **Runtime health** panel — the two admin
+actions a stalled project needs, on the page where you notice it is stalled
+rather than in a different client:
+
+* **Stalled runtimes**, as a dry run. Opening the panel moves nobody's work.
+  Each row names the session the task is bound to, the agent that owns it,
+  and why the binding is no longer worth holding. One button recovers them.
+* **Stale sessions**, with the report's own evidence beside each one and a
+  per-session cleanup button whose precondition is re-derived from a fresh
+  fleet read before anything is deleted. Sessions that are busy, waiting for
+  input, holding tasks or protected are excluded by construction and are
+  counted, not hidden.
+
+Every page under `/dashboard` now carries the same global navigation bar —
+see `docs/dashboard-navigation.md`. Project detail adds a breadcrumb
+(Projects / `<name>`) rather than a back button.
+
 ## Node capability
 
 `available_agent_types` calls `shutil.which` per configured launcher, so a node
-advertises `claude`/`codex` only if the binary is on the **service's** PATH —
+advertises `claude`/`codex` only if the binary is on the **service's** PATH --
 systemd's minimal default, not the login shell's. On hp-linux both CLIs were
 installed under `~/.local/bin` and the node still reported shell-only.
 Detection was right; the environment was wrong. The shipped unit examples now
-set `Environment=PATH=%h/.local/bin:…`.
+set `Environment=PATH=%h/.local/bin:...`.
+
+Re-verified live on hp-linux (2026-09-20): `claude 2.1.278` and
+`codex-cli 0.154.0` both resolve on the running service's own PATH
+(`/home/kimex/.local/bin` is first on it), and the node advertises
+`agent_types: ["shell", "claude", "codex"]`. The capability is real.
+
+`agent_type_evidence` now answers the follow-up question that
+`agent_types: ["shell"]` could not: **why not**. Per agent type it reports
+`available`, the configured `launcher`, and a `detail` that distinguishes
+"no launcher is configured", "the launcher does not resolve on this node's
+effective PATH" and "resolved to `<absolute path>`" -- the last of which is
+the difference between believing a capability and being able to check it.
+`terminal_node_capabilities` carries it for the local node (another node's
+PATH is not readable from here, and inventing an answer for it is exactly
+what this module exists not to do) alongside `router_may_spawn`, which is
+`router.spawn_enabled` AND the node having any runtime: "the node has claude"
+and "the router will create a claude session here" are different facts and
+conflating them is how the second gets assumed.
+
+## PM recovery
+
+`project_recover` (MCP `terminal_project_recover`, `turn` aliases `recover` /
+`pm_recover`, and the Runtime health panel on project detail) is the PM
+acting rather than reporting: a task whose execution session or node has gone
+away has its **runtime binding alone** released and is handed back to the
+Agent/Session router, with project, agent, pinned skills and evidence intact
+and every decision appended to the task's durable handoff history. See
+`docs/task-router.md` for the rules it will not bend -- in particular that
+live work is never moved on a timer and an unreadable fleet is never treated
+as an empty one.

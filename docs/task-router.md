@@ -25,7 +25,8 @@ Task  ->  TaskProfile  ->  SessionMatcher  ->  claim  ->  dispatch
 | `task_profile.py` | What the task needs. Metadata first, prompt heuristics last, **no LLM call**. |
 | `session_matcher.py` | Hard rejects (safety) and the scoring table (preference). Pure functions. |
 | `task_router.py` | Sequencing, claiming, dispatch, spawn, and the rescue sweep. |
-| `stale_sessions.py` | A cleanup **report**. No delete path exists, not even behind a flag. |
+| `stale_sessions.py` | A cleanup **report**, plus ONE named, re-checked delete. Nothing sweeps and nothing runs on a timer. |
+| `pm_recovery.py` | The PM's recovery pass: a runtime that died, released and re-routed. |
 
 ## Hard rejects vs. scoring
 
@@ -142,8 +143,41 @@ router:
   rescue_interval_seconds: 10
   rescue_batch_size: 20
   dispatch_budget_seconds: 12   # wall-clock ceiling on the synchronous half
-  probe_limit: 3                # live status probes before committing
+  probe_limit: 8                # live status probes before committing
+  snapshot_budget_seconds: 4    # of that ceiling, the most the FLEET LOOK may take
+  stale_snapshot_max_age_seconds: 60   # fallback view when a listing comes back empty
 ```
+
+### The budget is split, and that is the point
+
+Measured live on hp-linux (2026-09-20), before this split: `project_start`
+returned after **12.5s** carrying `dispatch_ticks: 0` and
+`budget_exhausted: true`. The task was bound to a session and had never been
+started — the caller got `TASK_ACCEPTED`/`QUEUED` for work that looked
+assigned and was not running.
+
+The whole 12s had gone into `terminal_list_sessions`, which walked five nodes
+**in series**. Repeated timings of that one call: 3.6s, 11.8s (one node timed
+out), 25.4s, 12.3s, 5.2s. Individual `terminal_status` probes, by contrast,
+cost 0.05–0.15s each.
+
+Three changes, all of them about bounding rather than hurrying:
+
+1. `ControllerService.terminal_list_sessions` and `list_nodes` fan out across
+   nodes **concurrently under one wall clock**. The cost is the slowest node,
+   not the sum of them, and a node that misses the budget is reported
+   `status: "timeout"` in `unreachable_nodes` rather than extending the call.
+2. `snapshot_budget_seconds` caps what the fleet look may spend — at that
+   value **or half the dispatch budget, whichever is smaller**. The rest is
+   left for the dispatch ticks that actually start the task.
+3. The router's live probe uses `terminal_status_bounded` with whatever is
+   left of the route budget, so `probe_limit` probes can no longer consume a
+   clock they were never given.
+
+A fresh listing that comes back empty falls back to the last snapshot, if it
+is younger than `stale_snapshot_max_age_seconds`. An empty fleet and an
+unreadable one have the same shape, and treating the second as the first
+defers the whole queue on one slow node.
 
 `enabled`/`rescue_enabled` default **on**, unlike every other autonomous
 switch in this project. Routing creates nothing — it only decides where work a
@@ -155,9 +189,54 @@ session is the one routing action that changes the fleet rather than using it.
 
 | Surface | Call |
 | --- | --- |
-| MCP | `terminal_route_start`, `terminal_task_route`, `terminal_queue_rescue_once`, `terminal_session_cleanup_candidates` |
-| Compact `turn` | `action="route_start"` (aliases: `start_auto`, `auto`, `route`) |
-| Dashboard | Global Tasks cards show execution session/node, routing state, the one-line reason, and the top rejected candidates |
+| MCP | `terminal_route_start`, `terminal_task_route`, `terminal_queue_rescue_once`, `terminal_session_cleanup_candidates`, `terminal_session_cleanup`, `terminal_project_recover` |
+| Compact `turn` | `action="route_start"` (aliases: `start_auto`, `auto`, `route`); `action="project_recover"` (aliases: `recover`, `pm_recover`) |
+| Dashboard | Global Tasks cards show execution session/node, routing state, the one-line reason, and the top rejected candidates. Project detail carries a **Runtime health** panel: stalled runtimes (dry run) with a recover action, and stale sessions with their evidence and a re-checked cleanup action. |
+
+## PM recovery
+
+A task bound to a session on a node that has gone offline is invisible to both
+existing sweeps: `routable_tasks` skips it (its `routing_state` is `BOUND`, so
+by definition it is not waiting for a runtime) and `bound_unstarted_tasks`
+re-drives a lane that is no longer there. It simply stops, looking perfectly
+assigned — which is how a project silently stalls with everything green.
+
+`pm_recovery.ProjectPMRecovery` is the missing step. It releases **only** the
+runtime binding and re-runs the router:
+
+| released | preserved |
+| --- | --- |
+| `execution_session`, `execution_node_id`, `routing_state` | `project_id`, `agent_id`, `skill_ids`, prompt, priority, lane position, verification evidence, coordinator history |
+
+That split is why it reuses `release_execution_binding` rather than writing
+its own UPDATE: those three columns are exactly what that method touches.
+
+Rules it will not bend:
+
+* **Live work is never moved on a timer.** A `RUNNING`/`VERIFYING` task is
+  recovered only when its runtime is demonstrably gone. A model mid-turn looks
+  exactly like a stall from outside, and re-dispatching it would run the same
+  work twice on two sessions.
+* **A fleet read that failed is not absence evidence.** If any node was
+  unreachable, the sweep reports `fleet_evidence_usable: false` and only acts
+  on facts that do not depend on the listing.
+* **No double dispatch.** The task is re-read immediately before releasing and
+  skipped if the binding changed since the scan; the authoritative guard
+  remains `bind_task_to_session`'s own `BEGIN IMMEDIATE`.
+* **Every decision is durable.** `QueueStore.record_pm_decision` appends to the
+  task's append-only `migration_history` and emits a `TASK_PM_DECISION` queue
+  event, so a task that moved at 3am is explainable at 9am from the row.
+
+## Stale-session cleanup
+
+The report is unchanged and still refuses to act on its own. What it grew is
+one named, single-session delete (`cleanup_session`) that **re-derives the
+whole candidacy decision from a freshly refreshed fleet read** immediately
+before deleting. The report an operator is looking at is seconds old at best,
+so the click authorizes deleting a session that is *still* a candidate, never
+one that merely was. Busy, `WAITING_INPUT`, task-holding, claimed and
+protected/admin sessions are excluded by construction and cannot be removed
+through it at all.
 
 An unexplained `QUEUED` is no longer representable: every path that leaves a
 task queued writes `WAITING_RUNTIME` plus the per-candidate rejection reasons.

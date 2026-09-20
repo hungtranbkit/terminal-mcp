@@ -20,6 +20,7 @@ from terminal_mcp import dashboard as dashboard_module
 from terminal_mcp.config import (AppConfig, DashboardConfig, InputPolicyConfig, PermissionsConfig,
                                  SessionAccessConfig, load_config)
 from terminal_mcp.core import TerminalService
+from terminal_mcp import dashboard_nav as _nav
 from terminal_mcp.dashboard import DASHBOARD_HTML, SESSIONS_ADMIN_HTML, register_dashboard
 from terminal_mcp.mcp_app import build_mcp
 
@@ -1710,6 +1711,15 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/projects/plan": {"POST"},
         "/dashboard/api/projects/advance": {"POST"},
         "/dashboard/api/projects/reconcile": {"POST"},
+        # Runtime health: the two admin actions a stalled project needs, which
+        # existed only as MCP tools. The GET is a REPORT (the recovery half
+        # runs as a dry run, so opening the panel moves nothing); both
+        # mutations are POST behind _mutation_guard like every other write
+        # here, and the cleanup re-derives candidacy from a fresh fleet read
+        # before it deletes anything.
+        "/dashboard/api/runtime-health": {"GET", "HEAD"},
+        "/dashboard/api/runtime-health/recover": {"POST"},
+        "/dashboard/api/runtime-health/cleanup": {"POST"},
     }
     # The web terminal's WebSocket route is registered too, just outside
     # this HTTP-methods-only dict (WebSocketRoute has no .methods).
@@ -1747,12 +1757,32 @@ def test_dashboard_mobile_media_query_matches_landscape_phones_too():
     # either way, so no rule silently stops mid-rotation.
     portrait_start = DASHBOARD_HTML.index("@media (max-width:760px) and (orientation:portrait)")
     portrait_end = DASHBOARD_HTML.index("@media (max-height:560px) and (orientation:landscape)")
+    # The shared global navigation bar (dashboard_nav.py) is spliced into every
+    # page and brings its own width breakpoint. It is exempt from the rule
+    # below, and the exemption is EARNED rather than assumed: its breakpoint
+    # only chooses WHERE the destinations are shown, never WHETHER. Below it
+    # the links collapse into the overflow panel; above it they sit in the bar.
+    # The panel carries the complete set at every width (asserted just below
+    # and in tests/test_dashboard_global_nav.py), so rotating a phone across
+    # the breakpoint cannot strand a destination -- which is the exact failure
+    # this test exists to prevent.
+    nav_start = DASHBOARD_HTML.index('<style id="tmcp-global-nav-style">')
+    nav_end = DASHBOARD_HTML.index("</style>", nav_start)
+    panel = DASHBOARD_HTML[DASHBOARD_HTML.index('id="tmcpNavPanel"'):]
+    panel = panel[:panel.index("</div>")]
+    for destination in _nav.DESTINATIONS:
+        assert f'href="{destination.href}"' in panel, (
+            f"{destination.key} is missing from the narrow-screen menu, so the nav breakpoint "
+            f"really would strand it")
+
     for match in re.finditer(r"@media \([^)]*(?:max-width|max-height)[^{]*\{", DASHBOARD_HTML):
         query = match.group(0)
         if "max-width:760px), (max-height:760px" in query:
             continue                                  # the base breakpoint
         if "orientation:" in query:
             continue                                  # an orientation-qualified refinement
+        if nav_start < match.start() < nav_end:
+            continue                                  # the shared nav -- see above
         # A query NESTED inside an orientation-qualified block inherits that
         # qualifier, so it cannot strand a rule across a rotation either.
         assert portrait_start < match.start() < portrait_end, \
@@ -1762,10 +1792,14 @@ def test_dashboard_mobile_media_query_matches_landscape_phones_too():
     # prefers-reduced-motion is an accessibility preference, never a
     # breakpoint, so any number of them is harmless here.
     assert DASHBOARD_HTML.count("@media (prefers-reduced-motion:reduce)") >= 1
-    # Exactly two width-keyed queries: the base breakpoint and the portrait
-    # refinement. A third would need its own justification -- the loop above
-    # is what actually enforces the orientation rule.
-    assert DASHBOARD_HTML.count("@media (max-width") == 2
+    # Exactly two width-keyed queries IN THE PAGE'S OWN STYLES: the base
+    # breakpoint and the portrait refinement. A third would need its own
+    # justification -- the loop above is what actually enforces the
+    # orientation rule. The shared nav's block is excluded and justified
+    # above; counting it here would make this assertion about how many
+    # stylesheets the page has rather than about rotation safety.
+    own_styles = DASHBOARD_HTML[:nav_start] + DASHBOARD_HTML[nav_end:]
+    assert own_styles.count("@media (max-width") == 2
 
 
 def test_dashboard_fullscreen_rules_live_inside_the_orientation_safe_query():
