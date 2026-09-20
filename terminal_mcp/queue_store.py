@@ -59,6 +59,7 @@ from . import retry_recovery
 
 from . import worktree_cleanup as wj
 from .schema import Migration, apply_migrations
+from .harness_schema import HARNESS_MIGRATIONS
 
 # -- Task status state machine ------------------------------------------
 #
@@ -1052,6 +1053,17 @@ QUEUE_MIGRATIONS = [
     Migration(14, "TMCP-BLOCKED-REVIEW-AUTOCLEAR-001: queue_lanes.paused_origin, so a "
               "coordinator guard pause is distinguishable from a standing operator pause",
               _add_v14_paused_origin),
+    # TMCP-HARNESS-001. The Harness tables are APPENDED to this ladder rather
+    # than given a database of their own, because a HarnessRun and the
+    # queue_task it drives must be able to commit together. See
+    # harness_schema.py's module docstring for the full argument; the short
+    # version is that a second store is a second runtime source of truth, and
+    # removing those is the entire point of the feature.
+    #
+    # They are listed here -- not appended inside harness_store -- so that
+    # opening EITHER store migrates the database identically, and there is
+    # exactly one ordered ladder no matter which entry point ran first.
+    *HARNESS_MIGRATIONS,
 ]
 
 
