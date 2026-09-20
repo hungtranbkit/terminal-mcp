@@ -61,13 +61,21 @@ iteration budget would have spent learning the same thing.
 **Nothing downstream started.** All seven remaining tasks stayed `NOT_STARTED`
 with their unmet dependencies named. No partial credit, no fabricated progress.
 
-## Phase B — after the human answered
+## Phase B — after the blocker was answered
 
-The operator resolution recorded on the run:
+**This answer has not been confirmed by a human.** The agent running the pilot
+supplied it so the chain could be measured, under a stated assumption, and it
+is recorded here so it can be accepted or overruled rather than inherited
+silently:
 
 > Environment fact, not a code defect: the repo pins node 24.21.0 (.nvmrc) and
 > this host runs v26.7.0. Accepting "the repo's pinned major or newer". The
 > blocked run keeps its record of the original bar.
+
+If that assumption is wrong — if ENV-001 genuinely means node 24 and the host
+should be downgraded — then Phase B's chain rests on a false premise and
+should be re-run after the host is changed. Phase A's result stands either
+way: the harness found the mismatch and asked.
 
 A redefine opens a **new run** rather than editing the blocked one — the
 definition changed, so its hash changed. The blocked run keeps its entire audit
