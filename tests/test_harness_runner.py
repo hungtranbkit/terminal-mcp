@@ -651,3 +651,66 @@ def test_real_session_smoke(tmp_path):
     dispatch = store.latest_dispatch(run.id, iteration=1, role=policy.BUILDER)
     assert dispatch is not None
     assert dispatch["idempotency_key"].startswith("harness:")
+
+
+def test_an_artifact_carrying_this_dispatchs_nonce_completes_it_alone(store, artifacts):
+    """Claude Code repaints with no scrollback, so a printed marker may
+    already be erased. The nonce in the FILE is the stronger signal: it is
+    unguessable and unique to this attempt, so a file carrying it cannot be a
+    leftover, an echo, or anything but a deliberate answer to this request."""
+    ops = FakeOps([FakeSession("claude-a")])
+    runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
+    run = _run(store)
+    runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run, tier="balanced",
+               session_id=None, iteration=1)
+    dispatch = store.open_dispatch_for(run.id)
+
+    Path(dispatch["artifact_path"]).parent.mkdir(parents=True, exist_ok=True)
+    Path(dispatch["artifact_path"]).write_text(json.dumps(
+        {"reported": "done", "harness_nonce": dispatch["nonce"]}))
+    # The pane still shows only our own prompt -- no marker was ever readable.
+    result = runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
+                        tier="balanced", session_id=None, iteration=1)
+
+    assert result.pending is False
+    assert result.payload["reported"] == "done"
+
+
+def test_an_artifact_with_the_wrong_nonce_does_not_complete_a_dispatch(store, artifacts):
+    ops = FakeOps([FakeSession("claude-a")])
+    runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
+    run = _run(store)
+    runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run, tier="balanced",
+               session_id=None, iteration=1)
+    dispatch = store.open_dispatch_for(run.id)
+    Path(dispatch["artifact_path"]).parent.mkdir(parents=True, exist_ok=True)
+    Path(dispatch["artifact_path"]).write_text(json.dumps(
+        {"reported": "done", "harness_nonce": "a-nonce-from-some-other-attempt"}))
+
+    result = runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
+                        tier="balanced", session_id=None, iteration=1)
+    assert result.pending is True
+
+
+def test_the_prompt_asks_for_the_nonce_in_the_file():
+    text = build_agent_text(prompt_text="x", role="builder", dispatch_id="d",
+                            attempt=1, nonce="NONCE123", artifact_path="/tmp/a.json",
+                            run_id="r", iteration=1)
+    assert '"harness_nonce": "NONCE123"' in text
+
+
+def test_the_adapter_spawns_through_either_session_api(store, artifacts):
+    """A multi-node controller places a session on a node; a single-host
+    service has no `node` parameter at all. Both are valid SessionOps."""
+    class LocalOnlyOps(FakeOps):
+        def terminal_create_session(self, name, agent_type="shell", cwd=None):
+            return super().terminal_create_session(name, agent_type=agent_type, cwd=cwd)
+
+    ops = LocalOnlyOps([])
+    broker = SessionBroker(ops, store)
+    pick = broker.spawn(run=_run(store), role=policy.BUILDER, runtime="claude")
+    assert pick.spawned is True
+    assert ops.created[0]["agent_type"] == "claude"
+
+    multi = FakeOps([])
+    assert "node" in SessionBroker(multi, store)._spawn_kwargs()

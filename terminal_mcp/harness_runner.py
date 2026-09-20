@@ -54,6 +54,7 @@ work is done, ever.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -163,13 +164,15 @@ class SessionBroker:
     def __init__(self, ops: SessionOps, store: Any, *, router: Any = None,
                  default_runtime: str = "claude",
                  reuse_ceiling: float = policy.SESSION_REUSE_CONTEXT_CEILING,
-                 session_prefix: str = "harness") -> None:
+                 session_prefix: str = "harness",
+                 spawn_node: str = "auto") -> None:
         self.ops = ops
         self.store = store
         self.router = router
         self.default_runtime = default_runtime
         self.reuse_ceiling = reuse_ceiling
         self.session_prefix = session_prefix
+        self.spawn_node = spawn_node
 
     # -- health --------------------------------------------------------------
     def context_percent(self, session: str) -> float | None:
@@ -310,12 +313,32 @@ class SessionBroker:
                 f"no compatible {wanted} session for {role} and spawning is disabled")
         return self.spawn(run=run, role=role, runtime=wanted, worktree_path=worktree_path)
 
+    def _spawn_kwargs(self) -> dict[str, Any]:
+        """Only the arguments THIS ops object actually accepts.
+
+        Both a multi-node ControllerService and a single-host TerminalService
+        are valid SessionOps, and they differ: the controller places a session
+        on a node, the local service has only the one host and no `node`
+        parameter at all. Passing it regardless raises TypeError, and catching
+        TypeError around a call that does real work would swallow a genuine
+        bug in the callee. Asking the signature is exact.
+        """
+        try:
+            accepted = inspect.signature(self.ops.terminal_create_session).parameters
+        except (TypeError, ValueError):
+            return {}
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in accepted.values()):
+            return {"node": self.spawn_node, "requested_by": "harness"}
+        return {name: value for name, value in
+                (("node", self.spawn_node), ("requested_by", "harness"))
+                if name in accepted}
+
     def spawn(self, *, run: Any, role: str, runtime: str,
               worktree_path: str | None = None) -> SessionPick:
         name = f"{self.session_prefix}-{role}-{run.task_id}-{secrets.token_hex(3)}".lower()
         response = self.ops.terminal_create_session(
             name, agent_type=runtime, cwd=worktree_path or run.worktree_path,
-            node="auto", requested_by="harness")
+            **self._spawn_kwargs())
         if response.get("error"):
             raise NoSessionAvailable(
                 f"could not spawn a {runtime} session for {role}: {response['error']}")
@@ -355,6 +378,8 @@ def build_agent_text(*, prompt_text: str, role: str, dispatch_id: str, attempt: 
         f"Create the parent directory if it does not exist. Write the FILE, not the\n"
         f"terminal -- this pane has no scrollback and long output is lost, so anything\n"
         f"printed here cannot be read back.\n"
+        f'Include this exact key in the JSON object: "harness_nonce": "{nonce}"\n'
+        f"Write the file completely, then add that key last, then print the line below.\n"
         f"Run: {run_id} iteration {iteration} role {role}.\n\n"
         f"{COMPLETION_INSTRUCTION_SENTENCE}\n"
         f"###TERMINAL_MCP_COMPLETION protocol=terminal-mcp-completion/v1 "
@@ -600,8 +625,32 @@ class TerminalAgentRunner:
         return AgentResult(pending=True, dispatch_id=dispatch_id, session_id=session)
 
     def _read_completion(self, dispatch: Mapping[str, Any], session: str) -> Any:
-        """The marker says finished; the file says what. Both are required."""
+        """Is the answer really there, and is it really for THIS dispatch?
+
+        TWO SIGNALS, AND THE FILE IS THE STRONGER ONE
+
+        The obvious completion signal is the pane marker, and on a normal CLI
+        it is enough. Claude Code is not a normal CLI: it repaints in place
+        with no scrollback, so a marker printed and then repainted over is
+        simply not there the next time the pane is read. Waiting for a signal
+        that may have already been erased is how a finished run sits in
+        BUILDING forever.
+
+        So the nonce is ALSO written into the artifact, and a file carrying
+        this dispatch's nonce is accepted on its own. That is not a weaker
+        check -- it is a stronger one. The nonce is unguessable and unique to
+        this attempt, so a file containing it cannot be a leftover from an
+        earlier attempt, cannot be our own prompt echoed back, and cannot be
+        anything but a deliberate answer to exactly this request. The pane
+        marker stays as the fallback for agents that write the file without
+        the key.
+        """
         from .harness_engine import AgentResult
+
+        payload, artifact_error = self._load_artifact(dispatch.get("artifact_path"))
+        if artifact_error is None and isinstance(payload, dict) \
+                and str(payload.get("harness_nonce") or "") == dispatch["nonce"]:
+            return self._complete(dispatch, session, payload)
 
         try:
             capture = self.ops.terminal_tail(session, 200)
@@ -619,13 +668,17 @@ class TerminalAgentRunner:
                                         nonce=dispatch["nonce"], nonce_consumed=False):
             return None
 
-        payload, error = self._load_artifact(dispatch.get("artifact_path"))
+        error = artifact_error
         if error is not None:
             # It said it was done and there is nothing to read. That is an
             # infrastructure failure of the exchange, not a wrong answer about
             # the code -- so it resumes rather than spending an iteration.
             self.store.update_dispatch(dispatch["id"], state="failed", error=error)
             return AgentResult(infra_failure=True, session_id=session, error=error)
+        return self._complete(dispatch, session, payload)
+
+    def _complete(self, dispatch: Mapping[str, Any], session: str, payload: Any) -> Any:
+        from .harness_engine import AgentResult
 
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         self.store.update_dispatch(
