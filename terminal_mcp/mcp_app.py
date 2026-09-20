@@ -23,6 +23,7 @@ from .integration_service import IntegrationService
 from .integration_store import publish_handoff_for_completed_task
 from .dor_gate import check_definition_of_ready
 from .git_isolation_service import GitIsolationService
+from . import harness_trust
 from .node_models import node_to_dict as _node_to_dict
 from . import orchestration_policy
 from .notes_service import NotesService
@@ -5096,7 +5097,17 @@ def build_mcp(service: TerminalService | None = None,
         # assembled and cached. Passing them is what makes
         # `terminal_harness_step` able to reach an actual agent rather than
         # only plan and run checks.
-        ops=controller, router=task_router)
+        ops=controller, router=task_router,
+        # WORKSPACE TRUST for Harness-created worktrees. Derived from the
+        # operator's EXISTING allowed_cwd_roots declaration and then
+        # narrowed to the one subdirectory the worktree convention uses --
+        # a new config key would be a second place to get this wrong, and a
+        # directory a person works in, which sits directly under the
+        # approved root rather than inside .terminal-mcp-worktrees, stays
+        # refused. An explicit lifecycle.worktree_roots wins when set.
+        worktree_roots=(tuple(terminal.config.lifecycle.worktree_roots)
+                        or harness_trust.default_worktree_roots(
+                            terminal.config.session_lifecycle.allowed_cwd_roots)))
 
     # ------------------------------------------------------------------
     # P0.2 Event Bus. Publish/claim/ack only -- NOTHING here starts an

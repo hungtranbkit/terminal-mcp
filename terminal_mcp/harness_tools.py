@@ -28,7 +28,7 @@ against, with a content hash, before anything is allowed to write anywhere.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from . import harness_policy as policy
 from . import harness_scheduler as sched
@@ -37,6 +37,7 @@ from .harness_context import ContextAssembler
 from .harness_engine import HarnessEngine
 from .harness_runner import TerminalAgentRunner
 from .harness_store import HarnessStore
+from .harness_trust import WorkspaceTrust
 
 #: Where an agent's structured answer is written. Outside any repository on
 #: purpose: an artifact inside the worktree would show up as an untracked file
@@ -46,7 +47,9 @@ DEFAULT_ARTIFACTS_ROOT = "~/.local/state/terminal-mcp/harness/artifacts"
 
 def build_engine(store: HarnessStore, *, ops: Any = None, router: Any = None,
                  repo_root: str | None = None,
-                 artifacts_root: str | None = None) -> HarnessEngine:
+                 artifacts_root: str | None = None,
+                 worktree_roots: Sequence[str] = (),
+                 claude_config_path: str | None = None) -> HarnessEngine:
     """The engine the server drives, with a REAL runner when one is possible.
 
     `ops` is the controller (or the local terminal service) -- anything with
@@ -62,8 +65,18 @@ def build_engine(store: HarnessStore, *, ops: Any = None, router: Any = None,
     """
     runner = None
     if ops is not None:
+        # WORKSPACE TRUST. Only constructed when an operator has named the
+        # worktree roots: with none, WorkspaceTrust refuses everything (the
+        # empty-set reading of an allowlist is the dangerous one), so wiring
+        # it would add a call that can only ever say no. Absent, the spawned
+        # session asks its question and the runner reports
+        # PERMISSION_REQUIRED -- which is what happens today.
+        trust = None
+        if worktree_roots:
+            trust = WorkspaceTrust(config_path=claude_config_path, store=store,
+                                   worktree_roots=tuple(worktree_roots))
         runner = TerminalAgentRunner(
-            ops, store, router=router,
+            ops, store, router=router, trust=trust,
             artifacts_root=Path(artifacts_root or DEFAULT_ARTIFACTS_ROOT).expanduser())
     return HarnessEngine(store, runner=runner, repo_root=repo_root,
                          assembler=ContextAssembler(store, repo_root=repo_root))
@@ -71,10 +84,14 @@ def build_engine(store: HarnessStore, *, ops: Any = None, router: Any = None,
 
 def register_harness_tools(server: Any, store: HarnessStore, *,
                            engine: HarnessEngine | None = None,
-                           ops: Any = None, router: Any = None) -> dict[str, Any]:
+                           ops: Any = None, router: Any = None,
+                           worktree_roots: Sequence[str] = (),
+                           claude_config_path: str | None = None) -> dict[str, Any]:
     """Register the surface. Returns the handlers for the compact `turn` map."""
 
-    harness = engine or build_engine(store, ops=ops, router=router)
+    harness = engine or build_engine(store, ops=ops, router=router,
+                                     worktree_roots=worktree_roots,
+                                     claude_config_path=claude_config_path)
 
     @server.tool()
     def terminal_harness_start(task_id: str, prompt: str, title: str = "",

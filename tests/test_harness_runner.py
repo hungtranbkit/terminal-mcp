@@ -887,3 +887,118 @@ def test_without_ops_the_engine_is_degraded_but_never_lies(store):
     with pytest.raises(HarnessError) as excinfo:
         engine.step(run.id)
     assert "no AgentRunner is configured" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# workspace trust, registered before the session opens the directory
+# ---------------------------------------------------------------------------
+
+class RecordingTrust:
+    """Stands in for WorkspaceTrust. Records what it was asked, nothing more.
+
+    Deliberately not the real thing: what is under test here is WHEN the
+    runner asks and what it does with the answer. harness_trust's own tests
+    cover whether the answer is right.
+    """
+
+    def __init__(self, granted=True, explode=False):
+        self.calls: list[dict] = []
+        self.granted = granted
+        self.explode = explode
+
+    def register(self, path, *, run_id=None, source="harness"):
+        self.calls.append({"path": path, "run_id": run_id, "source": source})
+        if self.explode:
+            raise RuntimeError("the trust service is down")
+        from terminal_mcp.harness_trust import TrustDecision
+        return TrustDecision(path=str(path), granted=self.granted,
+                             reason="registered" if self.granted else "not_harness_owned",
+                             run_id=run_id, source=source)
+
+
+def test_trust_is_registered_before_the_session_is_picked(store, artifacts):
+    """After the spawn is too late: Claude Code reads trust when it starts,
+    so a grant that lands afterwards leaves the session on the question."""
+    ops = FakeOps([FakeSession("harness-claude-a")])
+    trust = RecordingTrust()
+    runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts, trust=trust)
+    run = _run(store, worktree="/tmp/wt/MOB-1")
+
+    runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
+               tier="balanced", session_id=None, iteration=1)
+
+    assert len(trust.calls) == 1
+    assert trust.calls[0]["path"] == "/tmp/wt/MOB-1"
+    assert trust.calls[0]["run_id"] == run.id
+    assert trust.calls[0]["source"] == "harness-runner"
+
+
+def test_a_run_with_no_worktree_asks_for_no_trust(store, artifacts):
+    """Nothing was created, so there is nothing to vouch for."""
+    ops = FakeOps([FakeSession("harness-claude-a")])
+    trust = RecordingTrust()
+    runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts, trust=trust)
+
+    runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=_run(store),
+               tier="balanced", session_id=None, iteration=1)
+
+    assert trust.calls == []
+
+
+def test_a_refused_grant_does_not_stop_the_dispatch(store, artifacts):
+    """A refusal must not turn a recoverable human question into a hard stop
+    for every worktree this module does not recognise. The session is still
+    dispatched; if it asks, the existing PERMISSION_REQUIRED path reports it."""
+    ops = FakeOps([FakeSession("harness-claude-a")])
+    runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts,
+                                 trust=RecordingTrust(granted=False))
+    run = _run(store, worktree="/tmp/somebody-elses-directory")
+
+    result = runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
+                        tier="balanced", session_id=None, iteration=1)
+
+    assert result.pending is True
+    assert len(ops.sends) == 1
+
+
+def test_a_trust_service_that_throws_never_takes_the_run_with_it(store, artifacts):
+    """Without the service at all the run dispatches; with a broken one it
+    must do no worse."""
+    ops = FakeOps([FakeSession("harness-claude-a")])
+    runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts,
+                                 trust=RecordingTrust(explode=True))
+    run = _run(store, worktree="/tmp/wt/MOB-1")
+
+    result = runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
+                        tier="balanced", session_id=None, iteration=1)
+
+    assert result.pending is True
+    assert len(ops.sends) == 1
+
+
+def test_without_a_trust_service_the_behaviour_is_exactly_as_before(store, artifacts):
+    ops = FakeOps([FakeSession("harness-claude-a")])
+    runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
+    run = _run(store, worktree="/tmp/wt/MOB-1")
+
+    result = runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
+                        tier="balanced", session_id=None, iteration=1)
+
+    assert result.pending is True
+    assert runner.trust is None
+
+
+def test_re_dispatching_the_same_run_re_asserts_trust_cheaply(store, artifacts):
+    """Idempotent at the trust layer, so asking again on a later attempt
+    costs a config read and writes nothing."""
+    ops = FakeOps([FakeSession("harness-claude-a")])
+    trust = RecordingTrust()
+    runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts, trust=trust)
+    run = _run(store, worktree="/tmp/wt/MOB-1")
+
+    runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
+               tier="balanced", session_id=None, iteration=1)
+    runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
+               tier="balanced", session_id=None, iteration=2)
+
+    assert len(trust.calls) == 2, "asked per dispatch; the trust layer dedupes"

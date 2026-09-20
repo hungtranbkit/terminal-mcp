@@ -472,9 +472,17 @@ class TerminalAgentRunner:
                  #: and told nobody. The gate already knows how to say
                  #: "the prompt is still in the composer" -- it just has to
                  #: be asked.
-                 require_acceptance: bool = True) -> None:
+                 require_acceptance: bool = True,
+                 #: Registers workspace trust for a worktree the Harness
+                 #: itself created, before a session is opened in it. None
+                 #: keeps the previous behaviour exactly: the spawn happens,
+                 #: Claude Code asks its question, and `_send_when_ready`
+                 #: names it PERMISSION_REQUIRED. See harness_trust for why
+                 #: this cannot be pointed at a directory a person owns.
+                 trust: Any = None) -> None:
         self.ops = ops
         self.store = store
+        self.trust = trust
         self.artifacts_root = Path(artifacts_root)
         self.broker = broker or SessionBroker(ops, store, router=router,
                                               default_runtime=default_runtime)
@@ -512,6 +520,15 @@ class TerminalAgentRunner:
         # demanding independence -- see harness_policy.INDEPENDENT_EVALUATOR.
         independent = role == policy.EVALUATOR
         runtime = self.runtime_for_role.get(role, self.default_runtime)
+        # BEFORE the session opens the directory, not after it has asked.
+        # Trust is keyed by exact path and read when Claude Code starts, so
+        # a grant that lands afterwards helps nobody -- the session is
+        # already sitting on the question. A refusal is deliberately NOT an
+        # error here: the run proceeds, the session asks, and the existing
+        # PERMISSION_REQUIRED path reports it. Refusing to dispatch on a
+        # refused grant would turn a recoverable human question into a hard
+        # stop for every worktree this module does not recognise.
+        self._register_trust(run)
         try:
             pick = self.broker.pick(run=run, role=role, runtime=runtime,
                                     independent=independent,
@@ -560,6 +577,22 @@ class TerminalAgentRunner:
             dispatch_id=dispatch["id"], attempt=attempt, nonce=dispatch["nonce"],
             artifact_path=str(artifact), run_id=run.id, iteration=iteration)
         return self._send(dispatch, pick, text)
+
+    def _register_trust(self, run: Any) -> Any:
+        """Record workspace trust for this run's worktree, if it has one.
+
+        Idempotent and cheap on the common path: a worktree already trusted
+        costs one config read and writes nothing. Never raises -- a trust
+        service that is down must not take the run with it, because the
+        outcome without it is the behaviour that already existed.
+        """
+        if self.trust is None or not getattr(run, "worktree_path", None):
+            return None
+        try:
+            return self.trust.register(run.worktree_path, run_id=run.id,
+                                       source="harness-runner")
+        except Exception:  # noqa: BLE001 -- reported by the trust audit, never fatal
+            return None
 
     def _send_when_ready(self, dispatch: Mapping[str, Any], prompt: Any, run: Any,
                          role: str, iteration: int) -> Any:
