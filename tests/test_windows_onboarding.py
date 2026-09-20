@@ -861,7 +861,11 @@ def test_enrolled_node_can_heartbeat_immediately(tmp_path, monkeypatch):
                              "shell_capabilities": ["powershell"], "labels": ["windows", "onboarded"]})
     assert beat.status_code == 200, beat.text
     node = controller.node_status("win1")
-    assert node.status == "online" and node.platform == "windows"
+    # A fresh heartbeat proves transport reachability only. Composite health
+    # remains degraded until an execution probe succeeds; onboarding must not
+    # manufacture EXECUTION_OK from heartbeat presence alone.
+    assert node.transport_status == "online" and node.platform == "windows"
+    assert node.status == "degraded"
     assert node.session_backend == "windows_pty"
 
     # A wrong token is refused, so an enrolled node id is not a free pass.
