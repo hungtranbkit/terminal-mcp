@@ -60,20 +60,64 @@ NEEDS_REWORK = "NEEDS_REWORK"
 NEEDS_HUMAN = "NEEDS_HUMAN"
 ALL_DECISIONS = (READY, BLOCKED, NEEDS_REWORK, NEEDS_HUMAN)
 
-# Reused as-is from supervisor2.py's own ATTENTION_STOP_PATTERNS (task
-# instruction: "Reuse Supervisor v2 Phase 1 claim/decision/... thay vì
-# viết lại") -- the same content-based safety screen (credentials,
-# destructive shell commands, confirmation prompts) already proven in
-# production there, applied here to a task's own PROMPT before it is
-# ever dispatched, rather than to a pane's output after the fact.
-SENSITIVE_PROMPT_PATTERNS = tuple(
+# The prompt screen, in two tiers.
+#
+# WHY IT IS NOT ONE FLAT KEYWORD LIST ANY MORE. The original list was
+# supervisor2.py's ATTENTION_STOP_PATTERNS -- a screen designed for a PANE'S
+# OUTPUT, where a bare "token" or "credential" really is a signal. Applied to a
+# task's PROMPT -- paragraphs of developer prose -- it matched almost nothing
+# it meant to. Every one of the ten prompts it gated on this fleet was a false
+# positive, and the four worst were self-inflicted:
+#
+#   "stop only for credential/destructive blockers"  -> matched 'credential'
+#   "Do not merge main and do not push (no remote)"  -> matched 'merge main'
+#   "ONE shared neutral visual token"                -> matched 'token'
+#   "Reply with exactly this token: PHASEB_OK_..."   -> matched 'token'
+#
+# The first two are the prompt telling the agent to BE careful, and the gate
+# reading its own safety instruction as the danger. A screen with a 100% false
+# positive rate is not a security control: it trains everyone to wave tasks
+# through, which is how the real ones get waved through too.
+#
+# So: a noun is no longer evidence. An ACTION on that noun is. And a match
+# inside a negation ("do not ...", "never ...") is not a match at all.
+
+_NEGATORS = (
+    r"do not", r"don'?t", r"never", r"avoid", r"refuse to", r"without",
+    # "stop only for credential/destructive blockers", "ask only for
+    # credentials" -- the prompt delegating the escalation, not requesting it.
+    r"stop (?:only )?(?:for|at)", r"ask (?:only )?(?:for|about)", r"escalate (?:only )?for",
+    r"only if", r"unless",
+    # "no API keys in repo", "no plaintext credentials in source/docs/logs".
+    # A rule the prompt is imposing on itself, and the single most common way
+    # a security-conscious prompt named a secret at all.
+    r"\bno\b",
+)
+_NEGATION_WINDOW = 40
+"""How far back a negator may sit and still govern the match. Deliberately
+about a clause, not a sentence: far enough to catch "do not merge main", short
+enough that an unrelated earlier "never" cannot launder a real instruction."""
+
+_NEGATION_RE = re.compile(
+    r"(?:" + "|".join(_NEGATORS) + r")[^.\n]{0,%d}$" % _NEGATION_WINDOW, re.IGNORECASE)
+
+
+def _negated(text: str, start: int) -> bool:
+    """Is the match at `start` governed by a negation just before it?
+
+    Looks only at the text back to the start of the current clause, so a
+    "do not" in a previous sentence never reaches forward into this one."""
+    window = text[max(0, start - (_NEGATION_WINDOW + 24)):start]
+    clause = re.split(r"[.\n;,]", window)[-1]
+    return bool(_NEGATION_RE.search(clause))
+
+
+# Tier 1: DESTRUCTIVE. An instruction to destroy, force-publish, or escalate
+# privilege. These are imperative commands, not topics, so they stay exactly
+# as they were -- this tier is the reason the gate exists and is not relaxed.
+DESTRUCTIVE_PROMPT_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
-        r"enter (your |the )?password",
-        r"api[_ -]?key",
-        r"credential",
-        r"\bsecret\b",
-        r"\btoken\b",
         r"force[ -]push",
         r"\brm -rf\b",
         r"drop (table|database)",
@@ -84,6 +128,39 @@ SENSITIVE_PROMPT_PATTERNS = tuple(
         r"push (to |origin )?main\b",
     )
 )
+
+# Tier 2: SECRET HANDLING. A credential noun on its own is a topic; what makes
+# it a gate is a verb that would EXPOSE it (print/paste/commit it somewhere) or
+# SET it (write a real one into a config). Both are listed explicitly rather
+# than inferred, and both are subject to the same negation rule as tier 1.
+_SECRET_NOUN = (
+    r"(?:passwords?|passphrases?|api[_ -]?keys?|client[_ -]?secrets?|private keys?|"
+    r"credentials?|secret keys?|"
+    # A bare "token" is a design token as often as a bearer token on this
+    # fleet, so `token` counts only when something qualifies it as a secret.
+    r"(?:auth|access|bearer|refresh|session|api|github|gitlab|npm|personal[_ -]access|secret)"
+    r"[_ -]tokens?)"
+)
+_EXPOSE_VERB = (
+    r"(?:print|echo|cat|show|reveal|display|dump|log|paste|send|post|upload|share|"
+    r"e-?mail|leak|exfiltrat\w*|hard-?code|embed)"
+)
+_SET_VERB = r"(?:set|add|put|write|store|save|configure|rotate|replace|update|generate|create)"
+_SINK = r"(?:git|repo(?:sitory)?|commit|source|chat|slack|e-?mail|log|logs|issue|ticket|comment|pr\b)"
+
+SECRET_PROMPT_PATTERNS = (
+    # An interactive credential prompt, by its own signature.
+    re.compile(r"enter (your |the )?(password|passphrase|api[_ -]?key)", re.IGNORECASE),
+    # "print the API key", "paste the access token"
+    re.compile(rf"\b{_EXPOSE_VERB}\b[^.\n]{{0,24}}\b{_SECRET_NOUN}\b", re.IGNORECASE),
+    # "set the GitHub token", "rotate the client secret"
+    re.compile(rf"\b{_SET_VERB}\b[^.\n]{{0,24}}\b{_SECRET_NOUN}\b", re.IGNORECASE),
+    # "the credentials into the repo", "the api key in the commit"
+    re.compile(rf"\b{_SECRET_NOUN}\b[^.\n]{{0,30}}\b(?:into|in|to)\b[^.\n]{{0,20}}\b{_SINK}",
+               re.IGNORECASE),
+)
+
+SENSITIVE_PROMPT_PATTERNS = DESTRUCTIVE_PROMPT_PATTERNS + SECRET_PROMPT_PATTERNS
 
 DEFAULT_MAX_REVIEW_ATTEMPTS = 5
 """Item: "Coordinator có... max review attempts, không loop vô hạn." A
@@ -138,6 +215,20 @@ class RepoEvidenceUnavailable(RepoEvidenceError):
     Still fail-closed by default -- the gate refuses to dispatch on unverified
     evidence -- but with an accurate reason and a deliberate, auditable opt-in,
     rather than a misleading one and no way forward."""
+
+
+class RepoEvidenceNotARepository(RepoEvidenceError):
+    """`cwd` exists on this host and is simply not a git repository.
+
+    This is an ANSWER, not a failure to look. It used to be reported as
+    "could not read git/repo status ... fail-closed", which sent operators to
+    debug a repository that does not exist -- observed live on a task whose
+    session sat in a scratchpad directory.
+
+    Nothing is weakened by accepting it: the two checks the evidence feeds are
+    "are there uncommitted changes" and "has this branch diverged", and a
+    directory with no repository in it can be neither. It is recorded on the
+    decision so the absence is visible rather than assumed."""
 
 
 @dataclass(frozen=True)
@@ -199,6 +290,13 @@ def git_repo_evidence(cwd: str, node_id: str | None = None, *,
             raise RepoEvidenceError(f"git {' '.join(args)} exited {result.returncode} in {cwd!r}: "
                                     f"{result.stderr.strip()[:300]}")
         return result.returncode, result.stdout
+
+    # Asked FIRST and allowed to fail: this is the one question that
+    # distinguishes "not a repository" from "the repository is unreadable",
+    # and every call below would otherwise fail with the same opaque message.
+    inside_code, inside = run("rev-parse", "--is-inside-work-tree", allow_failure=True)
+    if inside_code != 0 or inside.strip() != "true":
+        raise RepoEvidenceNotARepository(f"{cwd!r} is not a git repository")
 
     _, branch = run("rev-parse", "--abbrev-ref", "HEAD")
     branch = branch.strip()
@@ -592,11 +690,23 @@ class CoordinatorGate:
 
         # 1. Sensitive/destructive prompt screen (item 3's "destructive/
         #    sensitive"; reused pattern list from supervisor2.py).
+        prompt_text = task.prompt or ""
         for pattern in self.sensitive_patterns:
-            if pattern.search(task.prompt or ""):
+            for match in pattern.finditer(prompt_text):
+                # "Do not merge main", "stop only for credential blockers":
+                # the prompt is ruling the action OUT. Gating on it told an
+                # operator the task wanted to do the very thing it forbade.
+                # Keep scanning -- a later, ungoverned occurrence of the same
+                # pattern in the same prompt still gates.
+                if _negated(prompt_text, match.start()):
+                    continue
+                excerpt = prompt_text[max(0, match.start() - 40):match.end() + 40].replace("\n", " ")
                 return CoordinatorDecision(
-                    NEEDS_HUMAN, evidence={"matched_pattern": pattern.pattern},
-                    reason=f"task prompt matches a sensitive/destructive pattern ({pattern.pattern!r})",
+                    NEEDS_HUMAN,
+                    evidence={"matched_pattern": pattern.pattern, "matched_text": match.group(0),
+                              "excerpt": excerpt},
+                    reason=f"task prompt matches a sensitive/destructive pattern ({pattern.pattern!r}) "
+                           f"at {match.group(0)!r}",
                     required_actions=["a human confirms this task is safe/intended before it is dispatched"],
                 )
 
@@ -733,16 +843,31 @@ class CoordinatorGate:
         #    khác đang sửa cùng repo/file/branch").
         if session.cwd:
             for other in other_active:
-                if other.session != task.session and other.cwd and other.cwd == session.cwd:
-                    return CoordinatorDecision(
-                        NEEDS_HUMAN, evidence={"conflicting_session": other.session, "cwd": session.cwd},
-                        reason=f"session {other.session!r} is already actively working in the same "
-                              f"repo/worktree ({session.cwd})",
-                    )
+                if other.session == task.session or not other.cwd:
+                    continue
+                if other.cwd != session.cwd:
+                    continue
+                # SAME PATH IS NOT THE SAME DIRECTORY unless it is the same
+                # machine. Every node in this fleet lays its workspaces out
+                # the same way, so /home/kimex/workspace/terminal-mcp names a
+                # different working tree on each of them -- comparing the
+                # string alone reported a conflict between two sessions that
+                # could not touch each other's files. Only compared when both
+                # nodes are actually known; an unknown node stays a conflict,
+                # because refusing to dispatch is the safe direction.
+                if (other.node_id and session.node_id and other.node_id != session.node_id):
+                    continue
+                return CoordinatorDecision(
+                    NEEDS_HUMAN, evidence={"conflicting_session": other.session, "cwd": session.cwd,
+                                           "node_id": session.node_id},
+                    reason=f"session {other.session!r} is already actively working in the same "
+                          f"repo/worktree ({session.cwd})",
+                )
 
         # 7. Repo evidence (git status/branch/HEAD) -- fail-closed on
         #    ANY collection failure (item 7).
         repo: RepoEvidence | None = None
+        not_a_repository: str | None = None
         if session.cwd:
             try:
                 repo = self._collect_repo_evidence(session.cwd, session.node_id)
@@ -767,6 +892,34 @@ class CoordinatorGate:
                         required_actions=[
                             "give this node a repo-evidence capable agent, or set "
                             "allow_unverified_repo on the task to accept dispatch without it"],
+                    )
+            except RepoEvidenceNotARepository as exc:
+                # STILL FAIL-CLOSED. A task whose session is sitting somewhere
+                # that is not a repository is usually a session in the wrong
+                # place, and that is worth stopping for.
+                #
+                # What changes is the REASON. This used to be reported as
+                # "could not read git/repo status ... fail-closed", which sent
+                # an operator to debug a repository that does not exist --
+                # observed live on a task whose session sat in a scratchpad
+                # directory. It now says what is actually true, and offers the
+                # same deliberate, auditable opt-out RepoEvidenceUnavailable
+                # already had rather than leaving no way forward.
+                if task.metadata.get("allow_unverified_repo"):
+                    repo = None
+                    not_a_repository = str(exc)
+                else:
+                    return CoordinatorDecision(
+                        NEEDS_HUMAN,
+                        evidence={"not_a_git_repository": str(exc), "cwd": session.cwd,
+                                  "session_node_id": session.node_id,
+                                  "override": "set task metadata allow_unverified_repo=true to "
+                                              "dispatch into a directory with no repository"},
+                        reason=f"{session.cwd!r} is not a git repository -- fail-closed, refusing "
+                               f"to dispatch (the session may be in the wrong directory)",
+                        required_actions=[
+                            "point the session at the task's repository/worktree, or set "
+                            "allow_unverified_repo on the task if this work genuinely has no repo"],
                     )
             except RepoEvidenceError as exc:
                 return CoordinatorDecision(
@@ -822,6 +975,8 @@ class CoordinatorGate:
 
         # All checks passed.
         ready_evidence: dict[str, Any] = {"node_id": session.node_id, "cwd": session.cwd}
+        if not_a_repository is not None:
+            ready_evidence["repo_evidence"] = not_a_repository
         if repo is not None:
             ready_evidence.update({"branch": repo.branch, "head": repo.head, "has_upstream": repo.has_upstream,
                                    "ahead": repo.ahead, "behind": repo.behind})
