@@ -70,6 +70,15 @@ GROUPS: dict[str, list[str]] = {
                     "integration_store.py", "git_worktree.py",
                     "git_isolation_service.py", "release_store.py",
                     "release_service.py"],
+    # TMCP-HARNESS-001. The single execution state machine and everything
+    # that decides for it. Grouped rather than scattered into queue/planner/
+    # pm because the whole point of the feature is that these eleven files
+    # hold ONE answer to "what is this task doing" -- splitting them across
+    # the subsystems they replaced would index them as more of the same.
+    "harness": ["harness_state.py", "harness_schema.py", "harness_store.py",
+                "harness_contract.py", "harness_policy.py", "harness_context.py",
+                "harness_engine.py", "harness_scheduler.py", "harness_service.py",
+                "harness_pilot.py", "harness_migration.py"],
     "pm": ["pm_router.py", "pm_service.py", "pm_store.py", "pm_summary.py"],
     "backlog": ["backlog_db.py", "backlog_service.py", "backlog_store.py",
                 "project_service.py", "project_identity.py"],
