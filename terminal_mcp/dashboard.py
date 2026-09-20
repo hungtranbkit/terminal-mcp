@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import hmac
 import json
 import logging
@@ -23,6 +24,7 @@ from starlette.responses import (
 from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
+from . import harness_policy
 from . import lan_discovery, network_bind, remote_connect, tunnel_diagnostics
 from html import escape as html_escape
 from . import dashboard_nav
@@ -55,6 +57,7 @@ from .core import TerminalService
 from .ai_usage_service import AiUsageService
 from . import terminal_wall
 from .recovery_engine import RecoveryEngine
+from .harness_service import HarnessService
 from .integration_service import IntegrationService
 from .integration_store import IntegrationStore
 from .node_models import NODE_ONLINE, SESSION_BACKEND_TMUX, node_to_dict
@@ -13048,6 +13051,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                        notes: NotesService | None = None,
                        agents: Any = None,
                        projects: Any = None,
+                       harness: "HarnessService | None" = None,
                        webauth: WebAuthStore | None = None) -> None:
     if supervisor is None:
         supervisor = SupervisorService(terminal, SupervisorStore())
@@ -13098,6 +13102,13 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     if integration is None:
         integration = IntegrationService(IntegrationStore(
             ephemeral_db_path("integration", "integration.db")))
+    if harness is None:
+        # TMCP-HARNESS-001. Built from whatever queue this registration
+        # ended up with -- including the private temp one above -- because
+        # the harness tables live in the QUEUE's database. Deriving it from
+        # `queue` rather than letting HarnessStore find its own default is
+        # what keeps a test's ephemeral dashboard off the real queue.db.
+        harness = HarnessService(queue=queue)
     if ai_usage is None:
         # No persistent store at all (in-memory cache only) -- no
         # private-temp-file discipline needed, unlike queue/integration
@@ -16244,7 +16255,102 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             if (row.get("metadata") or {}).get("is_split_parent"):
                 progress = await anyio.to_thread.run_sync(planner.children_progress, row["id"])
                 row["child_progress"] = {"total": progress["total"], "done": progress["done"]}
+        # TMCP-HARNESS-001. The board READS the run; it does not keep a
+        # second workflow state of its own. Every harness field on a card is
+        # a pure function of HarnessRun.stage (see harness_state.project_
+        # stage), so the board can never show a stage the engine does not
+        # believe in -- which is exactly what the old five-state-machine
+        # board did, routinely.
+        #
+        # One bulk read for the whole board, at this layer, for the same
+        # reason the PM enrichment above is here: queue_service.py must not
+        # learn about a feature built on top of it, and a view that
+        # refreshes on a timer must not issue one SELECT per card.
+        harness_rows = await anyio.to_thread.run_sync(
+            harness.projections_for_tasks, [row["id"] for row in all_rows])
+        for row in all_rows:
+            projection = harness_rows.get(row["id"])
+            if projection is None:
+                continue  # never harnessed: absent, not zeroed
+            row["harness"] = projection
+        # The Human Decision Queue is its own column, and it holds ONLY the
+        # closed list of things a human actually decides (harness_policy.
+        # HUMAN_DECISION_REASONS). A failing test is not on that list and
+        # cannot reach here: an evaluator FAIL goes to REVISING, which is a
+        # stage, not a question.
+        result["human_decisions"] = await anyio.to_thread.run_sync(
+            harness.human_decisions)
+        counts = result.get("counts")
+        if isinstance(counts, dict):
+            counts["human_decisions"] = len(result["human_decisions"])
+            counts["harnessed"] = len(harness_rows)
         return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
+
+    # -- TMCP-HARNESS-001 ------------------------------------------------
+    #
+    # Three READ routes, and deliberately no write route. Starting, resuming
+    # and cancelling a run happen through terminal_turn's harness actions --
+    # the one surface -- so the dashboard cannot become a second place where
+    # a run is driven by different rules. What the dashboard owns is the
+    # picture, and every field in it is derived from HarnessRun.
+
+    @server.custom_route("/dashboard/api/harness/runs", methods=["GET"], include_in_schema=False)
+    async def harness_runs(request: Request) -> JSONResponse:
+        """The Project page's harness panel: every run, plus the totals.
+
+        `efficiency_totals` is what makes the cost claim checkable rather
+        than asserted -- planner/evaluator skips, cache hits, session reuse
+        and context bytes, summed across the project's real runs.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        project_id = (request.query_params.get("project_id") or "").strip() or None
+        result = await anyio.to_thread.run_sync(harness.project_overview, project_id)
+        return JSONResponse(result, status_code=200, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/harness/run", methods=["GET"], include_in_schema=False)
+    async def harness_run_detail(request: Request) -> JSONResponse:
+        """One run in full: contract, every iteration, every verdict with its
+        evidence, checkpoints, decisions and the event log.
+
+        This is `HarnessStore.run_report` verbatim -- the same read the MCP
+        status action returns -- so the run detail page and a tool call can
+        never describe the same run differently.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        run_id = (request.query_params.get("run_id") or "").strip() or None
+        task_id = (request.query_params.get("task_id") or "").strip() or None
+        if not run_id and not task_id:
+            return JSONResponse({"status": "FAILED", "error": "RUN_ID_OR_TASK_ID_REQUIRED"},
+                                status_code=400)
+        result = await anyio.to_thread.run_sync(
+            functools.partial(harness.status, run_id=run_id, task_id=task_id))
+        code = 200 if result.get("status") == "OK" else 404
+        return JSONResponse(result, status_code=code, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/harness/decisions", methods=["GET"], include_in_schema=False)
+    async def harness_decisions(request: Request) -> JSONResponse:
+        """The Human Decision Queue: the closed list, and nothing else.
+
+        Nine reasons, none of which is a failing test. The list is enforced
+        twice -- `HarnessStore.open_decision` refuses anything outside it,
+        and `HarnessService.human_decisions` filters again on the way out --
+        because this is the queue whose growth made humans the bottleneck on
+        work the machine could have fixed itself.
+        """
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        project_id = (request.query_params.get("project_id") or "").strip() or None
+        rows = await anyio.to_thread.run_sync(
+            functools.partial(harness.human_decisions, project_id=project_id))
+        return JSONResponse(
+            {"status": "OK", "decisions": rows, "count": len(rows),
+             "reasons": list(harness_policy.HUMAN_DECISION_REASONS)},
+            status_code=200, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/tasks/create", methods=["POST"], include_in_schema=False)
     async def tasks_create(request: Request) -> JSONResponse:

@@ -1610,6 +1610,15 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         # above.
         "/dashboard/tasks": {"GET", "HEAD"},
         "/dashboard/api/tasks/board": {"GET", "HEAD"},
+        # TMCP-HARNESS-001. Three READ routes and no write route, on
+        # purpose: a run is started, resumed and cancelled through
+        # terminal_turn's harness actions, so the dashboard cannot become a
+        # second place where runs are driven by different rules. If a write
+        # route ever appears here, this guard is where that decision gets
+        # noticed.
+        "/dashboard/api/harness/runs": {"GET", "HEAD"},
+        "/dashboard/api/harness/run": {"GET", "HEAD"},
+        "/dashboard/api/harness/decisions": {"GET", "HEAD"},
         "/dashboard/api/tasks/create": {"POST"},
         "/dashboard/api/tasks/assign": {"POST"},
         # AI Usage (read-only, local AI Usage Monitor) + Move-Task UI --
