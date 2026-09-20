@@ -90,7 +90,7 @@ file count from `ls tests/*.py`), not recalled from memory.
 | Notes / Ideas store (kho ghi chú: MCP `note_*` + `/dashboard/notes`) | VERIFIED |
 | Notes surface application-layer auth (webauth session or verified CF Access) | VERIFIED |
 | Dashboard: Requirements/Feature Matrix link | VERIFIED |
-| Worktree Janitor (reclaim isolated task worktrees) | CONTRACT ONLY — no executor, nothing deletes yet |
+| Worktree Janitor (reclaim isolated task worktrees) | VERIFIED LOCALLY — executor/router/review pipeline implemented; safe default observe_only + dry_run; 240 tests pass, production auto-delete remains opt-in |
 | Read-only repo access for external agents (`repo_*` MCP tools) | VERIFIED (V1, read-only) |
 | Prompt delivery / acceptance gate (`delivery_gate.py`) | VERIFIED (advisory default; enforce opt-in) |
 | Permissions: read/input grants + effective permissions | VERIFIED |
@@ -817,6 +817,17 @@ idempotency all stay in the controller on 8766.
   is attached to from inside a chat). One logical orchestration step is one
   call. `terminal_turn(action=inspect, targets=[...])` IS the canonical batch
   inspect — there is no separate batch tool to publish.
+- **One-call start deterministic-refusal settling (2026-09-20): VERIFIED LOCALLY.**
+  QueueStore intentionally persists a Coordinator `NEEDS_REWORK` decision as
+  `QUEUED` so a later background pass can re-review after the blocker is fixed.
+  The compact `start` surface now exposes that semantic decision as a settled
+  `NEEDS_REWORK` receipt after the first review instead of synchronously
+  re-running the identical coordinator check up to six times. This was
+  reproduced live with a dirty commercial worktree: the task was durably
+  persisted first, then the same blocker was reviewed repeatedly until the
+  30-second sidecar request timed out. Regression coverage proves one review,
+  no follower for the stopped receipt, and the coordinator's real reason is
+  returned to the caller.
 - **Cached-call compatibility (`CALL_COMPAT`/`_LEGACY_TRANSLATIONS`):** a
   ChatGPT conversation can only emit the schema it cached, and
   `tools.listChanged: false` means no backend change invalidates that cache.
@@ -4369,7 +4380,11 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
 
 ## Backlog (explicitly not done yet — tracked here so it isn't re-discovered)
 
-0a. **Worktree Janitor — CONTRACT ONLY as of 2026-09-14. No executor exists;
+0a. **Worktree Janitor — VERIFIED LOCALLY as of 2026-09-20. Executor, sweep,
+routing and review paths exist; the safe default is `observe_only` and routed
+cleanup defaults to `dry_run=True`. The P1-P5 janitor test suite passes 240/240.
+Production auto-delete remains opt-in/not live-promoted. Historical note: this
+section originally described the contract-only state before P1-P5 landed.
    nothing deletes anything.** The specification is
    `docs/WORKTREE_JANITOR.md` (state model, the nine AUTO_SAFE predicates,
    invariants I1-I8, failure modes F1-F13, multi-node ownership, audit shape,
