@@ -60,6 +60,7 @@ from . import retry_recovery
 from . import worktree_cleanup as wj
 from .schema import Migration, apply_migrations
 from .harness_schema import HARNESS_MIGRATIONS
+from . import harness_state
 
 # -- Task status state machine ------------------------------------------
 #
@@ -317,6 +318,45 @@ VALID_TRANSITIONS: dict[str, frozenset[str]] = {
     SKIPPED: frozenset(),
     CANCELLED: frozenset(),
 }
+
+
+class HarnessRunNotMerged(RuntimeError):
+    """A production deploy of work whose harness run has not merged yet.
+
+    The gate is on PROD only. A test deploy of an in-flight branch is how
+    the work gets evaluated, and refusing that would make the harness worse
+    at its job; production is the decision that cannot be taken back.
+    """
+
+    def __init__(self, task_id: str, run: dict) -> None:
+        self.task_id = task_id
+        self.run = run
+        super().__init__(
+            f"{task_id} cannot be deployed to production: harness run "
+            f"{run.get('id')} is at stage {run.get('stage')}, not MERGED. "
+            f"A run reaches MERGE_READY on its own and merges only when a "
+            f"named approver calls harness_review(approve_merge=true).")
+
+
+class HarnessRunOwnsTask(RuntimeError):
+    """A generic retry was aimed at a task a live harness run is executing.
+
+    Raised rather than accepted, because accepting it is precisely the
+    behaviour being removed: a restart-from-prompt that throws away a
+    contract, a worktree and an iteration history the run still holds. The
+    message names the run and the action that actually does what the caller
+    wanted.
+    """
+
+    def __init__(self, task_id: str, run: dict) -> None:
+        self.task_id = task_id
+        self.run = run
+        super().__init__(
+            f"{task_id} is being executed by harness run {run.get('id')} "
+            f"(stage {run.get('stage')}, iteration {run.get('current_iteration')}). "
+            f"A generic retry would restart it from its prompt and discard that "
+            f"work. Use terminal_turn(action='harness_resume') to continue the "
+            f"same run, or harness_cancel first if the attempt really should end.")
 
 
 class InvalidTransitionError(ValueError):
@@ -3299,6 +3339,20 @@ class QueueStore:
         task = self.get_task(task_id)
         if task is None:
             raise KeyError(task_id)
+        # TMCP-HARNESS-001. A production deploy of work a harness run is
+        # still executing is refused until that run has actually MERGED.
+        #
+        # DEPLOYED_TEST is deliberately NOT gated: deploying an in-progress
+        # branch to a test target is how the work gets evaluated at all, and
+        # gating it would make the harness worse at the thing it is for.
+        # Production is the one that cannot be taken back, so it waits for
+        # the merge decision -- which SUPERVISED requires a named human to
+        # make (see harness_engine.approve_merge).
+        if deploy_state == self.DEPLOYED_PROD:
+            owning = self.active_harness_run_for(task_id)
+            if owning and owning.get("stage") not in (
+                    harness_state.MERGED, harness_state.DONE):
+                raise HarnessRunNotMerged(task_id, owning)
         with self._connection() as connection:
             connection.execute(
                 "UPDATE queue_tasks SET deploy_state = ?, updated_at = ? WHERE id = ?",
@@ -3516,8 +3570,53 @@ class QueueStore:
             self.record_event(session=task.session, task_id=task_id,
                               event_type="RETRY_DEDUPED", reason=reason)
             return self.get_task(owner["task_id"]) or task
+        # TMCP-HARNESS-001. A generic retry must not restart work a harness
+        # run already owns.
+        #
+        # This is the defect the harness exists to remove, and it lives
+        # exactly here: "retry" could not tell an INFRASTRUCTURE failure (the
+        # machinery broke, the work is fine) from a PRODUCT failure (the
+        # machinery worked, the work is wrong), so it did the one thing that
+        # is wrong for both -- sent the task back to QUEUED to be executed
+        # again from its original prompt. Every hour of build, every
+        # checkpoint, every contract and the entire iteration history were
+        # discarded to re-derive what was already known.
+        #
+        # A harness run has the right answer for both cases and a different
+        # one for each: resume the same run, iteration and worktree, or open
+        # a new iteration against the same contract. So a retry aimed at a
+        # task the harness is actively running is REFUSED and told where to
+        # go, rather than quietly doing the destructive thing.
+        #
+        # Deliberately narrow: only an ACTIVE run blocks. A task whose run
+        # finished, was cancelled, or never existed at all -- which is every
+        # task in every database that predates this -- retries exactly as it
+        # always did.
+        if owning := self.active_harness_run_for(task_id):
+            raise HarnessRunOwnsTask(task_id, owning)
         return self.transition_task(task_id, QUEUED, event_type="RETRIED",
                                     extra_fields={"dispatch_idempotency_key": None})
+
+    def active_harness_run_for(self, task_id: str) -> dict[str, Any] | None:
+        """The live harness run for this task, if one owns it.
+
+        Read straight from harness_runs because it is in THIS database (see
+        the migration ladder above) -- the whole reason the harness tables
+        were appended to the queue's ladder rather than given a file of their
+        own is so a question like this one is a plain SELECT rather than a
+        cross-store consistency problem.
+        """
+        try:
+            with self._connection() as connection:
+                row = connection.execute(
+                    "SELECT id, stage, mode, write_authority, current_iteration "
+                    "FROM harness_runs WHERE task_id = ? AND status = 'active' "
+                    "ORDER BY created_at DESC LIMIT 1", (task_id,)).fetchone()
+        except sqlite3.Error:
+            # No harness tables on this database: there is no run to own the
+            # task, so the legacy path is the correct one.
+            return None
+        return dict(row) if row is not None else None
 
     def skip_task(self, task_id: str) -> QueueTask:
         task = self.get_task(task_id)

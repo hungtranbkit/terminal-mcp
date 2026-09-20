@@ -36,7 +36,7 @@ from .permissions import valid_session_name
 from .verify_queue import VerifyQueue
 from .queue_store import (
     PAUSE_ORIGIN_USER, PAUSED, QUEUED, TERMINAL_STATUSES, UNASSIGNED_LANE, VERIFYING,
-    InvalidTransitionError, TaskAlreadyClaimedError, QueueStore,
+    HarnessRunOwnsTask, InvalidTransitionError, TaskAlreadyClaimedError, QueueStore,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -754,6 +754,14 @@ class QueueService:
             updated = action(task_id)
         except InvalidTransitionError as exc:
             return {"error": "INVALID_TRANSITION", "session": session, "task_id": task_id, "reason": str(exc)}
+        except HarnessRunOwnsTask as exc:
+            # TMCP-HARNESS-001. Reported as a refusal with the run attached,
+            # not as a 500: the caller asked for something reasonable and
+            # there is a specific, better action available. See
+            # queue_store.retry_task for why a restart here is destructive.
+            return {"error": "HARNESS_RUN_OWNS_TASK", "session": session,
+                    "task_id": task_id, "reason": str(exc), "run": exc.run,
+                    "use_instead": "terminal_turn(action='harness_resume')"}
         return {"session": session, "task": updated.to_dict()}
 
     def reorder(self, session: str, ordered_task_ids: list[str]) -> dict[str, Any]:
