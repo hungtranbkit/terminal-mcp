@@ -54,6 +54,7 @@ from .agent_availability import available_agent_types
 from .capability_probe import probe_capabilities
 from .auth_throttle import AuthThrottle, client_key
 from .contract import describe as contract_describe
+from .replay_guard import HEADER_NONCE, HEADER_TIMESTAMP
 from . import node_profile
 from .launcher_resolution import resolve_launcher
 from .config import load_config
@@ -1158,6 +1159,10 @@ async def _heartbeat_loop(*, node_id: str, terminal: TerminalService, controller
             request = urllib.request.Request(url, data=body, method="POST")
             request.add_header("Authorization", f"Bearer {credential.current}")
             request.add_header("Content-Type", "application/json")
+            # A captured authenticated heartbeat must not be reusable to keep a
+            # dead node falsely online.  The controller persists consumed nonces.
+            request.add_header(HEADER_TIMESTAMP, str(time.time()))
+            request.add_header(HEADER_NONCE, secrets.token_urlsafe(24))
 
             def _push() -> dict:
                 with urllib.request.urlopen(request, timeout=10) as response:

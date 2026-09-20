@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -36,6 +37,7 @@ from terminal_mcp.grants import SessionGrantStore
 from terminal_mcp.mcp_app import build_mcp
 from terminal_mcp.node_agent import AgentCredential, _collect_rotated_token
 from terminal_mcp.node_client import LocalNodeClient, RemoteNodeClient
+from terminal_mcp.replay_guard import HeartbeatReplayGuard, HEADER_NONCE, HEADER_TIMESTAMP, MISSING_HEADERS, REPLAYED_NONCE
 from terminal_mcp.node_credentials import NodeCredentialStore
 from terminal_mcp.node_registry import NodeRegistry
 from terminal_mcp.token_rotation import DELIVERED, NONE, PENDING, TokenRotationService
@@ -406,7 +408,7 @@ def test_an_agent_refuses_a_delivered_token_that_is_not_the_announced_one(monkey
 # the routes, end to end
 # ---------------------------------------------------------------------------
 
-def _client(tmp_path, credentials):
+def _client(tmp_path, credentials, heartbeat_replay=None):
     service = TerminalService(_config(), grants=SessionGrantStore(tmp_path / "grants.db"),
                               audit=AuditStore(tmp_path / "audit.db"))
     registry = NodeRegistry(tmp_path / "nodes.db")
@@ -415,7 +417,7 @@ def _client(tmp_path, credentials):
     connections = ConnectionStore(tmp_path / "connections.db")
     mcp = build_mcp(service)
     register_dashboard(mcp, service, controller=controller, connection_store=connections,
-                       credentials=credentials)
+                       credentials=credentials, heartbeat_replay=heartbeat_replay)
     client = TestClient(mcp.streamable_http_app(), headers={"Origin": "http://testserver"})
     return client, controller
 
@@ -452,10 +454,14 @@ def test_a_full_rotation_over_the_real_routes_never_401s_the_node(tmp_path, monk
     fresh = collected.json()["token"]
 
     # The node's next heartbeat, signed with the new token, completes it.
-    confirmed = client.post(f"/dashboard/api/nodes/{NODE}/heartbeat", json=beat,
-                            headers={"Authorization": f"Bearer {fresh}"})
+    replay_headers = {"Authorization": f"Bearer {fresh}", HEADER_TIMESTAMP: str(time.time()), HEADER_NONCE: "abcdefghijklmnop"}
+    confirmed = client.post(f"/dashboard/api/nodes/{NODE}/heartbeat", json=beat, headers=replay_headers)
     assert confirmed.status_code == 200
     assert "token_refresh" not in confirmed.json()
+    replayed = client.post(f"/dashboard/api/nodes/{NODE}/heartbeat", json=beat, headers=replay_headers)
+    assert replayed.status_code == 409
+    assert replayed.json()["error"] == "REPLAY_REJECTED"
+    assert replayed.json()["verdict"] == REPLAYED_NONCE
 
     # AC3, at the route: the old token is refused, by name.
     refused = client.post(f"/dashboard/api/nodes/{NODE}/heartbeat", json=beat, headers=old_headers)
