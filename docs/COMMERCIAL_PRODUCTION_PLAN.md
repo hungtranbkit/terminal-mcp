@@ -1,9 +1,10 @@
 # Terminal MCP — Commercial Production Plan
 
-**Planning date:** 2026-09-20  
-**Target:** Commercial Production V1  
-**Status:** Execution plan; no feature status in this document overrides `docs/REQUIREMENTS.md`.  
-**Canonical technical truth:** `docs/REQUIREMENTS.md`  
+**Planning date:** 2026-09-20
+**Target:** Commercial Production V1
+**Status:** Execution plan; no feature status in this document overrides `docs/REQUIREMENTS.md`.
+**Canonical technical truth:** `docs/REQUIREMENTS.md`
+**Binding implementation contract:** `docs/COMMERCIAL_PRODUCTION_EXECUTION_SPEC.md`
 **Canonical live task state:** Terminal MCP durable backlog/controller DB. The repo backlog file is a portable projection only.
 
 ---
