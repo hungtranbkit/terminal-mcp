@@ -108,6 +108,7 @@ TURN_HANDLER_ACTIONS: dict[str, str] = {
     "project_advance": "project_advance",
     "project_reconcile_team": "project_reconcile_team",
     "project_start": "project_start",
+    "project_recover": "project_recover",
     "task_status": "task_status",
     "task_batch_status": "task_batch_status",
     # Browser gateway (TMCP-BROWSER-GATEWAY-001). The browser has to be
@@ -158,6 +159,8 @@ TURN_ACTION_ALIASES: dict[str, str] = {
     "phase": "project_phase_status",
     "advance": "project_advance",
     "reconcile": "project_reconcile_team",
+    "recover": "project_recover",
+    "pm_recover": "project_recover",
     "new_project": "project_bootstrap",
     "stale_sessions": "cleanup_candidates",
     "auto": "route_start",
@@ -213,6 +216,9 @@ AGENT_ARGS: dict[str, frozenset[str]] = {
     "project_reconcile_team": frozenset({"project_id"}),
     "project_start": frozenset({"project_id", "prompt", "title", "capabilities", "approval",
                                   "agent_id", "priority", "metadata", "request_key", "target"}),
+    # No required argument: the PM sweeps the whole fleet when no project is
+    # named, which is what an operator asking "is anything stuck?" means.
+    "project_recover": frozenset({"project_id", "limit", "dry_run"}),
 }
 
 #: Arguments without which the action cannot mean anything. Checked here so
@@ -1002,6 +1008,13 @@ class CompactTerminalTools:
             required = AGENT_REQUIRED.get(action, ())
             if target and required and required[0] in allowed:
                 extra.setdefault(required[0], target)
+            elif target and not required and "project_id" in allowed:
+                # An action with no REQUIRED argument still has a conventional
+                # positional. `project_recover` sweeps the whole fleet when
+                # nothing is named and one project when something is, so a
+                # bare `target` must not be silently dropped -- that would
+                # turn "recover this project" into "recover everything".
+                extra.setdefault("project_id", target)
             if text and len(required) > 1 and required[1] in allowed:
                 extra.setdefault(required[1], text)
             elif text and "prompt" in allowed:

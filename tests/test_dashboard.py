@@ -1710,6 +1710,15 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/projects/plan": {"POST"},
         "/dashboard/api/projects/advance": {"POST"},
         "/dashboard/api/projects/reconcile": {"POST"},
+        # Runtime health: the two admin actions a stalled project needs,
+        # which existed only as MCP tools. The GET is a REPORT (its recovery
+        # half runs as a dry run, so opening the panel moves nothing); both
+        # mutations are POST behind _mutation_guard like every other write
+        # here, and the cleanup re-derives candidacy from a fresh fleet read
+        # before it deletes anything.
+        "/dashboard/api/runtime-health": {"GET", "HEAD"},
+        "/dashboard/api/runtime-health/recover": {"POST"},
+        "/dashboard/api/runtime-health/cleanup": {"POST"},
     }
     # The web terminal's WebSocket route is registered too, just outside
     # this HTTP-methods-only dict (WebSocketRoute has no .methods).

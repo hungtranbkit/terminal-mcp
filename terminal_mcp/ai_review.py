@@ -100,23 +100,50 @@ ACTOR_AI_RECONCILER = "ai_reconciler"
 # the gate that actually refused, instead of forming a second opinion about the
 # same text.
 # --------------------------------------------------------------------------
+# NEEDLE -> class, matched as a SUBSTRING of the regex the coordinator
+# reported. Ordered: the first needle found wins, so a needle that also occurs
+# inside an unrelated pattern must come after the pattern it belongs to.
+#
+# Both spellings are listed on purpose. The coordinator's patterns became
+# action-shaped in 2026-09 (a bare "token" in a prompt is vocabulary, not a
+# credential disclosure -- see coordinator.SENSITIVE_PROMPT_PATTERNS), but the
+# OLD pattern text is durable: it is quoted verbatim into coordinator_reason on
+# every task refused before that change, and those rows still have to classify.
+# Dropping the old needles would silently reclassify historic refusals as
+# AI-owned.
 _PATTERN_APPROVAL_CLASS: tuple[tuple[str, str], ...] = (
-    # credentials / secrets the AI must not invent
-    ("enter (your |the )?password", APPROVAL_CREDENTIALS),
+    # -- credentials / secrets the AI must not invent ----------------------
+    ("enter (your |the )?password", APPROVAL_CREDENTIALS),       # pre-2026-09
+    ("enter (?:your |the )?password", APPROVAL_CREDENTIALS),     # action-shaped
+    ("exfiltrat", APPROVAL_CREDENTIALS),       # the disclose-a-credential verb set
+    ("pastebin", APPROVAL_CREDENTIALS),        # credential -> somewhere public
     ("api[_ -]?key", APPROVAL_CREDENTIALS),
     ("credential", APPROVAL_CREDENTIALS),
     (r"\bsecret\b", APPROVAL_CREDENTIALS),
     (r"\btoken\b", APPROVAL_CREDENTIALS),
-    # destructive actions
+    (".env", APPROVAL_CREDENTIALS),            # the credential FILE, not a noun
+    # -- destructive actions ------------------------------------------------
     ("force[ -]push", APPROVAL_DESTRUCTIVE),
     (r"\brm -rf\b", APPROVAL_DESTRUCTIVE),
+    ("[a-z]*r[a-z]*f", APPROVAL_DESTRUCTIVE),  # rm -rf / -fr, either spelling
     ("drop (table|database)", APPROVAL_DESTRUCTIVE),
+    ("(?:table|database)", APPROVAL_DESTRUCTIVE),
+    ("truncate", APPROVAL_DESTRUCTIVE),
+    ("mkfs", APPROVAL_DESTRUCTIVE),
+    ("if=", APPROVAL_DESTRUCTIVE),             # dd if=...
+    ("777", APPROVAL_DESTRUCTIVE),             # chmod 777
     (r"\bsudo\b", APPROVAL_DESTRUCTIVE),
+    ("sudo", APPROVAL_DESTRUCTIVE),
     ("reset --hard", APPROVAL_DESTRUCTIVE),
+    ("--hard", APPROVAL_DESTRUCTIVE),
     (r"\bgit clean\b", APPROVAL_DESTRUCTIVE),
-    # protected production deploy / merge
+    ("clean", APPROVAL_DESTRUCTIVE),
+    # -- protected production deploy / merge --------------------------------
     ("merge (to |into )?main", APPROVAL_PROTECTED_DEPLOY),
     ("push (to |origin )?main", APPROVAL_PROTECTED_DEPLOY),
+    ("(?:main|master)", APPROVAL_PROTECTED_DEPLOY),
+    ("(?:prod|production)", APPROVAL_PROTECTED_DEPLOY),
+    ("deploy", APPROVAL_PROTECTED_DEPLOY),
 )
 
 #: An explicit, deliberate marker a task (or a coordinator decision) can carry

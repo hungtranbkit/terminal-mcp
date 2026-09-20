@@ -201,9 +201,15 @@ NAV_CSS = """
 .tmcp-nav__burger:hover { background: #17203a; }
 /* Breadcrumbs. Nested trail, separate row, never competing with the bar. */
 .tmcp-crumbs {
-  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
-  padding: 5px 12px; font-size: 11px; color: #7e8db0;
-  background: #0a1020; border-bottom: 1px solid #1f2a44;
+  /* The bar is a <div role="navigation"> precisely so a page's bare `nav {}`
+     rule cannot reach it -- but the breadcrumb IS a <nav>, and the same rules
+     do reach it. AI Usage styles `nav` as a column-flex sidebar with a right
+     border, which stacked the trail vertically. Every property the trail's
+     own layout depends on is therefore stated here rather than inherited. */
+  display: flex; flex-direction: row; align-items: center; gap: 6px; flex-wrap: wrap;
+  padding: 5px 12px; margin: 0; font-size: 11px; color: #7e8db0;
+  background: #0a1020; border: 0; border-bottom: 1px solid #1f2a44;
+  overflow: visible;
 }
 .tmcp-crumbs ol { display: contents; list-style: none; margin: 0; padding: 0; }
 .tmcp-crumbs a { color: #9fb0d0; text-decoration: none; }

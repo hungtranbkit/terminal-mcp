@@ -17,6 +17,8 @@ include node_id/node_name để debug" -- never a breaking shape change).
 """
 from __future__ import annotations
 
+import concurrent.futures
+import logging
 import tempfile
 import time
 from dataclasses import dataclass
@@ -42,6 +44,87 @@ if TYPE_CHECKING:
 LOCAL_NODE_ID = "local"
 MAX_BOUNDED_NODE_PROBE_SECONDS = 3.0
 MIN_BOUNDED_NODE_PROBE_SECONDS = 0.05
+
+_LOGGER = logging.getLogger(__name__)
+
+#: Default wall-clock ceiling for one fleet-wide fan-out (session listing,
+#: node health). Measured live on hp-linux against a five-node fleet: the
+#: SERIAL form of terminal_list_sessions took 3.6s-25.4s depending on which
+#: node was slow that second, and a router whose whole synchronous budget is
+#: 12s therefore spent all of it listing and dispatched zero ticks. A fan-out
+#: is naturally max(node) rather than sum(node), and this bounds even that.
+DEFAULT_FLEET_FANOUT_BUDGET_SECONDS = 6.0
+
+#: Never fan out with fewer threads than this, and never more: one thread per
+#: node is the whole point, and a fleet of three does not want a pool of
+#: thirty-two sitting idle.
+_MIN_FANOUT_WORKERS = 1
+_MAX_FANOUT_WORKERS = 16
+
+
+def _fanout(work, *, budget_seconds: float | None, label: str):
+    """Run one callable per node concurrently, bounded by ONE wall clock.
+
+    `work` is a sequence of (key, callable) pairs. Returns
+    {key: (ok, value_or_exception)} -- a key whose callable had not finished
+    when the budget ran out comes back as (False, TimeoutError(...)) rather
+    than being waited on, because the caller's own deadline is the thing this
+    exists to protect. The unfinished future is abandoned, not cancelled: a
+    node round-trip already in flight will complete harmlessly in its thread
+    and its result is simply not used.
+
+    SERIAL IS THE BUG THIS REPLACES. Fanning out does not make any single node
+    faster; it stops the SLOWEST node from being added to every other node's
+    time. That is the difference between a bounded routing decision and one
+    whose cost is the sum of the fleet.
+    """
+    items = list(work)
+    if not items:
+        return {}
+    if len(items) == 1:
+        # One node is the overwhelmingly common single-host deployment. A
+        # thread pool for it would be pure overhead and would also change the
+        # thread the local TerminalService is touched from, so it is run
+        # inline exactly as it always was.
+        key, call = items[0]
+        try:
+            return {key: (True, call())}
+        except Exception as exc:  # noqa: BLE001 -- normalised for the caller
+            return {key: (False, exc)}
+    workers = max(_MIN_FANOUT_WORKERS, min(_MAX_FANOUT_WORKERS, len(items)))
+    deadline = time.monotonic() + float(
+        budget_seconds if budget_seconds is not None else DEFAULT_FLEET_FANOUT_BUDGET_SECONDS)
+    results: dict[Any, tuple[bool, Any]] = {}
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers,
+                                                     thread_name_prefix=f"fleet-{label}")
+    try:
+        pending = {executor.submit(call): key for key, call in items}
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            done, _not_done = concurrent.futures.wait(
+                list(pending), timeout=remaining,
+                return_when=concurrent.futures.FIRST_COMPLETED)
+            if not done:
+                break
+            for future in done:
+                key = pending.pop(future)
+                try:
+                    results[key] = (True, future.result())
+                except Exception as exc:  # noqa: BLE001 -- one node never breaks the fan-out
+                    results[key] = (False, exc)
+        for future, key in pending.items():
+            future.cancel()
+            results[key] = (False, TimeoutError(
+                f"node did not answer within the {budget_seconds or DEFAULT_FLEET_FANOUT_BUDGET_SECONDS}s "
+                f"fleet {label} budget"))
+    finally:
+        # Never block on an abandoned in-flight node call: shutdown(wait=True)
+        # here would re-introduce exactly the unbounded wait the budget exists
+        # to remove.
+        executor.shutdown(wait=False, cancel_futures=True)
+    return results
 
 
 @dataclass
@@ -145,6 +228,56 @@ class ControllerService:
         import socket
         hostname = local_hostname or socket.gethostname()
         self.registry.register(local_node_id, display_name=local_display_name, hostname=hostname, endpoint="local")
+        self.retire_legacy_local_node()
+
+    def retire_legacy_local_node(self) -> dict[str, Any]:
+        """Drop the placeholder `local` node row once this controller is named.
+
+        A controller that has never been given an identity registers itself as
+        `local`. Naming it later (TERMINAL_MCP_LOCAL_NODE_ID=hp-linux) writes a
+        SECOND row and leaves the first one behind for good -- nothing else in
+        the system ever deletes a node. Found live on hp-linux (2026-09-20):
+
+            hp-linux  online   endpoint=local
+            local     offline  endpoint=local   "heartbeat is not fresh"
+
+        That ghost is not cosmetic. It is permanently OFFLINE (nothing
+        heartbeats it), so it is a standing blocker in every node-health
+        summary; it is a node with no client, so any session resolution that
+        lands on it answers NODE_UNREACHABLE/BACKEND_UNAVAILABLE rather than
+        routing to the real local node; and it inflates the fleet fan-out with
+        a node that can never answer.
+
+        REFUSES to touch anything that could be real. Only a row whose id is
+        exactly the placeholder, whose endpoint is the local sentinel, that is
+        NOT this controller's own id and that has no client registered for it
+        is removed -- so a deployment that genuinely calls its local node
+        `local` (every single-host install) is completely unaffected, and a
+        REMOTE node someone happened to name `local` keeps its endpoint and is
+        left alone.
+        """
+        if self.local_node_id == LOCAL_NODE_ID:
+            return {"retired": False, "reason": "this controller IS the local node"}
+        if LOCAL_NODE_ID in self._clients:
+            return {"retired": False, "reason": "a client is registered for it"}
+        try:
+            ghost = self.registry.get(LOCAL_NODE_ID)
+        except Exception:  # noqa: BLE001 -- never block startup on registry repair
+            _LOGGER.exception("controller: could not read the legacy local node row")
+            return {"retired": False, "reason": "registry unreadable"}
+        if ghost is None:
+            return {"retired": False, "reason": "no legacy row"}
+        if (ghost.endpoint or "") != "local":
+            return {"retired": False, "reason": f"endpoint is {ghost.endpoint!r}, not the local sentinel"}
+        try:
+            removed = self.registry.deregister(LOCAL_NODE_ID)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("controller: could not retire the legacy local node row")
+            return {"retired": False, "reason": "deregister failed"}
+        if removed:
+            _LOGGER.info("controller: retired the legacy %r node row; this controller is %r",
+                         LOCAL_NODE_ID, self.local_node_id)
+        return {"retired": bool(removed), "local_node_id": self.local_node_id}
 
     # -- node registration (remote nodes) ---------------------------------
 
@@ -1229,15 +1362,40 @@ class ControllerService:
 
     # -- fleet-wide views -----------------------------------------------------
 
-    def terminal_list_sessions(self) -> dict[str, Any]:
+    def terminal_list_sessions(self, *, budget_seconds: float | None = None) -> dict[str, Any]:
         """Merges every ONLINE node's own session list, tagging each row
         with node_id/node_name -- OFFLINE/DEGRADED nodes are reported
         separately (never silently dropped -- a caller checking why a
         session isn't listed needs to see "that node is offline", not an
-        empty list indistinguishable from "no sessions exist there")."""
+        empty list indistinguishable from "no sessions exist there").
+
+        CONCURRENT AND BOUNDED. Every online node is asked at the same time
+        under ONE wall clock, so the cost is the slowest node rather than the
+        sum of them, and a node that does not answer inside the budget is
+        reported `status: "timeout"` instead of extending the caller's call.
+        Found live on hp-linux (2026-09-20): the serial form took 3.6s-25.4s
+        across a five-node fleet and consumed the task router's entire 12s
+        synchronous budget before a single dispatch tick could run.
+
+        `budget_seconds=None` uses DEFAULT_FLEET_FANOUT_BUDGET_SECONDS. The
+        answer is always a listing, never an exception: a partial fleet view
+        with the gaps named is strictly more useful than a 500.
+        """
         sessions: list[dict[str, Any]] = []
         unreachable: list[dict[str, Any]] = []
-        for node in self.list_nodes():
+        started = time.monotonic()
+        budget = float(budget_seconds if budget_seconds is not None
+                       else DEFAULT_FLEET_FANOUT_BUDGET_SECONDS)
+        # Health probing gets at most HALF the budget. Without that split a
+        # fleet where several nodes are simultaneously due a probe could spend
+        # the whole clock deciding who is online and leave nothing to ask them
+        # anything -- every node would then be reported `timeout` and the
+        # listing would come back empty, which is the worst possible answer.
+        nodes = self.list_nodes(budget_seconds=max(MIN_BOUNDED_NODE_PROBE_SECONDS, budget / 2))
+        askable: list[tuple[str, Any]] = []
+        by_id: dict[str, Any] = {}
+        for node in nodes:
+            by_id[node.id] = node
             if node.status != NODE_ONLINE:
                 unreachable.append({"node_id": node.id, "node_name": node.display_name, "status": node.status})
                 continue
@@ -1245,12 +1403,20 @@ class ControllerService:
             if client is None:
                 unreachable.append({"node_id": node.id, "node_name": node.display_name, "status": "no_client"})
                 continue
-            try:
-                listing = client.list_sessions()
-            except NodeClientError as exc:
-                unreachable.append({"node_id": node.id, "node_name": node.display_name, "status": "error",
-                                    "detail": str(exc)})
+            askable.append((node.id, client))
+        remaining = max(MIN_BOUNDED_NODE_PROBE_SECONDS, budget - (time.monotonic() - started))
+        answers = _fanout(
+            [(node_id, self._session_lister(client, remaining)) for node_id, client in askable],
+            budget_seconds=remaining, label="sessions")
+        for node_id, _client in askable:
+            node = by_id[node_id]
+            ok, value = answers.get(node_id, (False, TimeoutError("no answer")))
+            if not ok:
+                status = "timeout" if isinstance(value, TimeoutError) else "error"
+                unreachable.append({"node_id": node.id, "node_name": node.display_name,
+                                    "status": status, "detail": str(value)})
                 continue
+            listing = value if isinstance(value, dict) else {}
             for row in listing.get("sessions", []):
                 row = dict(row)
                 row.setdefault("node_id", node.id)
@@ -1268,7 +1434,27 @@ class ControllerService:
                 if "effective_read" in row:
                     row["allowed"] = bool(row["effective_read"])
                 sessions.append(row)
-        return {"sessions": sessions, "unreachable_nodes": unreachable}
+        unreachable.sort(key=lambda entry: str(entry.get("node_id") or ""))
+        return {"sessions": sessions, "unreachable_nodes": unreachable,
+                "listed_in_seconds": round(time.monotonic() - started, 3)}
+
+    @staticmethod
+    def _session_lister(client: Any, timeout_seconds: float):
+        """One node's listing call, with its own per-node socket timeout.
+
+        The fan-out budget stops US waiting; this stops the SOCKET waiting,
+        which is what keeps an abandoned future from holding a connection open
+        long after the answer stopped being wanted.
+        """
+        def call() -> dict[str, Any]:
+            try:
+                return client.list_sessions(
+                    timeout_seconds=min(MAX_BOUNDED_NODE_PROBE_SECONDS * 2, timeout_seconds))
+            except TypeError:
+                # A client old enough not to accept a timeout still works --
+                # it is simply bounded by the fan-out budget alone.
+                return client.list_sessions()
+        return call
 
     def terminal_list_killed_sessions(self) -> dict[str, Any]:
         entries: list[dict[str, Any]] = []
@@ -1291,7 +1477,7 @@ class ControllerService:
 
     # -- node views (dashboard/doctor) ---------------------------------------
 
-    def list_nodes(self) -> list[Node]:
+    def list_nodes(self, *, budget_seconds: float | None = None) -> list[Node]:
         # Watchdog (task: "theo dõi và noti khi node rớt đột ngột"): every
         # fleet-wide status read already happening here (dashboard's own
         # periodic /dashboard/api/nodes poll) doubles as the reconcile
@@ -1303,14 +1489,43 @@ class ControllerService:
             self.registry.sync_status_transitions()
         except Exception:  # noqa: BLE001
             pass
-        result = []
-        for node in self.registry.list():
+        registered = list(self.registry.list())
+        # NodeHealthService.evaluate already answers from cache inside its
+        # probe interval, so the common call costs nothing extra. The fan-out
+        # is for the OTHER case: when several nodes are all due a probe, each
+        # one is a real network round trip and doing them in a row is how a
+        # fleet listing becomes seconds long. Order is restored afterwards so
+        # the answer stays the registry's own stable order.
+        work = []
+        cached: dict[str, Node] = {}
+        for node in registered:
             client = self._clients.get(node.id)
             if client is None:
-                result.append(self.node_health._cached(node))
+                cached[node.id] = self.node_health._cached(node)
                 continue
-            result.append(self.node_health.evaluate(node, client))
+            work.append((node.id, self._node_evaluator(node, client)))
+        answers = _fanout(work, budget_seconds=budget_seconds, label="health")
+        result: list[Node] = []
+        for node in registered:
+            if node.id in cached:
+                result.append(cached[node.id])
+                continue
+            ok, value = answers.get(node.id, (False, TimeoutError("no answer")))
+            if ok and isinstance(value, Node):
+                result.append(value)
+                continue
+            # A probe that timed out or raised is NOT evidence the node is
+            # gone -- it is evidence we did not find out in time. The durable
+            # last-known state is the honest answer, and the next pass (or an
+            # explicit force_probe) will settle it.
+            _LOGGER.debug("controller: health probe for node %s did not complete (%s)", node.id, value)
+            result.append(self.node_health._cached(node))
         return result
+
+    def _node_evaluator(self, node: Node, client: Any):
+        def call() -> Node:
+            return self.node_health.evaluate(node, client)
+        return call
 
     def node_status(self, node_id: str) -> Node | None:
         node = self.registry.get(node_id)

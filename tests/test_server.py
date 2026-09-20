@@ -449,6 +449,12 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_project_phase_status",
         "terminal_project_registry_list",
         "terminal_project_reconcile_team",
+        # PM recovery: stalled runtime bindings back to the router. Also a
+        # terminal_turn action (`recover`), because an operator asking "is
+        # anything stuck?" should not need the full tool surface.
+        "terminal_project_recover",
+        # Stale-session cleanup: the report and the one confirmed action.
+        "terminal_session_cleanup",
     }
 
 
