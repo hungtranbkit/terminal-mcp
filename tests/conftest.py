@@ -400,3 +400,50 @@ def _canonical_knowledge_map_is_left_as_it_was():
         path.unlink(missing_ok=True)
     elif path.exists() and path.read_bytes() != before:
         path.write_bytes(before)
+
+
+# ---------------------------------------------------------------------------
+# A DECLARED TOOLCHAIN, so a harness test asserts about the harness.
+#
+# harness_engine.partition_checks asks THIS machine whether a declared check's
+# first word is a real program, and that is deliberate: the evaluator-skip is
+# sound only because an exit status is not an opinion, and "typecheck" has no
+# exit status. The consequence is that any test naming `node -v` or
+# `npm test` is secretly asserting something about the host, and the harness
+# tests are full of both.
+#
+# That is exactly what happened on the failover to this machine: ten harness
+# tests that were green where they were written went red here, not because
+# the engine changed but because the host has no Node at all. A suite whose
+# result depends on which laptop is running it cannot be used to prove a
+# recovery, which is the one job it had.
+#
+# So the toolchain a test DECLARES is materialised for that test. The shims
+# are never executed -- every one of these tests injects `check_runner`, and
+# the engine's real subprocess path is covered separately by checks that use
+# shell builtins -- so this supplies the one fact partition_checks needs
+# (`shutil.which` resolves the name) and supplies nothing else.
+#
+# It is not autouse: a test that means "a name this machine does not have"
+# must keep getting that answer.
+
+_DECLARED_PROGRAMS = ("node", "npm")
+
+
+@pytest.fixture
+def declared_toolchain(monkeypatch, tmp_path):
+    """Make the programs the harness tests name resolvable on PATH."""
+    bin_dir = tmp_path / "declared-toolchain-bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    for program in _DECLARED_PROGRAMS:
+        shim = bin_dir / program
+        # Exits non-zero if it is ever actually run, so a test that starts
+        # depending on the OUTPUT of one of these fails loudly here rather
+        # than silently passing against a stub.
+        shim.write_text(
+            "#!/bin/sh\n"
+            f"echo '{program}: test shim, not a real toolchain' >&2\n"
+            "exit 70\n")
+        shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    return bin_dir
