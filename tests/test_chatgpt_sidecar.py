@@ -436,6 +436,77 @@ def test_a_non_final_backend_result_is_refused_rather_than_half_forwarded():
     asyncio.run(run())
 
 
+
+
+def test_backend_preserves_successful_call_result_when_teardown_fails():
+    """A cleanup-only transport error must never convert an executed mutation
+    into BACKEND_UNAVAILABLE, because that can provoke a duplicate retry."""
+    import contextlib
+
+    async def run():
+        backend = Backend("http://127.0.0.1:9/mcp", timeout_seconds=1)
+        expected = types.CallToolResult(
+            content=[types.TextContent(type="text", text="done")],
+            is_error=False)
+
+        class FakeSession:
+            async def call_tool(self, name, arguments):
+                return expected
+
+        @contextlib.asynccontextmanager
+        async def fake_session():
+            yield FakeSession()
+            raise BackendUnavailable("teardown failed after response")
+
+        backend._session = fake_session
+        result = await backend.call_tool("terminal_turn", {"action": "start"})
+        assert result is expected
+
+    asyncio.run(run())
+
+
+def test_backend_preserves_successful_tools_list_when_teardown_fails():
+    import contextlib
+
+    async def run():
+        backend = Backend("http://127.0.0.1:9/mcp", timeout_seconds=1)
+
+        class ListResult:
+            tools = [_tool("terminal_turn")]
+
+        class FakeSession:
+            async def list_tools(self):
+                return ListResult()
+
+        @contextlib.asynccontextmanager
+        async def fake_session():
+            yield FakeSession()
+            raise BackendUnavailable("teardown failed after response")
+
+        backend._session = fake_session
+        result = await backend.list_tools()
+        assert [tool.name for tool in result] == ["terminal_turn"]
+
+    asyncio.run(run())
+
+
+def test_backend_still_reports_failure_before_any_result():
+    import contextlib
+
+    async def run():
+        backend = Backend("http://127.0.0.1:9/mcp", timeout_seconds=1)
+
+        @contextlib.asynccontextmanager
+        async def fake_session():
+            raise BackendUnavailable("connect failed")
+            yield  # pragma: no cover
+
+        backend._session = fake_session
+        with pytest.raises(BackendUnavailable, match="connect failed"):
+            await backend.call_tool("terminal_turn", {})
+
+    asyncio.run(run())
+
 # ---------------------------------------------------------------------------
 # Network posture and configuration
 # ---------------------------------------------------------------------------

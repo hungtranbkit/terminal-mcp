@@ -355,14 +355,40 @@ class Backend:
                 f"({type(exc).__name__}); it may be restarting -- retry shortly") from exc
 
     async def list_tools(self) -> list[types.Tool]:
-        async with self._session() as session:
-            result = await session.list_tools()
-            return list(result.tools)
+        # A Streamable HTTP teardown can fail after the controller response has
+        # already been decoded (for example when the best-effort session DELETE
+        # races an already-completed ASGI response).  Do not throw away a
+        # successful tools/list result just because closing that one-shot
+        # transport failed afterwards.
+        result = None
+        try:
+            async with self._session() as session:
+                result = await session.list_tools()
+        except BackendUnavailable as exc:
+            if result is None:
+                raise
+            _log.warning(
+                "chatgpt-v1: backend teardown failed after successful tools/list; "
+                "preserving the received result: %s", exc)
+        return list(result.tools)
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> types.CallToolResult:
-        async with self._session() as session:
-            with anyio.fail_after(self.timeout_seconds):
-                result = await session.call_tool(name, arguments)
+        # Same rule for mutations: once the final CallToolResult was decoded,
+        # a teardown-only failure must not turn it into BACKEND_UNAVAILABLE.
+        # Reporting UNKNOWN here is especially dangerous because a caller may
+        # retry a mutation.  We never retry the tool call ourselves.
+        result = None
+        try:
+            async with self._session() as session:
+                with anyio.fail_after(self.timeout_seconds):
+                    result = await session.call_tool(name, arguments)
+        except BackendUnavailable as exc:
+            if result is None:
+                raise
+            _log.warning(
+                "chatgpt-v1: backend teardown failed after successful call %s; "
+                "preserving the received result and not replaying it: %s",
+                name, exc)
         if not isinstance(result, types.CallToolResult):
             # An InputRequiredResult/elicitation cannot be represented on a
             # stateless proxy hop -- surfacing it as an error is honest,
