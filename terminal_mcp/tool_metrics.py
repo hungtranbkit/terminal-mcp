@@ -35,11 +35,21 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     tool        TEXT    NOT NULL,
     session     TEXT,
     ok          INTEGER NOT NULL,
-    latency_ms  REAL
+    latency_ms  REAL,
+    action      TEXT
 );
 CREATE INDEX IF NOT EXISTS tool_calls_ts   ON tool_calls(timestamp);
 CREATE INDEX IF NOT EXISTS tool_calls_tool ON tool_calls(tool);
 """
+
+# terminal_turn la mot tool nhung nhieu hanh vi: inspect, send, send_wait,
+# wait, resume. Chung khac nhau ca ve chi phi lan y nghia -- send_wait chan
+# cho toi khi lenh chay xong, inspect thi khong -- nen gop chung vao mot ten
+# tool lam moi con so trung binh thanh vo nghia. Do duoc 2026-09-21:
+# terminal_turn p50 3.0s nhung p90 23.1s va max 61.5s, va khong the noi
+# nhung lan 60 giay do la send_wait dung nghia hay mot duong khac dang bo
+# qua sync_wait_budget_ms (20s theo chinh phan hoi cua no).
+_ACTION_KEYS = ("action", "desired_states", "mode")
 
 # Doi so nao dang ra ten session, theo thu tu uu tien.
 _SESSION_KEYS = ("session", "target", "name", "binding", "session_name")
@@ -60,21 +70,30 @@ class ToolMetricsStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as connection:
             connection.executescript(SCHEMA)
+            self._migrate(connection)
+            connection.commit()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5)
         connection.execute("PRAGMA journal_mode=WAL")
         return connection
 
+    def _migrate(self, connection: sqlite3.Connection) -> None:
+        """Them cot `action` vao db da ton tai. ALTER TABLE tren SQLite la
+        thao tac metadata, khong viet lai bang, nen an toan voi db dang chay."""
+        cols = {r[1] for r in connection.execute("PRAGMA table_info(tool_calls)")}
+        if "action" not in cols:
+            connection.execute("ALTER TABLE tool_calls ADD COLUMN action TEXT")
+
     def record(self, tool: str, session: str | None, ok: bool,
-               latency_ms: float) -> None:
+               latency_ms: float, action: str | None = None) -> None:
         try:
             with closing(self._connect()) as connection:
                 connection.execute(
-                    "INSERT INTO tool_calls (timestamp, tool, session, ok, latency_ms)"
-                    " VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO tool_calls (timestamp, tool, session, ok, latency_ms, action)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
                     (datetime.now(timezone.utc).isoformat(), tool, session,
-                     int(ok), round(latency_ms, 2)))
+                     int(ok), round(latency_ms, 2), action))
                 connection.commit()
         except Exception:
             pass          # do luong khong bao gio duoc lam hong viec that
@@ -103,6 +122,17 @@ class ToolMetricsStore:
                     for r in rows]
         except Exception:
             return []
+
+
+def _action_of(kwargs: dict[str, Any]) -> str | None:
+    """Hanh vi cu the ben trong mot tool da nang."""
+    for key in _ACTION_KEYS:
+        value = kwargs.get(key)
+        if isinstance(value, str) and value:
+            return value[:40]
+        if isinstance(value, (list, tuple)) and value:
+            return ",".join(str(v) for v in value)[:40]
+    return None
 
 
 def _session_of(kwargs: dict[str, Any]) -> str | None:
@@ -141,7 +171,8 @@ def instrument(server: Any, store: ToolMetricsStore) -> None:
                     # lam hong mot loi goi tool that.
                     try:
                         store.record(fn.__name__, _session_of(kwargs), ok,
-                                     (time.perf_counter() - started) * 1000)
+                                     (time.perf_counter() - started) * 1000,
+                                     _action_of(kwargs))
                     except Exception:
                         pass
             return decorate(inner)

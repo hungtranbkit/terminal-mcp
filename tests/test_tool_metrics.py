@@ -114,3 +114,45 @@ def test_prune_keeps_only_the_most_recent_rows(wired):
     store.prune(keep_rows=5)
     with store._connect() as con:
         assert con.execute("select count(*) from tool_calls").fetchone()[0] == 5
+
+
+def test_the_action_inside_a_multi_behaviour_tool_is_recorded(wired):
+    # terminal_turn is one tool with five behaviours, and they do not cost the
+    # same: send_wait blocks until the command finishes, inspect does not.
+    # Averaging them together is what made "terminal_turn p50 3.0s, p90 23.1s"
+    # unreadable -- the number describes no real operation.
+    server, store = wired
+
+    @server.tool()
+    def terminal_turn(action: str, target: str | None = None) -> dict:
+        return {}
+
+    server.registered["terminal_turn"](action="send_wait", target="s1")
+    server.registered["terminal_turn"](action="inspect", target="s1")
+    with store._connect() as con:
+        rows = [r[0] for r in con.execute(
+            "select action from tool_calls order by id")]
+    assert rows == ["send_wait", "inspect"]
+
+
+def test_an_existing_database_without_the_action_column_is_migrated(tmp_path):
+    # The counter was already live and collecting when this column was added,
+    # so opening an older file must widen it in place rather than fail or
+    # start over -- the rows already gathered are the reason it exists.
+    import sqlite3
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.executescript(
+        "CREATE TABLE tool_calls (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " timestamp TEXT NOT NULL, tool TEXT NOT NULL, session TEXT,"
+        " ok INTEGER NOT NULL, latency_ms REAL);"
+        "INSERT INTO tool_calls (timestamp, tool, session, ok, latency_ms)"
+        " VALUES ('2026-09-21T00:00:00+00:00','terminal_turn','s1',1,10.0);")
+    con.commit()
+    con.close()
+
+    store = tool_metrics.ToolMetricsStore(path)
+    store.record("terminal_turn", "s2", True, 20.0, action="send_wait")
+    with store._connect() as con:
+        rows = con.execute("select tool, action from tool_calls order by id").fetchall()
+    assert rows == [("terminal_turn", None), ("terminal_turn", "send_wait")]

@@ -28,14 +28,25 @@ def main() -> int:
         total = con.execute("SELECT COUNT(*) FROM tool_calls WHERE timestamp>=?",
                             (cutoff,)).fetchone()[0]
         print(f"{total} loi goi trong {hours:g}h qua\n")
+        has_action = any(r[1] == "action" for r in
+                         con.execute("PRAGMA table_info(tool_calls)"))
+        key = "tool || COALESCE(' ' || action, '')" if has_action else "tool"
         rows = con.execute(
-            "SELECT tool, COUNT(*) n, SUM(ok=0), ROUND(AVG(latency_ms),1)"
-            " FROM tool_calls WHERE timestamp>=? GROUP BY tool ORDER BY n DESC",
-            (cutoff,)).fetchall()
+            f"SELECT {key} k, COUNT(*) n, SUM(ok=0) FROM tool_calls"
+            " WHERE timestamp>=? GROUP BY k ORDER BY n DESC", (cutoff,)).fetchall()
         if rows:
-            print(f"  {'tool':34} {'goi':>6} {'%':>6} {'loi':>5} {'ms':>8}")
-            for tool, n, err, ms in rows:
-                print(f"  {tool[:34]:34} {n:6} {n*100/total:5.1f}% {err or 0:5} {ms or 0:8.1f}")
+            # Trung binh giau het moi thu dang quan tam: mot tool co p50 3s
+            # va max 61s khong "trung binh 8s" theo bat ky nghia huu ich nao.
+            print(f"  {'tool':40} {'goi':>5} {'%':>6} {'loi':>4} "
+                  f"{'p50':>7} {'p90':>7} {'max':>7}")
+            for k, n, err in rows:
+                lat = sorted(r[0] or 0 for r in con.execute(
+                    f"SELECT latency_ms FROM tool_calls WHERE timestamp>=? AND {key}=?",
+                    (cutoff, k)))
+                p50 = lat[len(lat)//2]
+                p90 = lat[max(0, int(len(lat)*0.9)-1)]
+                print(f"  {k[:40]:40} {n:5} {n*100/total:5.1f}% {err or 0:4} "
+                      f"{p50:7.0f} {p90:7.0f} {lat[-1]:7.0f}")
         if by_session:
             print("\n  theo session:")
             for s, n in con.execute(
