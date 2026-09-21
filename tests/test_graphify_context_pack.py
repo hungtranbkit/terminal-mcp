@@ -76,3 +76,47 @@ def test_context_pack_render_remains_bounded_with_graph_context():
 
     assert len(rendered) <= context_pack.MAX_PACK_CHARS
     assert "MODULE auth" in rendered
+
+
+def test_graphify_is_skipped_when_existing_module_context_is_complete(tmp_path, monkeypatch):
+    calls = {"queries": 0}
+
+    class CompleteMap:
+        root = tmp_path
+
+        def exists(self):
+            return True
+
+        def head(self):
+            return "abc123"
+
+        def module_state(self, module):
+            return SimpleNamespace(
+                name=module,
+                summary="complete auth map",
+                confidence="HIGH",
+                paths=("auth.py",),
+                entry_points=("auth.py:authenticate",),
+                test_runbook="test-auth",
+                smoke_runbook="smoke-auth",
+                last_verified_commit="abc123",
+            )
+
+        def document(self, name):
+            return ""
+
+    class CountingGraph:
+        def __init__(self, root):
+            pass
+
+        def query(self, question, **kwargs):
+            calls["queries"] += 1
+            return GraphifyQuery(True, text="unneeded graph context")
+
+    monkeypatch.setattr(context_pack, "GraphifyBridge", CountingGraph)
+
+    pack = context_pack.build_context_pack("auth", knowledge=CompleteMap())
+
+    assert pack.graph_context == ""
+    assert calls["queries"] == 0
+    assert pack.summary == "complete auth map"
