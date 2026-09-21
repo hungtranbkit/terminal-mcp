@@ -1,0 +1,5 @@
+# Graphify updates these generated files frequently. Keeping them out of
+# Claude's raw workspace context avoids invalidating the prompt cache; agents
+# receive bounded graph context through Terminal MCP instead.
+graph.json
+graphify-out/
