@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+
+from . import composer
 from collections.abc import Mapping
 from typing import Any
 from abc import ABC, abstractmethod
@@ -184,7 +186,37 @@ class GenericShellAdapter(AgentAdapter):
         return True
 
     def submit_ack_evidence(self, before: list[str], after: list[str], sent_text: str) -> bool:
-        return after != before
+        # EXPRESS LANE for plain shells (2026-09-21). "Any pane change counts"
+        # is necessary but NOT sufficient: a shell echoes the command onto the
+        # prompt line while it is being typed, so for a command that prints
+        # nothing immediately the pane after Enter is byte-identical to the
+        # pane before it -- the trailing blank line tmux would show is stripped
+        # by the capture. Measured live on hp: `echo XONG` confirmed in 0.74s,
+        # while `sleep 3; echo XONG2` came back
+        #   SUBMIT_UNCONFIRMED / "the pane looked identical to its pre-Enter
+        #   state throughout the verification window"
+        # and send_wait returned FAILED without ever starting the wait, so the
+        # caller believed the command never landed and sent it again. The same
+        # bug hits every quiet command: sleep, cd, export, a compile before its
+        # first line of output, a git clone still buffering.
+        #
+        # This class's own docstring already states the correct reasoning:
+        # canonical tty line editing processes Enter SYNCHRONOUSLY and there is
+        # no composer to swallow it. So the echoed command line is itself proof
+        # the shell received the text. Added as an EXTRA positive-evidence path
+        # -- the original `after != before` still confirms on its own, so no
+        # target that passed before can start failing.
+        if after != before:
+            return True
+        probe = (sent_text or "").strip().splitlines()
+        if not probe:
+            return False
+        first = probe[0].strip()
+        # Only the last few lines: the command sits on the prompt line at the
+        # bottom, and matching it anywhere in scrollback would let stale output
+        # of an earlier identical command count as an ack for this one.
+        return bool(first) and any(first in line for line in
+                                   [ln for ln in after if ln.strip()][-3:])
 
     def stuck_composer_evidence(self, before: list[str], after: list[str]) -> bool:
         return False
@@ -401,6 +433,21 @@ class ClaudeAdapter(AgentAdapter):
             return TARGET_WAITING
         if _match_any(_WORKING_PATTERNS, tail):
             return TARGET_RUNNING
+        # An idle Claude pane is not UNKNOWN -- it is sitting at its composer,
+        # which is a fact this pane states plainly: composer.is_chrome matches
+        # the box border and the `⏵⏵ auto mode on ...` footer that Claude Code
+        # draws only when it is ready for the next prompt. Returning UNKNOWN
+        # here threw that evidence away, and every caller that asks "is this
+        # worker free yet" had nothing left but a timer. Measured 2026-09-21 on
+        # this host: all ten live nova-claude-* sessions sat idle at their
+        # composer and identify_target_state answered "unknown" for every one.
+        #
+        # Narrow on purpose: the WORKING/WAITING tests above still win, so this
+        # can never mask a turn in flight or a permission prompt, and a pane
+        # with no composer chrome (a redraw mid-flight, a pager, a crashed CLI)
+        # still falls through to UNKNOWN exactly as before.
+        if any(composer.is_chrome(line) for line in lines[-6:]):
+            return TARGET_COMPOSER
         return TARGET_UNKNOWN
 
     def can_submit_now(self, lines: list[str]) -> bool:

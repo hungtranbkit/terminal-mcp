@@ -7,7 +7,8 @@ from __future__ import annotations
 
 from terminal_mcp.adapters import (DELIVERY_STALLED, DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_STATES, DELIVERY_SUBMIT_CONFIRMED,
                                    DELIVERY_TEXT_SENT, DELIVERY_UNKNOWN, TARGET_RUNNING, TARGET_STATES,
-                                   TARGET_UNKNOWN, TARGET_WAITING, ClaudeAdapter, CodexAdapter, GenericShellAdapter,
+                                   TARGET_COMPOSER,
+    TARGET_UNKNOWN, TARGET_WAITING, ClaudeAdapter, CodexAdapter, GenericShellAdapter,
                                    normalize_command, select_adapter, to_legacy_submit_status)
 
 
@@ -84,7 +85,15 @@ def test_claude_adapter_normal_composer_mentioning_permission_is_not_waiting():
         "",
         "  new task? /clear to save 891k tokens",
     ]
-    assert adapter.identify_target_state(normal_composer) == TARGET_UNKNOWN
+    # 2026-09-21: this now answers TARGET_COMPOSER rather than TARGET_UNKNOWN.
+    # The pane shape is unchanged and so is what this test protects -- it is
+    # not WAITING and it can still be submitted to. The constant moved because
+    # "an entirely ordinary composer line" (this test's own words) IS a
+    # composer, and saying so lets delivery_gate report
+    # ACCEPTANCE_PROMPT_STILL_IN_COMPOSER for Claude, which it could never do
+    # while every idle Claude pane answered "unknown".
+    assert adapter.identify_target_state(normal_composer) == TARGET_COMPOSER
+    assert adapter.identify_target_state(normal_composer) != TARGET_WAITING
     assert adapter.can_submit_now(normal_composer) is True
 
 
@@ -270,3 +279,37 @@ def test_windows_claude_now_receives_the_activation_nudge():
     from terminal_mcp.submit_flow import ACTIVATION_ADAPTERS
     assert select_adapter("claude.EXE").name in ACTIVATION_ADAPTERS
     assert select_adapter("bash").name not in ACTIVATION_ADAPTERS
+
+
+# ---------------------------------------------------------------------------
+# Express lane for plain shells. Measured live on hp 2026-09-21: `echo XONG`
+# confirmed in 0.74s, but `sleep 3; echo XONG2` returned SUBMIT_UNCONFIRMED
+# ("the pane looked identical to its pre-Enter state") and send_wait answered
+# FAILED without ever starting the wait -- so the caller resent the command.
+# ---------------------------------------------------------------------------
+
+def test_quiet_shell_command_is_acknowledged_by_its_echoed_command_line():
+    adapter = select_adapter("bash")
+    # A command that prints nothing yet leaves the pane byte-identical: the
+    # command was already echoed onto the prompt line before Enter.
+    pane = ["kimex@hp:~$ sleep 3; echo XONG2"]
+    assert adapter.submit_ack_evidence(pane, list(pane), "sleep 3; echo XONG2") is True
+
+
+def test_shell_ack_still_confirms_on_a_plain_pane_change():
+    adapter = select_adapter("bash")
+    assert adapter.submit_ack_evidence(["$ "], ["$ echo hi", "hi"], "echo hi") is True
+
+
+def test_shell_ack_refuses_when_there_is_no_evidence_at_all():
+    # Unchanged pane AND no sign of the command: still not confirmed.
+    adapter = select_adapter("bash")
+    assert adapter.submit_ack_evidence(["$ "], ["$ "], "sleep 3") is False
+
+
+def test_shell_ack_ignores_an_identical_command_left_in_scrollback():
+    # Matching anywhere in history would let a previous identical command
+    # count as the ack for this one, so only the bottom lines are considered.
+    adapter = select_adapter("bash")
+    after = ["$ sleep 3", "done", "$ ", "unrelated", "more", "$ "]
+    assert adapter.submit_ack_evidence(list(after), list(after), "sleep 3") is False

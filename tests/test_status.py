@@ -2,6 +2,7 @@ from terminal_mcp.models import SessionInfo
 from terminal_mcp.status import (
     classify_status,
     classify_supervisor_state,
+    shell_prompt_is_back,
     detect_waiting_input,
     parse_completion_marker,
     verify_completion_marker,
@@ -225,3 +226,159 @@ def test_verify_completion_marker_none_nonce_on_watch_side_fails():
         MARKER_OK_FIELDS, task_id="abc123", attempt=1, nonce=None, nonce_consumed=False
     ) is False
 
+
+
+# ---------------------------------------------------------------------------
+# ERROR freshness (audited live on hp-linux, 2026-09-21). All five sessions
+# the dashboard reported as ERROR were idle shells showing old text; one was
+# matching against the operator's own typed command. Each case below is a
+# verbatim line from that audit.
+# ---------------------------------------------------------------------------
+
+def test_stale_error_on_an_idle_shell_is_not_reported_as_error():
+    # mesflow-ha-g3-hp: psql error still on screen 44 hours later, shell idle.
+    pane = 'ERROR:  column "received_lsn" does not exist\nkimex@hp:~$'
+    state, _ = classify_supervisor_state("IDLE", "shell pane has no tmux activity for 159483s", pane)
+    assert state == "IDLE"
+
+
+def test_fresh_error_on_an_active_pane_is_still_reported():
+    # The freshness rule must not silence a real, current failure: a shell
+    # with activity inside the last minute classifies RUNNING, not IDLE.
+    pane = "Traceback (most recent call last):\n  File x\nValueError: boom"
+    state, why = classify_supervisor_state("RUNNING", "r", pane)
+    assert state == "ERROR" and "traceback" in why.lower()
+
+
+def test_error_word_inside_the_typed_command_is_not_evidence_of_failure():
+    # urbanflow-hp-relay2: the word EXCEPTION was in the command, not output.
+    pane = 'kimex@hp:~$ adb logcat -t 600 2>/dev/null | grep -Ec "FATAL EXCEPTION|AndroidRuntime:"'
+    state, _ = classify_supervisor_state("RUNNING", "r", pane)
+    assert state != "ERROR"
+
+
+def test_error_scrolled_out_of_the_bottom_window_is_not_reported():
+    # repoport-public-smoke matched at offset 15 of the old 20-line window.
+    pane = "Error locating origin cert: client didn't specify origincert path\n" + \
+           "\n".join(f"line {i}" for i in range(12))
+    state, _ = classify_supervisor_state("RUNNING", "r", pane)
+    assert state != "ERROR"
+
+
+# ---------------------------------------------------------------------------
+# Shell readiness from the prompt instead of a timer. Measured 2026-09-21: a
+# bash pane that had already finished its command reported RUNNING at every age
+# from 0s to 60s and only flipped at 61s, so terminal_turn(send_wait) on a shell
+# burned up to a minute after the work was done.
+# ---------------------------------------------------------------------------
+
+def _shell(age, cmd="bash"):
+    return SessionInfo(name="s", activity_epoch=1_000_000 - age, pane_current_command=cmd,
+                       pane_dead=False, created_epoch=0, windows=1, attached=False,
+                       pane_pid=0, session_id="", pane_id="", pane_in_mode=False,
+                       pane_current_path="")
+
+
+def test_finished_shell_is_idle_immediately_not_after_sixty_seconds():
+    pane = "$ echo hi\nhi\ndell@dell-Latitude-5511:~/workspace$ "
+    for age in (0, 5, 30, 59):
+        state, _, _ = classify_status(_shell(age), pane, now=1_000_000)
+        assert state == "IDLE", f"age {age}s should already be IDLE"
+
+
+def test_a_command_still_on_the_prompt_line_is_not_treated_as_finished():
+    # The prompt is there, but something is typed after it -- the trailing
+    # `\\s*$` must refuse this, or send_wait would return before the work ran.
+    pane = "dell@dell-Latitude-5511:~/workspace$ sleep 30"
+    state, _, _ = classify_status(_shell(0), pane, now=1_000_000)
+    assert state == "RUNNING"
+
+
+def test_bash_continuation_prompt_is_not_idle():
+    # A bare ">" in bash means an unterminated quote: the shell is WAITING for
+    # input, so calling it idle would be wrong in the dangerous direction.
+    pane = "dell@host:~$ echo 'oops\n>"
+    state, _, _ = classify_status(_shell(0), pane, now=1_000_000)
+    assert state != "IDLE"
+
+
+def test_powershell_prompt_counts_as_ready():
+    pane = "PS C:\\Users\\tranv> dir\nDirectory listing\nPS C:\\Users\\tranv>"
+    assert shell_prompt_is_back(pane) is True
+
+
+def test_an_agent_pane_is_never_short_circuited_by_a_prompt_line():
+    # claude/codex are not shells: a prompt-looking line in their output must
+    # not make a thinking agent look finished.
+    pane = "some output\ndell@host:~/ws$ "
+    state, _, _ = classify_status(_shell(0, cmd="claude"), pane, now=1_000_000)
+    assert state == "RUNNING"
+
+
+def test_unrecognised_prompt_falls_back_to_the_timer():
+    pane = "output\n\u276f "          # a customised prompt this regex does not know
+    assert shell_prompt_is_back(pane) is False
+    state, _, _ = classify_status(_shell(0), pane, now=1_000_000)
+    assert state == "RUNNING"
+
+
+# ---------------------------------------------------------------------------
+# Agent panes: evidence, not a timer (audited live on this host, 2026-09-21).
+# All ten nova-claude-* sessions sat idle at their composer; classify_status
+# reported RUNNING for every one whose tmux activity age was under 60s, purely
+# because "claude" is in ACTIVE_COMMANDS. Panes below are verbatim tails.
+# ---------------------------------------------------------------------------
+
+IDLE_CLAUDE_PANE = (
+    "  Both peers have frozen and nothing is outstanding between the lanes.\n"
+    "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+    "\u276f \n"
+    "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+    "  [Opus 5 (1M context)] \u2502 novaretail-chatgpt-prod git:(feature/x)\n"
+    "  Context \u2588\u2591 74% \u2502 Usage \u2591 2% (resets in 4h 50m)\n"
+    "  \u23f5\u23f5 auto mode on (shift+tab to cycle) \u00b7 \u2190 for agents"
+)
+
+BUSY_CLAUDE_PANE = (
+    "  Reading tests/test_status.py\n"
+    "\u273b Brewing\u2026 (12s \u00b7 esc to interrupt)\n"
+    "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+    "  \u23f5\u23f5 auto mode on (shift+tab to cycle) \u00b7 \u2190 for agents"
+)
+
+
+def test_idle_claude_composer_is_idle_immediately_not_after_sixty_seconds():
+    # nova-claude-single-account: turn finished, composer back, activity 0s old.
+    for age in (0, 5, 30, 59):
+        state, waiting, why = classify_status(
+            info("claude", 100 - age), IDLE_CLAUDE_PANE, now=100)
+        assert state == "IDLE", f"age {age}s classified {state}"
+        assert waiting is False
+        assert "composer" in why
+
+
+def test_claude_mid_turn_is_running_even_when_tmux_activity_is_stale():
+    # The interrupt hint is live evidence; a quiet pane redraw must not make a
+    # turn in flight look finished.
+    state, _waiting, why = classify_status(info("claude", 1), BUSY_CLAUDE_PANE, now=10_000)
+    assert state == "RUNNING"
+    assert "in flight" in why
+
+
+def test_claude_pane_without_composer_chrome_falls_back_to_the_old_rules():
+    # No footer, no interrupt hint: the adapter has no opinion, so the existing
+    # ACTIVE_COMMANDS age gate must still decide exactly as it did before.
+    pane = "some half-drawn output with no composer at all"
+    assert classify_status(info("claude", 95), pane, now=100)[0] == "RUNNING"
+    # Unchanged from before this check existed: "claude" is not one of the
+    # shells the age>60 rule turns IDLE, so an unreadable pane stays UNKNOWN.
+    assert classify_status(info("claude", 1), pane, now=100)[0] == "UNKNOWN"
+
+
+def test_a_permission_prompt_still_wins_over_the_composer_check():
+    # detect_waiting_input runs first; an approval dialog must never read IDLE
+    # just because the footer is on screen underneath it.
+    pane = IDLE_CLAUDE_PANE + "\nDo you want to proceed? [y/N]"
+    state, waiting, _why = classify_status(info("claude", 100), pane, now=100)
+    assert state == "WAITING_INPUT"
+    assert waiting is True
