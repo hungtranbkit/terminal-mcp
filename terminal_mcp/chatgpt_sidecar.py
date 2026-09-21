@@ -344,6 +344,34 @@ def _transport_streams(transport: tuple[Any, ...]) -> tuple[Any, Any]:
     return transport[0], transport[1]
 
 
+def _looks_like_timeout(exc: BaseException, _depth: int = 0) -> bool:
+    """True when `exc` is, or wraps, a timeout rather than a transport failure.
+
+    anyio's fail_after raises TimeoutError from inside a task group, so it
+    reaches the caller wrapped in an ExceptionGroup and the catch-all below
+    used to label it "the controller is not reachable". That is the wrong
+    answer in the direction that costs the most: the controller was up and
+    answering, the request was merely QUEUED. Measured on hp 2026-09-21 --
+    claude_max_concurrency is 1 and the governor will hold a task for up to
+    queue_wait_timeout_seconds (900s), while this client gives up after 30s,
+    and there were 729 LLM_ADMISSION queued events in one day. A caller told
+    "not reachable" retries, each retry enqueues another task behind the same
+    limit, and the backlog feeds itself.
+    """
+    if _depth > 5:
+        return False
+    if isinstance(exc, TimeoutError):
+        return True
+    for nested in getattr(exc, "exceptions", ()) or ():
+        if _looks_like_timeout(nested, _depth + 1):
+            return True
+    for attr in ("__cause__", "__context__"):
+        inner = getattr(exc, attr, None)
+        if inner is not None and _looks_like_timeout(inner, _depth + 1):
+            return True
+    return False
+
+
 class Backend:
     """One MCP conversation with the full controller, per call.
 
@@ -372,6 +400,17 @@ class Backend:
         except BackendUnavailable:
             raise
         except Exception as exc:  # noqa: BLE001 -- every transport failure is the same answer
+            if _looks_like_timeout(exc):
+                # Deliberately NOT "not reachable": say what actually happened,
+                # and say that retrying is the wrong move, because a retry
+                # enqueues another task behind the very limit that caused this.
+                raise BackendUnavailable(
+                    f"BACKEND_BUSY: the terminal-mcp controller at {self.url} accepted the "
+                    f"connection but did not answer within {self.timeout_seconds:.0f}s. It is "
+                    f"almost certainly QUEUED behind the provider concurrency limit, not down. "
+                    f"Do NOT retry immediately -- a retry enqueues another task behind the same "
+                    f"limit. Wait, or use action=task to check the work already dispatched."
+                ) from exc
             raise BackendUnavailable(
                 f"the terminal-mcp controller at {self.url} is not reachable "
                 f"({type(exc).__name__}); it may be restarting -- retry shortly") from exc

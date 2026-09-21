@@ -746,3 +746,49 @@ def test_unsafe_screenshot_artifacts_are_rejected(tmp_path, case):
     assert result.is_error is True
     assert "SCREENSHOT_ARTIFACT_REJECTED" in _text(result)
     assert not any(isinstance(block, types.ImageContent) for block in result.content)
+
+
+# ---------------------------------------------------------------------------
+# A queued controller is not a missing one. anyio's fail_after raises
+# TimeoutError from inside a task group, so it arrives wrapped in an
+# ExceptionGroup; the catch-all used to call that "not reachable", which made
+# the caller retry -- and each retry enqueued another task behind the very
+# provider limit that caused the wait. Measured on hp 2026-09-21:
+# claude_max_concurrency 1, governor queue window 900s, this client's timeout
+# 30s, 729 queued events in a day.
+# ---------------------------------------------------------------------------
+
+from terminal_mcp.chatgpt_sidecar import _looks_like_timeout
+
+
+def test_a_bare_timeout_is_recognised():
+    assert _looks_like_timeout(TimeoutError("slow")) is True
+
+
+def test_a_timeout_wrapped_in_an_exception_group_is_recognised():
+    # This is the shape anyio actually delivers.
+    assert _looks_like_timeout(ExceptionGroup("tg", [TimeoutError()])) is True
+
+
+def test_a_timeout_nested_two_groups_deep_is_recognised():
+    inner = ExceptionGroup("inner", [TimeoutError()])
+    assert _looks_like_timeout(ExceptionGroup("outer", [inner])) is True
+
+
+def test_a_timeout_reached_through_cause_is_recognised():
+    exc = RuntimeError("wrapper")
+    exc.__cause__ = TimeoutError()
+    assert _looks_like_timeout(exc) is True
+
+
+def test_a_real_transport_failure_is_not_called_a_timeout():
+    # Must stay false, or a genuinely unreachable controller would be reported
+    # as merely busy and the caller would wait forever on nothing.
+    assert _looks_like_timeout(ConnectionRefusedError()) is False
+    assert _looks_like_timeout(ExceptionGroup("tg", [OSError("no route")])) is False
+
+
+def test_recursion_is_bounded_on_a_self_referential_cause():
+    exc = RuntimeError("loop")
+    exc.__cause__ = exc
+    assert _looks_like_timeout(exc) is False
