@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
 from .bug_spec import BugSpec, BugSpecStore
+from .graphify_bridge import GraphifyBridge, module_question
 from .work_telemetry_runtime import note as _note_signal
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -39,6 +40,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 MAX_PACK_FILES = 12
 MAX_PACK_BUGS = 5
 MAX_PACK_CHARS = 4000
+MAX_GRAPH_CONTEXT_CHARS = 1200
 
 # How many modules one task's briefing may load, and how long the whole thing
 # may get. A task that names six modules has not been narrowed enough for a
@@ -355,6 +357,7 @@ class ContextPack:
     smoke_runbook: str | None = None
     known_issues: tuple[str, ...] = ()
     past_bugs: tuple[dict[str, Any], ...] = ()
+    graph_context: str = ""
     last_verified_commit: str | None = None
     stale: bool = False
     gaps: tuple[str, ...] = field(default_factory=tuple)
@@ -367,6 +370,7 @@ class ContextPack:
             "test_runbook": self.test_runbook, "smoke_runbook": self.smoke_runbook,
             "known_issues": list(self.known_issues),
             "past_bugs": list(self.past_bugs),
+            "graph_context": self.graph_context,
             "last_verified_commit": self.last_verified_commit,
             "stale": self.stale, "gaps": list(self.gaps),
         }
@@ -385,6 +389,8 @@ class ContextPack:
                     (("test", self.test_runbook), ("smoke", self.smoke_runbook)) if name]
         if runbooks:
             lines.append("RUNBOOKS: " + " ".join(runbooks))
+        if self.graph_context:
+            lines.append("GRAPH CONTEXT: " + self.graph_context)
         if self.known_issues:
             lines.append("KNOWN ISSUES: " + "; ".join(self.known_issues))
         for bug in self.past_bugs:
@@ -444,6 +450,23 @@ def build_context_pack(module: str, *,
     else:
         gaps.append("no knowledge map for this project yet -- pack is history only")
 
+    # Graphify is an optional second map. It is queried only when an existing
+    # local graph and executable are both present; this path never builds a
+    # graph, installs anything, or makes a network request. A failure is
+    # intentionally silent here so projects without Graphify retain exactly
+    # the old context-pack behavior.
+    if knowledge is not None:
+        try:
+            graph = GraphifyBridge(knowledge.root)
+            graph_result = graph.query(
+                module_question(module, paths=pack.files),
+                max_chars=MAX_GRAPH_CONTEXT_CHARS,
+            )
+            if graph_result.useful:
+                pack.graph_context = graph_result.text
+        except Exception:  # noqa: BLE001 -- optional knowledge must fail open
+            pass
+
     if store is not None:
         if target is not None:
             bugs = [m.spec for m in similar_bugs(store, target, limit=MAX_PACK_BUGS)]
@@ -463,7 +486,7 @@ def build_context_pack(module: str, *,
     # Counted where the retrieval actually happened, not inferred later: a
     # pack with a summary or files in it is a briefing the worker did not
     # have to reconstruct by reading the module.
-    if pack.summary or pack.files:
+    if pack.summary or pack.files or pack.graph_context:
         _note_signal("context_pack_hits", source="context_pack.build_context_pack")
         _note_signal("knowledge_hits", source="context_pack.build_context_pack")
     return pack
@@ -510,7 +533,7 @@ class TaskKnowledge:
         else, and calling that a hit would let a map full of empty entries
         report the saving it never produced.
         """
-        return any(pack.summary or pack.files for pack in self.packs)
+        return any(pack.summary or pack.files or pack.graph_context for pack in self.packs)
 
     @property
     def confidence(self) -> str:
@@ -598,21 +621,39 @@ def load_task_knowledge(spec: Any, *, knowledge: "ProjectKnowledge | None" = Non
         return TaskKnowledge(asked_for=tuple(asked), gaps=(NO_MAP, *gaps))
 
     try:
-        if not knowledge.exists():
-            return TaskKnowledge(asked_for=tuple(asked), gaps=(NO_MAP, *gaps))
-    except Exception as exc:  # noqa: BLE001 -- a map that cannot be read is a gap
-        return TaskKnowledge(asked_for=tuple(asked),
-                             gaps=(f"the knowledge map could not be read: {exc}", *gaps))
+        map_exists = bool(knowledge.exists())
+    except Exception as exc:  # noqa: BLE001 -- the graph can still be usable
+        map_exists = False
+        gaps.append(f"the knowledge map could not be read: {exc}")
 
-    known, unknown = _resolve_modules(knowledge, asked)
+    if map_exists:
+        known, unknown = _resolve_modules(knowledge, asked)
+    else:
+        known, unknown = [], list(asked)
+        gaps.append(NO_MAP)
+
     packs: list[ContextPack] = []
     for module in known:
         try:
             packs.append(build_context_pack(module, knowledge=knowledge, store=store))
         except Exception as exc:  # noqa: BLE001
             gaps.append(f"{module}: briefing failed ({type(exc).__name__}: {exc})")
+
+    # An unindexed module may still be present in Graphify. Probe only the
+    # modules the spec named and keep them bounded by the same module limit.
+    graph_resolved: list[str] = []
+    for module in unknown:
+        try:
+            pack = build_context_pack(module, knowledge=knowledge, store=store)
+            if pack.graph_context:
+                packs.append(pack)
+                graph_resolved.append(module)
+        except Exception as exc:  # noqa: BLE001 -- graph is an optional fallback
+            gaps.append(f"{module}: graph briefing failed ({type(exc).__name__}: {exc})")
+    if graph_resolved:
+        unknown = [name for name in unknown if name not in graph_resolved]
     if unknown:
-        gaps.append(f"not in the knowledge map: {', '.join(unknown)}")
+        gaps.append(f"not in the knowledge map or Graphify: {', '.join(unknown)}")
 
     verified = next((p.last_verified_commit for p in packs if p.last_verified_commit), None)
     return TaskKnowledge(asked_for=tuple(asked), packs=tuple(packs),
