@@ -175,19 +175,27 @@ session_knowledge:
 # bootstrapped live over SSH -- see docs/multi-node.md's own "LAN
 # discovery + remote connect" and "Windows node support" sections.
 nodes:
+  # Tailnet addresses, not LAN. Checked 2026-09-21: the configured
+  # 192.168.1.x endpoints were ALL dead from this host (curl -> 000,
+  # timeout) because these machines no longer share a LAN with the
+  # controller. Runtime was unaffected only because the node registry
+  # learns the real address from each heartbeat and overrides this file --
+  # so a rebuilt registry would have started routing to addresses that do
+  # not answer.
+
   remote:
     - node_id: dell-5530
       display_name: "dell-5530 (Windows)"
-      hostname: "192.168.1.250"
-      endpoint: "http://192.168.1.250:8790"
+      hostname: "100.77.252.78"
+      endpoint: "http://100.77.252.78:8790"
       token_env: TERMINAL_MCP_NODE_TOKEN_DELL_5530
     # Linux worker node (M910, mesflow@192.168.1.109 / thinkcentre SSH
     # alias) -- installed via deploy/install-node-agent.sh, running as
     # a systemd --user service under the mesflow account.
     - node_id: m910
       display_name: "m910 (Linux)"
-      hostname: "192.168.1.109"
-      endpoint: "http://192.168.1.109:8790"
+      hostname: "100.117.214.87"
+      endpoint: "http://100.117.214.87:8790"
       token_env: TERMINAL_MCP_NODE_TOKEN_M910
     # macOS worker node (rumraisin's MacBook Pro, rumraisin@192.168.1.138
     # LAN / rumraisin@100.104.209.93 Tailscale) -- installed via
@@ -199,7 +207,7 @@ nodes:
     - node_id: macbook
       display_name: "macbook (macOS)"
       hostname: "Rums-MacBook-Pro.local"
-      endpoint: "http://192.168.1.138:8790"
+      endpoint: "http://100.104.209.93:8790"
       token_env: TERMINAL_MCP_NODE_TOKEN_MACBOOK
 
 # AI Usage: read-only integration with the separate, already-running
