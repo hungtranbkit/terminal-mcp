@@ -72,7 +72,75 @@ START_SERVER_PENDING_STATUSES = frozenset({"WAITING_SESSION", "DISPATCH_UNCERTAI
 START_SETTLED_STATUSES = (START_UNDERWAY_STATUSES | START_NEEDS_HUMAN_STATUSES
                           | START_SERVER_PENDING_STATUSES)
 # action -> handler key in CompactTerminalTools.handlers
+# `compact=True` is terminal_turn's DEFAULT, but until 2026-09-21 only
+# batch_inspect honoured it -- list_nodes and list_sessions were dispatched as
+# `lambda: handler()`, dropping the flag entirely. Measured that day on hp:
+# list_nodes returned 6 nodes x 57 fields = 13,655 characters and
+# list_sessions 54 sessions x 21 fields = 34,104, almost all of it
+# disk byte counts, probe timestamps and contract capability lists. A caller
+# that cannot find `status` in that wall asks again, which is precisely the
+# "many Called tool rows, no information" complaint. Projected here rather
+# than upstream so the FULL endpoint keeps returning everything, and
+# compact=False remains a complete escape hatch on this surface too.
+_NODE_COMPACT_FIELDS = (
+    "id", "status", "platform", "capacity_status", "draining",
+    "tmux_session_count", "cpu_percent", "ram_percent",
+    "claude_available", "codex_available", "last_error",
+)
+_SESSION_COMPACT_FIELDS = (
+    "name", "node_id", "attached", "activity", "allowed",
+    "effective_read", "effective_input",
+)
+
+
+def _slim(row: Any, fields: tuple[str, ...]) -> Any:
+    """`row` reduced to `fields`, dropping keys it does not have and any
+    null-valued extra. Percentages are rounded: `cpu_percent:
+    19.801976426529997` spends 16 characters saying nothing a caller acts on."""
+    if not isinstance(row, dict):
+        return row
+    out: dict[str, Any] = {}
+    for key in fields:
+        if key not in row:
+            continue
+        value = row[key]
+        if isinstance(value, float):
+            value = round(value, 1)
+        out[key] = value
+    # Keep a refusal reason only when there IS one -- it changes what the
+    # caller may do next, so dropping it would force another call.
+    reason = row.get("input_denied_reason")
+    if reason:
+        out["input_denied_reason"] = reason
+    # A whitelist that matched NOTHING means this is a shape it does not
+    # recognise -- a different projection upstream, a synthetic row, a future
+    # field rename. Returning {} there would destroy the caller's data to save
+    # bytes, which is strictly worse than not projecting at all, so hand the
+    # row back untouched and let the caller see what is really there.
+    if not out:
+        return row
+    return out
+
+
+def _project_nodes(result: Any, compact: bool) -> Any:
+    if not compact or not isinstance(result, list):
+        return result
+    return [_slim(node, _NODE_COMPACT_FIELDS) for node in result]
+
+
+def _project_sessions(result: Any, compact: bool) -> Any:
+    if not compact or not isinstance(result, dict):
+        return result
+    sessions = result.get("sessions")
+    if not isinstance(sessions, list):
+        return result
+    projected = dict(result)
+    projected["sessions"] = [_slim(row, _SESSION_COMPACT_FIELDS) for row in sessions]
+    return projected
+
+
 TURN_HANDLER_ACTIONS: dict[str, str] = {
+    "put_file": "put_file",
     "list_sessions": "list_sessions",
     "list_nodes": "list_nodes",
     "create_session": "create_session",
@@ -353,7 +421,9 @@ class CompactTerminalTools:
         return None
 
     def batch_inspect(self, targets: list[str], tail_lines: int = 20,
-                      compact: bool = True) -> dict[str, Any]:
+                      compact: bool = True,
+
+                      mode: str | None = None) -> dict[str, Any]:
         if (not isinstance(targets, list) or not targets or len(targets) > MAX_TARGETS
                 or any(not isinstance(target, str) or not target.strip()
                        or len(target) > _MAX_TARGET_CHARS for target in targets)):
@@ -650,6 +720,8 @@ class CompactTerminalTools:
              desired_states: list[str] | None = None, resume_token: str | None = None,
              timeout: float = DEFAULT_WAIT_SECONDS, poll_interval: float = 1,
              tail_lines: int = 20, compact: bool = True,
+             path: str | None = None, content_b64: str | None = None,
+             overwrite: bool = False, mode: str | None = None,
              idempotency_key: str | None = None,
              agent_type: str = "shell", working_directory: str | None = None,
              initial_prompt: str | None = None, grant_mode: str = "none",
@@ -704,7 +776,9 @@ class CompactTerminalTools:
                 working_directory=working_directory, initial_prompt=initial_prompt,
                 grant_mode=grant_mode, binding=binding, node=node, title=title,
                 priority=priority, metadata=metadata, request_key=request_key,
-                task_id=task_id, task_ids=task_ids, url=url, args=args)
+                task_id=task_id, task_ids=task_ids, url=url, args=args,
+                compact=compact, path=path, content_b64=content_b64,
+                overwrite=overwrite, mode=mode)
 
         if normalized == "inspect":
             resolved_targets = list(targets or ([] if target is None else [target]))
@@ -992,7 +1066,16 @@ class CompactTerminalTools:
                       priority: int, metadata: dict[str, Any] | None,
                       request_key: str | None, task_id: str | None,
                       task_ids: list[str] | None, url: str | None = None,
-                      args: dict | None = None) -> dict[str, Any]:
+                      args: dict | None = None,
+                      # Keyword-only with a default so the OTHER call site (the
+                      # long_task enqueue path) needs no change. Only the list
+                      # actions read it. Passing it is what makes terminal_turn's
+                      # documented `compact` flag real for list_nodes/
+                      # list_sessions -- before this it was silently dropped.
+                      compact: bool = True,
+                      path: str | None = None, content_b64: str | None = None,
+                      overwrite: bool = False,
+                      mode: str | None = None) -> dict[str, Any]:
         """Route one non-pane action to its injected implementation.
 
         Argument shaping only. Every authorization, allowed-cwd, protected-
@@ -1112,8 +1195,20 @@ class CompactTerminalTools:
             return {"status": status, "action": action, "result": result}
 
         calls: dict[str, Callable[[], Any]] = {
-            "list_sessions": lambda: handler(),
-            "list_nodes": lambda: handler(),
+            # Not routed through `args`: the payload is large and the path is
+            # security-relevant, so both are first-class arguments that the
+            # schema documents rather than free-form keys in a dict.
+            # node defaults to "auto" on terminal_turn (it means auto-PLACEMENT
+            # for create_session), but a file has no sensible auto placement --
+            # it is written so something on a specific machine can read it. Map
+            # it to None so the controller resolves the LOCAL node instead of
+            # looking up a node literally named "auto" and returning
+            # NODE_NOT_FOUND.
+            "put_file": lambda: handler(path or "", content_b64 or "",
+                                        overwrite=overwrite, mode=mode,
+                                        node=(None if node in (None, "auto") else node)),
+            "list_sessions": lambda: _project_sessions(handler(), compact),
+            "list_nodes": lambda: _project_nodes(handler(), compact),
             "create_session": lambda: handler(
                 target.strip(), agent_type=agent_type, working_directory=working_directory,
                 initial_prompt=initial_prompt, grant_mode=grant_mode, binding=binding,

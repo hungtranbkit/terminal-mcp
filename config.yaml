@@ -56,6 +56,10 @@ input_policy:
   allow_send_text: true
   allow_keys: [Enter, Escape, Up, Down, Left, Right, Tab]
   sensitive_keys_require_confirmation: [C-c, C-d]
+  # 30000 la tran AN TOAN da do thuc nghiem 2026-09-21. Chunk base64 <= 24000
+  # ky tu di den noi dung TUNG BYTE; 32000 bi SEND_FAILED; va 100000 thi
+  # tmux CAT CUT AM THAM (819200 ky tu gui, 19200 den) trong khi base64 -d
+  # van tra RC=0 -> file hop le nhung sai noi dung. Dung nang qua 30000.
   max_text_length: 30000
   allowed_sensitive_commands: []
 

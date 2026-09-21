@@ -276,7 +276,29 @@ def compact_instructions() -> str:
         "canonical catalog.\n"
         "This surface deliberately has NO terminal_send_text/terminal_send_keys: "
         "terminal_turn(action=send) is the guarded replacement. Admin tools live "
-        "on the full endpoint and are not reachable here.\n\n"
+        "on the full endpoint and are not reachable here.\n"
+        # Collapsing the CATALOG to one tool never collapsed the number of
+        # CALLS: every terminal_turn call is still its own "Called tool" row in
+        # the client, so a fanned-out turn reads exactly like the multi-tool
+        # surface this was meant to replace. The plural arguments already exist
+        # (`targets`, `task_ids`, `desired_states`); what was missing was an
+        # instruction to reach for them, stated in terms of the concrete
+        # mistake rather than as a general preference.
+        "BATCH, DO NOT FAN OUT. Answer the whole question in ONE call wherever "
+        "the action supports it. Inspecting several sessions is ONE call with "
+        "`targets` (a list) -- never one call per session with `target`. "
+        "Waiting is ONE call with action=wait plus `desired_states` and "
+        "`timeout` -- never a poll loop of inspects. Checking several queued "
+        "tasks is task_batch_status with `task_ids` -- never task_status "
+        "repeated. Do not call list_sessions and then inspect each result one "
+        "at a time: pass those names straight to `targets`. Before making a "
+        "SECOND terminal_turn call in the same turn, check whether a plural "
+        "argument or `desired_states` would have answered both at once; if it "
+        "would, make that one call instead.\n"
+        "Results are already compact by default -- every list action returns "
+        "only the fields an orchestrator acts on. Use compact=false ONLY after "
+        "reading a compact result that genuinely lacked a field you need, "
+        "never speculatively and never as a first call.\n\n"
         + orchestration_policy.server_instructions()
     )
 
@@ -497,6 +519,27 @@ def _attach_browser_screenshot_image(
     return result.model_copy(update={"content": [*result.content, image]})
 
 
+# Human-readable display name. MCP clients that honour `title`/
+# `annotations.title` (spec 2025-06-18 onward) render it instead of the raw
+# tool name, so a call shows as "Terminal MCP" rather than
+# `codex_apps.terminal_mcp.terminal_turn`. Purely cosmetic and best-effort:
+# a client is free to keep showing the name, and NOTHING here depends on it.
+# Set only when the backend left the field empty, so an upstream title always
+# wins.
+DISPLAY_TITLES = {"terminal_turn": "Terminal MCP"}
+
+
+def _with_display_title(tool: types.Tool) -> types.Tool:
+    title = DISPLAY_TITLES.get(tool.name)
+    if not title:
+        return tool
+    annotations = tool.annotations or types.ToolAnnotations()
+    return tool.model_copy(update={
+        "title": tool.title or title,
+        "annotations": annotations.model_copy(update={"title": annotations.title or title}),
+    })
+
+
 def build_sidecar(backend: Backend | None = None, *,
                   catalog: tuple[str, ...] = CATALOG,
                   browser_artifact_root: str | Path | None = None) -> Server:
@@ -522,7 +565,7 @@ def build_sidecar(backend: Backend | None = None, *,
             # this whole module exists to prevent, so it must be visible.
             _log.error("chatgpt-v1: backend is missing catalog tool(s) %s -- serving %d of %d",
                        missing, len(catalog) - len(missing), len(catalog))
-        tools = [by_name[name] for name in catalog if name in by_name]
+        tools = [_with_display_title(by_name[name]) for name in catalog if name in by_name]
         cached["tools"] = tools
         return types.ListToolsResult(tools=tools)
 
@@ -554,8 +597,19 @@ def build_sidecar(backend: Backend | None = None, *,
                         text=(f"TOOL_NOT_ON_THIS_SURFACE: {params.name!r} is not part of "
                               f"{SERVER_NAME}. Use the full /mcp endpoint for admin tools."))],
                     is_error=True)
-            _log.info("chatgpt-v1: translated cached call %s -> terminal_turn(action=%s)",
-                      call_name, translated["action"])
+            # WARNING, not info: a legacy name reaching this endpoint means some
+            # client is still driving the pre-compact, multi-tool catalog it
+            # cached earlier -- exactly the "many called-tool lines" symptom
+            # this surface was built to end. The call still succeeds (it is
+            # rewritten below), but the stale client is worth seeing, because
+            # a silent rewrite makes a regression here invisible. Audited
+            # 2026-09-21: the last such call was 2026-09-19T22:21, i.e. the
+            # fleet is clean and any NEW occurrence is a real signal.
+            _log.warning(
+                "chatgpt-v1: STALE_CLIENT_CATALOG -- legacy tool %s called; rewritten to "
+                "terminal_turn(action=%s). A client is still using a cached multi-tool "
+                "catalog; if this repeats, re-point or reconnect that connector.",
+                call_name, translated["action"])
             call_name = "terminal_turn"
             call_args = translated
         try:

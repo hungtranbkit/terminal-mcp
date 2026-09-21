@@ -45,6 +45,7 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_input_context",
         "terminal_create_session",
         "terminal_detach_session",
+        "terminal_put_file",
         "terminal_delete_session",
         "terminal_kill_session",
         "terminal_rename_session",

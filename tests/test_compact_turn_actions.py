@@ -409,3 +409,49 @@ def test_a_typo_in_harness_args_is_refused_by_name():
 def test_the_bare_noun_reads_rather_than_starts():
     """`harness` must never be the spelling that STARTS work."""
     assert TURN_ACTION_ALIASES["harness"] == "harness_status"
+
+
+# ---------------------------------------------------------------------------
+# terminal_turn's `compact` flag reaching the list actions. Before 2026-09-21
+# it was dispatched as `lambda: handler()` and silently dropped, so a caller
+# asking for a compact view still got 6 nodes x 57 fields (13,655 chars) and
+# 54 sessions x 21 fields (34,104 chars) measured live on hp.
+# ---------------------------------------------------------------------------
+
+from terminal_mcp.compact_tools import _slim, _project_nodes, _project_sessions
+from terminal_mcp.compact_tools import _NODE_COMPACT_FIELDS, _SESSION_COMPACT_FIELDS
+
+
+def test_compact_projection_keeps_only_orchestration_fields_and_rounds_floats():
+    node = {"id": "hp-linux", "status": "online", "cpu_percent": 19.801976426529997,
+            "disk_total_bytes": 249792131072, "contract_capabilities": ["a", "b"],
+            "last_probe_at": "2026-09-21T04:16:46"}
+    out = _project_nodes([node], compact=True)[0]
+    assert out["id"] == "hp-linux" and out["status"] == "online"
+    assert out["cpu_percent"] == 19.8               # not 19.801976426529997
+    assert "disk_total_bytes" not in out
+    assert "contract_capabilities" not in out
+    assert "last_probe_at" not in out
+
+
+def test_compact_false_returns_the_payload_untouched():
+    node = {"id": "hp-linux", "disk_total_bytes": 1}
+    assert _project_nodes([node], compact=False) == [node]
+
+
+def test_projection_never_empties_a_row_it_does_not_recognise():
+    # A whitelist that matches nothing must hand the row back, not return {} --
+    # destroying the caller's data to save bytes is worse than not projecting.
+    foreign = {"node_id": "hp", "something_else": 1}
+    assert _slim(foreign, _NODE_COMPACT_FIELDS) == foreign
+    assert _project_nodes([foreign], compact=True) == [foreign]
+
+
+def test_session_projection_keeps_a_refusal_reason_when_there_is_one():
+    # Dropping it would force the caller to make ANOTHER call to learn why.
+    denied = {"name": "s1", "node_id": "hp", "attached": False,
+              "input_denied_reason": "GRANT_REQUIRED", "pid": 99}
+    out = _project_sessions({"sessions": [denied]}, compact=True)["sessions"][0]
+    assert out["input_denied_reason"] == "GRANT_REQUIRED"
+    assert "pid" not in out
+    assert set(out) <= set(_SESSION_COMPACT_FIELDS) | {"input_denied_reason"}

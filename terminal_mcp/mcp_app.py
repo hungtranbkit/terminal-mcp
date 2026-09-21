@@ -105,7 +105,7 @@ def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_sessio
                      browser_status, browser_verify, browser_screenshot,
                      browser_run_task, browser_stop, dispatch_tick,
                      follow_task, harness_start, harness_status, harness_resume,
-                     harness_cancel, harness_review) -> dict[str, Any]:
+                     harness_cancel, harness_review, put_file) -> dict[str, Any]:
     """The implementations terminal_turn's non-pane actions route to.
 
     Keyword-only and exhaustive on purpose: every key in
@@ -116,6 +116,7 @@ def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_sessio
     one-tool surface cannot become a weaker path than the full one.
     """
     return {
+        "put_file": put_file,
         "list_sessions": list_sessions,
         "list_nodes": list_nodes,
         "create_session": create_session,
@@ -634,7 +635,9 @@ def build_mcp(service: TerminalService | None = None,
                       task_id: str | None = None,
                       task_ids: list[str] | None = None,
                       long_task: bool = False,
-                      url: str | None = None, args: dict | None = None) -> dict:
+                      url: str | None = None, args: dict | None = None,
+                      path: str | None = None, content_b64: str | None = None,
+                      overwrite: bool = False, mode: str | None = None) -> dict:
         """THE terminal surface: one logical orchestration step, one MCP call.
 
         NORMAL FLOW IS ONE CALL. To give a session work, use action="start":
@@ -711,6 +714,7 @@ def build_mcp(service: TerminalService | None = None,
             desired_states=desired_states, resume_token=resume_token,
             timeout=timeout, poll_interval=poll_interval, tail_lines=tail_lines,
             compact=compact, idempotency_key=idempotency_key,
+            path=path, content_b64=content_b64, overwrite=overwrite, mode=mode,
             agent_type=agent_type, working_directory=working_directory,
             initial_prompt=initial_prompt, grant_mode=grant_mode, binding=binding,
             node=node, title=title, priority=priority, metadata=metadata,
@@ -1044,6 +1048,30 @@ def build_mcp(service: TerminalService | None = None,
         not an error."""
         _refresh_local_heartbeat()
         return controller.terminal_detach_session(name)
+
+    @server.tool()
+    def terminal_put_file(path: str, content_b64: str, overwrite: bool = False,
+                          mode: str | None = None, node: str | None = None) -> dict:
+        """Write ONE file onto a node from base64, without going through a pane.
+
+        Use this instead of echoing base64 into a shell. Measured 2026-09-21,
+        the pane route runs at about 43 KB/s, costs one tool call per 18 KB,
+        and a chunk over ~24,000 characters is truncated by tmux SILENTLY while
+        `base64 -d` still exits 0 -- a valid file with the wrong contents. This
+        path has neither limit and returns a sha256 of what was written, so the
+        caller can prove the bytes landed.
+
+        `path` must be absolute and inside the node's allowed_cwd_roots; an
+        existing file is kept unless `overwrite` is true; an existing symlink at
+        the destination is refused rather than followed. `mode` is an octal
+        string such as "644" or "755". The capability is OFF unless the node
+        opts in. `node` defaults to the local node -- a file is written so that
+        something on a SPECIFIC machine can read it, so it is never auto-placed.
+        """
+        _refresh_local_heartbeat()
+        return controller.terminal_put_file(path, content_b64, node=node,
+                                            overwrite=overwrite, mode=mode,
+                                            requested_by="mcp")
 
     @server.tool()
     def terminal_delete_session(name: str) -> dict:
@@ -6015,6 +6043,7 @@ def build_mcp(service: TerminalService | None = None,
     # plain function, so this is an ordinary call with the wrapper-layer side
     # effects (heartbeat refresh, supervisor-watch cleanup on delete) intact.
     compact_tools.handlers.update(turn_handler_map(
+        put_file=terminal_put_file,
         list_sessions=terminal_list_sessions,
         list_nodes=terminal_list_nodes,
         create_session=terminal_create_session,
