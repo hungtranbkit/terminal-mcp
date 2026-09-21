@@ -24,7 +24,10 @@ telemetry, and verification discipline remain unchanged.
 
 Task start is query-only. It never installs Graphify, never builds a graph,
 and never performs network work. The adapter only runs when both the
-`graphify` executable and `graphify-out/graph.json` already exist.
+`graphify` executable and `graphify-out/graph.json` already exist. It also
+skips Graphify entirely when the existing module context is complete and
+current; graph lookup is reserved for missing, stale, or structurally thin
+context so the optimization does not add tokens to already-cheap tasks.
 
 Default limits:
 
