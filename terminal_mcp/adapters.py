@@ -184,7 +184,34 @@ class GenericShellAdapter(AgentAdapter):
         return True
 
     def submit_ack_evidence(self, before: list[str], after: list[str], sent_text: str) -> bool:
-        return after != before
+        # EXPRESS LANE for plain shells (2026-09-21). "Any pane change counts"
+        # is necessary but NOT sufficient: a shell echoes the command onto the
+        # prompt line while it is being typed, so for a command that prints
+        # nothing immediately the pane after Enter is byte-identical to the
+        # pane before it. Measured live on hp: `echo XONG` confirmed in 0.74s,
+        # while `sleep 3; echo XONG2` came back SUBMIT_UNCONFIRMED ("the pane
+        # looked identical to its pre-Enter state throughout the verification
+        # window") and send_wait returned FAILED without ever starting the
+        # wait, so the caller resent the command. Hits every quiet command:
+        # sleep, cd, export, a compile before its first output, a buffered
+        # git clone.
+        #
+        # This class's docstring already states the reasoning: canonical tty
+        # line editing processes Enter SYNCHRONOUSLY and there is no composer
+        # to swallow it, so the echoed command line is itself proof the shell
+        # received the text. Added as an EXTRA positive-evidence path -- the
+        # original `after != before` still confirms on its own, so nothing that
+        # passed before can start failing.
+        if after != before:
+            return True
+        probe = (sent_text or "").strip().splitlines()
+        if not probe:
+            return False
+        first = probe[0].strip()
+        # Only the last few lines: matching anywhere in scrollback would let a
+        # previous identical command count as the ack for this one.
+        return bool(first) and any(first in line for line in
+                                   [ln for ln in after if ln.strip()][-3:])
 
     def stuck_composer_evidence(self, before: list[str], after: list[str]) -> bool:
         return False

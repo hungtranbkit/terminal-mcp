@@ -39,6 +39,34 @@ WAIT_PATTERNS = tuple(
 ACTIVE_COMMANDS = {"claude", "codex", "python", "python3", "pytest", "node", "npm", "bash", "zsh"}
 
 
+# A shell pane whose LAST non-empty line is a bare prompt -- nothing typed after
+# it -- has handed control back: the command is over. Without this, a finished
+# bash pane is reported RUNNING for a full 60 seconds purely because "bash" is
+# in ACTIVE_COMMANDS and the age gate below is a timer, not evidence. Measured
+# 2026-09-21: age 0s..60s all RUNNING, flipping to IDLE only at 61s, while the
+# prompt sat visible at the bottom the whole time -- so terminal_turn(send_wait)
+# on a shell burned up to a minute after the work was done, which reads as
+# "Terminal MCP is slow / hanging".
+#
+# Deliberately narrow. A line with a command echoed after the prompt does NOT
+# match (\s*$ requires the prompt to end the line), so this cannot fire while a
+# command is still on screen waiting to run. A bare ">" is NOT accepted: in bash
+# that is a continuation prompt for an unterminated quote, where the shell is
+# waiting for input, not idle. An unrecognised or customised prompt simply does
+# not match and falls back to the old 60s timer -- degrading to today's
+# behaviour, never to a wrong answer.
+_SHELL_PROMPT_READY = re.compile(
+    r"^(?:\S+@\S+:\S*[$#]|PS [A-Za-z]:\\\S*>|[$#])\s*$"
+)
+_SHELLS = {"bash", "zsh", "sh", "fish", "dash"}
+
+
+def shell_prompt_is_back(output: str) -> bool:
+    """True when the bottom of the pane is a bare shell prompt."""
+    lines = [line.rstrip() for line in output.splitlines() if line.strip()]
+    return bool(lines) and bool(_SHELL_PROMPT_READY.match(lines[-1]))
+
+
 def detect_waiting_input(output: str) -> tuple[bool, str]:
     lines = [line.strip() for line in output.splitlines() if line.strip()]
     recent = lines[-12:]
@@ -58,6 +86,10 @@ def classify_status(session: SessionInfo, output: str, now: int | None = None) -
         return "IDLE", False, "tmux reports the active pane is dead"
     age = max(0, (now if now is not None else int(time.time())) - session.activity_epoch)
     command = session.pane_current_command.casefold()
+    # Evidence beats the timer: ask the pane whether the prompt is back before
+    # falling through to the age gate.
+    if command in _SHELLS and shell_prompt_is_back(output):
+        return "IDLE", False, "shell prompt is back at the bottom of the pane; the command has finished"
     if command in ACTIVE_COMMANDS and age <= 60:
         return "RUNNING", False, f"current command is {command!r}; tmux activity age is {age}s"
     if command in {"bash", "zsh", "sh", "fish"} and age > 60:
@@ -165,9 +197,28 @@ def to_legacy_event_type(event_type: str) -> str:
     return "completed" if event_type in ("completion_candidate", "verified_done") else event_type
 
 
-def _match_recent(patterns: tuple[re.Pattern[str], ...], output: str, window: int = 20) -> tuple[bool, str]:
+# A line that IS a shell prompt plus the command typed at it -- an echo of
+# input, never program output. Audited live 2026-09-21 on hp-linux: session
+# `urbanflow-hp-relay2` classified ERROR purely because the command the
+# operator had typed contained the word EXCEPTION, matching ERROR_PATTERNS'
+# r"\bexception\b.*:". Scanning what the user typed for evidence of a
+# failure is a category error, so those lines are skipped.
+_PROMPT_LINE = re.compile(r"^\S+@\S+:.*[$#]\s|^\s*[$#>]\s+\S|^PS [A-Za-z]:\\.*>\s")
+
+# ERROR looks only at the very bottom of the pane, the same posture
+# detect_waiting_input already takes (its window is 4). The shared 20-line
+# default let a failure that had already scrolled most of the way out of
+# view still mark a session ERROR -- measured on hp 2026-09-21,
+# `repoport-public-smoke` matched at offset 15 of 20 on an hours-old error.
+ERROR_WINDOW = 5
+
+
+def _match_recent(patterns: tuple[re.Pattern[str], ...], output: str, window: int = 20,
+                  skip_prompt_lines: bool = False) -> tuple[bool, str]:
     lines = [line for line in output.splitlines() if line.strip()][-window:]
     for offset, line in enumerate(reversed(lines)):
+        if skip_prompt_lines and _PROMPT_LINE.search(line):
+            continue
         for pattern in patterns:
             if pattern.search(line):
                 return True, f"matched {pattern.pattern!r} at offset {offset} from bottom"
@@ -319,9 +370,18 @@ def classify_supervisor_state(state: str, reason: str, output: str) -> tuple[str
     that maps to IDLE at the loop level instead (idle_threshold)."""
     if state == "WAITING_INPUT":
         return state, reason
-    matched, why = _match_recent(ERROR_PATTERNS, output)
-    if matched:
-        return "ERROR", why
+    # ERROR needs the failure to still be LIVE. This function has no clock,
+    # but `state` already carries one: classify_status only returns IDLE for
+    # a pane sitting at a plain shell with no tmux activity for over a
+    # minute -- whatever failed has finished and handed the prompt back, so
+    # text still on screen is history, not a running failure. Audited on hp
+    # 2026-09-21: ALL FIVE sessions reported ERROR were idle shells, the
+    # freshest matching a psql error 44 hours old.
+    if state != "IDLE":
+        matched, why = _match_recent(ERROR_PATTERNS, output, window=ERROR_WINDOW,
+                                     skip_prompt_lines=True)
+        if matched:
+            return "ERROR", why
     matched, why = _match_recent(DONE_PATTERNS, output)
     if matched:
         return "COMPLETION_CANDIDATE", why

@@ -99,6 +99,8 @@ class NodeClient(Protocol):
     def knowledge_checkpoint(self, session_name: str, summary: str) -> dict[str, Any]: ...
     def watchdog_session_events(self, *, unacknowledged_only: bool = False, limit: int = 50) -> dict[str, Any]: ...
     def watchdog_acknowledge_session_event(self, event_id: int, *, by: str | None = None) -> dict[str, Any]: ...
+    def put_file(self, path: str, content_b64: str, *, overwrite: bool = False,
+                 mode: str | None = None, requested_by: str | None = None) -> dict[str, Any]: ...
 
 
 class LocalNodeClient:
@@ -337,6 +339,11 @@ class LocalNodeClient:
 
     def watchdog_acknowledge_session_event(self, event_id: int, *, by: str | None = None) -> dict[str, Any]:
         return self._terminal.terminal_watchdog_acknowledge(event_id, by=by)
+
+    def put_file(self, path: str, content_b64: str, *, overwrite: bool = False,
+                 mode: str | None = None, requested_by: str | None = None) -> dict[str, Any]:
+        return self._terminal.terminal_put_file(path, content_b64, overwrite=overwrite,
+                                                mode=mode, requested_by=requested_by)
 
 
 class RemoteNodeClient:
@@ -653,3 +660,13 @@ class RemoteNodeClient:
         except NodeClientError as exc:
             return False, None, str(exc)
         return True, (time.monotonic() - started) * 1000.0, None
+
+    def put_file(self, path: str, content_b64: str, *, overwrite: bool = False,
+                 mode: str | None = None, requested_by: str | None = None) -> dict[str, Any]:
+        # POST not PUT: the node decides the final path (allowed_cwd_roots
+        # gated), so this is not an idempotent write to a caller-chosen URL.
+        # Overwriting is opt-in via the body, never implied by the method.
+        return self._request("POST", "/v1/files", body={
+            "path": path, "content_b64": content_b64, "overwrite": overwrite,
+            "mode": mode, "requested_by": requested_by,
+        })
