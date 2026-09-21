@@ -455,7 +455,13 @@ def build_context_pack(module: str, *,
     # graph, installs anything, or makes a network request. A failure is
     # intentionally silent here so projects without Graphify retain exactly
     # the old context-pack behavior.
-    if knowledge is not None:
+    graph_needed = (
+        not pack.summary
+        or not pack.files
+        or not pack.entry_points
+        or pack.stale
+    )
+    if knowledge is not None and graph_needed:
         try:
             graph = GraphifyBridge(knowledge.root)
             graph_result = graph.query(
