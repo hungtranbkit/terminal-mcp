@@ -5,6 +5,8 @@ import os
 
 from mcp.server.mcpserver import MCPServer
 
+from . import tool_metrics
+
 from . import __version__, ui_workflow
 from .access_policy import ROLE_OPERATOR, filter_record, policy_table
 from .fleet_service import auth_status_for_node
@@ -452,6 +454,15 @@ def build_mcp(service: TerminalService | None = None,
         instructions=orchestration_policy.server_instructions(),
         version=__version__,
     )
+
+    # Dem loi goi tung tool. Boc mot lan o day, truoc moi @server.tool ben
+    # duoi, nen ca ~290 tool deu duoc dem ma khong phai sua tung cho.
+    # input_audit khong ghi cac loi goi DOC va khong phan biet duoc tool nao
+    # goi xuong cung mot ham loi, nen truoc gio khong do duoc khoi luong that.
+    try:
+        tool_metrics.instrument(server, tool_metrics.ToolMetricsStore())
+    except Exception:   # do luong khong bao gio duoc chan server khoi chay
+        pass
 
     def _refresh_local_heartbeat() -> None:
         # Cheap (a few /proc reads + one real tmux listing, no network) --
