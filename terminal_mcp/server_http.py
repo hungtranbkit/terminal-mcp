@@ -319,7 +319,18 @@ def main() -> None:
     # The bind address is intentionally not configurable: remote access must go
     # through an authenticated HTTPS tunnel terminating on this loopback port.
     config = load_config()
-    terminal = TerminalService(config)
+    # Resolved HERE, before TerminalService exists, and passed into it.
+    # ControllerService further down already received this identity, but the
+    # TerminalService it wraps did not -- so the controller knew it was
+    # hp-linux while the session registry underneath it wrote every row under
+    # the placeholder "local". Measured on this host 2026-09-21:
+    # session_records split 785 `hp-linux` / 707 `local`, output_chunks
+    # 74,207 / 24,948, and the fleet projector raised
+    #   ValueError: node:node:local is owned by 'hp-linux', not 'local'
+    # on every refresh (~9 times per 30 minutes). The constructor parameter
+    # for exactly this already existed; the call site simply never used it.
+    local_node_id, local_display_name = local_node_identity()
+    terminal = TerminalService(config, registry_node_id=local_node_id)
     supervisor = SupervisorService(terminal, SupervisorStore())
     supervisor_v2 = build_supervisor_v2(supervisor)
     # ONE explicit, persistent (real default ~/.local/state/terminal-mcp/
@@ -357,7 +368,6 @@ def main() -> None:
                       _deny_migration.get("errors"))
     except Exception:  # noqa: BLE001 -- never block startup on a migration
         _log.exception("deny-record migration failed -- grants left unchanged")
-    local_node_id, local_display_name = local_node_identity()
     controller = ControllerService(registry, local_node_id=local_node_id,
                                    local_display_name=local_display_name,
                                    local_client=LocalNodeClient(terminal),
