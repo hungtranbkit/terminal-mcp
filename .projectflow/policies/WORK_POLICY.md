@@ -110,8 +110,10 @@ what it does not cover so a thin pack is not mistaken for a complete one.
 ## Graphify Repository Graph
 
 Graphify is an OPTIONAL structural supplement to the Knowledge Map and Module
-Context Pack. When a local `graphify-out/graph.json` is ready, query it for
-the task's named modules before widening to raw search/source reads. Admit only
+Context Pack. When module context is missing, stale or structurally thin and a
+local `graphify-out/graph.json` is ready, query it before widening to raw
+search/source reads. A complete current module pack skips Graphify entirely so
+an optimization never adds context to a task that is already cheap. Admit only
 the bounded query result into the context pack; never paste the full
 `graph.json` or full report into a worker prompt.
 
