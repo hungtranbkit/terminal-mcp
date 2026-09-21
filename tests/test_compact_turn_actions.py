@@ -455,3 +455,56 @@ def test_session_projection_keeps_a_refusal_reason_when_there_is_one():
     assert out["input_denied_reason"] == "GRANT_REQUIRED"
     assert "pid" not in out
     assert set(out) <= set(_SESSION_COMPACT_FIELDS) | {"input_denied_reason"}
+
+
+def test_start_stops_driving_the_lane_once_the_callers_budget_is_spent(monkeypatch):
+    """MAX_START_TICKS bounds transitions, not time, and the two came apart.
+
+    Measured on hp-linux 2026-09-21 over 12 real calls: `turn action=start`
+    ran p50 92s and max 244s while every other turn action stayed under 10s.
+    A call that blocks for minutes cannot share a client turn with anything
+    else, which is what stopped a conversation collapsing its tool calls.
+    """
+    from terminal_mcp import compact_tools as ct
+
+    clock = {"now": 0.0}
+    monkeypatch.setattr(ct.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(ct, "START_WAIT_BUDGET_SECONDS", 5.0)
+
+    ticked = []
+
+    def slow_tick(target):
+        ticked.append(target)
+        clock["now"] += 4.0          # each transition is slow, as observed
+
+    tools = ct.CompactTerminalTools.__new__(ct.CompactTerminalTools)
+    tools.handlers = {"dispatch_tick": slow_tick}
+    tools._task_snapshot = lambda task_id: ("QUEUED", None)
+
+    ticks, state, _reason = tools._drive_start("lane-1", "task-1")
+
+    # Two ticks fit in the budget (0s -> 4s -> 8s); the third is refused.
+    assert ticks == 2, f"drove {ticks} ticks, spending {clock['now']}s of a 5s budget"
+    assert len(ticked) == 2
+    assert state == "QUEUED"
+
+
+def test_start_still_drives_the_full_tick_budget_when_the_lane_is_quick(monkeypatch):
+    """The budget must not punish the fast path: when ticks are cheap the
+    caller should still get a dispatched receipt in one call, which is the
+    whole reason `start` drives the lane at all."""
+    from terminal_mcp import compact_tools as ct
+
+    clock = {"now": 0.0}
+    monkeypatch.setattr(ct.time, "monotonic", lambda: clock["now"])
+    states = iter(["QUEUED"] * 10)
+
+    def quick_tick(target):
+        clock["now"] += 0.01
+
+    tools = ct.CompactTerminalTools.__new__(ct.CompactTerminalTools)
+    tools.handlers = {"dispatch_tick": quick_tick}
+    tools._task_snapshot = lambda task_id: (next(states), None)
+
+    ticks, _state, _reason = tools._drive_start("lane-1", "task-1")
+    assert ticks == ct.MAX_START_TICKS

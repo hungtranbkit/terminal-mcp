@@ -48,6 +48,25 @@ TURN_PANE_ACTIONS = ("inspect", "send", "send_wait", "wait", "resume", "start")
 # CALLER'S wait, not on the task, which is durable from the first step and is
 # carried the rest of the way server-side.
 MAX_START_TICKS = 6
+
+# A tick count is not a bound on time, and MAX_START_TICKS above claims to be
+# one ("a bound on the CALLER'S wait"). It only bounds TRANSITIONS: when the
+# lane is quiet six ticks are a couple of seconds, and when it is busy the same
+# six become minutes. Measured on hp-linux 2026-09-21 over 12 real calls:
+# `turn action=start` ran p50 92s, p90 179s, max 244s, while every other turn
+# action stayed under 10s (send_wait p50 2.5s) and the durable queue path
+# answered in 2ms.
+#
+# The cost is not the waiting itself -- the task is durable from step 1 and the
+# follower carries it either way -- it is that a four-minute MCP call cannot
+# share a client turn with anything else, which is why one conversation
+# accumulated hundreds of separate tool blocks.
+#
+# So the caller's wait gets a real clock. This is a budget, not a hard ceiling:
+# a tick already in flight still finishes, so the worst case is the budget plus
+# one tick. Bounding it exactly would mean interrupting a transition mid-way,
+# which is precisely what persist-before-dispatch exists to avoid.
+START_WAIT_BUDGET_SECONDS = 5.0
 #: The task is genuinely UNDER WAY -- the only states that may be reported as
 #: `dispatched: True`. Found live (hp-linux, 2026-09-19): a single "settled"
 #: set conflated these with the refusal states below, so a task the coordinator
@@ -1001,8 +1020,15 @@ class CompactTerminalTools:
         if tick is None:
             return 0, state, reason
         ticks = 0
+        deadline = time.monotonic() + START_WAIT_BUDGET_SECONDS
         for _ in range(MAX_START_TICKS):
             if state in START_SETTLED_STATUSES:
+                break
+            if time.monotonic() >= deadline:
+                # Out of the caller's budget. The task keeps advancing --
+                # the follower owns it from here -- so this returns
+                # TASK_ACCEPTED rather than TASK_STARTED and says nothing
+                # untrue about where the work got to.
                 break
             try:
                 tick(target)
