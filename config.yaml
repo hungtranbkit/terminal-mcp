@@ -154,6 +154,30 @@ session_lifecycle:
   codex_yolo: true
   create_ready_timeout_seconds: 6
   default_grant_mode: none
+  # Admission control (2026-09-21). Without a ceiling this node grew to
+  # 141 sessions unattended; its agent's cgroup ran out of tasks and every
+  # request answered HTTP 500 `can't start new thread`, which the
+  # controller reported as flaky connectivity. 20 is an operator decision,
+  # well under the ~324 this machine's RAM could hold -- a deliberate working
+  # limit, not a hardware maximum. Deliberately the SMALLEST cap in the fleet
+  # even though this host has the most RAM: it is not just a session host, it
+  # also runs ~29 docker containers, chrome-headless and dotnet builds. Must
+  # stay equal to GUARD_MAX_SESSIONS in ~/.local/bin/session-guard-run or the
+  # two mechanisms fight.
+  # put_file: ghi file thang len node, khong day base64 qua pane tmux.
+  # Bat co y (mac dinh TAT). Dich den van bi chan boi allowed_cwd_roots
+  # o tren, va moi lan ghi deu co ban ghi audit.
+  allow_put_file: true
+  max_put_file_bytes: 8388608
+  max_sessions: 20
+  # Reclaim an idle slot rather than refusing real work. Narrow by design:
+  # only a DETACHED session whose pane sits at a plain shell (no agent
+  # process in it) and has been quiet for reap_idle_hours. A pane running
+  # claude/codex is never reaped however quiet -- measured here, 99 of 110
+  # sessions looked abandoned by activity timestamp while the registry
+  # called every one ACTIVE, so a timestamp alone is not evidence.
+  reap_idle_sessions: true
+  reap_idle_hours: 1
 
 # Session Knowledge Store: captures every session's REAL output (redacted)
 # into a searchable, durable record (session_knowledge.py) -- disabled by

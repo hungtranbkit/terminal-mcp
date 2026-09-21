@@ -728,6 +728,20 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
         result = await anyio.to_thread.run_sync(lambda: client.detach_session(request.path_params["name"]))
         return JSONResponse(result)
 
+    async def put_file(request: Request) -> JSONResponse:
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            return JSONResponse({"error": "INVALID_JSON"}, status_code=400)
+        result = await anyio.to_thread.run_sync(lambda: client.put_file(
+            body.get("path") or "", body.get("content_b64") or "",
+            overwrite=bool(body.get("overwrite")), mode=body.get("mode"),
+            requested_by=body.get("requested_by"),
+        ))
+        return JSONResponse(result)
+
     async def delete_session(request: Request) -> JSONResponse:
         if (blocked := require_auth(request)) is not None:
             return blocked
@@ -1030,6 +1044,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
         Route("/v1/input-context", input_context, methods=["GET"]),
         Route("/v1/sessions/{name}/detach", detach_session, methods=["POST"]),
         Route("/v1/sessions/{name}", delete_session, methods=["DELETE"]),
+        Route("/v1/files", put_file, methods=["POST"]),
         Route("/v1/sessions/{name}/kill", kill_session, methods=["POST"]),
         Route("/v1/sessions/{name}/rename", rename_session, methods=["POST"]),
         Route("/v1/sessions/{name}/reopen", reopen_session, methods=["POST"]),

@@ -1020,6 +1020,42 @@ class ControllerService:
 
     # -- create (needs a node CHOICE, not a resolution) ---------------------
 
+    def terminal_put_file(self, path: str, content_b64: str, *, node: str | None = None,
+                          overwrite: bool = False, mode: str | None = None,
+                          requested_by: str | None = None) -> dict[str, Any]:
+        """Route one file write to a node. `node` defaults to the LOCAL node
+        rather than auto-placing: a file is written so that something on a
+        specific machine can read it, so guessing the destination host would
+        be a silently wrong answer. The node performs its own allowed_cwd_roots
+        and allow_put_file checks -- this layer only resolves the target and
+        reports transport failure honestly."""
+        node_id = node or self.local_node_id
+        known = self.node_status(node_id)
+        if known is None:
+            return {"error": "NODE_NOT_FOUND", "node_id": node_id}
+        client = self._clients.get(node_id)
+        if client is None:
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id,
+                    "detail": "no client configured for this node"}
+        try:
+            result = client.put_file(path, content_b64, overwrite=overwrite,
+                                     mode=mode, requested_by=requested_by)
+        except NodeClientError as exc:
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": str(exc)}
+        if isinstance(result, dict):
+            # OVERRIDE, not setdefault. The node reports its OWN
+            # REGISTRY_LOCAL_NODE_ID, which on a self-hosting node is the
+            # literal string "local" -- so a caller that asked for
+            # node="dell-linux" got back node_id="local" and could not tell
+            # which machine the file actually landed on. The routed id is the
+            # caller's frame of reference; the node's name for itself is kept
+            # alongside rather than thrown away.
+            reported = result.get("node_id")
+            if reported is not None and reported != node_id:
+                result["node_reported_id"] = reported
+            result["node_id"] = node_id
+        return result
+
     def terminal_create_session(self, name: str, agent_type: str = "shell", cwd: str | None = None, *,
                                 node: str = "auto", platform: str | None = None, initial_prompt: str | None = None,
                                 grant_mode: str = "none", binding: str | None = None,

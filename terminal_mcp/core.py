@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import re
 import os
 import threading
@@ -3661,6 +3664,129 @@ class TerminalService:
             return (0, current)
         derived = total_mb // max(lifecycle.max_session_ram_mb, 1)
         return (max(derived, 1), current)
+
+    def terminal_put_file(self, path: str, content_b64: str, *, overwrite: bool = False,
+                          mode: str | None = None,
+                          requested_by: str | None = None) -> dict[str, Any]:
+        """Write ONE caller-supplied file onto this node, decoded from base64.
+
+        Exists because the only payload carrier on the MCP surface is a text
+        argument, so the alternative is pushing base64 through a tmux pane one
+        chunk at a time. Measured 2026-09-21: that tops out around 43 KB/s and
+        one "Called tool" row per 18 KB, and -- worse -- a chunk much over
+        24,000 characters is TRUNCATED BY TMUX SILENTLY while `base64 -d` still
+        exits 0, producing a valid file with the wrong contents. This path
+        never touches a pane, so neither limit applies and the returned sha256
+        lets the caller prove the bytes landed.
+
+        Safety, in order:
+        - OFF unless this host opts in: `session_lifecycle.allow_put_file`
+          where that field exists, else TERMINAL_MCP_ALLOW_PUT_FILE=1.
+        - The PARENT directory goes through lifecycle.resolve_cwd, the same
+          allowed_cwd_roots gate (symlinks resolved BEFORE containment) that
+          governs session creation. The final segment must be a plain file
+          name, so `..` cannot walk out after the gate has run.
+        - An existing symlink at the destination is refused outright rather
+          than followed, or an attacker-planted link would redirect the write
+          past a gate that has already passed.
+        - base64 is decoded with validate=True: a payload containing anything
+          outside the alphabet is an error, never silently skipped -- that is
+          the exact shape of the tmux truncation bug above.
+        - The write is atomic (temp file in the same directory + os.replace),
+          so a reader never sees a half-written file and a failure cannot
+          destroy an existing one.
+        """
+        action = "put_file"
+        lifecycle = self.config.session_lifecycle
+        # Read through getattr + environment rather than a hard config field.
+        # The three deployments of this repo have DIVERGED (dell, hp and m910
+        # each carry a different SessionLifecycleConfig), so a new dataclass
+        # field cannot be patched in uniformly -- anchoring on neighbouring
+        # lines applied on some hosts and not others, which is exactly how a
+        # partial, inconsistent rollout happens. A host that HAS the field
+        # wins; one that does not falls back to its own unit environment,
+        # which is per-host and explicit either way.
+        allow = getattr(lifecycle, "allow_put_file", None)
+        if allow is None:
+            allow = os.environ.get("TERMINAL_MCP_ALLOW_PUT_FILE", "") == "1"
+        max_bytes = getattr(lifecycle, "max_put_file_bytes", None)
+        if max_bytes is None:
+            try:
+                max_bytes = int(os.environ.get("TERMINAL_MCP_MAX_PUT_FILE_BYTES", "") or 8 * 1024 * 1024)
+            except ValueError:
+                max_bytes = 8 * 1024 * 1024
+        max_bytes = max(1, min(int(max_bytes), 256 * 1024 * 1024))
+
+        def blocked(error: str, **extra: Any) -> dict[str, Any]:
+            self.audit.record(action=action, session=None, result="BLOCKED", reason=error,
+                              actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
+            return {"error": error, **extra}
+
+        if not allow:
+            return blocked("PUT_FILE_DISABLED")
+        if not isinstance(path, str) or not path.strip():
+            return blocked("INVALID_PATH")
+        if mode is not None and (not isinstance(mode, str) or not re.fullmatch(r"[0-7]{3,4}", mode)):
+            return blocked("INVALID_MODE", detail="mode must be an octal string such as '644'")
+
+        candidate = Path(path.strip()).expanduser()
+        if not candidate.is_absolute():
+            return blocked("INVALID_PATH", detail="path must be absolute")
+        name = candidate.name
+        if not name or name in (".", "..") or "\x00" in name:
+            return blocked("INVALID_PATH", detail="the last path segment must be a plain file name")
+
+        parent, error = resolve_cwd(str(candidate.parent), self.config)
+        if error is not None:
+            self.audit.record(action=action, session=None, result="BLOCKED",
+                              reason=str(error.get("error")), actor=requested_by,
+                              node_id=self.REGISTRY_LOCAL_NODE_ID)
+            return error
+        target = parent / name
+
+        if not isinstance(content_b64, str) or not content_b64.strip():
+            return blocked("INVALID_BASE64", detail="content_b64 must be a non-empty string")
+        packed = "".join(content_b64.split())
+        # Bound the ENCODED length first so an oversized payload is refused
+        # without decoding it into memory. 4/3 is base64's inflation.
+        if len(packed) > (max_bytes * 4 // 3) + 8:
+            return blocked("FILE_TOO_LARGE", max_bytes=max_bytes)
+        try:
+            blob = base64.b64decode(packed, validate=True)
+        except (binascii.Error, ValueError):
+            return blocked("INVALID_BASE64")
+        if len(blob) > max_bytes:
+            return blocked("FILE_TOO_LARGE", bytes=len(blob),
+                           max_bytes=max_bytes)
+
+        if target.is_symlink():
+            return blocked("PATH_IS_SYMLINK", path=str(target))
+        if target.is_dir():
+            return blocked("PATH_IS_DIRECTORY", path=str(target))
+        existed = target.exists()
+        if existed and not overwrite:
+            return blocked("FILE_EXISTS", path=str(target))
+
+        digest = hashlib.sha256(blob).hexdigest()
+        temporary = target.with_name(f".{name}.tmcp-put-{uuid.uuid4().hex}")
+        try:
+            with open(temporary, "wb") as handle:
+                handle.write(blob)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, int(mode, 8) if mode is not None else 0o644)
+            os.replace(temporary, target)
+        except OSError as exc:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return blocked("WRITE_FAILED", detail=type(exc).__name__)
+
+        self.audit.record(action=action, session=None, result="OK", actor=requested_by,
+                          node_id=self.REGISTRY_LOCAL_NODE_ID)
+        return {"path": str(target), "bytes": len(blob), "sha256": digest,
+                "overwritten": existed, "node_id": self.REGISTRY_LOCAL_NODE_ID}
 
     def terminal_create_session(self, name: str, agent_type: str = "shell", cwd: str | None = None, *,
                                 initial_prompt: str | None = None, grant_mode: str = "none",

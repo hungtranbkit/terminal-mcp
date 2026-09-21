@@ -64,6 +64,8 @@ class NodeClient(Protocol):
                        resume_session_id: str | None = None) -> dict[str, Any]: ...
     def detach_session(self, name: str) -> dict[str, Any]: ...
     def delete_session(self, name: str) -> dict[str, Any]: ...
+    def put_file(self, path: str, content_b64: str, *, overwrite: bool = False,
+                 mode: str | None = None, requested_by: str | None = None) -> dict[str, Any]: ...
     def kill_session(self, name: str, confirm_name: str, *, requested_by: str | None = None) -> dict[str, Any]: ...
     def rename_session(self, name: str, new_name: str, *, requested_by: str | None = None) -> dict[str, Any]: ...
     def reopen_session(self, name: str, *, agent_type: str | None = None, cwd: str | None = None,
@@ -149,6 +151,11 @@ class LocalNodeClient:
 
     def delete_session(self, name: str) -> dict[str, Any]:
         return self._terminal.terminal_delete_session(name)
+
+    def put_file(self, path: str, content_b64: str, *, overwrite: bool = False,
+                 mode: str | None = None, requested_by: str | None = None) -> dict[str, Any]:
+        return self._terminal.terminal_put_file(path, content_b64, overwrite=overwrite,
+                                                mode=mode, requested_by=requested_by)
 
     def kill_session(self, name: str, confirm_name: str, *, requested_by: str | None = None) -> dict[str, Any]:
         return self._terminal.terminal_kill_session(name, confirm_name, requested_by=requested_by)
@@ -465,6 +472,17 @@ class RemoteNodeClient:
 
     def delete_session(self, name: str) -> dict[str, Any]:
         return self._request("DELETE", f"/v1/sessions/{urllib.parse.quote(name)}")
+
+    def put_file(self, path: str, content_b64: str, *, overwrite: bool = False,
+                 mode: str | None = None, requested_by: str | None = None) -> dict[str, Any]:
+        # POST rather than PUT: the node decides the final path (it is gated
+        # by allowed_cwd_roots), so this is not an idempotent write to a
+        # caller-chosen URL. Overwriting is opt-in via the body, never by
+        # the method.
+        return self._request("POST", "/v1/files", body={
+            "path": path, "content_b64": content_b64, "overwrite": overwrite,
+            "mode": mode, "requested_by": requested_by,
+        })
 
     def kill_session(self, name: str, confirm_name: str, *, requested_by: str | None = None) -> dict[str, Any]:
         return self._request("POST", f"/v1/sessions/{urllib.parse.quote(name)}/kill",

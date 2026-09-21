@@ -545,6 +545,18 @@ class SessionLifecycleConfig:
     reap_idle_sessions: bool = False
     reap_idle_hours: float = 6.0
     reap_idle_commands: tuple[str, ...] = ("bash", "sh", "zsh", "fish", "dash")
+    # put_file: write a caller-supplied file straight onto this node instead
+    # of pushing it through a tmux pane as base64. Default OFF and opted into
+    # per host, the same posture as reap_idle_sessions above: writing an
+    # arbitrary file is a real capability, so it is never enabled by the mere
+    # act of upgrading. The destination is gated by allowed_cwd_roots (the
+    # same lifecycle.resolve_cwd gate that governs session creation, symlinks
+    # resolved BEFORE the containment check), which is why both fields live in
+    # this block rather than under `permissions`.
+    allow_put_file: bool = False
+    # 8 MiB of DECODED bytes. base64 inflates by 4/3, so the request itself is
+    # bounded at roughly 10.7 MiB.
+    max_put_file_bytes: int = 8 * 1024 * 1024
 
     def __post_init__(self) -> None:
         # The "terminal-mcp is always protected, even if omitted" guarantee
@@ -2104,6 +2116,13 @@ def _load_session_lifecycle_config(raw: object) -> SessionLifecycleConfig:
     grant_mode = raw.get("default_grant_mode", SessionLifecycleConfig.default_grant_mode)
     if grant_mode not in ("none", "read", "read_send"):
         raise ValueError("session_lifecycle.default_grant_mode must be one of: none, read, read_send")
+    allow_put_file = raw.get("allow_put_file", SessionLifecycleConfig.allow_put_file)
+    if not isinstance(allow_put_file, bool):
+        raise ValueError("session_lifecycle.allow_put_file must be a boolean")
+    max_put_file_bytes = raw.get("max_put_file_bytes", SessionLifecycleConfig.max_put_file_bytes)
+    if (not isinstance(max_put_file_bytes, int) or isinstance(max_put_file_bytes, bool)
+            or not 1 <= max_put_file_bytes <= 256 * 1024 * 1024):
+        raise ValueError("session_lifecycle.max_put_file_bytes must be an integer between 1 and 268435456")
     max_sessions = raw.get("max_sessions", SessionLifecycleConfig.max_sessions)
     if not isinstance(max_sessions, int) or isinstance(max_sessions, bool) or max_sessions < 0:
         raise ValueError("session_lifecycle.max_sessions must be a non-negative integer (0 = derive from machine RAM)")
@@ -2135,6 +2154,7 @@ def _load_session_lifecycle_config(raw: object) -> SessionLifecycleConfig:
         launch_commands=tuple(sorted(launch_raw.items())), create_ready_timeout_seconds=timeout,
         default_grant_mode=grant_mode, resume_capable_agent_types=tuple(resume_capable_raw),
         codex_yolo=codex_yolo_raw, max_sessions=max_sessions,
+        allow_put_file=allow_put_file, max_put_file_bytes=max_put_file_bytes,
         max_session_ram_mb=max_session_ram_mb, reap_idle_sessions=reap,
         reap_idle_hours=float(reap_hours), reap_idle_commands=tuple(reap_cmds),
     )
