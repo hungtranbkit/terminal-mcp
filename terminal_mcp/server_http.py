@@ -20,6 +20,7 @@ from .node_credentials import NodeCredentialStore
 from .node_onboarding import OnboardingService
 from .node_transport import TransportStore
 from .rescue_gateway import RescuePortAllocator
+from .replay_guard import HeartbeatReplayGuard
 from .controller import LOCAL_NODE_ID, ControllerService
 from .core import TerminalService
 from .dashboard import node_token_env_var, register_dashboard
@@ -27,6 +28,7 @@ from .fleet_loop import FleetSyncLoop, FleetSyncLoopConfig
 from .fleet_registry import FleetRegistryStore
 from .fleet_service import ControllerFleetSync, FleetService
 from .health import register_health
+from .ephemeral_state import ephemeral_db_path
 from .integration_service import IntegrationService
 from .logging_setup import RequestIdMiddleware, SecurityHeadersMiddleware, configure_logging
 from .maintenance import MaintenanceLoop
@@ -533,13 +535,21 @@ def main() -> None:
     # with its own users and its own sessions.
     webauth = WebAuthStore()
     _ensure_webauth_bootstrap(webauth)
+    replay_cfg = config.nodes.heartbeat_replay
+    heartbeat_replay = HeartbeatReplayGuard(
+        ephemeral_db_path("heartbeat-replay", "heartbeat-replay.db"),
+        max_skew_seconds=replay_cfg.max_skew_seconds,
+        retention_seconds=replay_cfg.retention_seconds,
+        require_headers=replay_cfg.require_headers,
+    )
     server = build_mcp(terminal, supervisor, supervisor_v2, controller, queue=queue, integration=integration, pm=pm,
                        planner=planner, ai_usage=ai_usage, recovery=recovery, backlog=backlog, notes=notes,
                        events=events, fleet=fleet)
     register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store,
                        queue=queue, integration=integration, pm=pm, planner=planner, ai_usage=ai_usage,
                        recovery=recovery, backlog=backlog, fleet=fleet, onboarding=onboarding,
-                       credentials=credentials, notes=notes, webauth=webauth)
+                       credentials=credentials, heartbeat_replay=heartbeat_replay,
+                       notes=notes, webauth=webauth)
     register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2, controller)
     register_health(server, terminal, supervisor)
 

@@ -26,7 +26,7 @@ def _tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
 
 def _lifecycle_config(tmp_path, *, enabled: bool = True, protected=("terminal-mcp",),
                       launch_commands=(("claude", "claude"), ("codex", "codex")),
-                      timeout: float = 5.0, roots=None) -> AppConfig:
+                      timeout: float = 5.0, roots=None, codex_yolo: bool = False) -> AppConfig:
     return AppConfig(
         permissions=PermissionsConfig(True, True),
         allowed_session_patterns=("lifecycle-*", "claude-lc-*", "codex-lc-*"),
@@ -39,6 +39,7 @@ def _lifecycle_config(tmp_path, *, enabled: bool = True, protected=("terminal-mc
             protected_sessions=protected,
             launch_commands=launch_commands,
             create_ready_timeout_seconds=timeout,
+            codex_yolo=codex_yolo,
         ),
     )
 
@@ -252,7 +253,7 @@ def test_create_launch_fail_cleans_up_disposable_session(tmp_path, lifecycle_ses
     # default remain-on-exit=off tears the session down with it, so this
     # exercises the "session already gone" branch of the FAILED path
     # (LAUNCH_FAILED, never left behind as a zombie session either way).
-    config = _lifecycle_config(tmp_path, launch_commands=(("codex", "/bin/false"),))
+    config = _lifecycle_config(tmp_path, launch_commands=(("codex", "/bin/false"),), codex_yolo=True)
     service = TerminalService(config)
     name = lifecycle_session_factory("lifecycle-launchfail")
     result = service.terminal_create_session(name, "codex")
@@ -608,3 +609,8 @@ def test_a_session_merely_observed_records_neither(tmp_path, tmux_session_factor
     assert record is not None
     assert record.created_by_controller is False
     assert not record.launch_command
+
+
+def test_codex_yolo_defaults_to_least_privilege(tmp_path):
+    config = _lifecycle_config(tmp_path)
+    assert config.session_lifecycle.codex_yolo is False

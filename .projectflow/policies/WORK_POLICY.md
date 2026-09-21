@@ -107,6 +107,25 @@ A bounded briefing per module: purpose, files, entry points, test and smoke
 runbooks, known issues, past bugs. It is capped on purpose, and it states
 what it does not cover so a thin pack is not mistaken for a complete one.
 
+## Graphify Repository Graph
+
+Graphify is an OPTIONAL structural supplement to the Knowledge Map and Module
+Context Pack. When module context is missing, stale or structurally thin and a
+local `graphify-out/graph.json` is ready, query it before widening to raw
+search/source reads. A complete current module pack skips Graphify entirely so
+an optimization never adds context to a task that is already cheap. Admit only
+the bounded query result into the context pack; never paste the full
+`graph.json` or full report into a worker prompt.
+
+Task start is query-only: never install Graphify, rebuild the graph, or trigger
+network/LLM extraction from the dispatch path. Graph build/update belongs to an
+explicit setup/runbook step. If Graphify is missing, stale, disabled or errors,
+fail open to the existing Knowledge Map / exact-search flow.
+
+The current code and git state remain source of truth. Graphify can tell a
+worker which dependency path to inspect; it cannot override plan verification,
+knowledge confidence, or the File/Search Budget.
+
 ## Similar Bug Retrieval
 
 Before investigating, check whether this bug has been seen. A strong match is

@@ -1,0 +1,37 @@
+name: Graphify context checks
+
+on:
+  pull_request:
+    paths:
+      - "terminal_mcp/graphify_bridge.py"
+      - "terminal_mcp/context_pack.py"
+      - "terminal_mcp/project_knowledge.py"
+      - "tests/test_graphify_bridge.py"
+      - "tests/test_graphify_context_pack.py"
+      - "tests/test_context_pack.py"
+      - "tests/test_project_knowledge.py"
+      - "tests/test_work_reuse.py"
+      - "pyproject.toml"
+      - ".projectflow/policies/WORK_POLICY.md"
+      - ".github/workflows/graphify-integration.yml"
+  workflow_dispatch:
+
+jobs:
+  targeted:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[test]"
+      - run: >-
+          python -m pytest -q
+          tests/test_graphify_bridge.py
+          tests/test_graphify_context_pack.py
+          tests/test_context_pack.py
+          tests/test_project_knowledge.py
+          tests/test_work_reuse.py

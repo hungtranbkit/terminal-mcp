@@ -47,6 +47,7 @@ CAP_KEY_SENDS = "key_sends"
 policy-gated by permissions.allow_send_keys + input_policy.allow_keys."""
 
 CAP_REPO_EVIDENCE = "repo_evidence"
+CAP_HEARTBEAT_REPLAY = "heartbeat_replay_v1"
 """GET /v1/repo-evidence answers with git metadata for a path on this node:
 repo_valid, readable, branch, head, dirty, ahead/behind and collected_at.
 
@@ -63,6 +64,7 @@ CAPABILITIES: frozenset[str] = frozenset({
     CAP_RECOVERY_TOMBSTONE,
     CAP_KEY_SENDS,
     CAP_REPO_EVIDENCE,
+    CAP_HEARTBEAT_REPLAY,
 })
 
 LEGACY_CONTRACT_VERSION = 0

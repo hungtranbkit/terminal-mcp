@@ -5397,15 +5397,20 @@ Live fleet state at audit time: `local`, `dell-5530` (Windows) and `m910`
 correctly derived OFFLINE (~100 min stale). All four endpoints are
 plaintext `http://192.168.1.x:8790` — LAN only.
 
-Gaps deliberately NOT closed this pass (no acceptance evidence available
-without changing production): no node self-registration (an unknown
-`node_id` heartbeat is refused `NODE_NOT_FOUND`, so onboarding still
-requires a controller-side operator action *and* controller -> node
-reachability at onboarding time); no token rotation/revocation; no
-rate-limit or lockout on node-agent bearer auth; no replay protection
-(no nonce/timestamp) on heartbeats; `endpoint` scheme is unvalidated, so
-a plaintext `http://` endpoint to a public host would leak the bearer
-token; audit rows are written per-node, not centrally.
+Remaining gaps / security hardening status (updated 2026-09-21): node
+self-registration is still not claimed here; an unknown node_id heartbeat
+remains a separate onboarding contract. Node credential rotation/revocation
+and bearer-auth throttling are implemented and covered by the node credential
+and auth-throttle suites. Heartbeat replay protection is
+IMPLEMENTED_NOT_LIVE_VERIFIED: replay_guard.py persists one-use nonces in a
+private 0600 SQLite store, enforces bounded timestamp skew and nonce replay,
+and supports compatibility rollout mode (require_headers=false) before
+enforcement. heartbeat_replay_v1 is advertised in the node contract so the
+controller can distinguish upgraded nodes. The focused security suites pass,
+but fleet-wide require_headers=true remains a rollout gate and is not claimed
+VERIFIED until every active node sends timestamp/nonce headers. Endpoint
+scheme/public-transport hardening and central audit aggregation remain open;
+per-node audit evidence is still the current source. Commercial execution safety also defaults codex_yolo to false; the approvals/sandbox bypass is now an explicit trusted-environment opt-in only.
 
 ### Phase 1 — Controller decoupling
 

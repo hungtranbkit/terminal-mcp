@@ -77,6 +77,7 @@ from .webauth import SESSION_COOKIE_NAME, WebAuthStore
 from .webterm import WebTerminalProcess, pump_websocket
 from .webterm_assets import ASSETS
 from .ephemeral_state import ephemeral_db_path, ephemeral_state_dir
+from .replay_guard import (HEADER_NONCE, HEADER_TIMESTAMP, HeartbeatReplayGuard, LEGACY_ACCEPTED)
 from .novaretail_dispatch_dashboard import register as register_novaretail_dispatch_dashboard
 from .dispatch_settings_dashboard import register as register_dispatch_settings_dashboard
 
@@ -13093,6 +13094,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                        backlog: BacklogService | None = None,
                        onboarding: "OnboardingService | None" = None,
                        credentials: "node_credentials.NodeCredentialStore | None" = None,
+                       heartbeat_replay: "HeartbeatReplayGuard | None" = None,
                        rotation: "TokenRotationService | None" = None,
                        notes: NotesService | None = None,
                        agents: Any = None,
@@ -13217,6 +13219,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     if credentials is None:
         credentials = node_credentials.NodeCredentialStore(
             ephemeral_db_path("credentials", "node-credentials.db"))
+    if heartbeat_replay is None:
+        heartbeat_replay = HeartbeatReplayGuard(
+            ephemeral_db_path("heartbeat-replay", "heartbeat-replay.db"))
     if rotation is None:
         def _apply_outbound_token(node_id: str, token: str | None) -> None:
             """The controller's outbound half of a rotation, in one place.
@@ -18016,6 +18021,26 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if not accepted:
             return JSONResponse({"error": "UNAUTHORIZED", "verdict": verdict.verdict},
                                 status_code=401, headers={"Cache-Control": "no-store"})
+
+        replay = await anyio.to_thread.run_sync(
+            lambda: heartbeat_replay.check_and_record(
+                node_id,
+                request.headers.get(HEADER_TIMESTAMP),
+                request.headers.get(HEADER_NONCE),
+            )
+        )
+        if not replay.accepted:
+            _log.warning("dashboard heartbeat replay rejected node_id=%s verdict=%s",
+                         node_id, replay.verdict)
+            return JSONResponse(
+                {"error": "REPLAY_REJECTED", "verdict": replay.verdict},
+                status_code=409,
+                headers={"Cache-Control": "no-store"},
+            )
+        if replay.verdict == LEGACY_ACCEPTED:
+            # Rollout compatibility only.  No secret/value is logged; the node
+            # contract capability is the fleet-wide promotion signal for G3.
+            _log.debug("legacy heartbeat without replay headers node_id=%s", node_id)
         try:
             body = await request.json()
         except ValueError:

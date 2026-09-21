@@ -611,7 +611,7 @@ class SessionLifecycleConfig:
     resume_capable_agent_types: tuple[str, ...] = ("claude",)
     # Codex CLI's current, audited YOLO flag. Shared by create and
     # registry-reopen; never assembled by individual callers.
-    codex_yolo: bool = True
+    codex_yolo: bool = False
     create_ready_timeout_seconds: float = 5.0
     default_grant_mode: str = "none"
 
@@ -1145,6 +1145,19 @@ class OnboardingConfig:
 
 
 @dataclass(frozen=True)
+class HeartbeatReplayConfig:
+    """Replay-protection rollout for machine heartbeats.
+
+    require_headers stays false while old nodes are being upgraded.  G3 may
+    promote it only after every online node is confirmed to send nonce/time
+    headers; once true, legacy heartbeats fail closed.
+    """
+    require_headers: bool = False
+    max_skew_seconds: float = 120.0
+    retention_seconds: float = 300.0
+
+
+@dataclass(frozen=True)
 class NodesConfig:
     """Multi-node session management (controller.py/node_registry.py/
     scheduler.py). overload_thresholds/heartbeat_thresholds are the exact
@@ -1155,6 +1168,7 @@ class NodesConfig:
     deployment, unchanged."""
     overload_thresholds: OverloadThresholds = OverloadThresholds()
     heartbeat_thresholds: NodeHeartbeatThresholds = NodeHeartbeatThresholds()
+    heartbeat_replay: HeartbeatReplayConfig = HeartbeatReplayConfig()
     remote_nodes: tuple[RemoteNodeConfig, ...] = ()
     discovery: DiscoveryConfig = DiscoveryConfig()
     remote_connect: RemoteConnectConfig = RemoteConnectConfig()
@@ -1450,6 +1464,20 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     if heartbeat_thresholds.offline_after_seconds < heartbeat_thresholds.degraded_after_seconds:
         raise ValueError("nodes.heartbeat.offline_after_seconds must be >= degraded_after_seconds")
 
+    replay_raw = nodes_raw.get("heartbeat_replay", {})
+    if not isinstance(replay_raw, dict):
+        raise ValueError("nodes.heartbeat_replay must be a mapping")
+    replay_defaults = HeartbeatReplayConfig()
+    heartbeat_replay = HeartbeatReplayConfig(
+        require_headers=bool(replay_raw.get("require_headers", replay_defaults.require_headers)),
+        max_skew_seconds=float(replay_raw.get("max_skew_seconds", replay_defaults.max_skew_seconds)),
+        retention_seconds=float(replay_raw.get("retention_seconds", replay_defaults.retention_seconds)),
+    )
+    if heartbeat_replay.max_skew_seconds <= 0:
+        raise ValueError("nodes.heartbeat_replay.max_skew_seconds must be positive")
+    if heartbeat_replay.retention_seconds < heartbeat_replay.max_skew_seconds * 2:
+        raise ValueError("nodes.heartbeat_replay.retention_seconds must cover at least twice max_skew_seconds")
+
     health_raw = nodes_raw.get("health", {})
     if not isinstance(health_raw, dict):
         raise ValueError("nodes.health must be a mapping")
@@ -1571,6 +1599,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     onboarding_config = _load_onboarding_config(nodes_raw.get("onboarding", {}))
 
     nodes_config = NodesConfig(overload_thresholds=overload_thresholds, heartbeat_thresholds=heartbeat_thresholds,
+                               heartbeat_replay=heartbeat_replay,
                                remote_nodes=tuple(remote_nodes), discovery=discovery_config,
                                remote_connect=remote_connect_config, onboarding=onboarding_config,
                                health=node_health_config)
