@@ -66,7 +66,22 @@ MAX_START_TICKS = 6
 # a tick already in flight still finishes, so the worst case is the budget plus
 # one tick. Bounding it exactly would mean interrupting a transition mid-way,
 # which is precisely what persist-before-dispatch exists to avoid.
-START_WAIT_BUDGET_SECONDS = 5.0
+# 0 = do not drive the lane on the caller's thread at all: enqueue, hand to
+# the follower, return the task_id. The receipt already tells the truth in
+# that case ("work is started and tracked server-side under this task_id"),
+# because the task is durable from step 1 and the follower carries it whether
+# or not the caller stays -- driving ticks here only ever bought an earlier
+# `dispatched: True`, and 2026-09-21 measurement priced that convenience at a
+# p50 of 92 seconds and a worst case of 244.
+#
+# The client already works this way: terminal_task_status answers in 2ms and
+# ChatGPT calls it 55 times an hour. It does not need this call to block to
+# learn the outcome; it needs this call to return so the turn can hold more
+# than one thing.
+#
+# Raise it to re-enable in-call driving (the loop below still honours both
+# this budget and MAX_START_TICKS); the fast path is preserved, not deleted.
+START_WAIT_BUDGET_SECONDS = 0.0
 #: The task is genuinely UNDER WAY -- the only states that may be reported as
 #: `dispatched: True`. Found live (hp-linux, 2026-09-19): a single "settled"
 #: set conflated these with the refusal states below, so a task the coordinator

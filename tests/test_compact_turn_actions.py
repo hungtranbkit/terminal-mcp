@@ -497,6 +497,10 @@ def test_start_still_drives_the_full_tick_budget_when_the_lane_is_quick(monkeypa
 
     clock = {"now": 0.0}
     monkeypatch.setattr(ct.time, "monotonic", lambda: clock["now"])
+    # The shipped default is 0 (return the task_id, never drive on the
+    # caller's thread). This test covers the mechanism an operator re-enables
+    # by raising it, so it sets a budget explicitly rather than relying on it.
+    monkeypatch.setattr(ct, "START_WAIT_BUDGET_SECONDS", 5.0)
     states = iter(["QUEUED"] * 10)
 
     def quick_tick(target):
@@ -508,3 +512,24 @@ def test_start_still_drives_the_full_tick_budget_when_the_lane_is_quick(monkeypa
 
     ticks, _state, _reason = tools._drive_start("lane-1", "task-1")
     assert ticks == ct.MAX_START_TICKS
+
+
+def test_start_returns_the_task_id_without_driving_the_lane_by_default(monkeypatch):
+    """The shipped default must not spend the caller's thread at all.
+
+    Driving ticks here only ever bought an earlier `dispatched: True`, and on
+    2026-09-21 that convenience measured p50 92s / max 244s while the durable
+    queue path answered in 2ms. The task is durable from step 1 either way.
+    """
+    from terminal_mcp import compact_tools as ct
+
+    assert ct.START_WAIT_BUDGET_SECONDS == 0.0, "the shipped default changed"
+
+    ticked = []
+    tools = ct.CompactTerminalTools.__new__(ct.CompactTerminalTools)
+    tools.handlers = {"dispatch_tick": lambda target: ticked.append(target)}
+    tools._task_snapshot = lambda task_id: ("QUEUED", None)
+
+    ticks, state, _reason = tools._drive_start("lane-1", "task-1")
+    assert ticks == 0 and ticked == [], "start drove the lane on the caller's thread"
+    assert state == "QUEUED"
