@@ -45,6 +45,7 @@ dependencies = [
 
 [project.optional-dependencies]
 browser = ["playwright>=1.48,<2"]
+graphify = ["graphifyy>=0.9.65,<1"]
 test = ["pytest>=9,<10"]
 # Only needed to actually RUN terminal-windows-node-agent on a real
 # Windows node (windows_backend.py's real ConPTY process spawn) -- never
