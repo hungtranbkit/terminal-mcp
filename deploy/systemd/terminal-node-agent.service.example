@@ -30,8 +30,24 @@ StartLimitBurst=8
 # --- Hardening, same posture as terminal-mcp-http.service.example -------
 # PrivateTmp deliberately NOT set: this process needs real access to
 # ITS OWN node's tmux server socket (typically /tmp/tmux-$UID/default).
-MemoryMax=512M
-TasksMax=256
+# Sized by SESSION COUNT, not by feel. Each tmux session this node
+# supervises costs 2 tasks -- an `sh` + `cat` pair piping the pane into
+# ~/.local/state/terminal-mcp/raw/<session>.log -- plus the tmux server
+# and the agent itself. Budget ~2*sessions + 20.
+#
+# The previous values (512M / 256) were sized for a small fleet and
+# silently became the failure mode on dell-linux at 108 sessions: the
+# cgroup sat at 222/256 tasks, every request that needed a new thread
+# died with `RuntimeError: can't start new thread`, and the node answered
+# `GET /v1/sessions/<name>/status` with HTTP 500. The controller reports
+# that as flaky connectivity, which sends you looking at the network
+# instead of at `pids.events`. 2048 tasks covers ~1000 sessions.
+#
+# Check headroom with scripts/node-agent-health.sh; a non-zero `max`
+# counter in the cgroup's pids.events/memory.events means you already
+# hit the ceiling.
+MemoryMax=3G
+TasksMax=2048
 CPUQuota=200%
 ProtectSystem=full
 ProtectHome=read-only

@@ -513,6 +513,38 @@ class SessionLifecycleConfig:
     codex_yolo: bool = True
     create_ready_timeout_seconds: float = 5.0
     default_grant_mode: str = "none"
+    # Admission control. A node with no ceiling does not fail loudly when
+    # it runs out of room -- it degrades: on dell-linux 2026-09-21 the
+    # session count grew unattended past what the node agent's cgroup
+    # could supervise and EVERY request started answering HTTP 500
+    # (`can't start new thread`), which the controller reported as flaky
+    # connectivity. Refusing session 325 with a named error is strictly
+    # better than breaking the 324 that already work.
+    #
+    # 0 (the default) means derive it from this machine at use time --
+    # total RAM / max_session_ram_mb -- so a small node and a big node
+    # each get a limit that fits them without an operator hand-tuning a
+    # number per host. Set a positive value to pin it explicitly.
+    max_sessions: int = 0
+    # Conservative RAM slice assumed per session when deriving the limit.
+    # A pane may run a real agent (claude/codex), not just a shell, so
+    # this is deliberately not the few MB the pipe itself costs.
+    max_session_ram_mb: int = 96
+    # Reclaim, not refuse: when the node is at capacity, kill genuinely
+    # idle sessions to make room instead of turning a new request away.
+    # Default OFF because killing a session is destructive and, in this
+    # project, not trivially undoable -- a killed session cannot be
+    # recreated by hand, it needs POST /v1/sessions with grants or it
+    # comes back allowed:false. An operator opts a node in per host.
+    #
+    # "Idle" is deliberately narrow: detached, pane sitting at one of
+    # reap_idle_commands (i.e. NO agent process running in it), no
+    # activity for reap_idle_hours, and never in protected_sessions.
+    # A pane running claude/codex is never touched however long it has
+    # been quiet -- a thinking agent looks idle to tmux.
+    reap_idle_sessions: bool = False
+    reap_idle_hours: float = 6.0
+    reap_idle_commands: tuple[str, ...] = ("bash", "sh", "zsh", "fish", "dash")
 
     def __post_init__(self) -> None:
         # The "terminal-mcp is always protected, even if omitted" guarantee
@@ -2072,6 +2104,23 @@ def _load_session_lifecycle_config(raw: object) -> SessionLifecycleConfig:
     grant_mode = raw.get("default_grant_mode", SessionLifecycleConfig.default_grant_mode)
     if grant_mode not in ("none", "read", "read_send"):
         raise ValueError("session_lifecycle.default_grant_mode must be one of: none, read, read_send")
+    max_sessions = raw.get("max_sessions", SessionLifecycleConfig.max_sessions)
+    if not isinstance(max_sessions, int) or isinstance(max_sessions, bool) or max_sessions < 0:
+        raise ValueError("session_lifecycle.max_sessions must be a non-negative integer (0 = derive from machine RAM)")
+    max_session_ram_mb = raw.get("max_session_ram_mb", SessionLifecycleConfig.max_session_ram_mb)
+    if not isinstance(max_session_ram_mb, int) or isinstance(max_session_ram_mb, bool) or max_session_ram_mb < 16:
+        raise ValueError("session_lifecycle.max_session_ram_mb must be an integer >= 16")
+    reap = raw.get("reap_idle_sessions", SessionLifecycleConfig.reap_idle_sessions)
+    if not isinstance(reap, bool):
+        raise ValueError("session_lifecycle.reap_idle_sessions must be a boolean")
+    reap_hours = raw.get("reap_idle_hours", SessionLifecycleConfig.reap_idle_hours)
+    if isinstance(reap_hours, bool) or not isinstance(reap_hours, (int, float)) or reap_hours < 0.5:
+        raise ValueError("session_lifecycle.reap_idle_hours must be a number >= 0.5")
+    reap_cmds = raw.get("reap_idle_commands", list(SessionLifecycleConfig.reap_idle_commands))
+    if not isinstance(reap_cmds, list) or not all(isinstance(c, str) and c for c in reap_cmds):
+        raise ValueError("session_lifecycle.reap_idle_commands must be a list of strings")
+    if not reap_cmds:
+        raise ValueError("session_lifecycle.reap_idle_commands must not be empty when reaping is configured")
     resume_capable_raw = raw.get("resume_capable_agent_types",
                                  list(SessionLifecycleConfig.resume_capable_agent_types))
     if not isinstance(resume_capable_raw, list) or not all(isinstance(a, str) and a for a in resume_capable_raw):
@@ -2085,7 +2134,9 @@ def _load_session_lifecycle_config(raw: object) -> SessionLifecycleConfig:
         enabled=enabled, allowed_cwd_roots=tuple(roots), protected_sessions=protected_set,
         launch_commands=tuple(sorted(launch_raw.items())), create_ready_timeout_seconds=timeout,
         default_grant_mode=grant_mode, resume_capable_agent_types=tuple(resume_capable_raw),
-        codex_yolo=codex_yolo_raw,
+        codex_yolo=codex_yolo_raw, max_sessions=max_sessions,
+        max_session_ram_mb=max_session_ram_mb, reap_idle_sessions=reap,
+        reap_idle_hours=float(reap_hours), reap_idle_commands=tuple(reap_cmds),
     )
 
 

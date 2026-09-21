@@ -3566,6 +3566,102 @@ class TerminalService:
     # delete own the actual tmux decisions and never audit or authorize
     # anything themselves.
 
+    def _idle_reap_candidates(self, now_epoch: float | None = None) -> list[Any]:
+        """Sessions safe to kill to make room, oldest-idle first.
+
+        Deliberately narrow. A pane sitting at a bash prompt is the ONLY
+        thing treated as idle here, because a pane running claude/codex
+        can be quiet for a long time while the agent thinks -- reaping on
+        "no output recently" alone would kill live work. Measured on
+        dell-linux 2026-09-21: 99 of 110 sessions looked abandoned by
+        activity timestamp while the registry called every one ACTIVE, so
+        timestamps alone are not evidence.
+
+        A dead pane is always a candidate regardless of age: nothing is
+        running in it and nothing can.
+        """
+        import time as _time
+        lifecycle = self.config.session_lifecycle
+        now = _time.time() if now_epoch is None else now_epoch
+        cutoff = now - lifecycle.reap_idle_hours * 3600
+        idle_commands = {c.lower() for c in lifecycle.reap_idle_commands}
+        protected = set(lifecycle.protected_sessions)
+        try:
+            sessions = self.tmux.list_sessions()
+        except TmuxError:
+            return []
+        candidates = []
+        for item in sessions:
+            if item.name in protected or getattr(item, "attached", False):
+                continue
+            if getattr(item, "pane_dead", False):
+                candidates.append(item)
+                continue
+            if (getattr(item, "pane_current_command", "") or "").lower() not in idle_commands:
+                continue
+            if getattr(item, "activity_epoch", 0) > cutoff:
+                continue
+            candidates.append(item)
+        candidates.sort(key=lambda i: getattr(i, "activity_epoch", 0))
+        return candidates
+
+    def _reclaim_idle_sessions(self, needed: int) -> dict[str, Any]:
+        """Kill at most `needed` idle sessions, through the same
+        terminal_delete_session every manual delete uses -- so the
+        protected set, binding/grant cleanup, registry bookkeeping and
+        audit trail all behave identically to an operator pressing
+        delete. Never kills more than the shortfall."""
+        reclaimed: list[str] = []
+        if needed <= 0 or not self.config.session_lifecycle.reap_idle_sessions:
+            return {"reclaimed": reclaimed, "enabled": self.config.session_lifecycle.reap_idle_sessions}
+        for item in self._idle_reap_candidates():
+            if len(reclaimed) >= needed:
+                break
+            result = self.terminal_delete_session(item.name)
+            if "error" not in result:
+                reclaimed.append(item.name)
+                self.audit.record(action="reap_idle_session", session=item.name,
+                                  result="DELETED", reason="NODE_AT_SESSION_CAPACITY")
+        return {"reclaimed": reclaimed, "enabled": True}
+
+    def _session_capacity(self) -> tuple[int, int]:
+        """(limit, current) session counts for admission control.
+
+        A limit of 0 means "no ceiling" and is returned only when the
+        machine's RAM cannot be read -- never as a silent default, because
+        an unbounded node is exactly the failure this guard exists to
+        prevent. config.session_lifecycle.max_sessions pins the number
+        explicitly; left at 0 it is derived from this machine (total RAM /
+        max_session_ram_mb), so a small node and a big node each get a
+        limit that fits without per-host hand-tuning.
+
+        Counting uses the raw tmux inventory rather than
+        terminal_list_sessions: capacity is a property of the host, not of
+        what the calling identity happens to be allowed to see, and this
+        must not be skewed by read permissions or grant joins.
+        """
+        lifecycle = self.config.session_lifecycle
+        try:
+            current = len(self.tmux.list_sessions())
+        except TmuxError:
+            # Cannot count -> cannot honestly enforce. Allow, rather than
+            # refuse real work on a number we do not have.
+            return (0, 0)
+        if lifecycle.max_sessions > 0:
+            return (lifecycle.max_sessions, current)
+        try:
+            with open("/proc/meminfo", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("MemTotal:"):
+                        total_mb = int(line.split()[1]) // 1024
+                        break
+                else:
+                    return (0, current)
+        except OSError:
+            return (0, current)
+        derived = total_mb // max(lifecycle.max_session_ram_mb, 1)
+        return (max(derived, 1), current)
+
     def terminal_create_session(self, name: str, agent_type: str = "shell", cwd: str | None = None, *,
                                 initial_prompt: str | None = None, grant_mode: str = "none",
                                 binding: str | None = None, requested_by: str | None = None,
@@ -3618,6 +3714,34 @@ class TerminalService:
         if grant_mode not in ("none", "read", "read_send"):
             self.audit.record(action=action, session=name, result="BLOCKED", reason="INVALID_GRANT_MODE")
             return {"error": "INVALID_GRANT_MODE", "session": name}
+        # Admission control, checked before anything is created. Without
+        # it a node has no ceiling and does not fail loudly when it runs
+        # out of room -- it degrades. On dell-linux (2026-09-21) the
+        # session count grew unattended until the node agent's own cgroup
+        # was exhausted and EVERY request, including reads of healthy
+        # sessions, answered HTTP 500 `can't start new thread`; the
+        # controller reported that as flaky connectivity and the real
+        # cause stayed hidden for a long time. Refusing one create with a
+        # named error is strictly better than breaking every session that
+        # already works.
+        limit, current = self._session_capacity()
+        reclaimed: list[str] = []
+        if limit and current >= limit:
+            # Reclaim before refusing: an idle shell holding a slot should
+            # lose it to real work, not block it. Only ever frees the
+            # shortfall, never a blanket sweep.
+            reclaimed = self._reclaim_idle_sessions(current - limit + 1)["reclaimed"]
+            if reclaimed:
+                limit, current = self._session_capacity()
+        if limit and current >= limit:
+            self.audit.record(action=action, session=name, result="BLOCKED",
+                              reason="NODE_AT_SESSION_CAPACITY")
+            return {"error": "NODE_AT_SESSION_CAPACITY", "session": name,
+                    "sessions": current, "limit": limit, "reclaimed": reclaimed,
+                    "detail": (f"node is holding {current} sessions (limit {limit}); "
+                               f"{len(reclaimed)} idle session(s) reclaimed and it is "
+                               "still full -- delete a session, or raise "
+                               "session_lifecycle.max_sessions")}
         conversation_id: str | None = None
         extra_args: tuple[str, ...] = ()
         if agent_type == "codex" and resume_session_id:
