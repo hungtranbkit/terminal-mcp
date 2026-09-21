@@ -58,3 +58,8 @@ state/
 .projectflow/**/*.tmp
 helper/dist/
 helper/dist/
+
+# Graphify repository graph is a local, rebuildable cache. Keep the 10s-of-MB
+# generated graph out of git; bounded query results are consumed at runtime.
+graphify-out/
+graph.json
