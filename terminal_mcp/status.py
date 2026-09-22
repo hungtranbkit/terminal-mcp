@@ -126,7 +126,13 @@ def shell_prompt_is_back(output: str) -> bool:
 # record here, so none is guessed at -- the same standing rule the bare
 # \bapprove\b/\bpermission\b patterns above were deleted under.
 # ---------------------------------------------------------------------------
-AGENT_RUNNING_PATTERNS = (re.compile(r"esc to interrupt", re.IGNORECASE),)
+AGENT_RUNNING_PATTERNS = (
+    re.compile(r"esc to interrupt", re.IGNORECASE),
+    # Claude 2.1.278 auto mode omits the interrupt hint while still
+    # rendering its empty composer. Match the live spinner's timed chrome,
+    # not conversational mentions of "thinking" or the finished "for ...".
+    re.compile(r"^\s*[✢✳✶✻✽·*]\s+[^\n…]+…\s+\(\d+(?:h|m|s)\b[^\n]*\)\s*$"),
+)
 AGENT_IDLE_PATTERNS = (
     re.compile(r"·\s*done\s+\d{1,2}:\d{2}\s*[ap]\.?m\.?\b", re.IGNORECASE),
     re.compile(r"^\s*new task\?", re.IGNORECASE),
@@ -503,4 +509,3 @@ def classify_supervisor_state(state: str, reason: str, output: str) -> tuple[str
     if state in ("RUNNING", "IDLE", "UNKNOWN"):
         return state, reason
     return "UNKNOWN", reason
-

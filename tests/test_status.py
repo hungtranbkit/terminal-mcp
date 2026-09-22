@@ -62,6 +62,16 @@ def test_ordinary_composer_mentioning_permission_is_not_waiting_input():
 # ---------------------------------------------------------------------------
 RULE = "─" * 80
 
+
+def test_claude_278_live_spinner_wins_over_empty_composer():
+    pane = "\n".join(("● Auditing the corrected routing rules.",
+        "✢ Imagining… (58s · ↓ 2.6k tokens · thinking)", RULE, "❯", RULE,
+        "[Opus 5 (1M context)] │ facebook-sales-radar git:(main*)",
+        "Context ██░░░░ 36%", "⏵⏵ auto mode on (shift+tab to cycle) · ← for agents"))
+    state, required, _ = classify_status(info("claude", 1), pane, now=120)
+    assert state == "RUNNING"
+    assert not required
+
 # terminal-mcp-claude-tests: genuinely WORKING, but tmux reported an activity
 # age of 663s -- an Ink UI whose spinner had not redrawn while it waited on a
 # long shell command. This is the capture that made "agent + stale activity"
