@@ -802,6 +802,83 @@ Deleting is soft by default and reversible with `note_restore`. Only pass
 `hard=true` on an explicit "xóa hẳn": it unlinks the image files and
 cannot be undone.
 
+## 7c. Callback — getting a session's result back into THIS conversation
+
+**IMPLEMENTED_NOT_LIVE_VERIFIED** on hp-linux and m910; **VERIFIED** on the
+dell-latitude node, where the browser actually lives.
+
+A session you dispatch runs on its own. Nothing about it reaches this
+conversation unless you ask for it: you will not see the result, and polling
+`task_status` tells you a state, not a report. Callback closes that loop — the
+session's own final message is delivered back into a ChatGPT tab as an
+ordinary user message, so you read it here and decide what to dispatch next.
+
+### Turning it on
+
+Say it in the prompt you send to the session. One message both selects the
+session and assigns the work:
+
+```
+bật callback tab=<the title of THIS ChatGPT tab>
+<the actual task>
+... finish your turn with CALLBACK_DONE
+```
+
+To stop: `tắt callback` in a later prompt to the same session.
+`enable callback` / `disable callback` work too.
+
+### Why you must name the tab
+
+**You cannot be detected, only declared.** Your MCP calls arrive from
+OpenAI's servers, not from the user's browser, so nothing in the prompt this
+session receives says which conversation sent it — checked three ways on
+2026-09-21: `input_audit.origin`/`actor` are empty for every MCP call,
+`correlation_id` is per-submission rather than per-conversation, and the tab's
+DOM does not expose the tool name. The session sees `session_id`, `cwd` and
+the prompt text; that is all.
+
+`tab=` is therefore the only reliable link. Without it the system falls back
+to guessing from the session-name prefix against configured lanes, which is a
+convention rather than a fact and breaks the moment a tab is renamed or
+replaced — observed 2026-09-22, when three configured tabs disappeared
+overnight and every lane silently stopped reporting.
+
+Quote a title that contains a comma or a full stop: `tab="Nova, wave 2"`.
+Unquoted, the name ends at the first Vietnamese connector (`rồi`, `và`,
+`xong`, `sau đó`, `đi`, `nhé`), so `tab=Nova TEST Watch rồi làm tiếp` reads
+the tab as `Nova TEST Watch`.
+
+### What arrives, and when
+
+```
+[report · 17:02 21/09 · session nova-claude-single-account · feature/nwr-parity-order-edit]
+<the session's closing message, with the marker stripped>
+
+---
+<the configured follow-up question, e.g. "analyse this and decide what to dispatch next">
+```
+
+Delivery is deliberately paced. Every message into one tab is at least five
+minutes apart, whatever its source, because messages that stack up while you
+are still working on the previous one get answered out of order or not at all.
+A report that arrives inside that window is queued, not dropped, and carries
+the time its session actually finished, plus a line saying how late it was
+delivered.
+
+### What it does not do
+
+- **Nothing reports unless you asked it to.** A session with no `bật callback`
+  is silent, however it finishes. This is per-session on purpose: you dispatch
+  dozens and want results from the few you are waiting on.
+- **The tab must be open.** A report to a closed tab is refused and logged,
+  never redirected to another conversation.
+- **It is not a progress feed.** One report per finished turn that ends with
+  the marker, not a stream. For "where is everything up to", a separate
+  15-minute check asks you to go and look yourself, because you can query
+  terminal-mcp directly and a pre-built table would be stale before you read
+  it.
+
+
 ## 8. What NOT to do (anti-patterns, repeated for emphasis)
 
 - Never blind-resend a prompt on `DELIVERY_UNKNOWN` without checking
