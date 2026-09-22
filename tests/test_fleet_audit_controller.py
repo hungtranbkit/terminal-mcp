@@ -307,7 +307,8 @@ def test_no_raw_prompt_text_is_introduced_by_aggregation(tmp_path):
     assert "hunter2" not in row["preview"]
     assert row["text_sha256"]
     assert set(row) - set(service.terminal_list_input_audit(1)["events"][0]) == {
-        "node_id", "node_row_id", "audit_uid"}
+        "node_row_id", "audit_uid"}
+    assert row["node_id"] == controller.local_node_id
 
 
 def test_a_session_filter_is_forwarded_to_every_node(tmp_path):

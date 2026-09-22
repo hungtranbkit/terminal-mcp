@@ -99,7 +99,7 @@ def test_real_process_death_reconcile_and_recovery_same_logical_session(rig):
     time.sleep(0.3)
     service.terminal_list_sessions()  # first reconcile -- ACTIVE, real stable_session_id assigned
     original_record = service.session_registry.get("local", "recovery-a")
-    original_pid = created["pane_id"]
+    original_pid = service.tmux.get_session("recovery-a").pane_pid
 
     # Real, out-of-band process death -- NEVER through terminal_kill_
     # session (that would mark KILLED, a completely different, already-
@@ -125,7 +125,7 @@ def test_real_process_death_reconcile_and_recovery_same_logical_session(rig):
     assert new_record.cwd == original_record.cwd
     info = service.tmux.get_session("recovery-a")
     assert info is not None and not info.pane_dead
-    assert info.pane_id != original_pid  # genuinely a new process, never a resurrection
+    assert info.pane_pid != original_pid  # genuinely a new process, never a resurrection
 
 
 def test_no_duplicate_process_under_a_genuine_concurrent_race(rig):

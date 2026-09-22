@@ -24,7 +24,7 @@ def populated(tmp_path):
     path = tmp_path / "queue.db"
     store = QueueStore(path)
     store.set_tasks("lane-a", [{"prompt": f"task {i}", "title": f"T{i}"} for i in range(6)])
-    # Reconstruct a genuine v14 file: drop what v15/v16 added and wind the
+    # Reconstruct a genuine v14 file: drop what v15/v16/v17 added and wind the
     # stamp back. Winding the stamp back alone would leave the tables in
     # place, and then the migration under test would have nothing to do --
     # a fixture that is easier to satisfy than production tests nothing.
@@ -32,6 +32,7 @@ def populated(tmp_path):
     try:
         for name in HARNESS_TABLES:
             connection.execute(f'DROP TABLE IF EXISTS "{name}"')
+        connection.execute("ALTER TABLE queue_tasks DROP COLUMN analysis")
         connection.execute("PRAGMA user_version = 14")
         connection.commit()
     finally:
@@ -92,7 +93,7 @@ def test_a_backup_that_does_not_verify_stops_the_migration(populated, monkeypatc
 def test_a_dry_run_reports_what_would_happen_and_changes_nothing(populated):
     report = backup_then_migrate(populated, QUEUE_MIGRATIONS, dry_run=True)
     assert report.dry_run is True
-    assert report.applied == (15, 16)
+    assert report.applied == (15, 16, 17)
     assert report.version_after == 14
     version, tables = _schema(populated)
     assert version == 14
@@ -104,11 +105,13 @@ def test_migrating_adds_the_harness_tables_and_touches_no_existing_row(populated
     report = backup_then_migrate(populated, QUEUE_MIGRATIONS)
 
     assert report.version_before == 14
-    assert report.version_after == 16
-    assert report.applied == (15, 16)
+    assert report.version_after == 17
+    assert report.applied == (15, 16, 17)
     assert set(HARNESS_TABLES) <= set(report.tables_added)
     assert report.integrity == "ok"
     assert report.rows_preserved is True
+    with sqlite3.connect(populated) as connection:
+        assert connection.execute("SELECT analysis FROM queue_tasks").fetchall() == [(None,)] * 6
     after = _counts(populated)
     for name, count in before.items():
         assert after[name] == count, f"{name} changed"
@@ -126,7 +129,7 @@ def test_rollback_restores_the_version_an_older_binary_will_accept(populated):
     """Additive migrations never need a rollback to recover DATA. They need
     one to recover a VERSION: an older binary refuses a newer user_version."""
     report = backup_then_migrate(populated, QUEUE_MIGRATIONS)
-    assert report.version_after == 16
+    assert report.version_after == 17
 
     restored = rollback(populated, report.backup_path)
     assert restored["user_version"] == 14

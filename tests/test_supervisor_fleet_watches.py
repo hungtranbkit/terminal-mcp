@@ -120,9 +120,10 @@ REMOTE_ROWS = ["hp/wtest", "hp/hp-work", "hp/hp1", "hp/hp2", "hp/hp3-work", "del
 
 
 def test_the_six_target_missing_watches_come_back_when_their_nodes_do(tmp_path):
-    """The whole point, at production scale: six watches disabled while their
-    nodes were unreachable, all six restored once the fleet can see them --
-    and NOT restored while it still cannot."""
+    """Outages retain all six watches; a successful poll resumes observation.
+
+    Legacy disabled rows are covered by the production-mix recovery test.
+    """
     service = _service(tmp_path)
     fleet = FakeFleet(live=[], down=["hp", "dell-5530"])
     service.fleet_status = fleet.terminal_status
@@ -132,11 +133,13 @@ def test_the_six_target_missing_watches_come_back_when_their_nodes_do(tmp_path):
     service.run_once()
 
     status = service.status()
-    assert status["enabled_watch_count"] == 0, "precondition: the nodes are down"
-    assert status["recoverable_disabled_count"] == 6
-    assert set(status["disabled_reasons"].values()) == {"node_unreachable"}
+    assert status["enabled_watch_count"] == 6, "outages retain watches for the next poll"
+    assert status["recoverable_disabled_count"] == 0
+    assert status["disabled_reasons"] == {}
+    for target in REMOTE_ROWS:
+        assert service.store.get_watch(watch_key("session", target))["state"] == "UNKNOWN"
 
-    # Still down: reconciliation must not re-enable into a void.
+    # Still down: reconciliation has no disabled rows to resurrect.
     for target in REMOTE_ROWS:
         _age(service.store, watch_key("session", target), 600)
     assert service.reconcile_watches()["restored"] == []
@@ -147,9 +150,11 @@ def test_the_six_target_missing_watches_come_back_when_their_nodes_do(tmp_path):
         fleet.live[target] = {"state": "RUNNING", "exists": True, "last_output": f"out:{target}"}
         _age(service.store, watch_key("session", target), 600)
 
-    restored = service.reconcile_watches()["restored"]
-    assert sorted(item["target"] for item in restored) == sorted(REMOTE_ROWS)
+    assert service.reconcile_watches()["restored"] == []
+    service.run_once()
     assert service.status()["enabled_watch_count"] == 6
+    for target in REMOTE_ROWS:
+        assert service.store.get_watch(watch_key("session", target))["state"] == "RUNNING"
 
 
 def test_a_manual_unwatch_is_never_resurrected_by_any_of_this(tmp_path):
@@ -229,8 +234,15 @@ def test_each_fleet_error_records_its_own_disable_reason(tmp_path, error, expect
     service.watch(session="hp/thing")
     service.run_once()
     row = service.store.get_watch(watch_key("session", "hp/thing"))
-    assert row["disabled_reason"] == expected
-    assert expected in sh.RECOVERABLE_DISABLE_REASONS
+    if error in {"NODE_UNREACHABLE", "NODE_NOT_FOUND"}:
+        assert bool(row["enabled"]) is True
+        assert row["disabled_reason"] is None
+        assert row["state"] == "UNKNOWN"
+        events = service.list_events(limit=1)["events"]
+        assert error in events[0]["reason"]
+    else:
+        assert row["disabled_reason"] == expected
+        assert expected in sh.RECOVERABLE_DISABLE_REASONS
 
 
 def test_an_unknown_status_error_is_still_recoverable(tmp_path):

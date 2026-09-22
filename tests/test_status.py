@@ -562,7 +562,7 @@ def test_claude_mid_turn_is_running_even_when_tmux_activity_is_stale():
     # turn in flight look finished.
     state, _waiting, why = classify_status(info("claude", 1), BUSY_CLAUDE_PANE, now=10_000)
     assert state == "RUNNING"
-    assert "in flight" in why
+    assert "esc to interrupt" in why
 
 
 def test_claude_pane_without_composer_chrome_falls_back_to_the_old_rules():

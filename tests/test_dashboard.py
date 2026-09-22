@@ -1134,11 +1134,11 @@ def test_dashboard_tab_click_selects_and_close_opens_the_real_kill_modal():
     assert "tab.onclick = activate;" in DASHBOARD_HTML
     assert "if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); activate(); }" in DASHBOARD_HTML
     assert "closeBtn.className = 'tab-close';" in DASHBOARD_HTML
-    assert "openKillModal(row.name, row.kill_reopen_ready !== false);" in DASHBOARD_HTML
+    assert "openKillModal(row.name, row.kill_reopen_ready !== false, row.node_id);" in DASHBOARD_HTML
     # Gated exactly like the old per-row Kill button: disabled (not
     # hidden), with a reason, for a protected session or when session
     # lifecycle management is off entirely.
-    assert "closeBtn.disabled = !sessionLifecycleEnabled || isProtected;" in DASHBOARD_HTML
+    assert "closeBtn.disabled = !sessionLifecycleEnabled || isProtected || !!row.delete_block_reason;" in DASHBOARD_HTML
 
 
 def test_dashboard_tab_state_dot_reflects_only_real_backend_states():
@@ -1478,6 +1478,7 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         # selects from (read-only, _read_guard like every other GET).
         "/dashboard/api/projects": {"GET", "HEAD"},
         "/dashboard/api/backlog": {"GET", "HEAD"},
+        "/dashboard/api/backlog/projects": {"GET", "HEAD"},
         "/dashboard/api/backlog/add": {"POST"},
         "/dashboard/api/backlog/update": {"POST"},
         "/dashboard/api/backlog/dispatch": {"POST"},

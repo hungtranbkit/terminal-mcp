@@ -164,7 +164,8 @@ def test_a_peer_cannot_push_a_credential_onto_this_node(store):
     assert store.get(KIND_SSH_TARGET, "ssh:x") is None
 
 
-def test_the_ssh_projector_never_emits_a_key_path_or_its_contents(tmp_path):
+def test_the_ssh_projector_never_emits_a_key_path_or_its_contents(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
     config = tmp_path / "config"
     config.write_text(
         "Host secret-box\n  HostName 10.0.0.9\n  User root\n"
@@ -355,7 +356,8 @@ def test_legacy_local_session_projection_keeps_canonical_owner_after_adoption(tm
     adopted = canonical.get(KIND_SESSION, "session:local:uuid-legacy")
     assert adopted.owner_node == "hp-linux"
 
-    assert project_sessions(canonical, [record], local_node_id="hp-linux") == 1
+    assert project_sessions(canonical, [record], local_node_id="hp-linux") == 0
+    # Legacy rows remain adopted but are not republished as resolvable sessions.
     after = canonical.get(KIND_SESSION, "session:local:uuid-legacy")
     assert after.owner_node == "hp-linux"
     assert after.object_id == "session:local:uuid-legacy", \
@@ -389,7 +391,7 @@ def test_fleet_refresh_handles_legacy_local_session_without_projector_error(tmp_
     service = FleetService(store, local_node_id="hp-linux")
     summary = service.refresh_local(sessions=[record], include_ssh_config=False, network={})
 
-    assert summary["sessions"] == 1
+    assert summary["sessions"] == 0
     assert "sessions" not in summary.get("errors", {})
     assert store.get(KIND_SESSION, "session:local:uuid-legacy").owner_node == "hp-linux"
 

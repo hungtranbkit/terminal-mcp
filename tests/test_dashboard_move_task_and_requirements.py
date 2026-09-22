@@ -92,7 +92,8 @@ def test_requirements_route_serves_the_real_doc(client_and_queue):
     client, _queue = client_and_queue
     response = client.get("/dashboard/requirements")
     assert response.status_code == 200
-    assert response.headers["content-type"].startswith("text/plain")
+    assert response.headers["content-type"].startswith("text/html")
+    assert "/dashboard" in response.text
     assert "Unified Task System" in response.text  # a real §20 heading from the real file
 
 

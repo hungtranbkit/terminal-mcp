@@ -183,7 +183,8 @@ def test_rendering_a_second_time_over_a_stale_unit_replaces_it(tmp_path):
     out.mkdir()
     (out / SERVICE).write_text("[Service]\nExecStart=/home/dell/nope\n", encoding="utf-8")
     render_units(repo_dir=REPO, venv_dir=venv, config_path=tmp_path / "w.json", output_dir=out)
-    assert "/home/dell" not in (out / SERVICE).read_text(encoding="utf-8")
+    assert "/home/dell/nope" not in (out / SERVICE).read_text(encoding="utf-8")
+    assert _directive((out / SERVICE).read_text(), "ExecStart") == watcher_exec_start(venv, config_path=tmp_path / "w.json")
 
 
 def test_render_unit_rewrites_each_directive_exactly_once(tmp_path):

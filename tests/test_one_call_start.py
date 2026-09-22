@@ -34,6 +34,14 @@ from terminal_mcp.compact_tools import (MAX_START_TICKS, TURN_ACTION_ALIASES,
 from terminal_mcp.queue_task_follower import StartedTaskFollower
 
 
+@pytest.fixture(autouse=True)
+def _exercise_bounded_in_call_dispatch(monkeypatch):
+    # These tests exercise the optional bounded synchronous transition path.
+    # Production defaults to enqueue + follower with no caller-thread ticks;
+    # test_compact_turn_actions pins that shipped zero-budget behavior.
+    monkeypatch.setattr("terminal_mcp.compact_tools.START_WAIT_BUDGET_SECONDS", 5.0)
+
+
 class FakeLane:
     """A minimal stand-in for one queue lane's durable state machine.
 
@@ -486,3 +494,14 @@ def test_the_long_task_send_spelling_reports_a_refusal_the_same_way():
     assert result["dispatched"] is False
     assert result["needs_human"] is True
     assert result["blocked_reason"] == lane.reason
+
+
+def test_default_async_start_reports_queued_until_execution_is_observed(monkeypatch):
+    monkeypatch.setattr("terminal_mcp.compact_tools.START_WAIT_BUDGET_SECONDS", 0.0)
+    lane = FakeLane()
+    result = _tools(lane).turn(action="start", target="worker", text="work")
+    assert result["status"] == "TASK_ACCEPTED"
+    assert result["dispatched"] is False
+    assert lane.ticks == 0
+    assert "durably queued" in result["guidance"]
+    assert "work is started" not in result["guidance"]

@@ -298,7 +298,12 @@ def test_create_launch_fail_cleans_up_disposable_session(tmp_path, lifecycle_ses
     # default remain-on-exit=off tears the session down with it, so this
     # exercises the "session already gone" branch of the FAILED path
     # (LAUNCH_FAILED, never left behind as a zombie session either way).
-    config = _lifecycle_config(tmp_path, launch_commands=(("codex", "/bin/false"),), codex_yolo=True)
+    # Use a script so tmux observes the shell interpreter during startup,
+    # not a fleeting process named "false" that satisfies the READY check.
+    launcher = tmp_path / "immediate-failure"
+    launcher.write_text("#!/bin/sh\nexit 1\n")
+    launcher.chmod(0o755)
+    config = _lifecycle_config(tmp_path, launch_commands=(("codex", str(launcher)),), codex_yolo=True)
     service = TerminalService(config)
     name = lifecycle_session_factory("launchfail")
     result = service.terminal_create_session(name, "codex")
@@ -443,11 +448,13 @@ def test_delete_refuses_attached_session(tmp_path, tmux_session_factory, monkeyp
     assert service.tmux.get_session(name) is not None
 
 
-def test_delete_refuses_live_pane_lease(tmp_path, tmux_session_factory):
+@pytest.mark.parametrize("legacy", [False, True])
+def test_delete_refuses_live_pane_lease(tmp_path, tmux_session_factory, legacy):
     service = TerminalService(_lifecycle_config(tmp_path))
     name = tmux_session_factory("lifecycle-lease-refusal")
     info = service.tmux.get_session(name)
-    key = f"{info.session_id}:{info.pane_id}"
+    key = (f"{info.session_id}:{info.pane_id}" if legacy
+           else service.resolve_identity(name).lease_key)
     assert service.leases.acquire(key, "test-owner", ttl_seconds=60)
     result = service.terminal_delete_session(name, confirm=True)
     assert result == {"error": "SESSION_LEASED", "session": name}

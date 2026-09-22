@@ -1086,7 +1086,7 @@ def _add_v17_analysis(connection: sqlite3.Connection) -> None:
     and, carrying no task_class either, resolves to PROFILE_NONE -- so
     no pre-existing task in a real queue changes behaviour, and nothing
     needs backfilling."""
-    columns = {row["name"] for row in connection.execute("PRAGMA table_info(queue_tasks)")}
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(queue_tasks)")}
     if "analysis" not in columns:
         connection.execute("ALTER TABLE queue_tasks ADD COLUMN analysis TEXT")
 

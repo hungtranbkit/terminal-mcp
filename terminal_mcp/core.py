@@ -1713,7 +1713,7 @@ class TerminalService:
                     return existing
                 return {"session": session, "error": "DUPLICATE_IN_PROGRESS", "idempotency_key": idempotency_key}
         identity = self.resolve_identity(session)
-        lock_key = f"{identity.session_id}:{identity.pane_id}" if identity is not None else f"name:{session}"
+        lock_key = identity.lease_key if identity is not None else f"name:{session}"
         correlation_id = uuid.uuid4().hex
         if not self._acquire_pane_lease(lock_key, correlation_id):
             result = self._enrich_receipt({
@@ -2867,7 +2867,7 @@ class TerminalService:
         `["Enter"]`) keeps the EXACT prior unverified behavior --
         deliberately narrow, not a general raw-key verification system."""
         identity = self.resolve_identity(session)
-        lock_key = f"{identity.session_id}:{identity.pane_id}" if identity is not None else f"name:{session}"
+        lock_key = identity.lease_key if identity is not None else f"name:{session}"
         correlation_id = uuid.uuid4().hex
         if not self._acquire_pane_lease(lock_key, correlation_id):
             return {"session": session, "error": "PANE_BUSY", "correlation_id": correlation_id,
@@ -3081,7 +3081,7 @@ class TerminalService:
                               reason="NOT_IN_COPY_MODE", source_transport="mcp")
             return response
 
-        lock_key = f"{identity.session_id}:{identity.pane_id}"
+        lock_key = identity.lease_key
         correlation_id = uuid.uuid4().hex
         if not self._acquire_pane_lease(lock_key, correlation_id):
             response = {"error": "PANE_BUSY", "session": session, "correlation_id": correlation_id,
@@ -4435,7 +4435,7 @@ class TerminalService:
         if record is not None and record.recovery_state == "RESTORING":
             return "SESSION_RECOVERING"
         identity = SessionIdentity.from_session_info(info)
-        lease_keys = (f"{identity.session_id}:{identity.pane_id}",
+        lease_keys = (identity.lease_key, f"{identity.session_id}:{identity.pane_id}",
                       f"recovery:{self.REGISTRY_LOCAL_NODE_ID}/{name}")
         now = datetime.now(timezone.utc)
         for lease_key in lease_keys:

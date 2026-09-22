@@ -32,9 +32,6 @@ from . import host_metrics
 from .fleet_registry_read import NodeSource, matches_query, merge_sources, paginate
 from .node_client import LocalNodeClient, NodeClient, NodeClientError, RemoteNodeClient
 from .node_models import (
-    HEALTH_AUTH_UNAUTHORIZED,
-    HEALTH_DEGRADED,
-    HEALTH_EXECUTION_DOWN,
     NODE_ONLINE,
     Node,
 )
@@ -1721,7 +1718,8 @@ class ControllerService:
             pass
         registered = list(self.registry.list())
         # NodeHealthService.evaluate already answers from cache inside its
-        # probe interval, so the common call costs nothing extra. The fan-out
+        # probe interval or failure backoff. Failed nodes must reach evaluate
+        # again so expired backoff can trigger recovery. The fan-out
         # is for the OTHER case: when several nodes are all due a probe, each
         # one is a real network round trip and doing them in a row is how a
         # fleet listing becomes seconds long. Order is restored afterwards so
@@ -1730,7 +1728,7 @@ class ControllerService:
         cached: dict[str, Node] = {}
         for node in registered:
             client = self._clients.get(node.id)
-            if client is None or node.execution_state in {HEALTH_AUTH_UNAUTHORIZED, HEALTH_DEGRADED, HEALTH_EXECUTION_DOWN}:
+            if client is None:
                 cached[node.id] = self.node_health._cached(node)
                 continue
             work.append((node.id, self._node_evaluator(node, client)))
@@ -1762,8 +1760,7 @@ class ControllerService:
         if node is None:
             return None
         client = self._clients.get(node_id)
-        if (client is None or node.execution_state in {
-                HEALTH_AUTH_UNAUTHORIZED, HEALTH_DEGRADED, HEALTH_EXECUTION_DOWN}):
+        if client is None:
             return self.node_health._cached(node)
         return self.node_health.evaluate(node, client)
 

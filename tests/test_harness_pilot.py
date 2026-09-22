@@ -133,6 +133,14 @@ def test_nothing_is_invented_for_a_criterion_with_no_derivable_gate():
     assert decisive_check_for("the header looks balanced") is None
 
 
+@pytest.fixture
+def pilot_toolchain(declared_toolchain):
+    """Planning tests model a host meeting the pilot's declared Node version."""
+    node = declared_toolchain / "node"
+    node.write_text("#!/bin/sh\necho v24.0.0\n")
+    node.chmod(0o755)
+
+
 # ---------------------------------------------------------------------------
 # against the real repository
 # ---------------------------------------------------------------------------
@@ -148,7 +156,7 @@ def test_exactly_one_urbanflow_task_needs_a_human_asset():
 
 
 @real_repo_only
-def test_the_real_mob_011_chain_is_nine_tasks_deep():
+def test_the_real_mob_011_chain_is_nine_tasks_deep(pilot_toolchain):
     definitions = load_definitions(REAL_REPO / "TASKS.json")
     nodes = to_nodes(definitions, repo_root=REAL_REPO, critical_tasks=["MOB-011"])
     order = [a.task_id for a in sched.plan(nodes, target="MOB-011").order]
@@ -167,7 +175,7 @@ def test_only_the_milestone_is_escalated_to_critical():
 
 
 @real_repo_only
-def test_the_cost_first_plan_opens_two_sessions_for_nine_tasks():
+def test_the_cost_first_plan_opens_two_sessions_for_nine_tasks(pilot_toolchain):
     definitions = load_definitions(REAL_REPO / "TASKS.json")
     nodes = to_nodes(definitions, repo_root=REAL_REPO, critical_tasks=["MOB-011"])
     plan = sched.plan(nodes, target="MOB-011", mode=sched.COST_FIRST)

@@ -79,11 +79,18 @@ class SessionIdentity:
     session_id: str
     pane_id: str
     created_epoch: int
+    pane_pid: int = 0
+
+    @property
+    def lease_key(self) -> str:
+        # tmux IDs reset when its server restarts. Include process identity
+        # so a lease for a dead incarnation cannot block its replacement.
+        return f"{self.session_id}:{self.pane_id}:{self.created_epoch}:{self.pane_pid}"
 
     @classmethod
     def from_session_info(cls, info: SessionInfo) -> "SessionIdentity":
         return cls(name=info.name, session_id=info.session_id, pane_id=info.pane_id,
-                  created_epoch=info.created_epoch)
+                  created_epoch=info.created_epoch, pane_pid=info.pane_pid)
 
     def matches(self, other: "SessionIdentity") -> bool:
         # session_id is tmux's own never-reused-while-alive identifier --

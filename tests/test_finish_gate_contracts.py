@@ -21,9 +21,13 @@ class _StubClient:
         return {"sessions": self._rows}
 
 
-def _controller_with(rows):
+def _controller_with(rows, tmp_path):
     controller = ControllerService.__new__(ControllerService)
-    node = type("N", (), {"id": "dell-linux", "display_name": "dell-linux", "status": NODE_ONLINE})()
+    from dataclasses import replace
+    from terminal_mcp.node_registry import NodeRegistry
+    registry = NodeRegistry(tmp_path / "nodes.db")
+    registry.register("dell-linux", display_name="dell-linux", hostname="dell", endpoint="http://127.0.0.1:8790")
+    node = replace(registry.get("dell-linux"), status=NODE_ONLINE)
     controller.registry = type("R", (), {"list": staticmethod(lambda: [node])})()
     controller._clients = {"dell-linux": _StubClient(rows)}   # type: ignore[attr-defined]
     # terminal_list_sessions reaches the node list through list_nodes, which
@@ -38,7 +42,7 @@ def _controller_with(rows):
     return controller
 
 
-def test_a_remote_row_never_reports_allowed_false_next_to_readable():
+def test_a_remote_row_never_reports_allowed_false_next_to_readable(tmp_path):
     """The exact contradiction default-open exists to remove.
 
     Measured live before this fix: 16 of 20 sessions -- every remote one --
@@ -47,22 +51,22 @@ def test_a_remote_row_never_reports_allowed_false_next_to_readable():
     """
     rows = [{"name": "mesflow", "allowed": False, "effective_read": True,
              "effective_input": True, "read_allowed": True, "input_allowed": True}]
-    merged = ControllerService.terminal_list_sessions(_controller_with(rows))["sessions"]
+    merged = ControllerService.terminal_list_sessions(_controller_with(rows, tmp_path))["sessions"]
     assert merged[0]["allowed"] is True
     assert merged[0]["allowed"] == merged[0]["effective_read"]
 
 
-def test_normalising_allowed_never_widens_access():
+def test_normalising_allowed_never_widens_access(tmp_path):
     # A genuinely unreadable session must stay unreadable in the alias too.
     rows = [{"name": "root-shell", "allowed": True, "effective_read": False,
              "effective_input": False}]
-    merged = ControllerService.terminal_list_sessions(_controller_with(rows))["sessions"]
+    merged = ControllerService.terminal_list_sessions(_controller_with(rows, tmp_path))["sessions"]
     assert merged[0]["allowed"] is False
 
 
-def test_a_row_without_effective_read_is_left_alone():
+def test_a_row_without_effective_read_is_left_alone(tmp_path):
     # Nothing to restate; inventing an answer would be worse than passing
     # through whatever the node said.
     rows = [{"name": "legacy", "allowed": True}]
-    merged = ControllerService.terminal_list_sessions(_controller_with(rows))["sessions"]
+    merged = ControllerService.terminal_list_sessions(_controller_with(rows, tmp_path))["sessions"]
     assert merged[0]["allowed"] is True

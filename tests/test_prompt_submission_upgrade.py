@@ -52,7 +52,7 @@ def test_receipt_confirmed_send_has_agent_type_and_evidence(tmux_session_factory
     result = service.terminal_send_text(session, "echo hi", press_enter=True)
     assert result["delivery_state"] == DELIVERY_SUBMIT_CONFIRMED
     assert result["agent_type"] == "generic"
-    assert result["evidence"] == ["OUTPUT_CHANGED"]
+    assert result["evidence"] == ["SHELL_ENTER_DELIVERED"]
     assert result["activation_attempts"] == 1
     assert "stage" not in result  # nothing to diagnose on a confirmed send
 
@@ -72,7 +72,7 @@ def test_receipt_pane_busy_has_write_stage_and_no_evidence(tmux_session_factory,
     time.sleep(0.2)
     service = _service(tmp_path)
     identity = service.resolve_identity(session)
-    lock_key = f"{identity.session_id}:{identity.pane_id}"
+    lock_key = identity.lease_key
     assert service.leases.acquire(lock_key, "someone-else", ttl_seconds=30)
     try:
         result = service.terminal_send_text(session, "hello", press_enter=True)

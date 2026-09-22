@@ -627,8 +627,20 @@ class ClaudeAdapter(AgentAdapter):
         # can never mask a turn in flight or a permission prompt, and a pane
         # with no composer chrome (a redraw mid-flight, a pager, a crashed CLI)
         # still falls through to UNKNOWN exactly as before.
-        if any(composer.is_chrome(line) for line in lines[-6:]):
-            return TARGET_COMPOSER
+        recent = [composer.normalize_spaces(line).strip() for line in lines[-8:]]
+        markers = [i for i, line in enumerate(recent)
+                   if re.match(r"^[│┃║]?\s*[❯›»>](?:\s|$)", line)]
+        if markers:
+            marker = markers[-1]
+            footer = recent[marker + 1:]
+            ready_footer = any(re.search(
+                r"⏵+\s*(?:auto|plan|accept)|shift\+tab to cycle|/clear to save \d+k tokens",
+                line, re.IGNORECASE) for line in footer)
+            rule = re.compile(r"^[─━═]{3,}$")
+            boxed = (any(rule.fullmatch(line) for line in recent[:marker])
+                     and any(rule.fullmatch(line) for line in footer))
+            if ready_footer or boxed:
+                return TARGET_COMPOSER
         return TARGET_UNKNOWN
 
     def can_submit_now(self, lines: list[str]) -> bool:

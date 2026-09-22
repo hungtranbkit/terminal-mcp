@@ -162,9 +162,9 @@ def test_real_production_config_yaml_declares_the_real_worker_nodes(tmp_path):
     config = load_config(str(real_config_path))
     by_id = {n.node_id: n for n in config.nodes.remote_nodes}
     assert set(by_id) == {"dell-5530", "m910", "macbook"}
-    assert by_id["dell-5530"].endpoint == "http://192.168.1.250:8790"
+    assert by_id["dell-5530"].endpoint == 'http://100.77.252.78:8790'
     assert by_id["dell-5530"].token_env == "TERMINAL_MCP_NODE_TOKEN_DELL_5530"
-    assert by_id["m910"].endpoint == "http://192.168.1.109:8790"
+    assert by_id["m910"].endpoint == 'http://100.117.214.87:8790'
     assert by_id["m910"].token_env == "TERMINAL_MCP_NODE_TOKEN_M910"
-    assert by_id["macbook"].endpoint == "http://192.168.1.138:8790"
+    assert by_id["macbook"].endpoint == 'http://100.104.209.93:8790'
     assert by_id["macbook"].token_env == "TERMINAL_MCP_NODE_TOKEN_MACBOOK"

@@ -68,7 +68,7 @@ MAX_START_TICKS = 6
 # which is precisely what persist-before-dispatch exists to avoid.
 # 0 = do not drive the lane on the caller's thread at all: enqueue, hand to
 # the follower, return the task_id. The receipt already tells the truth in
-# that case ("work is started and tracked server-side under this task_id"),
+# that case (durably queued, execution not yet confirmed),
 # because the task is durable from step 1 and the follower carries it whether
 # or not the caller stays -- driving ticks here only ever bought an earlier
 # `dispatched: True`, and 2026-09-21 measurement priced that convenience at a
@@ -1016,6 +1016,13 @@ class CompactTerminalTools:
                 "next_action": "none",
                 "guidance": ("the target was not reachable yet, so the server will retry this "
                              "task itself under this task_id -- do not poll and do not re-send"),
+            }
+        if task_state not in START_UNDERWAY_STATUSES:
+            return {
+                "poll": False, "needs_human": False, "next_action": "none",
+                "guidance": ("task is durably queued under this task_id; execution has not yet "
+                             "been confirmed. Progress is tracked server-side -- do not poll "
+                             "or re-send; use action=task only if the user asks to check"),
             }
         return {
             "poll": False,

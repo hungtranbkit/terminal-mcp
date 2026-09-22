@@ -102,6 +102,8 @@ class WebTerminalProcess:
             self._proc = subprocess.Popen(
                 args, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
                 start_new_session=True, close_fds=True,
+                # The peer is xterm.js, even when the HTTP service is headless.
+                env={**os.environ, "TERM": "xterm-256color"},
             )
         finally:
             # The child has its own dup of the slave fd now (or the Popen
@@ -224,6 +226,10 @@ async def pump_websocket(websocket: WebSocket, proc: Any) -> None:
         with contextlib.suppress(Exception):
             if websocket.client_state == WebSocketState.CONNECTED:
                 await websocket.send_json({"type": "closed", "reason": "session_client_exited"})
+                await websocket.close()
+        # EOF must stop the receive task too: a connected browser may never
+        # send another frame after its tmux attach client has exited.
+        tg.cancel_scope.cancel()
 
     async def _from_ws() -> None:
         while True:

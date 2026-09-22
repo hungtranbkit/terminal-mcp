@@ -134,7 +134,7 @@ def test_crashed_holder_lease_is_reclaimed_after_restart(tmux_session_factory, t
     store = PaneLeaseStore(lease_db)
     svc = _service(tmp_path, lease_db=lease_db, suffix="restarted")
     identity = svc.resolve_identity(session)
-    lock_key = f"{identity.session_id}:{identity.pane_id}"
+    lock_key = identity.lease_key
 
     # A prior (now-dead) process claimed the lease and never released it.
     assert store.acquire(lock_key, "dead-process-owner", ttl_seconds=30) is True
@@ -150,7 +150,11 @@ def test_crashed_holder_lease_is_reclaimed_after_restart(tmux_session_factory, t
     assert store.holder(lock_key) is None
 
 
-def test_recreated_session_same_name_gets_an_independent_lease(tmux_session_factory, tmp_path):
+def test_recreated_session_same_name_gets_an_independent_lease(monkeypatch, tmux_session_factory, tmp_path):
+    import uuid
+    from terminal_mcp.tmux import TMUX_SOCKET_ENV
+    # Own a fresh server so killing its only session restarts the ID counters.
+    monkeypatch.setenv(TMUX_SOCKET_ENV, f"tmcp-lease-restart-{uuid.uuid4().hex}")
     # A lease is keyed by resolved tmux identity (session_id:pane_id), not
     # by session *name* -- a session killed and recreated under the same
     # name is a completely different identity, so an old, still-unexpired
@@ -164,7 +168,7 @@ def test_recreated_session_same_name_gets_an_independent_lease(tmux_session_fact
     store = PaneLeaseStore(lease_db)
     svc = _service(tmp_path, lease_db=lease_db, suffix="recreate")
     old_identity = svc.resolve_identity(session)
-    old_key = f"{old_identity.session_id}:{old_identity.pane_id}"
+    old_key = old_identity.lease_key
     assert store.acquire(old_key, "still-holding-old-identity", ttl_seconds=30) is True
 
     import subprocess
@@ -177,7 +181,9 @@ def test_recreated_session_same_name_gets_an_independent_lease(tmux_session_fact
     result = svc.terminal_send_text(session, "hello-again", press_enter=True)
     assert result["delivery_state"] == "SUBMIT_CONFIRMED"  # not blocked by the old identity's lease
     new_identity = svc.resolve_identity(session)
-    assert new_identity.session_id != old_identity.session_id
+    assert new_identity.session_id == old_identity.session_id
+    assert new_identity.pane_id == old_identity.pane_id
+    assert new_identity.lease_key != old_identity.lease_key
     # The old identity's lease is still exactly as it was -- untouched by
     # the new session's send, proving isolation rather than accidental reuse.
     assert store.holder(old_key)["owner_id"] == "still-holding-old-identity"
@@ -216,7 +222,7 @@ def test_idempotent_replay_never_touches_the_lease(tmux_session_factory, tmp_pat
     svc = _service(tmp_path, lease_db=lease_db, suffix="idem")
     first = svc.terminal_send_text(session, "once", press_enter=True, idempotency_key="lease-idem-key")
     identity = svc.resolve_identity(session)
-    lock_key = f"{identity.session_id}:{identity.pane_id}"
+    lock_key = identity.lease_key
     assert store.holder(lock_key) is None  # released after the real send
     second = svc.terminal_send_text(session, "once", press_enter=True, idempotency_key="lease-idem-key")
     assert second == first

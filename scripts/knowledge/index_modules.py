@@ -118,6 +118,32 @@ GROUPS: dict[str, list[str]] = {
     "config": ["config.py"],
 }
 
+# Files recovered from the fleet branch consolidation, indexed by subsystem.
+GROUPS.setdefault('auth', []).extend(['auth_throttle.py'])
+GROUPS.setdefault('backlog', []).extend(['notes_service.py', 'notes_store.py', 'project_analyzer.py', 'project_coordinator.py', 'project_dispatch_bridge.py', 'project_runtime.py', 'project_task_feeder.py', 'project_workflows.py'])
+GROUPS.setdefault('browser', []).extend(['browser_gateway.py', 'browser_network.py', 'browser_safety.py', 'browser_script.py', 'browser_tools.py', 'browser_worker.py'])
+GROUPS.setdefault('capabilities', []).extend(['agent_bundle.py', 'agent_registry.py', 'agent_service.py', 'ai_context_window.py', 'capability_profile.py'])
+GROUPS.setdefault('deployment', []).extend(['effective_bind.py', 'endpoint_policy.py', 'listen_evidence.py', 'release_manifest.py', 'system_report.py'])
+GROUPS.setdefault('fleet', []).extend(['fleet_audit.py', 'fleet_registry_read.py', 'scheduler_health.py'])
+GROUPS.setdefault('harness', []).extend(['harness_affinity.py', 'harness_deprecations.py', 'harness_migrate.py', 'harness_runner.py', 'harness_tools.py', 'harness_trust.py'])
+GROUPS.setdefault('integration', []).extend(['ai_review.py', 'integration_worktree.py', 'worktree_cleanup.py', 'worktree_executor.py', 'worktree_janitor.py', 'worktree_review.py', 'worktree_router.py', 'worktree_sweep.py'])
+GROUPS.setdefault('knowledge', []).extend(['context_compiler.py', 'graphify_bridge.py', 'skill_packages.py'])
+GROUPS.setdefault('mcp_surface', []).extend(['chat_checkpoint_tools.py', 'chatgpt_sidecar.py', 'compact_tools.py'])
+GROUPS.setdefault('nodes', []).extend(['connection_manager.py', 'controller_affinity.py', 'controller_proxy.py', 'lan_route_policy.py', 'node_credentials.py', 'node_health.py'])
+GROUPS.setdefault('orchestration', []).extend(['orchestration_policy.py', 'orchestrator_checkpoint.py', 'retry_recovery.py', 'task_router.py', 'worker_discovery.py'])
+GROUPS.setdefault('planner', []).extend(['task_profile.py'])
+GROUPS.setdefault('policy', []).extend(['impl_contract.py'])
+GROUPS.setdefault('procedures', []).extend(['runbook_registry.py'])
+GROUPS.setdefault('prompt_submission', []).extend(['composer.py', 'delivery_gate.py', 'prompt_start_watcher.py'])
+GROUPS.setdefault('queue', []).extend(['analysis_gate.py', 'queue_event_drain.py'])
+GROUPS.setdefault('security', []).extend(['replay_guard.py', 'token_rotation.py'])
+GROUPS.setdefault('session_ops', []).extend(['lifecycle_service.py', 'lifecycle_store.py', 'session_deletion.py', 'session_matcher.py', 'session_resource.py'])
+GROUPS.setdefault('session_registry', []).extend(['registry_cleanup.py', 'stale_sessions.py'])
+GROUPS.setdefault('windows', []).extend(['windows_detached.py', 'windows_session_host.py'])
+GROUPS.setdefault('work_runtime', []).extend(['run_journal.py', 'work_microtask.py', 'work_recovery.py', 'work_runtime.py'])
+GROUPS.setdefault('work_telemetry', []).extend(['tool_metrics.py', 'work_telemetry_service.py', 'work_telemetry_store.py'])
+GROUPS.setdefault('work_ui', []).extend(['dispatch_settings_dashboard.py', 'novaretail_dispatch_dashboard.py', 'ui_workflow.py'])
+
 # Operational artifacts that are part of the system but are not Python. Kept
 # separate from GROUPS so the completeness check over the package stays
 # exact, and indexed on the same basis: the system depends on them and a

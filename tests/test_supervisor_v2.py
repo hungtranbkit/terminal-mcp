@@ -508,6 +508,7 @@ def test_send_result_never_contains_raw_prompt_text(tmp_path, tmux_session_facto
             "could not capture a pre-submit baseline to verify against",
             "post-send capture failed",
             "the pane looked identical to its pre-Enter state throughout the verification window",
+            "confirmed by guarded shell Enter delivery",
         )
 
 
@@ -1201,11 +1202,23 @@ def _nonce_chain_session(tmux_session_factory, name: str) -> str:
     # classify_supervisor_state). Matches the real shape of the existing
     # (already-passing) test_full_e2e_approved_auto_continue_reaches_done
     # fixture above, which has the same five-real-lines structure.
-    return tmux_session_factory(
+    session = tmux_session_factory(
         name,
         "bash -lc 'echo \"Do you want to continue? [y/N]\"; read x; "
         "printf \"step one\\nstep two\\n\"; read marker; printf \"%s\\n\" \"$marker\"; sleep 20'",
     )
+
+    # Login-shell startup competes with many tmux fixtures in the full suite.
+    # Observe readiness instead of assuming 300ms was enough to print a prompt.
+    import subprocess
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        capture = subprocess.run([*tmux_cmd(), "capture-pane", "-p", "-t", session],
+                                 check=True, capture_output=True, text=True).stdout
+        if "Do you want to continue? [y/N]" in capture:
+            return session
+        time.sleep(0.05)
+    pytest.fail(f"disposable nonce fixture never reached its input prompt: {capture!r}")
 
 
 def _send_marker(session: str, marker: str) -> None:

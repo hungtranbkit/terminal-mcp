@@ -5,6 +5,8 @@ tmux panes) lives in test_send_reliability.py (Codex, via the reproduced
 fixture) and test_adapters_real_cli.py (both CLIs, live)."""
 from __future__ import annotations
 
+import pytest
+
 from terminal_mcp.adapters import (DELIVERY_STALLED, DELIVERY_ACTIVATION_UNCERTAIN, DELIVERY_BLOCKED, DELIVERY_NOT_ACTIVATED, DELIVERY_ERROR, DELIVERY_STATES, DELIVERY_SUBMIT_CONFIRMED,
                                    DELIVERY_TEXT_SENT, DELIVERY_UNKNOWN, TARGET_RUNNING, TARGET_STATES,
                                    TARGET_COMPOSER,
@@ -391,3 +393,20 @@ def test_shell_ack_ignores_an_identical_command_left_in_scrollback():
     adapter = select_adapter("bash")
     after = ["$ sleep 3", "done", "$ ", "unrelated", "more", "$ "]
     assert adapter.submit_ack_evidence(list(after), list(after), "sleep 3") is False
+
+
+@pytest.mark.parametrize("pane", [
+    ["reading files...", ""],
+    ["reading files...", "", "❯", "────────"],
+    ["────────", "unrecognised half-drawn output", ""],
+])
+def test_claude_blank_or_partial_chrome_is_not_idle(pane):
+    assert ClaudeAdapter().identify_target_state(pane) == TARGET_UNKNOWN
+
+
+@pytest.mark.parametrize("pane", [
+    ["────────", "❯", "────────"],
+    ["❯", "⏵⏵ auto mode on (shift+tab to cycle)"],
+])
+def test_claude_ready_composer_requires_positive_chrome(pane):
+    assert ClaudeAdapter().identify_target_state(pane) == TARGET_COMPOSER

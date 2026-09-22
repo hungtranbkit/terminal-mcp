@@ -161,3 +161,57 @@ def test_webterm_read_only_client_cannot_type(tmp_path, tmux_session_factory):
         ws2.send_bytes(b"echo confirm_readonly_had_no_effect\n")
         buffer = _drain_until(ws2, b"confirm_readonly_had_no_effect")
         assert b"should_never_run_readonly" not in buffer
+
+
+def test_pty_exit_closes_websocket_without_waiting_for_browser():
+    import anyio
+    from starlette.websockets import WebSocket
+    from terminal_mcp.webterm import pump_websocket
+
+    class ExitedProcess:
+        def read(self, timeout):
+            return b""
+
+    sent = []
+
+    async def receive():
+        await anyio.sleep_forever()
+
+    async def send(message):
+        sent.append(message)
+
+    async def run():
+        socket = WebSocket({"type": "websocket"}, receive, send)
+        from starlette.websockets import WebSocketState
+        socket.client_state = WebSocketState.CONNECTED
+        await socket.accept()
+        with anyio.fail_after(1):
+            await pump_websocket(socket, ExitedProcess())
+
+    anyio.run(run)
+    assert sent[-1]["type"] == "websocket.close"
+
+
+@pytest.mark.parametrize("term", [None, "dumb"])
+def test_browser_pty_uses_xterm_even_in_headless_service(monkeypatch, tmux_session_factory, term):
+    from terminal_mcp.webterm import WebTerminalProcess
+    if term is None:
+        monkeypatch.delenv("TERM", raising=False)
+    else:
+        monkeypatch.setenv("TERM", term)
+    name = tmux_session_factory("webterm-smoke-headless", "bash")
+    proc = WebTerminalProcess("tmux", name, readonly=False, takeover=False)
+    try:
+        proc.write(b"printf 'browser-%s\\n' terminal-ready\n")
+        output = b""
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            chunk = proc.read(0.1)
+            if chunk == b"":
+                break
+            output += chunk or b""
+            if b"browser-terminal-ready" in output:
+                break
+        assert b"browser-terminal-ready" in output, output
+    finally:
+        proc.close()
