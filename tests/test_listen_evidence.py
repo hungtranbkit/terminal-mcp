@@ -158,7 +158,7 @@ def test_no_reader_available_is_unknown_not_not_configured(monkeypatch):
     """The heart of the bug. Blindness reported as absence is what made the
     doctor confidently wrong."""
     # Isolate from the host: this machine really does listen on 8766.
-    monkeypatch.setattr(le, "_from_proc", lambda port: [])
+    monkeypatch.setattr(le, "_from_proc", lambda port: None)
     monkeypatch.setattr(le.os.path, "exists", lambda p: False)
     monkeypatch.setattr(le.shutil, "which", lambda name: None)
 
@@ -170,7 +170,7 @@ def test_no_reader_available_is_unknown_not_not_configured(monkeypatch):
 
 
 def test_no_reader_but_a_configured_bind_falls_back_and_says_so(monkeypatch):
-    monkeypatch.setattr(le, "_from_proc", lambda port: [])
+    monkeypatch.setattr(le, "_from_proc", lambda port: None)
     monkeypatch.setattr(le.os.path, "exists", lambda p: False)
     monkeypatch.setattr(le.shutil, "which", lambda name: None)
 
@@ -201,7 +201,7 @@ def test_nothing_listening_and_nothing_configured_is_not_configured(procfs):
 # -- reader fallbacks -------------------------------------------------------------------
 
 def test_ss_is_used_when_procfs_has_nothing(monkeypatch):
-    monkeypatch.setattr(le, "_from_proc", lambda port: [])
+    monkeypatch.setattr(le, "_from_proc", lambda port: None)
     monkeypatch.setattr(le.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     class _Done:
@@ -218,7 +218,7 @@ def test_ss_is_used_when_procfs_has_nothing(monkeypatch):
 
 
 def test_a_bracketed_ipv6_listener_is_parsed_from_ss(monkeypatch):
-    monkeypatch.setattr(le, "_from_proc", lambda port: [])
+    monkeypatch.setattr(le, "_from_proc", lambda port: None)
     monkeypatch.setattr(le.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     class _Done:
@@ -232,7 +232,7 @@ def test_a_bracketed_ipv6_listener_is_parsed_from_ss(monkeypatch):
 
 
 def test_a_star_wildcard_from_netstat_is_understood(monkeypatch):
-    monkeypatch.setattr(le, "_from_proc", lambda port: [])
+    monkeypatch.setattr(le, "_from_proc", lambda port: None)
     monkeypatch.setattr(le.shutil, "which",
                         lambda name: "/usr/bin/netstat" if name == "netstat" else None)
 
@@ -271,7 +271,7 @@ def test_a_permission_error_on_procfs_degrades_to_the_next_reader(monkeypatch):
 
     evidence = le.observe_listeners(PORT)
     assert evidence["listeners"] == []
-    assert evidence["observed"] is True, "procfs exists, so we could look -- and saw none"
+    assert evidence["observed"] is False, "existence is not proof that a read succeeded"
 
 
 # -- stale configuration ------------------------------------------------------------------
@@ -377,3 +377,34 @@ def test_without_runtime_the_old_config_only_behaviour_is_unchanged():
     configured = _endpoints(lan_bind_env="192.168.1.109")
     assert configured["lan"] == f"http://192.168.1.109:{PORT}"
     assert configured["lan_source"] == "config"
+
+
+@pytest.mark.parametrize("address,expected", [("0100007F", le.UNKNOWN), ("6D01A8C0", le.LAN_BOUND)])
+def test_partial_proc_read_cannot_prove_loopback_only(procfs, monkeypatch, address, expected):
+    procfs["v4"].write_text(_PROC_HEADER + _proc_line(address))
+    procfs["v6"].unlink()
+    monkeypatch.setattr(le.shutil, "which", lambda name: None)
+    state = le.lan_state(PORT)
+    assert state["state"] == expected
+    assert state["confident"] is (expected == le.LAN_BOUND)
+
+
+def test_existing_but_failed_commands_are_not_observation(monkeypatch):
+    monkeypatch.setattr(le.shutil, "which", lambda name: "/usr/bin/" + name)
+    class Failed:
+        returncode = 1
+        stdout = ""
+    monkeypatch.setattr(le.subprocess, "run", lambda *a, **kw: Failed())
+    evidence = le.observe_listeners(PORT, readers=[le.SOURCE_SS, le.SOURCE_NETSTAT])
+    assert evidence["observed"] is False
+
+
+def test_successful_empty_command_is_observation(monkeypatch):
+    monkeypatch.setattr(le.shutil, "which", lambda name: "/usr/bin/" + name)
+    class Empty:
+        returncode = 0
+        stdout = ""
+    monkeypatch.setattr(le.subprocess, "run", lambda *a, **kw: Empty())
+    evidence = le.observe_listeners(PORT, readers=[le.SOURCE_SS])
+    assert evidence["observed"] is True
+    assert evidence["listeners"] == []

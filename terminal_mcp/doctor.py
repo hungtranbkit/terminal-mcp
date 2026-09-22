@@ -32,9 +32,8 @@ def cmd_connection(args: argparse.Namespace) -> int:
     state = WatchdogState.load(default_state_path())
     result = diagnose(stale_threshold=args.stale_threshold, state=state)
     # Controller endpoints (task item 7: "Doctor/dashboard phải hiển thị
-    # rõ controller endpoints: loopback, LAN, tunnel") -- reads the exact
-    # same env vars server_http.py's own startup resolves, so this always
-    # reflects the RUNNING process's real binding, never a guess.
+    # rõ controller endpoints: loopback, LAN, tunnel"). Socket evidence
+    # describes runtime; this CLI's environment supplies only declared intent.
     from . import network_bind
     from .listen_evidence import lan_state
     from .server_http import HTTP_PORT
@@ -88,13 +87,11 @@ def _print_human(result: dict) -> None:
     print(f"    loopback: {endpoints.get('loopback')}")
     if endpoints.get("lan"):
         how = endpoints.get("lan_source") or "config"
+        if endpoints.get("lan_confident") is False:
+            print("    lan state: UNKNOWN -- exposure NOT verified; URLs below are declared intent")
         for url in endpoints.get("lans") or [endpoints["lan"]]:
             print(f"    lan:      {url}  (allowed_cidrs={endpoints.get('allowed_cidrs')}, "
                  f"source={how})")
-        drift = endpoints.get("config_drift")
-        if drift:
-            print(f"    ⚠ config drift: {', '.join(drift['configured_not_listening'])} "
-                 f"configured but not listening -- {drift['detail']}")
         print(f"    ⚠ {endpoints.get('firewall_reminder')}")
     elif endpoints.get("lan_error"):
         print(f"    lan:      DISABLED -- {endpoints['lan_error']}")
@@ -114,6 +111,10 @@ def _print_human(result: dict) -> None:
                  f" -- set TERMINAL_MCP_LAN_BIND to enable")
             if detail:
                 print(f"              {detail}")
+    drift = endpoints.get("config_drift")
+    if drift:
+        print(f"    ⚠ config drift: {', '.join(drift['configured_not_listening'])} "
+              f"configured but not listening -- {drift['detail']}")
     print(f"    tunnel:   {endpoints.get('tunnel')}")
 
 

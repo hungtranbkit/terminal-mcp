@@ -129,12 +129,12 @@ def _hex_to_ipv6(value: str) -> str:
     return str(ipaddress.ip_address(packed))
 
 
-def _read_proc(path: str, port: int, family: str) -> list[Listener]:
+def _read_proc(path: str, port: int, family: str) -> list[Listener] | None:
     try:
         with open(path, "r", encoding="ascii", errors="replace") as handle:
             lines = handle.read().splitlines()
     except (OSError, PermissionError):
-        return []
+        return None
     out: list[Listener] = []
     for line in lines[1:]:
         parts = line.split()
@@ -154,9 +154,20 @@ def _read_proc(path: str, port: int, family: str) -> list[Listener]:
     return out
 
 
-def _from_proc(port: int) -> list[Listener]:
-    return (_read_proc("/proc/net/tcp", port, "ipv4")
-            + _read_proc("/proc/net/tcp6", port, "ipv6"))
+class _ListenerRead(list):
+    """A partial read proves presence, but cannot prove absence."""
+    def __init__(self, listeners, *, complete: bool):
+        super().__init__(listeners)
+        self.complete = complete
+
+
+def _from_proc(port: int) -> list[Listener] | None:
+    v4 = _read_proc("/proc/net/tcp", port, "ipv4")
+    v6 = _read_proc("/proc/net/tcp6", port, "ipv6")
+    if v4 is None and v6 is None:
+        return None
+    return _ListenerRead((v4 or []) + (v6 or []),
+                         complete=v4 is not None and v6 is not None)
 
 
 def _parse_addr_port(token: str) -> tuple[str, int] | None:
@@ -175,17 +186,17 @@ def _parse_addr_port(token: str) -> tuple[str, int] | None:
     return host, int(port_text)
 
 
-def _from_command(argv: Sequence[str], port: int, source: str) -> list[Listener]:
+def _from_command(argv: Sequence[str], port: int, source: str) -> list[Listener] | None:
     binary = shutil.which(argv[0])
     if binary is None:
-        return []
+        return None
     try:
         done = subprocess.run([binary, *argv[1:]], capture_output=True, text=True,
                               timeout=10, check=False)
     except (OSError, subprocess.SubprocessError):
-        return []
+        return None
     if done.returncode != 0:
-        return []
+        return None
     out: list[Listener] = []
     for line in done.stdout.splitlines():
         if "LISTEN" not in line.upper():
@@ -213,6 +224,7 @@ def observe_listeners(port: int, *, readers: Iterable[str] | None = None) -> dic
     """
     order = list(readers) if readers is not None else [SOURCE_PROC, SOURCE_SS, SOURCE_NETSTAT]
     attempted: list[str] = []
+    empty_source = None
     for reader in order:
         attempted.append(reader)
         if reader == SOURCE_PROC:
@@ -223,22 +235,23 @@ def observe_listeners(port: int, *, readers: Iterable[str] | None = None) -> dic
             found = _from_command(["netstat", "-ltn"], port, SOURCE_NETSTAT)
         else:
             continue
-        if found:
+        if found is None:
+            continue
+        complete = getattr(found, "complete", True)
+        if found and (complete or any(listener.is_routable for listener in found)):
             return {"observed": True, "source": reader, "attempted": attempted,
+                    "complete": complete,
                     "listeners": [listener.as_dict() for listener in found]}
+        if complete:
+            empty_source = reader
 
-    # Nothing found. Distinguish "looked and saw none" from "could not look":
-    # the first means the server is down, the second means we are blind, and
-    # an operator does opposite things about them.
-    could_look = os.path.exists("/proc/net/tcp") or shutil.which("ss") or shutil.which("netstat")
-    if could_look:
-        return {"observed": True, "source": order[0] if order else SOURCE_PROC,
+    if empty_source is not None:
+        return {"observed": True, "source": empty_source,
                 "attempted": attempted, "listeners": [],
                 "detail": f"nothing is listening on port {port}"}
     return {"observed": False, "source": SOURCE_UNAVAILABLE, "attempted": attempted,
             "listeners": [],
-            "detail": "no way to enumerate listening sockets on this host "
-                      "(no /proc/net/tcp, no ss, no netstat)"}
+            "detail": "could not completely enumerate listening sockets on this host"}
 
 
 def lan_state(port: int, *, configured_binds: Sequence[str] = (),
@@ -297,7 +310,7 @@ def lan_state(port: int, *, configured_binds: Sequence[str] = (),
 
     # Drift: configuration that no longer describes the running process. Worth
     # naming -- it is the file an operator is about to edit.
-    if configured:
+    if configured and evidence.get("complete", True):
         observed = {l.address for l in listeners}
         missing = [b for b in configured if b not in observed and not wildcard]
         if missing:

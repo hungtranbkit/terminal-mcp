@@ -269,44 +269,60 @@ def test_duplicate_listeners_are_deduplicated():
 
 # --- doctor output must name its source ------------------------------
 
-def _render(result: dict, capsys) -> str:
-    doctor._print_human({
+def _render(addresses, capsys, monkeypatch, *, declared=None, observed=True) -> str:
+    import argparse
+    from terminal_mcp import listen_evidence
+
+    monkeypatch.setattr(listen_evidence, "observe_listeners", lambda *a, **kw: {
+        "observed": observed,
+        "source": listen_evidence.SOURCE_PROC if observed else "unavailable",
+        "listeners": [listen_evidence.Listener(ip, PORT, "ipv4", "proc_net_tcp").as_dict()
+                      for ip in addresses],
+    })
+    monkeypatch.setattr(doctor, "default_state_path", lambda: None)
+    monkeypatch.setattr(doctor.WatchdogState, "load", lambda path: None)
+    monkeypatch.delenv("TERMINAL_MCP_LAN_BIND", raising=False)
+    monkeypatch.setenv("TERMINAL_MCP_ALLOWED_NODE_CIDRS", "192.168.0.0/16,100.64.0.0/10")
+    monkeypatch.setenv("TERMINAL_MCP_TRUSTED_VPN_CIDRS", "100.64.0.0/10")
+    if declared:
+        monkeypatch.setenv("TERMINAL_MCP_LAN_BIND", declared)
+    monkeypatch.setattr(doctor, "diagnose", lambda **kwargs: {
         "mcp_local": "healthy", "mcp_local_detail": "ok", "tunnel_process": "active",
         "tunnel_process_sub_state": "running", "tunnel_ready": "ready",
         "last_heartbeat_age_sec": 1, "network_dns_tls": "pass", "network_dns_tls_detail": "ok",
         "chatgpt_side": "ok", "last_recovery_action": "none", "last_recovery_action_reason": "",
         "last_recovery_action_at": "", "recommended_action": "none",
-        "endpoints": {"loopback": f"http://127.0.0.1:{PORT}", "tunnel": "t"},
-        "effective_lan": result,
     })
+    assert doctor.cmd_connection(argparse.Namespace(json=False, stale_threshold=60)) == 0
     return capsys.readouterr().out
 
 
-def test_output_states_the_source_for_a_live_lan_bind(capsys):
-    out = _render(_describe(tcp4=_table([("127.0.0.1", PORT, "0A"), ("100.81.85.120", PORT, "0A")])), capsys)
+def test_output_states_the_source_for_a_live_lan_bind(capsys, monkeypatch):
+    out = _render(["127.0.0.1", "100.81.85.120"], capsys, monkeypatch)
     assert f"lan:      http://100.81.85.120:{PORT}" in out
-    assert "lan src:  listening-sockets(" in out
-    assert "confidence=effective" in out
+    assert "source=proc_net_tcp" in out
     assert "not configured" not in out
 
 
-def test_output_states_the_source_for_loopback_only(capsys):
-    out = _render(_describe(tcp4=_table([("127.0.0.1", PORT, "0A")])), capsys)
+def test_output_states_the_source_for_loopback_only(capsys, monkeypatch):
+    out = _render(["127.0.0.1"], capsys, monkeypatch)
     assert "loopback-only" in out
-    assert "source: listening-sockets(" in out
+    assert "observed via proc_net_tcp" in out
 
 
-def test_output_refuses_to_assume_exposure_when_evidence_is_missing(capsys):
-    out = _render(_describe(tcp4=None, tcp6=None, declared="100.81.85.120"), capsys)
+def test_output_refuses_to_assume_exposure_when_evidence_is_missing(capsys, monkeypatch):
+    out = _render([], capsys, monkeypatch, observed=False, declared="100.81.85.120")
     assert "UNKNOWN" in out
     assert "exposure NOT verified" in out
     assert "declared intent" in out
 
 
-def test_output_flags_a_config_runtime_mismatch(capsys):
-    out = _render(_describe(tcp4=_table([("127.0.0.1", PORT, "0A")]), declared="192.168.1.132"), capsys)
-    assert "config/runtime mismatch" in out
-    assert "stale config" in out
+def test_output_flags_a_config_runtime_mismatch(capsys, monkeypatch):
+    out = _render(["127.0.0.1"], capsys, monkeypatch, declared="192.168.1.132")
+    assert "loopback-only" in out
+    assert "config drift" in out
+    assert "192.168.1.132 configured but not listening" in out
+    assert f"lan:      http://192.168.1.132:{PORT}" not in out
 
 
 def test_real_proc_tables_are_parseable_on_this_host():

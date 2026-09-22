@@ -248,13 +248,16 @@ def describe_endpoints(*, port: int, lan_bind_env: str | None, cidrs_env: str | 
     if observed:
         # Runtime wins outright, including when the env said nothing.
         lan_binds = tuple(observed)
-    elif runtime is not None and runtime.get("confident") and not lan_binds:
+    elif runtime is not None and runtime.get("confident"):
         # Looked, and there genuinely is no LAN listener. Carry WHY, so the
         # caller can tell loopback-only from "the service is down" from
         # "unconfigured" -- three states one string used to flatten.
         return {"loopback": f"http://{LOOPBACK}:{port}", "lan": None, "tunnel": tunnel_note,
                 "lan_state": runtime.get("state"), "lan_source": runtime.get("source"),
-                "lan_detail": runtime.get("detail")}
+                "lan_detail": runtime.get("detail"),
+                "lan_confident": True,
+                **({"config_drift": runtime["config_drift"]}
+                   if runtime.get("config_drift") else {})}
     if not lan_binds:
         return {"loopback": f"http://{LOOPBACK}:{port}", "lan": None, "tunnel": tunnel_note,
                 **({"lan_state": runtime.get("state"), "lan_source": runtime.get("source"),
@@ -271,6 +274,7 @@ def describe_endpoints(*, port: int, lan_bind_env: str | None, cidrs_env: str | 
         "loopback": f"http://{LOOPBACK}:{port}", "lan": lan_urls[0], "lans": lan_urls,
         "lan_state": (runtime or {}).get("state"),
         "lan_source": (runtime or {}).get("source") or "config",
+        "lan_confident": (runtime or {}).get("confident", False),
         **({"config_drift": runtime["config_drift"]}
            if runtime and runtime.get("config_drift") else {}),
         "allowed_cidrs": [str(c) for c in allowed], "firewall_verified": False,
