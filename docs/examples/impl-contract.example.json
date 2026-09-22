@@ -1,0 +1,123 @@
+{
+  "_comment": [
+    "A worked STANDARD Implementation Contract v1 (docs/impl-contract.md).",
+    "It lives on a task as `metadata.impl_contract`. This example is",
+    "deliberately a STATEFUL task, because that is where the gate earns its",
+    "keep: it carries a source_of_truth and a state_model, one HIGH decision",
+    "that analysis actually resolved, one MEDIUM decision legitimately",
+    "deferred with a default AND a guardrail, and two LOW decisions handed to",
+    "the coding agent. `enforcement` is `advisory` -- the v1 rollout default:",
+    "real verdicts, zero refusals.",
+    "This `_comment` key is itself a demonstration: it is not a v1 field,",
+    "so the gate reports UNKNOWN_FIELD against it -- non-blocking, because a",
+    "field is reported rather than dropped in silence. The contract is READY."
+  ],
+
+  "protocol": "terminal-mcp-impl-contract/v1",
+  "profile": "STANDARD",
+  "enforcement": "advisory",
+  "stateful": true,
+
+  "goal": "A worker crash must free its claimed task within one lease TTL instead of stranding it in RUNNING forever.",
+  "current_behavior": "queue_tasks.claim_token/lease_expires_at are stamped at claim time but nothing ever reads lease_expires_at back, so a task whose worker died stays RUNNING until a human notices and re-assigns it by hand.",
+  "expected_behavior": "A task whose lease has expired and whose worker has not renewed is returned to READY with attempt_count unchanged, and the release is recorded with a reason so it is distinguishable from a voluntary release.",
+
+  "source_of_truth": "the queue_tasks table (sqlite). Every board/fleet view already derives from it; the in-memory engine state is a cache and is rebuilt from it on restart.",
+  "state_model": {
+    "states": ["UNASSIGNED", "READY", "RUNNING", "VERIFYING", "COMPLETED", "FAILED"],
+    "transitions_added": ["RUNNING -> READY (lease expiry, this change)"],
+    "writer": "queue_store, inside BEGIN IMMEDIATE -- no other module writes these columns"
+  },
+
+  "invariants": [
+    "a task is claimed by at most one worker at a time (BEGIN IMMEDIATE, unchanged)",
+    "attempt_count is incremented only on dispatch, never on a lease release",
+    "a COMPLETED or FAILED task is never re-opened by expiry"
+  ],
+
+  "assumptions": [
+    {
+      "id": "A1",
+      "statement": "lease_expires_at is always written in UTC by every existing claim path",
+      "confidence": "HIGH",
+      "impact": "HIGH"
+    },
+    {
+      "id": "A2",
+      "statement": "a worker that is alive but merely slow will renew within the TTL",
+      "confidence": "MEDIUM",
+      "impact": "HIGH",
+      "guardrail": "every expiry release is logged with the last renewal age; a release whose age is under 2x TTL is an alertable signal that the TTL is too short, not a normal event"
+    },
+    {
+      "id": "A3",
+      "statement": "no dashboard view caches RUNNING state longer than its poll interval",
+      "confidence": "MEDIUM",
+      "impact": "LOW"
+    }
+  ],
+
+  "edge_cases": [
+    "clock moved backwards between claim and expiry check",
+    "the worker renews in the same tick the sweeper decides to expire it",
+    "a task released by expiry is immediately re-claimed by the same worker that had it"
+  ],
+
+  "dangerous_failure_modes": [
+    "releasing a task whose worker IS alive, so two workers edit the same tree -- this is the window/window2 transcript-collision class of incident",
+    "double-incrementing attempt_count on release, which silently burns the task's retry budget",
+    "expiring a task that is already COMPLETED and re-dispatching finished work"
+  ],
+
+  "acceptance": [
+    "a task whose lease_expires_at is in the past and whose worker has not renewed returns to READY within one sweep",
+    "attempt_count is unchanged across the release",
+    "a renewed lease is never released",
+    "the release row records reason=LEASE_EXPIRED and the last renewal age"
+  ],
+  "live_verify": "claim a task on a disposable lane, SIGKILL the worker's tmux session, and watch the task return to READY on the real dashboard within one TTL -- not just the unit test",
+  "out_of_scope": [
+    "changing the TTL default",
+    "the handoff verb (P0.4's own separate item)",
+    "the verify queue's own leases"
+  ],
+
+  "context_pack": [
+    { "ref": "terminal_mcp/queue_store.py::claim_next_task", "kind": "file", "why": "the BEGIN IMMEDIATE claim pattern this must not break" },
+    { "ref": "terminal_mcp/lease.py::PaneLeaseStore", "kind": "file", "why": "the renewal model to copy; already pane_key-generic" },
+    { "ref": "docs/PROJECT_COORDINATION_ROADMAP.md#p04", "kind": "doc", "why": "why this exists and what was deliberately left out" },
+    { "ref": "tests/test_queue_service_fleet_views.py", "kind": "test", "why": "where the queue-state assertions already live" }
+  ],
+
+  "decision_budget": [
+    {
+      "id": "D1",
+      "question": "On expiry, does the task go back to READY or to UNASSIGNED?",
+      "impact": "HIGH",
+      "status": "RESOLVED",
+      "decision": "READY, keeping its session binding. UNASSIGNED would drop the project/session affinity that routing already paid for, and a crashed worker is usually restarted on the same node.",
+      "decided_by": "analysis"
+    },
+    {
+      "id": "D2",
+      "question": "Who runs the expiry sweep -- the engine tick, or a dedicated loop?",
+      "impact": "MEDIUM",
+      "status": "OPEN",
+      "default": "the existing engine tick, so there is no new process and no new failure mode",
+      "guardrail": "the sweep must be O(expired), bounded per tick, and must log when it hits its own bound -- a sweep that silently truncates is worse than no sweep"
+    },
+    {
+      "id": "D3",
+      "question": "What is the log message wording for a lease release?",
+      "impact": "LOW",
+      "status": "OPEN"
+    },
+    {
+      "id": "D4",
+      "question": "Does the sweeper live in queue_store or queue_engine?",
+      "impact": "LOW",
+      "status": "OPEN",
+      "default": "wherever the surrounding transaction already is"
+    }
+  ]
+}

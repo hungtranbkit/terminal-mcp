@@ -1988,6 +1988,96 @@ Every phase above gets its OWN such pass before its own status moves
 off PLANNED — this file must never claim VERIFIED for something that
 hasn't had one.
 
+### 20.9 Implementation Contract v1 + Analysis Gate (BUILT, unit-tested, NOT WIRED, NOT DEPLOYED)
+
+Full format, rules and consumer interfaces: **`docs/impl-contract.md`**.
+Module: `terminal_mcp/impl_contract.py`. Tests:
+`tests/test_impl_contract.py` (66, pure unit, no I/O). Worked example:
+`docs/examples/impl-contract.example.json`.
+
+**Status is deliberately "built, not wired."** No queue/coordinator/
+dashboard/telemetry file is touched: `impl_contract.py` is pure and
+side-effect free, nothing in the runtime calls it, and no MCP tool or
+dashboard route is added (so §15's tool inventory is unchanged). Wiring
+it into the delivery gate, persisting its verdicts, measuring it and
+drawing it are four separate pieces of work with other owners; a
+contract format is worth agreeing on before it has four callers.
+
+**What it is.** The analysis agent's reasoning is currently done once
+and thrown away — a task carries a free-text `prompt`, and every coding
+agent re-derives the same decisions from the same prose, sometimes
+differently, silently. This defines a structured contract carried on
+`metadata.impl_contract` (goal / current+expected behavior /
+`source_of_truth` / `state_model` / invariants / assumptions with
+confidence+impact / edge cases / dangerous failure modes / acceptance /
+`live_verify` / out-of-scope / `context_pack` refs / `decision_budget`),
+a deterministic gate over it, and a prompt builder that **references**
+the contract and its context pack instead of restating it as more prose.
+
+**The decision budget** (the core rule): `HIGH` impact must be RESOLVED
+before READY, or the task returns `NEED_ANALYSIS` rather than
+dispatching with a shrug; `MEDIUM` may stay open but only with an
+explicit `default` **and** a `guardrail`; `LOW` is the coding agent's to
+choose and **never** blocks READY, at any profile, in any quantity (a
+gate that punishes detail teaches agents to write less of it). An
+assumption is budgeted the same way — HIGH impact + LOW confidence
+blocks; HIGH impact + MEDIUM confidence blocks unless a guardrail bounds
+it. An unreadable `impact` is treated as HIGH, never as LOW, so the
+cheapest way to defeat the gate is not to omit the field.
+
+**Profiles.** `FAST_FIX` (goal/expected_behavior/acceptance only),
+`STANDARD` (default), `HIGH_RISK` (+`context_pack` +`critic_result`, an
+independent critic whose verdict must not be FAIL — this module never
+scores or re-runs a critic; that contract is owned elsewhere). The
+minimal gate is minimal about **detail**, never about **judgment**:
+`FAST_FIX` still blocks on an unresolved HIGH decision, and
+`source_of_truth` is required on a stateful task at every profile,
+because a one-line fix to the wrong store is still a write to the wrong
+store.
+
+**NEED_ANALYSIS** is a real return path for the coding agent, not just a
+gate verdict: `###TERMINAL_MCP_NEED_ANALYSIS protocol=terminal-mcp-need-
+analysis/v1 ... impact=HIGH decision_id=<slug>###`, same marker shape
+and same never-partially-trusted parsing posture as §7's completion
+marker. The generated prompt states in as many words that returning it
+is a **correct outcome, not a failed task** — an agent only stops
+instead of guessing if stopping is obviously allowed.
+
+**Legacy compatibility, three explicit layers** (nothing retrofits onto
+existing free-text tasks — same opt-in posture as §20.6's
+`metadata.dor_required`): (1) no contract → `SKIPPED`, never blocking;
+(2) `enforcement: "advisory"`, the v1 **default** → findings computed
+and reported in full, `blocks_ready` false, so the finding rate can be
+measured before anything is enforced; (3) `enforcement: "enforcing"` →
+blocking findings mean `NEED_ANALYSIS`, opted into per task/project,
+never globally. An unreadable enforcement value falls back to advisory,
+never to enforcing. A contract declaring an unknown `protocol` is
+`UNSUPPORTED_VERSION` and is never partially validated against v1's
+rules.
+
+**Interface note for the consumers:** branch on `blocks_ready`, never on
+`verdict` and never re-derive it from `findings` — `blocks_ready`
+already folds in the advisory/enforcing mode, and a caller that
+re-derives it will start refusing work the moment advisory mode is on.
+Finding codes are stable strings and are part of the interface.
+
+**Disclosed scope cuts:** `context_pack` refs are validated for shape
+only (this module never opens a file or fetches a URL — the gate must be
+runnable on the analysis agent's side); no field's *content* is judged
+for quality (`"acceptance": "it works"` passes — detecting a vacuous
+field is the critic's job or a human's); `live_verify` is required as a
+declaration but never executed here; `stateful` is **declared, never
+detected**, so an analysis that forgets it escapes the source-of-truth
+rule entirely (the mitigation is an upstream project policy, not a
+heuristic in the gate); and the gate is deterministic, not
+an LLM call, for the same reason `coordinator.py`'s gate and
+`dor_gate.py` are — a gate that is itself a guess cannot credibly refuse
+a guess.
+
+**Not VERIFIED.** Per §20.8's own rule, this stays "built, not wired"
+until it has had a real live pass, which it cannot have until something
+calls it.
+
 ---
 
 ## Feature Details
