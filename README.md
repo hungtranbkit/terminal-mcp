@@ -169,6 +169,26 @@ opaque `resume_token` rather than resending the task or restarting the wait.
 
 Execution-aware node health is stricter than heartbeat-only presence: a node is green only after a bounded execution-backend probe succeeds. `terminal_node_health` exposes transport/execution state, retry/backoff evidence, last success, and sanitized failure details without changing legacy node APIs.
 
+For project-level intents, configure an explicit `project_profiles` allowlist
+and use one composite call:
+
+| User intent | Preferred tool |
+| --- | --- |
+| `check` | `project_check` |
+| `giao task` | `project_dispatch` |
+| `deploy preview` | `deploy_preview` |
+
+`project_check` combines bounded session, supervisor, Git, deploy-profile, and
+health evidence, including execution-aware node counts and blockers. A fresh
+heartbeat alone is never green: `EXECUTION_OK` also requires a bounded session
+backend probe. `terminal_node_health` exposes the additive transport,
+execution, retry, and last-success fields without changing legacy node APIs.
+`project_dispatch` selects only a profile target and delegates
+to the existing guarded send or durable queue. `deploy_preview` accepts fixed
+command/probe IDs from a preview-safe profile; it never accepts arbitrary shell
+commands. ChatGPT controls whether its UI visually collapses tool cards, but
+serving each intent with one MCP call minimizes the cards it needs to show.
+
 Its unit is `~/.config/systemd/user/terminal-mcp-http.service`, runs as the
 current user, and uses `Restart=on-failure`. Authentication is intentionally
 not implemented as an ad-hoc MCP wrapper: it must be enforced by the HTTPS

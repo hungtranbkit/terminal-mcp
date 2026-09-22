@@ -445,3 +445,32 @@ session_health:
 # Quota severity (usage.status) deliberately reuses ai_usage's own
 # warning_threshold_percent / critical_threshold_percent rather than
 # duplicating a second pair of numbers that could drift from the dashboard's.
+
+
+# -- Project compact workflows ----------------------------------------------
+# Optional and empty by default. Each entry is an operator allowlist: callers
+# cannot supply repo paths, probes, deploy commands, or targets outside it.
+# No credential/header/token field exists here.
+# project_profiles:
+#   - project_id: terminal-mcp-smoke
+#     aliases: [terminal-mcp]
+#     repo_root: /home/operator/terminal-mcp-prod
+#     preferred_targets:
+#       - target: session:test-project-compact
+#         capabilities: [shell]
+#     bindings: []
+#     sessions: []
+#     git_remote: https://github.com/example/terminal-mcp.git
+#     health_probes:
+#       - id: fixture-ready
+#         kind: fixture
+#         check_id: fixture.pass
+#         public: false
+#     deploy:
+#       # IDs select code-owned handlers; they are not shell commands.
+#       build_command_id: fixture.build
+#       service_id: fixture.noop
+#       health_probe_ids: [fixture-ready]
+#       public_probe_ids: []
+#       rollback_capture_method: git_head
+#       preview_safe: true
