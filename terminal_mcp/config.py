@@ -450,6 +450,27 @@ class SessionHealthConfig:
     git_probe_cache_seconds: float = 10.0
 
 
+@dataclass(frozen=True)
+class RunbookConfig:
+    """Runbook Registry (runbook_registry.py) -- the read-only lookup the
+    queue's dispatch path consults so a worker is handed a canonical
+    runbook REFERENCE instead of rediscovering a procedure.
+
+    Defaults ON for the same reason ai_usage does: there is no autonomous
+    ACTION gated here, only a bounded read of one repo file, and a missing
+    file degrades to exactly the pre-registry behaviour rather than
+    breaking a dispatch. Retrieval is advisory -- nothing in this project
+    executes a runbook step, and this config has no switch that would let
+    it, deliberately (see runbook_registry.py's own docstring).
+
+    `path` empty means the conventional location under the controller's
+    own working directory (`.terminal-mcp/runbooks.json`, the same
+    in-repo-file precedent as the Project Backlog). An operator pointing
+    at a shared checkout sets an explicit absolute path instead."""
+    enabled: bool = True
+    path: str = ""
+
+
 # The image types notes_service.py can both content-sniff and serve.
 # Kept as a literal here rather than imported from notes_service so
 # config.py's import graph stays as narrow as it is today;
@@ -1313,6 +1334,7 @@ class AppConfig:
     lifecycle: LifecycleConfig = LifecycleConfig()
     submit_watchdog: SubmitWatchdogConfig = SubmitWatchdogConfig()
     ai_usage: AiUsageConfig = AiUsageConfig()
+    runbooks: RunbookConfig = RunbookConfig()
     notes: NotesConfig = NotesConfig()
     auto_recovery: AutoRecoveryConfig = AutoRecoveryConfig()
     session_health: SessionHealthConfig = SessionHealthConfig()
@@ -1770,6 +1792,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         lifecycle=_load_lifecycle_config(raw.get("lifecycle", {})),
         submit_watchdog=watchdog_config,
         ai_usage=_load_ai_usage_config(raw.get("ai_usage", {})),
+        runbooks=_load_runbook_config(raw.get("runbooks", {})),
         notes=_load_notes_config(raw.get("notes", {})),
         auto_recovery=_load_auto_recovery_config(raw.get("auto_recovery", {})),
         session_health=_load_session_health_config(raw.get("session_health", {})),
@@ -1962,6 +1985,15 @@ def _load_notes_config(raw: object) -> NotesConfig:
         max_attachment_bytes=max_bytes,
         allowed_mime_types=allowed,
         attachment_source_roots=roots,
+    )
+
+
+def _load_runbook_config(raw: object) -> RunbookConfig:
+    if not isinstance(raw, dict):
+        raw = {}
+    return RunbookConfig(
+        enabled=bool(raw.get("enabled", RunbookConfig.enabled)),
+        path=str(raw.get("path", RunbookConfig.path) or ""),
     )
 
 

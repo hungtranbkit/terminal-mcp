@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "revision": 1,
+  "updated_at": "2026-09-14T00:00:00+00:00",
+  "runbooks": [
+    {
+      "id": "cf_tunnel_down",
+      "title": "Cloudflare tunnel down / dashboard unreachable from outside",
+      "version": 2,
+      "source": "docs/CONTROLLER_RUNBOOK.md#tunnel",
+      "summary": "Check cloudflared service state and the tunnel's own diagnostics BEFORE touching DNS or recreating the tunnel.",
+      "destructive": false,
+      "match": {
+        "failure_fingerprints": ["cf_tunnel_502", "cf_tunnel_unreachable"],
+        "task_classes": ["incident.tunnel"],
+        "context_tags": []
+      }
+    },
+    {
+      "id": "controller_split_brain",
+      "title": "Two controllers claiming the same node",
+      "version": 1,
+      "source": "docs/CONTROLLER_RUNBOOK.md#split-brain",
+      "summary": "Identify the authoritative controller first; stopping the wrong one strands every session on that node.",
+      "destructive": true,
+      "match": {
+        "failure_fingerprints": ["controller_split_brain"],
+        "task_classes": ["incident.controller"],
+        "context_tags": ["role:controller"]
+      }
+    }
+  ]
+}

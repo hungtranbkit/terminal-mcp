@@ -127,6 +127,8 @@ file count from `ls tests/*.py`), not recalled from memory.
 | Token-efficiency benchmark (18 real bugs from git + 2 synthetic) | MEASURED, 2026-09-14 — headline verdict **FAIL** against its own pre-registered bar; see `docs/TOKEFF_BENCHMARK.md` |
 
 | Fleet audit aggregation read path (blg_178d7b6506b7) | TESTING (35 tests green; no real 2-node run, not deployed) |
+
+| Runbook Registry retrieval from the worker dispatch flow | TESTING (39 unit+integration tests green; not yet exercised on a live lane, not deployed) |
 | Unified Task System §20 (Kanban/PM/Planner/git isolation/Phase A-E) | VERIFIED — see §20 itself for the exact per-slice scope |
 | Work Mode: a planner claim briefs itself (similar-bug retrieval + module context pack, paths verified) | VERIFIED (V1) |
 | Work Mode: the budget and the gate constrain a REAL run (dogfood, `dogfood` runbook) | VERIFIED (dogfood; see its own "what is not claimed" note) |
@@ -4699,6 +4701,83 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
   row cap, worth an index if this becomes a hot path; (4) no dashboard
   surface yet, MCP tool only; (5) not exercised against a real remote
   node.
+
+### Runbook Registry (read-only retrieval from the worker dispatch flow)
+
+- **Goal / user value:** when a worker picks up a task whose failure has
+  already been classified, it is handed the CANONICAL runbook reference
+  someone already wrote, instead of rediscovering the procedure from
+  scratch — and that retrieval is recorded as evidence.
+- **Status:** TESTING (2026-09-14). Unit + integration tests green; NOT
+  yet exercised against a live lane and NOT deployed. No live evidence
+  claim is made here.
+- **Audit first (per the task's own instruction).** There was no runbook
+  registry in this project. `grep -ri runbook terminal_mcp/` returned
+  nothing; the only runbook that existed was one hand-written document,
+  `docs/CONTROLLER_RUNBOOK.md`, that nothing read programmatically. So
+  the retrieval side did not exist to "use" and had to be built before it
+  could be wired. The dispatch flow itself was already the right seam:
+  `queue_engine.build_dispatch_text` is the ONE place a short,
+  clearly-delimited advisory block is appended to a task's verbatim
+  prompt (the completion-marker protocol and the living-requirements
+  reminder already live there), and `queue_events` is already the
+  durable audit trail every queue transition writes to.
+- **Source of truth:** `.terminal-mcp/runbooks.json` INSIDE the project
+  repo — the same in-repo-file precedent as the Project Backlog, reusing
+  `backlog_store.BACKLOG_DIRNAME` rather than declaring a second
+  directory constant. No new table, no migration, no controller-side
+  store. Example: `docs/examples/runbooks.example.json`.
+- **Architecture:** `runbook_registry.py` is read-only and owns no
+  procedure text. `lookup()` returns a `RunbookLookup` in EVERY case and
+  never raises — HIT / MISS / STALE / UNAVAILABLE are four distinct,
+  separately-reported facts (a miss is normal; a stale entry is version
+  skew; an unreadable registry is a deployment problem — collapsing them
+  into one boolean would hide two real failures behind the boring one).
+  Match precedence is failure_fingerprint > task_class > context_tag,
+  and the choice among several candidates is a TOTAL order (axis, then
+  highest version, then lowest id) so two workers reading the same
+  registry can never follow different procedures for the same failure.
+- **Advisory, never executed:** the retrieved reference reaches a worker
+  only as `build_runbook_notice` text — a pointer (id/version/source/
+  title/summary) that says out loud it is advisory and subordinate to
+  the task's own prompt. There is no execute path anywhere in this
+  feature, and an entry marked `destructive: true` additionally carries
+  an explicit do-not-execute line.
+- **Secret handling:** two layers. Any entry key whose NAME looks like a
+  credential is dropped before a reference is built, and every surfaced
+  string is run through `redaction.redact_text` and length-capped. The
+  runbook BODY never travels — only the `source` pointer to it.
+- **Fallback / legacy behaviour:** `QueueEngine(runbooks=None)` (the
+  default) performs no lookup, writes no event, and produces a
+  byte-for-byte identical dispatch text — asserted by a full-string
+  equality test, not a prefix check. A configured registry whose file is
+  missing/unreadable/malformed degrades to the same thing at runtime. A
+  task carrying no lookup keys records no event at all.
+- **Hit/miss/source/version tracking:** one `queue_events` row per real
+  lookup (`RUNBOOK_HIT` / `RUNBOOK_MISS` / `RUNBOOK_STALE` /
+  `RUNBOOK_UNAVAILABLE`) whose metadata carries the status, matched axis,
+  chosen runbook id+version, the other candidates considered, the stale
+  ids, and the registry's own source path + revision + schema_version.
+- **Config:** `RunbookConfig` (`config.py`) — `enabled` (default `True`,
+  same reasoning as `ai_usage`: a bounded read, no autonomous action to
+  gate, degrades cleanly) and `path` (empty = `.terminal-mcp/
+  runbooks.json` under the controller's own working directory).
+- **Integration contract with the worker flow:** classification is
+  SOMEBODY ELSE'S job. `lookup_key_for_task` reads `failure_fingerprint`
+  / `task_class` / `context_tags` from a task's OWN metadata and never
+  mines `last_error` or a title for them — a task nobody classified gets
+  a clean miss rather than a guessed match.
+- **Acceptance/tests/evidence:** `tests/test_runbook_registry.py` (27) and
+  `tests/test_runbook_worker_integration.py` (12) — real files on disk,
+  real `QueueStore`/`QueueEngine`/`queue_events`, no mocked loader.
+- **Known limitations:** (1) nothing WRITES the lookup keys yet — until a
+  coordinator/verifier stamps `failure_fingerprint` onto a task, every
+  lookup is a keyless no-op, so this is retrieval-ready but not yet
+  retrieval-active; (2) no live-lane run and no deploy; (3) the registry
+  is per-controller-working-directory, not per-lane-repo.
+- **Follow-up/backlog:** have the coordinator write `failure_fingerprint`
+  when it classifies a failure; surface RUNBOOK_* events in the
+  Supervisor/Coordinator dashboard panel.
 
 ---
 

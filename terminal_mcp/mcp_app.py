@@ -21,6 +21,7 @@ from .coordinator import CoordinatorGate, node_aware_repo_evidence
 from .project_workflows import ProjectProfileRegistry, ProjectWorkflowTools
 from .integration_engine import IntegrationEngine
 from .ai_usage_service import AiUsageService
+from .runbook_registry import registry_from_config
 from .recovery_engine import RecoveryEngine
 from .recovery_loop import RecoveryLoop
 from .integration_loop import IntegrationLoop
@@ -415,7 +416,8 @@ def build_mcp(service: TerminalService | None = None,
     terminal.request_governor = request_governor
     queue_engine = QueueEngine(queue.store, controller, coordinator=_gate,
                               on_completed=_on_task_completed, verify_queue=queue.verify_queue,
-                              governor=request_governor)
+                              governor=request_governor,
+                              runbooks=registry_from_config(terminal.config.runbooks))
     # TMCP-CALLED-TOOL-SPAM-002: carries a task that `terminal_turn
     # action="start"` explicitly started, so normal orchestration costs ONE
     # client call instead of one per queue transition. Scoped to that single
@@ -488,7 +490,7 @@ def build_mcp(service: TerminalService | None = None,
         # purpose -- the alternative is appending policy to 280+ individual
         # tool descriptions. See terminal_mcp/orchestration_policy.py for the
         # single source of truth (and why the doc cannot drift from it).
-        instructions=orchestration_policy.server_instructions(),
+        instructions=orchestration_policy.server_instructions() + "\n\n" + ANALYSIS_GATE_BOOTSTRAP,
         version=__version__,
     )
 
