@@ -283,7 +283,12 @@ class WorkService:
                             "queue_position": result.get("queue_position")})
 
         if self.store.get_run(work_id).state == ws.PLANNING:
-            self.store.transition_run(work_id, ws.READY, actor=actor)
+            try:
+                self.store.transition_run(work_id, ws.READY, actor=actor)
+            except ws.WorkAnalysisGateError as exc:
+                return {"error": "ANALYSIS_GATE_REFUSED", "work_id": work_id,
+                        "detail": str(exc), "analysis_gate": exc.verdict.as_dict(),
+                        "tasks": created}
         self.store.record_event(work_id, kind="planned",
                                 summary=f"{len(created)} task(s) queued on {run.lane}",
                                 actor=actor)

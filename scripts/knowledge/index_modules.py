@@ -85,7 +85,7 @@ GROUPS: dict[str, list[str]] = {
     "planner": ["bug_spec.py", "task_classifier.py", "planner_service.py",
                 "planner_store.py", "requirement_contract.py", "test_selection.py"],
     "work_runtime": ["work_store.py", "work_service.py", "work_loop.py",
-                     "work_eligibility.py", "work_decompose.py"],
+                     "work_eligibility.py", "work_decompose.py", "work_analysis_gate.py"],
     "work_planning": ["work_spec.py", "work_planning.py", "work_inbox.py",
                       "work_reuse.py", "work_writeback.py"],
     "work_telemetry": ["work_telemetry.py", "work_telemetry_runtime.py",

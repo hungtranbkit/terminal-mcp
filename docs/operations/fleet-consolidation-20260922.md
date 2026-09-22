@@ -17,7 +17,11 @@ The old SQLite-only project knowledge prototype is superseded by the canonical M
 
 Pre-consolidation patches, untracked source, and worktree archives are in `/home/dell/workspace/tmcp-consolidation-backup-20260922`. Live SQLite databases were backed up with SQLite's backup API on each host. HP backups are in `/home/kimex/.local/share/terminal-mcp-backups/20260922-unified`.
 
-57 merged worktrees were removed across Dell and HP after checking active process directories. Worktrees containing uncommitted material were archived and their file contents verified before removal. The original live checkout and integration checkout remain on each host.
+64 merged worktrees were removed across Dell, HP, and M910 after checking active process directories. Worktrees containing uncommitted material were archived and their file contents verified before removal. Active runtime checkouts and any worktree still under review are retained.
+
+## M910 recovery and additional source
+
+M910 became reachable during final validation. Its enabled user node-agent automatically connected after boot. Its separate WorkStore opt-in analysis contract and watch persistence tests were recovered under `work_analysis_gate.py`; canonical queue analysis profiles remain unchanged. The explicitly parked composer experiment remains archival; its old code is not deployed over the newer composer implementation.
 
 ## Deployment verification
 

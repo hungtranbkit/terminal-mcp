@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from .work_analysis_gate import AnalysisGateError, evaluate as evaluate_analysis_gate
 from .schema import Migration, apply_migrations
 
 # -- work run states. The template's vocabulary, unchanged. ------------------
@@ -87,6 +88,10 @@ APPROVAL_EXPIRED = "EXPIRED"
 
 class WorkError(ValueError):
     """A refused operation, with a reason a caller can show a human."""
+
+
+class WorkAnalysisGateError(AnalysisGateError, WorkError):
+    """An analysis refusal is also a normal refused WorkStore operation."""
 
 
 def _now() -> str:
@@ -170,7 +175,12 @@ class WorkRun:
 
 
 class WorkStore:
-    def __init__(self, path: str | os.PathLike[str] | None = None) -> None:
+    def __init__(self, path: str | os.PathLike[str] | None = None, *,
+                 require_analysis_gate: bool = False) -> None:
+        # Default False keeps every existing deployment behaving exactly as it
+        # did: only runs that opt in by carrying an `analysis_gate` block are
+        # judged. See docs/work-analysis-gate.md.
+        self.require_analysis_gate = bool(require_analysis_gate)
         self.path = Path(path) if path is not None else default_work_db_path()
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._connection = sqlite3.connect(str(self.path), check_same_thread=False)
@@ -336,6 +346,21 @@ class WorkStore:
             raise WorkError(
                 f"{work_id}: {run.state} -> {to_state} is not a valid transition "
                 f"(allowed: {sorted(allowed) or 'none -- terminal state'})")
+        # Analysis Gate. AFTER the edge check so an impossible transition still
+        # reports the more basic fault, and BEFORE the write so a refusal
+        # leaves the run in the state it was already in. Only the edge into
+        # READY is gated -- gating a run that is already executing would strand
+        # it, which is worse than letting one start. See
+        # docs/work-analysis-gate.md.
+        if to_state == READY:
+            verdict = evaluate_analysis_gate(
+                run.metadata, require_gate=self.require_analysis_gate)
+            if not verdict.allowed:
+                self.record_event(
+                    work_id, kind="analysis_gate_refused",
+                    summary=f"{run.state} -> {to_state} refused: {verdict.reason}",
+                    detail=verdict.message(), actor=actor)
+                raise WorkAnalysisGateError(verdict)
         now = _now()
         with self._connection:
             self._connection.execute(

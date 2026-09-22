@@ -147,8 +147,18 @@ def test_connection_reports_loopback_only_when_lan_bind_unset(
     assert result["endpoints"]["lan"] is None
 
 
+@pytest.fixture
+def configured_runtime_listener(monkeypatch, no_runtime_listeners):
+    """Configuration supplies policy; observed sockets supply exposure."""
+    from terminal_mcp import listen_evidence
+
+    monkeypatch.setattr(listen_evidence, "_from_proc", lambda port: [
+        listen_evidence.Listener("192.168.1.132", port, "ipv4", listen_evidence.SOURCE_PROC),
+    ])
+
+
 def test_connection_reports_lan_endpoint_and_cidrs_when_configured(
-        monkeypatch, capsys, no_runtime_listeners):
+        monkeypatch, capsys, configured_runtime_listener):
     monkeypatch.setenv("TERMINAL_MCP_LAN_BIND", "192.168.1.132")
     monkeypatch.setenv("TERMINAL_MCP_ALLOWED_NODE_CIDRS", "192.168.1.0/24")
     doctor.main(["connection", "--json"])
@@ -156,10 +166,12 @@ def test_connection_reports_lan_endpoint_and_cidrs_when_configured(
     assert result["endpoints"]["lan"] == "http://192.168.1.132:8766"
     assert result["endpoints"]["allowed_cidrs"] == ["192.168.1.0/24"]
     assert result["endpoints"]["firewall_verified"] is False
+    assert result["endpoints"]["lan_source"] == "proc_net_tcp"
+    assert result["endpoints"]["lan_confident"] is True
 
 
 def test_connection_human_output_shows_endpoints_section(
-        monkeypatch, capsys, no_runtime_listeners):
+        monkeypatch, capsys, configured_runtime_listener):
     monkeypatch.setenv("TERMINAL_MCP_LAN_BIND", "192.168.1.132")
     monkeypatch.setenv("TERMINAL_MCP_ALLOWED_NODE_CIDRS", "192.168.1.0/24")
     doctor.main(["connection"])
@@ -192,3 +204,14 @@ def test_connection_prefers_the_running_process_over_its_own_environment(monkeyp
     assert result["endpoints"]["lan"] == "http://192.168.1.50:8766"
     assert result["endpoints"]["lan_source"] == listen_evidence.SOURCE_PROC
     assert result["lan_state"]["state"] == listen_evidence.LAN_BOUND
+
+
+def test_connection_config_alone_does_not_invent_a_listener(
+        monkeypatch, capsys, no_runtime_listeners):
+    monkeypatch.setenv("TERMINAL_MCP_LAN_BIND", "192.168.1.132")
+    monkeypatch.setenv("TERMINAL_MCP_ALLOWED_NODE_CIDRS", "192.168.1.0/24")
+    doctor.main(["connection", "--json"])
+    result = json.loads(capsys.readouterr().out)
+    assert result["endpoints"]["lan"] is None
+    assert result["endpoints"]["config_drift"]["configured_not_listening"] == ["192.168.1.132"]
+    assert result["lan_state"]["all_addresses"] == []
