@@ -1,0 +1,101 @@
+{
+  "antigravity": {
+    "_cache_age": 1930,
+    "_cached": true,
+    "account": null,
+    "agent_state": null,
+    "api_key_configured": false,
+    "auth_mode": "Google OAuth / secure keyring",
+    "binary": null,
+    "context_window": null,
+    "execution_mode": null,
+    "installed": false,
+    "model": "Auto / unknown",
+    "ok": true,
+    "plan": null,
+    "processes": [],
+    "provider": "antigravity",
+    "quota_windows": [],
+    "running": false,
+    "status": "NOT_INSTALLED",
+    "telemetry_age_seconds": null,
+    "telemetry_fresh": false,
+    "updated_at": "2026-09-14T08:03:15.639849+00:00",
+    "usage_message": "Chưa có live telemetry. Sau khi cài hook, mở/chạy agy để monitor nhận model/quota tự động.",
+    "usage_status": "TELEMETRY_WAITING",
+    "version": null
+  },
+  "app_version": "0.6.0",
+  "claude": {
+    "_cache_age": 33,
+    "_cached": true,
+    "account": "Claude Code",
+    "claude_version": "unknown",
+    "five_hour": {
+      "remaining_percent": 76.0,
+      "resets_at": "2026-09-14T10:10:00.090989+00:00",
+      "used_percent": 24.0
+    },
+    "ok": true,
+    "provider": "claude",
+    "updated_at": "2026-09-14T08:02:42.269233+00:00",
+    "weekly": {
+      "remaining_percent": 49.0,
+      "resets_at": "2026-09-18T23:00:00.091012+00:00",
+      "used_percent": 51.0
+    },
+    "weekly_opus": null,
+    "weekly_sonnet": null
+  },
+  "codex": {
+    "_cache_age": 32,
+    "_cached": true,
+    "account": "redacted@example.com",
+    "five_hour": {
+      "remaining_percent": 100.0,
+      "resets_at": 1789390960,
+      "used_percent": 0.0,
+      "window_seconds": 18000
+    },
+    "ok": true,
+    "other_windows": [],
+    "plan": "plus",
+    "provider": "codex",
+    "reset_credits": {
+      "available_count": 3,
+      "total_earned_count": 0
+    },
+    "updated_at": "2026-09-14T08:02:42.494569+00:00",
+    "weekly": {
+      "remaining_percent": 55.0,
+      "resets_at": 1789806153,
+      "used_percent": 45.0,
+      "window_seconds": 604800
+    }
+  },
+  "gemini": {
+    "_cache_age": 1930,
+    "_cached": true,
+    "account": null,
+    "api_key_configured": false,
+    "auth_type": "gemini-api-key",
+    "authenticated": false,
+    "binary": "/usr/local/bin/gemini",
+    "installed": true,
+    "mode": "Gemini API Key",
+    "model": "Auto / unknown",
+    "ok": true,
+    "processes": [],
+    "provider": "gemini",
+    "quota": null,
+    "reset_time": null,
+    "running": false,
+    "status": "NOT_AUTHENTICATED",
+    "updated_at": "2026-09-14T08:03:15.593435+00:00",
+    "usage": null,
+    "usage_message": "Usage data unavailable",
+    "usage_status": "USAGE_UNAVAILABLE",
+    "version": "0.55.1"
+  },
+  "timestamp": "2026-09-14T08:03:15.640086+00:00"
+}
