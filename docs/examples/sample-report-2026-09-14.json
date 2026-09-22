@@ -1,0 +1,75 @@
+{
+  "generated_at": "2026-09-14T09:10:45+00:00",
+  "harness_version": "1.1.0",
+  "price_table_version": "2026-06-24",
+  "assignment": "observational",
+  "cache_ttl_policy": "split_required",
+  "verdict": "INSUFFICIENT_DATA",
+  "min_matched_per_group": 10,
+  "loaded_tasks": 0,
+  "unavailable_reentry_reasons": [],
+  "stratification_key_sources": [],
+  "sources": [
+    {
+      "name": "queue.db",
+      "path": "/home/dell/.local/state/terminal-mcp/queue.db",
+      "available": true,
+      "task_count": 0,
+      "detail": "table present but empty -- no tasks have been queued on this host yet"
+    },
+    {
+      "name": "queue.db",
+      "path": "/home/dell/.local/state/tmcp-fed/terminal-mcp/queue.db",
+      "available": true,
+      "task_count": 0,
+      "detail": "table present but empty -- no tasks have been queued on this host yet"
+    },
+    {
+      "name": "work.db (state/terminal-mcp)",
+      "path": "/home/dell/.local/state/terminal-mcp/work.db",
+      "available": false,
+      "task_count": 0,
+      "detail": "file does not exist -- this telemetry is not produced on this host yet"
+    },
+    {
+      "name": "ai_usage.db (state/terminal-mcp)",
+      "path": "/home/dell/.local/state/terminal-mcp/ai_usage.db",
+      "available": false,
+      "task_count": 0,
+      "detail": "file does not exist -- this telemetry is not produced on this host yet"
+    },
+    {
+      "name": "work.db (tmcp-fed/terminal-mcp)",
+      "path": "/home/dell/.local/state/tmcp-fed/terminal-mcp/work.db",
+      "available": false,
+      "task_count": 0,
+      "detail": "file does not exist -- this telemetry is not produced on this host yet"
+    },
+    {
+      "name": "ai_usage.db (tmcp-fed/terminal-mcp)",
+      "path": "/home/dell/.local/state/tmcp-fed/terminal-mcp/ai_usage.db",
+      "available": false,
+      "task_count": 0,
+      "detail": "file does not exist -- this telemetry is not produced on this host yet"
+    },
+    {
+      "name": "work_telemetry.db",
+      "path": "/home/dell/.local/state/terminal-mcp/work_telemetry.db",
+      "available": false,
+      "task_count": 0,
+      "detail": "file does not exist -- no worker has emitted telemetry on this host yet"
+    },
+    {
+      "name": "work_telemetry.db",
+      "path": "/home/dell/.local/state/tmcp-fed/terminal-mcp/work_telemetry.db",
+      "available": false,
+      "task_count": 0,
+      "detail": "file does not exist -- no worker has emitted telemetry on this host yet"
+    }
+  ],
+  "risk_groups": [],
+  "warnings": [],
+  "notes": [
+    "Sources listed as unavailable are reported, not silently skipped \u2014 an empty comparison always says which telemetry was missing."
+  ]
+}

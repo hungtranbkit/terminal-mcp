@@ -1,0 +1,788 @@
+"""The work_telemetry.db adapter, against the schema Task A committed.
+
+Fixtures are built to the real column names from
+docs/WORK_EFFICIENCY_TELEMETRY.md. Every test here pins a semantic that
+a generic schema reader would get subtly, silently wrong."""
+from __future__ import annotations
+
+import json
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from terminal_mcp.bench.model import COHORT_LEGACY, COHORT_NEW
+from terminal_mcp.bench.work_telemetry import (
+    FLAG_COUNTER_RESET,
+    FLAG_PARTIAL_SAMPLES,
+    WorkTelemetryDbSource,
+)
+
+TASK_COLUMNS = (
+    "task_id TEXT PRIMARY KEY, work_id TEXT, project_id TEXT, first_pass_success TEXT, "
+    "terminal_status TEXT, reentry_count INTEGER, contract_gap_count INTEGER, "
+    "started_at TEXT, completed_at TEXT, metadata TEXT"
+)
+SAMPLE_COLUMNS = (
+    "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, phase TEXT, kind TEXT, "
+    "idempotency_key TEXT, input_tokens INTEGER, output_tokens INTEGER, "
+    "cache_read_tokens INTEGER, cache_write_tokens INTEGER, turn_count INTEGER, "
+    "reported_input_tokens INTEGER, reported_output_tokens INTEGER, "
+    "counter_reset INTEGER, confidence TEXT, evidence_source TEXT"
+)
+_V3_REASONS = (
+    "TEST_FAILURE", "CONTRACT_GAP", "IMPLEMENTATION_BUG", "ENVIRONMENT_FAILURE",
+    "USER_CHANGED_REQUIREMENT", "DELIVERY_FAILURE", "MERGE_CONFLICT", "STALE_CONTEXT", "OTHER",
+)
+_V2_REASONS = tuple(r for r in _V3_REASONS if r != "STALE_CONTEXT")
+
+
+def _reentry_ddl(reasons: tuple[str, ...], comment: str = "") -> str:
+    """Mirrors the store's real DDL, CHECK constraint included. A
+    fixture without the constraint would exercise none of the
+    vocabulary machinery."""
+    allowed = ", ".join(f"'{reason}'" for reason in reasons)
+    return (
+        "CREATE TABLE telemetry_reentries (\n"
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+        f"  {comment}\n"
+        "  task_id TEXT NOT NULL, reason TEXT NOT NULL, phase TEXT,\n"
+        "  occurred_at TEXT, detail TEXT,\n"
+        f"  CHECK (reason IN ({allowed})))"
+    )
+
+
+REENTRY_COLUMNS = "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, reason TEXT, phase TEXT, occurred_at TEXT, detail TEXT"
+
+
+def build(path: Path, tasks: list[dict], samples: list[dict], reentries: list[dict]) -> Path:
+    connection = sqlite3.connect(path)
+    connection.execute(f"CREATE TABLE telemetry_tasks ({TASK_COLUMNS})")
+    connection.execute(f"CREATE TABLE telemetry_usage_samples ({SAMPLE_COLUMNS})")
+    connection.execute(f"CREATE TABLE telemetry_reentries ({REENTRY_COLUMNS})")
+    connection.execute("CREATE TABLE telemetry_counters (name TEXT, value INTEGER)")
+    for table, rows in (
+        ("telemetry_tasks", tasks),
+        ("telemetry_usage_samples", samples),
+        ("telemetry_reentries", reentries),
+    ):
+        for row in rows:
+            keys = list(row)
+            connection.execute(
+                f"INSERT INTO {table} ({', '.join(keys)}) VALUES ({', '.join('?' for _ in keys)})",
+                tuple(row[key] for key in keys),
+            )
+    connection.commit()
+    connection.close()
+    return path
+
+
+def base_task(task_id: str, **overrides) -> dict:
+    payload = {
+        "task_id": task_id,
+        "project_id": "git:github.com/acme/widget",
+        "first_pass_success": "TRUE",
+        "terminal_status": "COMPLETED",
+        "reentry_count": 0,
+        "contract_gap_count": 0,
+        "started_at": "2026-09-14T00:00:00+00:00",
+        "completed_at": "2026-09-14T00:20:00+00:00",
+        "metadata": json.dumps({"cohort": "new_pipeline"}),
+    }
+    payload.update(overrides)
+    return payload
+
+
+def sample(task_id: str, phase: str, **overrides) -> dict:
+    payload = {
+        "task_id": task_id,
+        "phase": phase,
+        "kind": "DELTA",
+        "idempotency_key": f"{task_id}-{phase}-{overrides.get('turn_count', 1)}",
+        "input_tokens": 100,
+        "output_tokens": 200,
+        "cache_read_tokens": 5000,
+        "cache_write_tokens": 400,
+        "turn_count": 1,
+        "reported_input_tokens": 999_999,
+        "reported_output_tokens": 999_999,
+        "counter_reset": 0,
+        "confidence": "MEASURED",
+        "evidence_source": "claude_usage_json",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_delta_samples_sum_and_reported_columns_are_ignored(tmp_path: Path) -> None:
+    """`reported_*` is cumulative when kind='CUMULATIVE'. Summing it
+    would be the exact double-count this harness exists to prevent."""
+    path = build(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [sample("t1", "IMPLEMENTATION") for _ in range(3)],
+        [],
+    )
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert record.usage.input_tokens == 300
+    assert record.usage.output_tokens == 600
+    assert record.usage.cache_write_tokens == 1200
+    assert record.usage.input_tokens != 999_999 * 3
+
+
+def test_only_worker_phases_count_toward_worker_turns(tmp_path: Path) -> None:
+    """ANALYSIS and CONTRACT are the investment being measured, and
+    UNKNOWN is unattributed. Counting either into the worker's turns
+    would inflate the precise number under test."""
+    path = build(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [
+            sample("t1", "ANALYSIS", turn_count=5),
+            sample("t1", "CONTRACT", turn_count=4),
+            sample("t1", "UNKNOWN", turn_count=7),
+            sample("t1", "IMPLEMENTATION", turn_count=2),
+            sample("t1", "VERIFICATION", turn_count=1),
+            sample("t1", "DELIVERY", turn_count=1),
+        ],
+        [],
+    )
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert record.worker_turn_count == 4, "2+1+1, not 20"
+    # Tokens from every phase still count toward cost -- the investment
+    # is real spend, and excluding it is what biases the comparison.
+    assert record.usage.input_tokens == 600
+
+
+def test_a_task_with_no_samples_is_unmeasured_not_zero(tmp_path: Path) -> None:
+    path = build(tmp_path / "work_telemetry.db", [base_task("t1")], [], [])
+    result = WorkTelemetryDbSource(path).load()
+    record = result.records[0]
+    assert record.usage.is_empty is True
+    assert record.usage.input_tokens is None
+    assert record.usage.primary_cost_tokens is None
+    assert record.worker_turn_count is None
+    assert any("never entered as zero" in warning for warning in result.warnings)
+
+
+def test_a_genuine_zero_is_kept_as_zero(tmp_path: Path) -> None:
+    """NULL means never measured, 0 means measured as zero. They are
+    different facts and must stay different."""
+    path = build(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [sample("t1", "IMPLEMENTATION", input_tokens=0, output_tokens=0,
+                cache_read_tokens=0, cache_write_tokens=0)],
+        [],
+    )
+    usage = WorkTelemetryDbSource(path).load().records[0].usage
+    assert usage.input_tokens == 0
+    assert usage.is_empty is False
+    assert usage.primary_cost_tokens == 0
+
+
+def test_partially_null_samples_are_flagged(tmp_path: Path) -> None:
+    path = build(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [
+            sample("t1", "IMPLEMENTATION"),
+            sample("t1", "IMPLEMENTATION", input_tokens=None),
+        ],
+        [],
+    )
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert FLAG_PARTIAL_SAMPLES in record.flags
+    assert record.usage.input_tokens == 100
+
+
+def test_counter_reset_is_flagged_not_excluded(tmp_path: Path) -> None:
+    path = build(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [sample("t1", "IMPLEMENTATION", counter_reset=1)],
+        [],
+    )
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert FLAG_COUNTER_RESET in record.flags
+    assert record.usage.input_tokens == 100
+
+
+def test_weakest_confidence_propagates(tmp_path: Path) -> None:
+    path = build(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [
+            sample("t1", "IMPLEMENTATION", confidence="MEASURED"),
+            sample("t1", "IMPLEMENTATION", confidence="ESTIMATED"),
+            sample("t1", "IMPLEMENTATION", confidence="DERIVED"),
+        ],
+        [],
+    )
+    assert "CONFIDENCE_ESTIMATED" in WorkTelemetryDbSource(path).load().records[0].flags
+
+
+def test_first_pass_success_is_tri_state(tmp_path: Path) -> None:
+    path = build(
+        tmp_path / "work_telemetry.db",
+        [
+            base_task("t1", first_pass_success="TRUE"),
+            base_task("t2", first_pass_success="FALSE"),
+            base_task("t3", first_pass_success="UNKNOWN", terminal_status="CANCELLED"),
+        ],
+        [],
+        [],
+    )
+    by_id = {record.task_id: record for record in WorkTelemetryDbSource(path).load().records}
+    assert by_id["t1"].first_pass_success is True
+    assert by_id["t2"].first_pass_success is False
+    assert by_id["t3"].first_pass_success is None, "UNKNOWN leaves the denominator"
+    assert by_id["t3"].first_pass_success_adjusted is None
+
+
+def test_reentry_reasons_come_through_for_the_exclusion_logic(tmp_path: Path) -> None:
+    path = build(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1", first_pass_success="FALSE", reentry_count=3)],
+        [],
+        [
+            {"task_id": "t1", "reason": "USER_CHANGED_REQUIREMENT", "phase": "IMPLEMENTATION",
+             "occurred_at": "2026-09-14T00:05:00+00:00", "detail": ""},
+            {"task_id": "t1", "reason": "ENVIRONMENT_FAILURE", "phase": "VERIFICATION",
+             "occurred_at": "2026-09-14T00:06:00+00:00", "detail": ""},
+            {"task_id": "t1", "reason": "CONTRACT_GAP", "phase": "IMPLEMENTATION",
+             "occurred_at": "2026-09-14T00:07:00+00:00", "detail": ""},
+        ],
+    )
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert record.counted_reentry_count == 1
+    assert len(record.excluded_reentries) == 2
+    assert record.first_pass_success_adjusted is False
+
+
+def test_excluded_reasons_only_flips_first_pass_and_flags_the_task(tmp_path: Path) -> None:
+    path = build(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1", first_pass_success="FALSE", reentry_count=2)],
+        [],
+        [
+            {"task_id": "t1", "reason": "ENVIRONMENT_FAILURE", "phase": "IMPLEMENTATION",
+             "occurred_at": "2026-09-14T00:05:00+00:00", "detail": ""},
+            {"task_id": "t1", "reason": "USER_CHANGED_REQUIREMENT", "phase": "IMPLEMENTATION",
+             "occurred_at": "2026-09-14T00:06:00+00:00", "detail": ""},
+        ],
+    )
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert record.first_pass_success_adjusted is True
+    assert record.has_excluded_reason_only is True
+
+
+def test_retries_is_not_invented(tmp_path: Path) -> None:
+    """A retry that costs a worker round trip IS a re-entry in this
+    store, so reporting a separate retries number would double count."""
+    path = build(tmp_path / "work_telemetry.db", [base_task("t1")], [], [])
+    assert WorkTelemetryDbSource(path).load().records[0].retries is None
+
+
+def test_duration_and_project_come_from_the_rollup(tmp_path: Path) -> None:
+    path = build(tmp_path / "work_telemetry.db", [base_task("t1")], [], [])
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert record.duration_seconds == 1200.0
+    assert record.project == "git:github.com/acme/widget"
+    assert record.cohort == COHORT_NEW
+
+
+def test_cohort_map_overrides_metadata(tmp_path: Path) -> None:
+    path = build(tmp_path / "work_telemetry.db", [base_task("t1")], [], [])
+    record = WorkTelemetryDbSource(path, cohort_map={"t1": "legacy"}).load().records[0]
+    assert record.cohort == COHORT_LEGACY
+
+
+def test_price_model_assumption_is_disclosed(tmp_path: Path) -> None:
+    """The store records no model id, so cost is unpriceable unless an
+    operator states an assumption -- and then the report must say so."""
+    path = build(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [sample("t1", "IMPLEMENTATION")],
+        [],
+    )
+    plain = WorkTelemetryDbSource(path).load().records[0]
+    assert plain.model is None
+    assert plain.cost_units() is None
+
+    result = WorkTelemetryDbSource(path, price_model="claude-opus-5").load()
+    priced = result.records[0]
+    assert priced.model == "claude-opus-5"
+    assert any("--price-model" in warning for warning in result.warnings)
+
+
+def test_missing_store_is_reported_not_crashed(tmp_path: Path) -> None:
+    result = WorkTelemetryDbSource(tmp_path / "absent.db").load()
+    assert result.status.available is False
+    assert "no worker has emitted telemetry" in result.status.detail
+
+
+def test_empty_store_says_empty_not_absent(tmp_path: Path) -> None:
+    path = build(tmp_path / "work_telemetry.db", [], [], [])
+    result = WorkTelemetryDbSource(path).load()
+    assert result.status.available is True
+    assert "no worker has written a row yet" in result.status.detail
+
+
+def test_the_store_declares_the_reason_vocabulary_it_can_record(tmp_path: Path) -> None:
+    """EM-C1 at the source: the adapter publishes the CHECK-constrained
+    enum so the report can mark what the store physically cannot say.
+    Migration v3 added STALE_CONTEXT, so the set is now complete with
+    respect to what this harness knows -- the mechanism stays for the
+    next reason, and for an older database."""
+    from terminal_mcp.bench.model import KNOWN_REENTRY_REASONS, STALE_CONTEXT
+    from terminal_mcp.bench.work_telemetry import STORE_REENTRY_REASONS
+
+    path = build(tmp_path / "work_telemetry.db", [base_task("t1")], [], [])
+    result = WorkTelemetryDbSource(path).load()
+    assert result.reason_vocabulary == STORE_REENTRY_REASONS
+    assert STALE_CONTEXT in result.reason_vocabulary, "added in migration v3"
+    assert "CONTRACT_GAP" in result.reason_vocabulary
+    assert not (KNOWN_REENTRY_REASONS - result.reason_vocabulary), (
+        "nothing this harness knows about should render UNAVAILABLE against a current store"
+    )
+    assert not any("could not be probed" in warning for warning in result.warnings), (
+        "the constraint is present, so it must be probed rather than assumed"
+    )
+
+
+def test_a_missing_store_declares_no_vocabulary(tmp_path: Path) -> None:
+    assert WorkTelemetryDbSource(tmp_path / "absent.db").load().reason_vocabulary is None
+
+
+def test_a_flattering_stored_outcome_is_overridden_and_flagged(tmp_path: Path) -> None:
+    """EM-C3: the reporter writes its own outcome, so it is recomputed
+    from that task's own re-entry rows and disagreement is flagged."""
+    from terminal_mcp.bench.model import FLAG_FPS_DISAGREEMENT
+
+    path = build(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1", first_pass_success="TRUE", reentry_count=1)],
+        [],
+        [{"task_id": "t1", "reason": "CONTRACT_GAP", "phase": "IMPLEMENTATION",
+          "occurred_at": "2026-09-14T00:05:00+00:00", "detail": ""}],
+    )
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert record.first_pass_success is True, "what the reporter claimed"
+    assert record.first_pass_success_recomputed is False, "what its own rows say"
+    assert record.first_pass_success_adjusted is False
+    assert FLAG_FPS_DISAGREEMENT in record.flags
+
+
+def test_an_honest_stored_outcome_is_not_flagged(tmp_path: Path) -> None:
+    from terminal_mcp.bench.model import FLAG_FPS_DISAGREEMENT
+
+    path = build(tmp_path / "work_telemetry.db", [base_task("t1")], [], [])
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert record.first_pass_success_recomputed is True
+    assert FLAG_FPS_DISAGREEMENT not in record.flags
+
+
+def test_excluded_reasons_do_not_make_a_task_fail_on_recompute(tmp_path: Path) -> None:
+    path = build(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1", first_pass_success="FALSE", reentry_count=1)],
+        [],
+        [{"task_id": "t1", "reason": "ENVIRONMENT_FAILURE", "phase": "IMPLEMENTATION",
+          "occurred_at": "2026-09-14T00:05:00+00:00", "detail": ""}],
+    )
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert record.first_pass_success_recomputed is True
+    assert record.has_excluded_reason_only is True
+
+
+def test_cancelled_leaves_the_denominator_on_recompute(tmp_path: Path) -> None:
+    path = build(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1", first_pass_success="UNKNOWN", terminal_status="CANCELLED")],
+        [],
+        [],
+    )
+    assert WorkTelemetryDbSource(path).load().records[0].first_pass_success_adjusted is None
+
+
+def test_failed_tasks_recompute_as_not_first_pass(tmp_path: Path) -> None:
+    path = build(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1", first_pass_success="FALSE", terminal_status="FAILED")],
+        [],
+        [],
+    )
+    assert WorkTelemetryDbSource(path).load().records[0].first_pass_success_recomputed is False
+
+
+# --- migration 2: cache-write TTL split + model_id ------------------------
+
+SAMPLE_COLUMNS_V2 = (
+    "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, phase TEXT, kind TEXT, "
+    "idempotency_key TEXT, input_tokens INTEGER, output_tokens INTEGER, "
+    "cache_read_tokens INTEGER, cache_write_tokens INTEGER, "
+    "cache_write_5m_tokens INTEGER, cache_write_1h_tokens INTEGER, model_id TEXT, "
+    "turn_count INTEGER, reported_input_tokens INTEGER, counter_reset INTEGER, "
+    "confidence TEXT, evidence_source TEXT"
+)
+
+
+def build_v2(path: Path, tasks: list[dict], samples: list[dict]) -> Path:
+    connection = sqlite3.connect(path)
+    connection.execute(f"CREATE TABLE telemetry_tasks ({TASK_COLUMNS})")
+    connection.execute(f"CREATE TABLE telemetry_usage_samples ({SAMPLE_COLUMNS_V2})")
+    connection.execute(_reentry_ddl(_V3_REASONS))
+    connection.execute("PRAGMA user_version = 3")
+    for table, rows in (("telemetry_tasks", tasks), ("telemetry_usage_samples", samples)):
+        for row in rows:
+            keys = list(row)
+            connection.execute(
+                f"INSERT INTO {table} ({', '.join(keys)}) VALUES ({', '.join('?' for _ in keys)})",
+                tuple(row[key] for key in keys),
+            )
+    connection.commit()
+    connection.close()
+    return path
+
+
+def sample_v2(task_id: str, **overrides) -> dict:
+    payload = {
+        "task_id": task_id,
+        "phase": "IMPLEMENTATION",
+        "kind": "DELTA",
+        "idempotency_key": f"{task_id}-{overrides.get('model_id', 'a')}-{overrides.get('input_tokens', 0)}",
+        "input_tokens": 100,
+        "output_tokens": 200,
+        "cache_read_tokens": 1000,
+        "cache_write_tokens": 500,
+        "cache_write_5m_tokens": 400,
+        "cache_write_1h_tokens": 100,
+        "model_id": "claude-opus-5",
+        "turn_count": 1,
+        "counter_reset": 0,
+        "confidence": "MEASURED",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_the_cache_write_ttl_split_is_read_when_present(tmp_path: Path) -> None:
+    """Reading only the collapsed total would discard the coefficient
+    that makes cost computable, and report every task as unpriceable
+    under the default split_required policy."""
+    path = build_v2(tmp_path / "work_telemetry.db", [base_task("t1")], [sample_v2("t1")])
+    usage = WorkTelemetryDbSource(path).load().records[0].usage
+    assert usage.cache_write_5m_tokens == 400
+    assert usage.cache_write_1h_tokens == 100
+    assert usage.has_ttl_split is True
+
+
+def test_cost_is_priceable_from_the_store_alone(tmp_path: Path) -> None:
+    """model_id arrived in migration 2, so no --price-model assumption
+    is needed and none is claimed."""
+    path = build_v2(tmp_path / "work_telemetry.db", [base_task("t1")], [sample_v2("t1")])
+    result = WorkTelemetryDbSource(path).load()
+    record = result.records[0]
+    assert record.model == "claude-opus-5"
+    # 100 + 400*1.25 + 100*2 + 1000*0.1 + 200*5
+    assert record.cost_units() == pytest.approx(100 + 500 + 200 + 100 + 1000)
+    assert not any("--price-model" in warning for warning in result.warnings)
+
+
+def test_a_mixed_model_task_is_priced_per_sample_not_per_task(tmp_path: Path) -> None:
+    """A worker delegating to a cheaper sub-agent cannot be priced from
+    one task-level model. Per-sample pricing is the only correct answer,
+    and the task is flagged so the reader knows why."""
+    from terminal_mcp.bench.model import FLAG_MIXED_MODEL
+
+    path = build_v2(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [
+            sample_v2("t1", model_id="claude-opus-5"),
+            sample_v2("t1", model_id="claude-haiku-4-5"),
+        ],
+    )
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert FLAG_MIXED_MODEL in record.flags
+    # Both models have the same multipliers, so the two samples price
+    # identically in base-input-equivalents -- but each was priced with
+    # its OWN table entry, not with one guessed for the task.
+    assert record.cost_units() == pytest.approx(2 * (100 + 500 + 200 + 100 + 1000))
+    assert record.model is None, "no single task-level model is claimed"
+
+
+def test_per_sample_pricing_respects_a_models_own_cache_read_rate(tmp_path: Path) -> None:
+    """Fable 5.1 reads cache at 0.025x base input, not the usual 0.1x."""
+    path = build_v2(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [sample_v2("t1", model_id="claude-fable-5-1")],
+    )
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert record.cost_units() == pytest.approx(100 + 500 + 200 + 1000 * 0.025 + 1000)
+
+
+def test_one_unpriceable_sample_makes_the_whole_task_unpriceable(tmp_path: Path) -> None:
+    path = build_v2(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [
+            sample_v2("t1"),
+            sample_v2("t1", input_tokens=None),
+        ],
+    )
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert record.cost_units() is None, "a partial cost is a wrong cost"
+
+
+def test_an_unknown_model_is_flagged_and_unpriceable(tmp_path: Path) -> None:
+    from terminal_mcp.bench.model import FLAG_UNKNOWN_MODEL_PRICE
+
+    path = build_v2(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [sample_v2("t1", model_id="some-other-vendor-model")],
+    )
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert FLAG_UNKNOWN_MODEL_PRICE in record.flags
+    assert record.cost_units() is None
+
+
+def test_the_pre_migration_schema_still_reads(tmp_path: Path) -> None:
+    """Migration 2 is not assumed. An older store without the split or
+    model_id degrades to the collapsed total and an unpriceable cost,
+    rather than failing."""
+    path = build(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [sample("t1", "IMPLEMENTATION")],
+        [],
+    )
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert record.usage.cache_write_tokens == 400
+    assert record.usage.has_ttl_split is False
+    assert record.cost_units() is None
+
+
+def test_the_ttl_split_is_a_breakdown_never_an_addition(tmp_path: Path) -> None:
+    """Mirrors the store's own pinned case: 100 input, 800 5m, 200 1h is
+    1,100 prompt tokens, not 3,100. Including the split alongside the
+    total would count every cache write twice."""
+    path = build_v2(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [sample_v2("t1", input_tokens=100, output_tokens=0, cache_read_tokens=0,
+                   cache_write_tokens=1000, cache_write_5m_tokens=800,
+                   cache_write_1h_tokens=200)],
+    )
+    usage = WorkTelemetryDbSource(path).load().records[0].usage
+    assert usage.cache_write_tokens == 1000, "the total, not 800+200+1000"
+    assert usage.total_prompt_tokens == 1100, "not 3100"
+
+
+def test_both_splits_without_a_total_derive_the_total(tmp_path: Path) -> None:
+    path = build_v2(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [sample_v2("t1", input_tokens=100, output_tokens=0, cache_read_tokens=0,
+                   cache_write_tokens=None, cache_write_5m_tokens=800,
+                   cache_write_1h_tokens=200)],
+    )
+    usage = WorkTelemetryDbSource(path).load().records[0].usage
+    assert usage.cache_write_tokens == 1000
+    assert usage.has_ttl_split is True
+
+
+def test_only_a_collapsed_total_leaves_the_ttl_mix_unknown_not_zero(tmp_path: Path) -> None:
+    path = build_v2(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [sample_v2("t1", cache_write_tokens=1000, cache_write_5m_tokens=None,
+                   cache_write_1h_tokens=None)],
+    )
+    usage = WorkTelemetryDbSource(path).load().records[0].usage
+    assert usage.cache_write_tokens == 1000
+    assert usage.cache_write_5m_tokens is None, "TTL mix unknown, not zero"
+    assert usage.has_ttl_split is False
+
+
+def test_a_total_disagreeing_with_its_split_is_flagged_and_unpriced(tmp_path: Path) -> None:
+    """The store refuses such a write, so this can only come from an
+    older or foreign database. Preferring one figure over the other
+    would be picking a winner between contradictory measurements."""
+    from terminal_mcp.bench.work_telemetry import FLAG_CACHE_WRITE_INCONSISTENT
+
+    path = build_v2(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [sample_v2("t1", cache_write_tokens=999, cache_write_5m_tokens=800,
+                   cache_write_1h_tokens=200)],
+    )
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert FLAG_CACHE_WRITE_INCONSISTENT in record.flags
+    assert record.cost_units() is None
+
+
+def test_an_unattributed_sample_groups_under_unknown_not_a_neighbour(tmp_path: Path) -> None:
+    """Usage with no model_id is real usage whose price is genuinely
+    unknown. It must not inherit the model of the sample next to it."""
+    from terminal_mcp.bench.work_telemetry import FLAG_MODEL_UNATTRIBUTED
+
+    path = build_v2(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [
+            sample_v2("t1", model_id="claude-opus-5"),
+            sample_v2("t1", model_id=None, input_tokens=101),
+        ],
+    )
+    record = WorkTelemetryDbSource(path).load().records[0]
+    assert FLAG_MODEL_UNATTRIBUTED in record.flags
+    assert record.cost_units() is None, "cost is gated on full attribution, not caveated"
+    assert record.model == "claude-opus-5", "the one model actually recorded"
+
+
+def test_an_unattributed_sample_is_not_counted_as_a_second_model(tmp_path: Path) -> None:
+    from terminal_mcp.bench.model import FLAG_MIXED_MODEL
+
+    path = build_v2(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [
+            sample_v2("t1", model_id="claude-opus-5"),
+            sample_v2("t1", model_id=None, input_tokens=101),
+        ],
+    )
+    assert FLAG_MIXED_MODEL not in WorkTelemetryDbSource(path).load().records[0].flags
+
+
+def test_an_operator_assumption_can_stand_in_for_a_missing_model(tmp_path: Path) -> None:
+    path = build_v2(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [sample_v2("t1", model_id=None)],
+    )
+    result = WorkTelemetryDbSource(path, price_model="claude-opus-5").load()
+    record = result.records[0]
+    assert record.cost_units() is not None
+    assert any("--price-model" in warning for warning in result.warnings)
+
+
+def test_per_model_costs_sum_to_the_whole_task(tmp_path: Path) -> None:
+    """Pricing per model and adding up must not disagree with pricing
+    the task -- the store pins the same invariant on its own totals."""
+    path = build_v2(
+        tmp_path / "work_telemetry.db",
+        [base_task("t1")],
+        [
+            sample_v2("t1", model_id="claude-opus-5"),
+            sample_v2("t1", model_id="claude-sonnet-5", input_tokens=101),
+        ],
+    )
+    record = WorkTelemetryDbSource(path).load().records[0]
+    opus = 100 + 400 * 1.25 + 100 * 2 + 1000 * 0.1 + 200 * 5
+    sonnet = 101 + 400 * 1.25 + 100 * 2 + 1000 * 0.1 + 200 * 5
+    assert record.cost_units() == pytest.approx(opus + sonnet)
+
+
+# --- the emittable vocabulary is observed, not read off the prose --------
+
+
+def _build_with_reentry_ddl(path: Path, ddl: str, user_version: int | None) -> Path:
+    connection = sqlite3.connect(path)
+    connection.execute(f"CREATE TABLE telemetry_tasks ({TASK_COLUMNS})")
+    connection.execute(f"CREATE TABLE telemetry_usage_samples ({SAMPLE_COLUMNS})")
+    connection.execute(ddl)
+    if user_version is not None:
+        connection.execute(f"PRAGMA user_version = {user_version}")
+    connection.commit()
+    connection.close()
+    return path
+
+
+def test_a_comment_naming_a_reason_does_not_make_it_emittable(tmp_path: Path) -> None:
+    """The exact trap the telemetry lane hit in their own migration
+    guard: sqlite_master stores the CREATE statement verbatim, comments
+    included, so a comment explaining that a migration ADDS a value
+    contains that value as literal text. A text match reports the value
+    as admitted because somebody wrote about it — the prose describing
+    the rule mistaken for the rule. A false 'available' is the dangerous
+    direction, because a spurious zero row reads as data where an
+    UNAVAILABLE row reads as an absence."""
+    path = _build_with_reentry_ddl(
+        tmp_path / "work_telemetry.db",
+        _reentry_ddl(_V2_REASONS, comment="-- migration 3 adds STALE_CONTEXT to this constraint"),
+        user_version=2,
+    )
+    result = WorkTelemetryDbSource(path).load()
+    ddl = sqlite3.connect(path).execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'telemetry_reentries'"
+    ).fetchone()[0]
+    assert "STALE_CONTEXT" in ddl, "the fixture must contain the trap"
+    assert "STALE_CONTEXT" not in result.reason_vocabulary, "the constraint rejects it"
+    assert "CONTRACT_GAP" in result.reason_vocabulary
+
+
+def test_a_pre_v3_file_reports_stale_context_unavailable(tmp_path: Path) -> None:
+    """This reader never migrates, so it can legitimately meet a v2 file
+    that no producer has opened with current code. For that file
+    STALE_CONTEXT is genuinely unavailable, not zero."""
+    path = _build_with_reentry_ddl(
+        tmp_path / "work_telemetry.db", _reentry_ddl(_V2_REASONS), user_version=2
+    )
+    assert "STALE_CONTEXT" not in WorkTelemetryDbSource(path).load().reason_vocabulary
+
+
+def test_a_v3_file_reports_stale_context_available(tmp_path: Path) -> None:
+    """A v3 store with no STALE_CONTEXT rows is available-with-count-0,
+    a real finding — a different fact from a v2 store's UNAVAILABLE."""
+    path = _build_with_reentry_ddl(
+        tmp_path / "work_telemetry.db", _reentry_ddl(_V3_REASONS), user_version=3
+    )
+    assert "STALE_CONTEXT" in WorkTelemetryDbSource(path).load().reason_vocabulary
+
+
+def test_an_unconstrained_column_admits_everything(tmp_path: Path) -> None:
+    path = _build_with_reentry_ddl(
+        tmp_path / "work_telemetry.db",
+        f"CREATE TABLE telemetry_reentries ({REENTRY_COLUMNS})",
+        user_version=1,
+    )
+    vocabulary = WorkTelemetryDbSource(path).load().reason_vocabulary
+    assert "STALE_CONTEXT" in vocabulary, "no CHECK means nothing is rejected"
+
+
+def test_user_version_is_the_fallback_when_the_constraint_cannot_be_probed(tmp_path: Path) -> None:
+    """No telemetry_reentries table at all: the declared migration level
+    is the next best evidence, and the report says it was not observed."""
+    connection = sqlite3.connect(tmp_path / "work_telemetry.db")
+    connection.execute(f"CREATE TABLE telemetry_tasks ({TASK_COLUMNS})")
+    connection.execute(f"CREATE TABLE telemetry_usage_samples ({SAMPLE_COLUMNS})")
+    connection.execute("PRAGMA user_version = 2")
+    connection.commit()
+    connection.close()
+
+    result = WorkTelemetryDbSource(tmp_path / "work_telemetry.db").load()
+    assert "STALE_CONTEXT" not in result.reason_vocabulary
+    assert any("PRAGMA user_version = 2" in warning for warning in result.warnings)
+
+
+def test_the_probe_never_writes_to_the_file_being_read(tmp_path: Path) -> None:
+    """The store's own fix — probe inside a SAVEPOINT and roll back —
+    is unavailable here: mode=ro plus query_only makes an INSERT fail
+    because writes are forbidden, not because the CHECK rejected the
+    value, so every reason would report as not-admitted. A silent
+    fail-closed. The DDL is replayed into a fresh in-memory database
+    instead, so nothing touches the file."""
+    path = _build_with_reentry_ddl(
+        tmp_path / "work_telemetry.db", _reentry_ddl(_V3_REASONS), user_version=3
+    )
+    before = path.stat().st_mtime_ns, path.stat().st_size
+    result = WorkTelemetryDbSource(path).load()
+    assert "STALE_CONTEXT" in result.reason_vocabulary
+    assert (path.stat().st_mtime_ns, path.stat().st_size) == before
+    connection = sqlite3.connect(path)
+    assert connection.execute("SELECT count(*) FROM telemetry_reentries").fetchone()[0] == 0

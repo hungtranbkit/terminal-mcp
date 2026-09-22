@@ -60,6 +60,7 @@ terminal-mcp-http = "terminal_mcp.server_http:main"
 terminal-mcp-webauth = "terminal_mcp.webauth_cli:main"
 terminal-mcp-doctor = "terminal_mcp.doctor:main"
 terminal-mcp-node-doctor = "terminal_mcp.node_profile:main"
+terminal-mcp-bench = "terminal_mcp.bench.cli:main"
 terminal-mcp-tunnel-watchdog = "terminal_mcp.tunnel_watchdog:main"
 terminal-mcp-prompt-watcher = "terminal_mcp.prompt_start_watcher:main"
 # Canonical name -- deliberately IDENTICAL to chatgpt_sidecar.SERVER_NAME, so
