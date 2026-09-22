@@ -21,6 +21,8 @@ import yaml
 from terminal_mcp import doctor
 from terminal_mcp.grants import SessionGrantStore
 
+from tests.conftest import tmux_cmd
+
 
 def _write_config(tmp_path) -> str:
     raw = {
@@ -38,7 +40,7 @@ def tmux_cleanup():
     created: list[str] = []
     yield created
     for name in created:
-        subprocess.run(["tmux", "kill-session", "-t", name], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", name], check=False, capture_output=True)
 
 
 def test_clean_fleet_reports_nothing_flagged(tmp_path, monkeypatch, capsys):
@@ -60,7 +62,7 @@ def test_stale_identity_pin_is_flagged_but_explained_and_exits_zero(tmp_path, mo
 
     name = "test-doctor-grants-stale1"
     tmux_cleanup.append(name)
-    subprocess.run(["tmux", "new-session", "-d", "-s", name, "-c", str(tmp_path), "bash -lc 'sleep 30'"], check=True)
+    subprocess.run([*tmux_cmd(), "new-session", "-d", "-s", name, "-c", str(tmp_path), "bash -lc 'sleep 30'"], check=True)
 
     # A real active grant, deliberately pinned to an identity that does
     # NOT match this session's real one -- same mechanism as the live
@@ -92,7 +94,7 @@ def test_human_output_labels_stale_pin_as_re_grant_to_fix(tmp_path, monkeypatch,
 
     name = "test-doctor-grants-stale2"
     tmux_cleanup.append(name)
-    subprocess.run(["tmux", "new-session", "-d", "-s", name, "-c", str(tmp_path), "bash -lc 'sleep 30'"], check=True)
+    subprocess.run([*tmux_cmd(), "new-session", "-d", "-s", name, "-c", str(tmp_path), "bash -lc 'sleep 30'"], check=True)
     store = SessionGrantStore(grants_path)
     store.set_read(name, True, granted_by="tester")
     store.set_input(name, True, granted_by="tester",
@@ -141,7 +143,7 @@ def test_a_grant_whose_session_is_live_is_not_called_orphaned(
 
     name = "test-doctor-grants-present"
     tmux_cleanup.append(name)
-    subprocess.run(["tmux", "new-session", "-d", "-s", name, "-c", str(tmp_path),
+    subprocess.run([*tmux_cmd(), "new-session", "-d", "-s", name, "-c", str(tmp_path),
                     "bash -lc 'sleep 30'"], check=True)
     SessionGrantStore(grants_path).set_read(name, True, granted_by="tester")
 

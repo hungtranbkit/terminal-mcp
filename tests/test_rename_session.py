@@ -33,6 +33,8 @@ from terminal_mcp.queue_store import QueueStore
 from terminal_mcp.session_registry import SessionRegistryStore
 from terminal_mcp.supervisor import SupervisorService, SupervisorStore
 
+from tests.conftest import tmux_cmd
+
 
 def _unique(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
@@ -74,7 +76,7 @@ def rig(tmp_path, tmux_session_factory):
 
 
 def _kill_tmux(name: str) -> None:
-    subprocess.run(["tmux", "kill-session", "-t", name], check=False, capture_output=True)
+    subprocess.run([*tmux_cmd(), "kill-session", "-t", name], check=False, capture_output=True)
 
 
 @pytest.mark.anyio

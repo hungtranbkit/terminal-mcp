@@ -16,6 +16,8 @@ from mcp.client.streamable_http import streamable_http_client
 from terminal_mcp import __version__
 from terminal_mcp.server_http import HTTP_HOST, HTTP_PATH, HTTP_PORT
 
+from tests.conftest import tmux_cmd
+
 
 def result_json(result) -> dict:
     if result.structured_content is not None:
@@ -264,7 +266,7 @@ async def test_http_real_node_tools_full_lifecycle_round_trip(http_server):
                 assert reopened.get("error") is None
                 assert reopened["node_id"] == "local"
     finally:
-        subprocess.run(["tmux", "kill-session", "-t", name], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", name], check=False, capture_output=True)
 
 
 def test_http_bind_is_fixed_loopback():

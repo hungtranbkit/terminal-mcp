@@ -15,6 +15,8 @@ from terminal_mcp.audit import AuditStore
 from terminal_mcp.grants import SessionGrantStore
 from terminal_mcp.lease import PaneLeaseStore
 
+from tests.conftest import tmux_cmd
+
 
 def _config() -> AppConfig:
     return AppConfig(
@@ -166,9 +168,9 @@ def test_recreated_session_same_name_gets_an_independent_lease(tmux_session_fact
     assert store.acquire(old_key, "still-holding-old-identity", ttl_seconds=30) is True
 
     import subprocess
-    subprocess.run(["tmux", "kill-session", "-t", session], check=True)
+    subprocess.run([*tmux_cmd(), "kill-session", "-t", session], check=True)
     time.sleep(0.2)
-    subprocess.run(["tmux", "new-session", "-d", "-s", session,
+    subprocess.run([*tmux_cmd(), "new-session", "-d", "-s", session,
                     "bash -lc 'read v; echo GOT=$v; sleep 15'"], check=True)
     time.sleep(0.3)
 
@@ -179,7 +181,7 @@ def test_recreated_session_same_name_gets_an_independent_lease(tmux_session_fact
     # The old identity's lease is still exactly as it was -- untouched by
     # the new session's send, proving isolation rather than accidental reuse.
     assert store.holder(old_key)["owner_id"] == "still-holding-old-identity"
-    subprocess.run(["tmux", "kill-session", "-t", session], check=False)
+    subprocess.run([*tmux_cmd(), "kill-session", "-t", session], check=False)
 
 
 def test_pane_busy_when_lease_genuinely_cannot_be_acquired_in_time(tmp_path, monkeypatch):

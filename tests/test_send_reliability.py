@@ -33,6 +33,8 @@ from terminal_mcp.audit import AuditStore
 from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig
 from terminal_mcp.core import TerminalService, _extract_composer_text
 
+from tests.conftest import tmux_cmd
+
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 LAGGY_READER = f"python3 -u {FIXTURES_DIR / 'laggy_line_reader.py'}"
 NEVER_SUBMITS = f"python3 -u {FIXTURES_DIR / 'never_submits.py'}"
@@ -64,13 +66,13 @@ def test_evidence_raw_tmux_swallows_enter_without_a_settle_gap(tmux_session_fact
     time.sleep(0.2)
 
     def raw_send_keys(*args: str) -> None:
-        subprocess.run(["tmux", "send-keys", "-t", session, *args], check=True)
+        subprocess.run([*tmux_cmd(), "send-keys", "-t", session, *args], check=True)
 
     # Old behavior: text, then Enter, with zero gap.
     raw_send_keys("-l", "--", "hello")
     raw_send_keys("Enter")
     time.sleep(0.3)
-    pane = subprocess.run(["tmux", "capture-pane", "-t", session, "-p"],
+    pane = subprocess.run([*tmux_cmd(), "capture-pane", "-t", session, "-p"],
                           check=True, capture_output=True, text=True).stdout
     assert "SUBMITTED[1]" not in pane, "expected the no-gap Enter to be swallowed (that is the bug)"
     assert "hello" in pane
@@ -83,7 +85,7 @@ def test_evidence_raw_tmux_swallows_enter_without_a_settle_gap(tmux_session_fact
     time.sleep(0.08)
     raw_send_keys("Enter")
     time.sleep(0.3)
-    pane = subprocess.run(["tmux", "capture-pane", "-t", session, "-p"],
+    pane = subprocess.run([*tmux_cmd(), "capture-pane", "-t", session, "-p"],
                           check=True, capture_output=True, text=True).stdout
     assert "SUBMITTED[1]: helloworld" in pane
 

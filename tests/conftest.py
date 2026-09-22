@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import os
+import uuid
 import shutil
 import subprocess
 from pathlib import Path
 import time
 
 import pytest
+
+from terminal_mcp.tmux import TMUX_SOCKET_ENV
 
 from terminal_mcp.config import AppConfig, PermissionsConfig, SessionAccessConfig
 
@@ -124,16 +127,8 @@ def pytest_configure(config: pytest.Config) -> None:
     tab, a real MCP client), ITS OWN reconcile pass sees whatever test
     session happens to be alive on the shared tmux server at that
     instant and writes a real row into the PRODUCTION session_registry.
-    db for it -- a completely separate process, with its own unmodified
-    XDG_STATE_HOME, that this hook has no way to reach or isolate. Not a
-    bug in this isolation mechanism (which correctly covers everything
-    the TEST process itself writes) -- an inherent consequence of this
-    project's own testing philosophy (real tmux, real shared server)
-    combined with a real, live sibling service. Harmless (rows are
-    obviously test-named, and correctly age into MISSING once the test's
-    tmux session ends) -- clean up periodically with the same read-only-
-    diff-then-DELETE approach used to discover this, never treat it as
-    a regression to chase further."""
+    db for it. A unique tmux socket per test run also isolates sessions
+    from live services and other concurrent test runs."""
     # Isolation unchanged; what is added is the other half of it. This used to
     # be a bare mkdtemp that nothing removed, so every pytest run left one more
     # directory in /tmp forever -- the same shape of leak as the six in
@@ -145,6 +140,8 @@ def pytest_configure(config: pytest.Config) -> None:
     state_home = tempfile.mkdtemp(prefix="terminal-mcp-test-state-")
     os.environ["XDG_STATE_HOME"] = state_home
     atexit.register(lambda: shutil.rmtree(state_home, ignore_errors=True))
+    config._tmcp_test_socket = f"tmcp-test-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    os.environ[TMUX_SOCKET_ENV] = config._tmcp_test_socket
     config.addinivalue_line(
         "markers",
         "closed_access: run with session_access defaults CLOSED (the production posture) -- "
@@ -173,8 +170,20 @@ def find_node() -> str | None:
     return None
 
 
+def pytest_unconfigure(config: pytest.Config) -> None:
+    socket_name = getattr(config, "_tmcp_test_socket", None)
+    if socket_name and shutil.which("tmux"):
+        subprocess.run(["tmux", "-L", socket_name, "kill-server"],
+                       check=False, capture_output=True, timeout=10)
+
+
+def tmux_cmd() -> list[str]:
+    socket_name = os.environ.get(TMUX_SOCKET_ENV, "")
+    return ["tmux", *(("-L", socket_name) if socket_name else ())]
+
+
 def tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["tmux", *args], check=check, capture_output=True, text=True, timeout=10)
+    return subprocess.run([*tmux_cmd(), *args], check=check, capture_output=True, text=True, timeout=10)
 
 
 # Set on every tmux session this fixture creates, and read back on a later

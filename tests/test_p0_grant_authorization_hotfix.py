@@ -34,6 +34,8 @@ from terminal_mcp.grants import SessionGrantStore
 from terminal_mcp.supervisor import SupervisorService, SupervisorStore
 from terminal_mcp.supervisor2 import build_supervisor_v2
 
+from tests.conftest import tmux_cmd
+
 
 def _config(*, terminal_input=True, denied_session_patterns=()) -> AppConfig:
     # "promptflow"-shaped: NOT in either static whitelist, exactly the
@@ -309,9 +311,9 @@ def test_recreated_same_name_session_does_not_inherit_input_grant(tmp_path, tmux
     service, session = _granted_session(tmp_path, tmux_session_factory, "newsession-recreate-identity")
     assert "error" not in service.terminal_send_text(session, "x", dry_run=True)
 
-    subprocess.run(["tmux", "kill-session", "-t", session], check=True)
+    subprocess.run([*tmux_cmd(), "kill-session", "-t", session], check=True)
     time.sleep(0.2)
-    subprocess.run(["tmux", "new-session", "-d", "-s", session, "bash -lc 'sleep 20'"], check=True)
+    subprocess.run([*tmux_cmd(), "new-session", "-d", "-s", session, "bash -lc 'sleep 20'"], check=True)
     time.sleep(0.3)
 
     result = service.terminal_send_text(session, "x", dry_run=True)
@@ -320,7 +322,7 @@ def test_recreated_same_name_session_does_not_inherit_input_grant(tmp_path, tmux
     # a specific pane the way input grants are) -- still works for the
     # new pane under the same name.
     assert "error" not in service.terminal_status(session)
-    subprocess.run(["tmux", "kill-session", "-t", session], check=False)
+    subprocess.run([*tmux_cmd(), "kill-session", "-t", session], check=False)
 
 
 def test_dashboard_listing_never_shows_a_stale_grant_as_currently_effective(tmp_path, tmux_session_factory):
@@ -338,9 +340,9 @@ def test_dashboard_listing_never_shows_a_stale_grant_as_currently_effective(tmp_
     import subprocess
 
     service, session = _granted_session(tmp_path, tmux_session_factory, "newsession-stale-badge")
-    subprocess.run(["tmux", "kill-session", "-t", session], check=True)
+    subprocess.run([*tmux_cmd(), "kill-session", "-t", session], check=True)
     time.sleep(0.2)
-    subprocess.run(["tmux", "new-session", "-d", "-s", session, "bash -lc 'sleep 20'"], check=True)
+    subprocess.run([*tmux_cmd(), "new-session", "-d", "-s", session, "bash -lc 'sleep 20'"], check=True)
     time.sleep(0.3)
     try:
         dash_row = {r["name"]: r for r in service.dashboard_list_sessions()["sessions"]}[session]
@@ -352,7 +354,7 @@ def test_dashboard_listing_never_shows_a_stale_grant_as_currently_effective(tmp_
         assert mcp_row["input_granted"] is True
         assert mcp_row["effective_input"] is False
     finally:
-        subprocess.run(["tmux", "kill-session", "-t", session], check=False)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", session], check=False)
 
 
 # ---------------------------------------------------------------------------

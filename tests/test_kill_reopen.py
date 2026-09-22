@@ -15,10 +15,12 @@ import time
 
 import pytest
 
-import tmux_isolation
+from tests import tmux_isolation
 
 from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig, SessionLifecycleConfig
 from terminal_mcp.core import TerminalService
+
+from tests.conftest import tmux_cmd
 
 
 def _config(tmp_path, *, protected=("terminal-mcp",)) -> AppConfig:
@@ -125,7 +127,7 @@ def test_kill_refuses_protected_session_even_with_correct_confirm(tmp_path, sess
     name = session_name("protected-sim")
     config = _config(tmp_path, protected=(name,))
     service = TerminalService(config, killed_sessions=_isolated_killed_store(tmp_path))
-    subprocess.run(["tmux", "new-session", "-d", "-s", name, "bash"], check=True)
+    subprocess.run([*tmux_cmd(), "new-session", "-d", "-s", name, "bash"], check=True)
     time.sleep(0.2)
 
     result = service.terminal_kill_session(name, name)  # confirm_name matches exactly
@@ -242,7 +244,7 @@ def test_reopen_with_explicit_override_bypasses_incomplete_saved_metadata(tmp_pa
     config = _config(tmp_path)
     service = TerminalService(config, killed_sessions=_isolated_killed_store(tmp_path))
     name = session_name("legacy-unmanaged")
-    subprocess.run(["tmux", "new-session", "-d", "-s", name, "-c", str(tmp_path), "sleep 300"], check=True)
+    subprocess.run([*tmux_cmd(), "new-session", "-d", "-s", name, "-c", str(tmp_path), "sleep 300"], check=True)
     time.sleep(0.3)
 
     killed = service.terminal_kill_session(name, name)
@@ -290,7 +292,7 @@ def test_list_killed_sessions_self_heals_when_name_reused_outside_reopen(tmp_pat
     # session (e.g. created directly, or via terminal_create_session
     # again) -- the stale killed_sessions record must never keep showing
     # up as "still reopenable".
-    subprocess.run(["tmux", "new-session", "-d", "-s", name, "bash"], check=True)
+    subprocess.run([*tmux_cmd(), "new-session", "-d", "-s", name, "bash"], check=True)
     time.sleep(0.2)
 
     listed = service.terminal_list_killed_sessions()
@@ -364,7 +366,7 @@ def test_dashboard_kill_route_refuses_protected_session(tmp_path, session_name):
     config = _config(tmp_path, protected=(name,))
     client, service = _dashboard_client(config)
     import subprocess, time
-    subprocess.run(["tmux", "new-session", "-d", "-s", name, "bash"], check=True)
+    subprocess.run([*tmux_cmd(), "new-session", "-d", "-s", name, "bash"], check=True)
     time.sleep(0.2)
     try:
         response = client.post("/dashboard/api/session/kill", json={"name": name, "confirm_name": name})
@@ -428,7 +430,7 @@ def test_dashboard_rename_route_refuses_protected_session(tmp_path, session_name
     config = _config(tmp_path, protected=(name,))
     client, service = _dashboard_client(config)
     import subprocess, time
-    subprocess.run(["tmux", "new-session", "-d", "-s", name, "bash"], check=True)
+    subprocess.run([*tmux_cmd(), "new-session", "-d", "-s", name, "bash"], check=True)
     time.sleep(0.2)
     try:
         response = client.post("/dashboard/api/session/rename", json={"name": name, "new_name": session_name("newname")})

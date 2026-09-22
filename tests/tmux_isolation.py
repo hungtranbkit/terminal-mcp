@@ -58,6 +58,8 @@ import re
 import subprocess
 import uuid
 
+from tests.conftest import tmux_cmd
+
 #: Default prefix -- the suites configure
 #: `allowed_session_patterns=("lifecycle-*", ...)`, so a disposable
 #: session normally has to start with it. Callers pass `prefix=` when a
@@ -130,7 +132,7 @@ def pid_alive(pid: int) -> bool:
 def list_tmux_sessions() -> list[str]:
     """Every session on the host, or [] when tmux has no server running
     at all (a completely normal state, not an error)."""
-    result = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"],
+    result = subprocess.run([*tmux_cmd(), "list-sessions", "-F", "#{session_name}"],
                             capture_output=True, text=True, check=False)
     if result.returncode != 0:
         return []
@@ -148,7 +150,7 @@ def kill_session(name: str) -> None:
         raise AssertionError(
             f"refusing to kill tmux session {name!r}: not an owned test session "
             f"(expected <prefix>-own<pid>x<6 hex>-<slug>)")
-    subprocess.run(["tmux", "kill-session", "-t", name], check=False, capture_output=True)
+    subprocess.run([*tmux_cmd(), "kill-session", "-t", name], check=False, capture_output=True)
 
 
 def sweep_orphans(*, sessions: list[str] | None = None,

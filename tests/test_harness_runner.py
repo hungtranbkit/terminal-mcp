@@ -712,7 +712,7 @@ def test_real_session_smoke(tmp_path):
         try:
             assert _pane_has_no_trust_dialog(dispatch["session_id"])
         finally:
-            subprocess.run(["tmux", "kill-session", "-t", dispatch["session_id"]],
+            subprocess.run([*tmux_cmd(), "kill-session", "-t", dispatch["session_id"]],
                            capture_output=True)
     finally:
         subprocess.run(["git", "worktree", "remove", "--force", str(worktree)],
@@ -731,7 +731,7 @@ def _pane_has_no_trust_dialog(session: str) -> bool:
     import time
 
     time.sleep(8)  # let Claude Code paint its first frame
-    pane = subprocess.run(["tmux", "capture-pane", "-p", "-t", session],
+    pane = subprocess.run([*tmux_cmd(), "capture-pane", "-p", "-t", session],
                           capture_output=True, text=True).stdout.lower()
     for phrase in ("do you trust", "trust the files", "is this a project you trust"):
         assert phrase not in pane, f"workspace-trust dialog appeared: {phrase!r}"
@@ -1141,3 +1141,5 @@ def test_a_live_pane_reporting_UNKNOWN_is_still_alive(store, artifacts):
 
     broker = SessionBroker(UnclassifiableOps([]), store)
     assert broker.health("harness-claude-a")["alive"] is True
+
+from tests.conftest import tmux_cmd

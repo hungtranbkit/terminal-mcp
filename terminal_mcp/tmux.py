@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shlex
 import subprocess
 import time
@@ -33,6 +34,22 @@ post-send confirmation layered on top of this."""
 
 PASTE_BUFFER_THRESHOLD = 4096
 
+TMUX_SOCKET_ENV = "TERMINAL_MCP_TMUX_SOCKET"
+"""Env var naming the tmux server socket (`tmux -L <name>`) this process
+talks to. Same "env var first, sane default otherwise" shape every
+default_*_path() in this project already uses, and for the same reason:
+it lets a whole process be redirected at once, without threading a
+parameter through every construction site (core.py's
+`TerminalService(tmux=...)` is the only one in the product, but the
+node-agent, webterm and the MCP server all build their client through
+it). Unset -- always, in production -- means tmux's own default
+server, i.e. behaviour identical to before this existed."""
+
+
+def default_socket_name() -> str | None:
+    value = os.environ.get(TMUX_SOCKET_ENV, "").strip()
+    return value or None
+
 
 class TmuxClient:
     #: `capture-pane -e` really does preserve the SGR runs tmux's own
@@ -58,13 +75,38 @@ class TmuxClient:
         )
     )
 
-    def __init__(self, binary: str = "tmux") -> None:
+    def __init__(self, binary: str = "tmux", socket_name: str | None = None) -> None:
         self.binary = binary
+        self.socket_name = socket_name if socket_name is not None else default_socket_name()
+
+    def _argv(self, args: list[str]) -> list[str]:
+        """`tmux -L <socket>` selects a SERVER, not a session -- every
+        tmux server is a fully separate namespace of sessions, so two
+        clients on two sockets cannot see, list, or kill each other's
+        sessions at all.
+
+        This exists for exactly one reason (see tests/conftest.py's
+        `pytest_configure`): the test suite creates real, disposable
+        tmux sessions, and this host also runs a real, separate
+        terminal-mcp service against the SAME default tmux server. That
+        service's own reconcile pass sees whatever test session happens
+        to be alive at that instant and writes a real row for it into
+        the PRODUCTION session_registry.db -- a different process, with
+        its own state dir, that no amount of in-test store redirection
+        can reach. Pointing the TEST process at its own socket removes
+        the shared namespace the leak travels through, rather than
+        trying to clean up after it.
+
+        Unset (the normal production case) means the default socket and
+        a completely unchanged argv."""
+        if self.socket_name:
+            return [self.binary, "-L", self.socket_name, *args]
+        return [self.binary, *args]
 
     def _run(self, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
         try:
             result = subprocess.run(
-                [self.binary, *args],
+                self._argv(args),
                 check=False,
                 capture_output=True,
                 text=True,

@@ -50,6 +50,8 @@ from typing import Any
 import anyio
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
+from .tmux import default_socket_name
+
 _log = logging.getLogger(__name__)
 
 # Bounds for client-requested resize -- generous enough for any real
@@ -84,7 +86,14 @@ class WebTerminalProcess:
         self.session = session
         self.readonly = readonly
         master_fd, slave_fd = pty.openpty()
-        args = [tmux_binary, "attach-session", "-t", session]
+        # Same server selection TmuxClient._argv makes, for the same
+        # reason -- this module builds its own argv (it needs a PTY, so
+        # it cannot go through TmuxClient._run), and attaching on the
+        # DEFAULT socket while the session itself was created on an
+        # isolated one would simply fail to find the session.
+        socket_name = default_socket_name()
+        args = [tmux_binary, *(("-L", socket_name) if socket_name else ()),
+                "attach-session", "-t", session]
         if takeover:
             args.append("-d")
         if readonly:

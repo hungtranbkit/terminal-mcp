@@ -22,6 +22,8 @@ from terminal_mcp.core import TerminalService
 from terminal_mcp.supervisor import SupervisorService, SupervisorStore
 from terminal_mcp.supervisor2 import build_supervisor_v2
 
+from tests.conftest import tmux_cmd
+
 
 def _config(*, terminal_input=True, **overrides) -> AppConfig:
     # v2_enabled=True by default here so the existing tests exercise the
@@ -412,8 +414,8 @@ def test_execute_send_still_respects_input_policy_denied_pattern(tmp_path, tmux_
     ))
     session_factory_name = "test-v2-policyoff"
     import subprocess
-    subprocess.run(["tmux", "kill-session", "-t", session_factory_name], check=False, capture_output=True)
-    subprocess.run(["tmux", "new-session", "-d", "-s", session_factory_name, _wait_prompt("")], check=True, capture_output=True, text=True)
+    subprocess.run([*tmux_cmd(), "kill-session", "-t", session_factory_name], check=False, capture_output=True)
+    subprocess.run([*tmux_cmd(), "new-session", "-d", "-s", session_factory_name, _wait_prompt("")], check=True, capture_output=True, text=True)
     time.sleep(0.3)
     try:
         store = SupervisorStore(tmp_path / "supervisor.db")
@@ -430,7 +432,7 @@ def test_execute_send_still_respects_input_policy_denied_pattern(tmp_path, tmux_
         assert result["error"] == "ACCESS_DENIED"
         assert v2.store.get_action(claim["id"])["state"] == "failed"
     finally:
-        subprocess.run(["tmux", "kill-session", "-t", session_factory_name], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", session_factory_name], check=False, capture_output=True)
 
 
 def test_approved_auto_continue_only_sends_exact_template_match(tmp_path, tmux_session_factory):
@@ -1209,8 +1211,8 @@ def _nonce_chain_session(tmux_session_factory, name: str) -> str:
 def _send_marker(session: str, marker: str) -> None:
     import subprocess
 
-    subprocess.run(["tmux", "send-keys", "-t", session, "-l", "--", marker], check=True)
-    subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=True)
+    subprocess.run([*tmux_cmd(), "send-keys", "-t", session, "-l", "--", marker], check=True)
+    subprocess.run([*tmux_cmd(), "send-keys", "-t", session, "Enter"], check=True)
 
 
 def test_nonce_verified_marker_reconciles_as_verified_done_and_resets_chain(tmp_path, tmux_session_factory):

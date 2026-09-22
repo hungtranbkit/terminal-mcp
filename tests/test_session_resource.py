@@ -480,10 +480,12 @@ def test_batch_inspect_unchanged_when_status_has_no_resource_block(tmp_path):
 # a terminal; "any bracketed word" was never a model field.
 # ---------------------------------------------------------------------------
 
-def test_bracketed_source_code_is_never_read_as_a_model():
+@pytest.mark.parametrize("source", ['h["Mcp-Session-Id"]=sid',
+                                   '    if sid: h["Mcp-Session-Id"] = sid'])
+def test_bracketed_source_code_is_never_read_as_a_model(source):
     pane = "\n".join([
         '    h = {"Content-Type": "application/json"}',
-        '    if sid: h["Mcp-Session-Id"] = sid',
+        source,
         '    r = urllib.request.Request(URL, json.dumps(payload).encode(), h)',
         "    print(rows[0], data['result'])",
     ])
@@ -532,6 +534,17 @@ def test_model_is_only_read_from_something_that_is_a_footer():
     screen, not a status footer."""
     assert parse_session_resources("Running with [Opus 5 (1M context)] today").model is None
     assert parse_session_resources("Running with [Opus 5 (1M context)] today").context_max_tokens is None
+
+
+@pytest.mark.parametrize("text", [
+    "models[Opus 5] = selected\nContext 42%",
+    "Running with [Opus 5 (1M context)] today\nContext 42%",
+    "[Opus 5]\nordinary output\nUsage 10%",
+])
+def test_model_must_occupy_a_status_field(text):
+    parsed = parse_session_resources(text)
+    assert parsed.model is None
+    assert parsed.context_max_tokens is None
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +660,8 @@ def test_controller_enrichment_honours_disabled_config():
     assert "resource" not in controller.terminal_status("nova-claude-long")
 
 
-def test_batch_inspect_includes_resource_for_a_remote_target():
+@pytest.mark.parametrize("compact", [True, False])
+def test_batch_inspect_includes_resource_for_a_remote_target(compact):
     payload = {"session": "nova-claude-long", "state": "RUNNING",
                "last_output": _pane(REMOTE_FOOTER), "cwd": "/home/mesflow/work/nova"}
     controller = _remote_controller(payload)
@@ -664,8 +678,9 @@ def test_batch_inspect_includes_resource_for_a_remote_target():
             return {"session": session, "output": "tail", "truncated": False}
 
     rows = CompactTerminalTools(Terminal(), RoutingController()).batch_inspect(
-        ["nova-claude-long"])["targets"]
+        ["nova-claude-long"], compact=compact)["targets"]
     assert rows[0]["resource"]["context"]["percent"] == 7
+    assert rows[0]["resource"]["usage"]["percent"] == 34
     assert rows[0]["resource"]["usage"]["reset_in_minutes"] == 20
 
 

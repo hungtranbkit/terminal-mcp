@@ -33,6 +33,8 @@ from terminal_mcp.mcp_app import build_mcp
 from terminal_mcp.node_client import LocalNodeClient, NodeClientError
 from terminal_mcp.node_registry import NodeRegistry
 
+from tests.conftest import tmux_cmd
+
 
 def _config(tmp_path) -> AppConfig:
     return AppConfig(
@@ -168,7 +170,7 @@ def _heartbeat_local(controller: ControllerService) -> None:
 
 
 def _kill_tmux(name: str) -> None:
-    subprocess.run(["tmux", "kill-session", "-t", name], check=False, capture_output=True)
+    subprocess.run([*tmux_cmd(), "kill-session", "-t", name], check=False, capture_output=True)
 
 
 # ---------------------------------------------------------------------------

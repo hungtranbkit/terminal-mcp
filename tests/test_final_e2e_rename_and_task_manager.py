@@ -32,6 +32,8 @@ from terminal_mcp.queue_store import QueueStore
 from terminal_mcp.session_registry import SessionRegistryStore
 from terminal_mcp.supervisor import SupervisorService, SupervisorStore
 
+from tests.conftest import tmux_cmd
+
 
 def _unique(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
@@ -141,4 +143,4 @@ async def test_final_e2e_burst_enqueue_task_manager_rename_migrate_restart(tmp_p
             assert task.id == task_id
             assert task.prompt.startswith("feature ")
     finally:
-        subprocess.run(["tmux", "kill-session", "-t", new_name], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", new_name], check=False, capture_output=True)

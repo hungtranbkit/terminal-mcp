@@ -8,6 +8,8 @@ from terminal_mcp.config import SessionAccessConfig, AppConfig, PermissionsConfi
 from terminal_mcp.core import TerminalService
 from terminal_mcp.supervisor import SupervisorService, SupervisorStore, watch_key
 
+from tests.conftest import tmux_cmd
+
 
 def _config(**overrides) -> AppConfig:
     supervisor = SupervisorConfig(**overrides)
@@ -193,8 +195,8 @@ def _print_into_pane(session: str, text: str) -> None:
     # is needed between the literal text and Enter.
     import subprocess
 
-    subprocess.run(["tmux", "send-keys", "-t", session, "-l", "--", f"printf '%s\\n' '{text}'"], check=True)
-    subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=True)
+    subprocess.run([*tmux_cmd(), "send-keys", "-t", session, "-l", "--", f"printf '%s\\n' '{text}'"], check=True)
+    subprocess.run([*tmux_cmd(), "send-keys", "-t", session, "Enter"], check=True)
 
 
 def test_nonce_verified_marker_promotes_to_verified_done_on_the_very_first_poll(tmp_path, tmux_session_factory):
@@ -595,7 +597,7 @@ def test_missing_session_emits_watch_target_missing_and_disables(tmp_path, tmux_
     svc.run_once()  # first poll while it exists
 
     import subprocess
-    subprocess.run(["tmux", "kill-session", "-t", session], check=True, capture_output=True, text=True, timeout=10)
+    subprocess.run([*tmux_cmd(), "kill-session", "-t", session], check=True, capture_output=True, text=True, timeout=10)
 
     result = svc.run_once()
     assert result["events"][0]["event_type"] == "watch_target_missing"

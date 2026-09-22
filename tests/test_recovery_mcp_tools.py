@@ -15,6 +15,8 @@ from terminal_mcp.controller import build_default_controller
 from terminal_mcp.core import TerminalService
 from terminal_mcp.mcp_app import build_mcp
 
+from tests.conftest import tmux_cmd
+
 
 async def _call(server, tool_name, **kwargs):
     result = await server.call_tool(tool_name, kwargs)
@@ -24,7 +26,7 @@ async def _call(server, tool_name, **kwargs):
 
 
 def _tmux(*args, check=False):
-    return subprocess.run(["tmux", *args], check=check, capture_output=True, text=True, timeout=10)
+    return subprocess.run([*tmux_cmd(), *args], check=check, capture_output=True, text=True, timeout=10)
 
 
 def _rig_config(tmp_path, *, auto_recovery_enabled=False) -> AppConfig:

@@ -12,8 +12,10 @@ dependencies = [
   "mcp>=2.1,<3",
   "PyYAML>=6,<7",
   "PyJWT[crypto]>=2,<3",
+  "cryptography>=42,<47",
   "uvicorn>=0.30,<1",
   "anyio>=4,<5",
+  "httpx>=0.28,<1",
   # Only needed for uvicorn's WebSocket upgrade support (the web terminal
   # feature, webterm.py/dashboard.py's /dashboard/ws/terminal +
   # webauth_dashboard.py's /app/ws/terminal) -- uvicorn has no built-in
@@ -67,6 +69,7 @@ terminal-mcp-prompt-watcher = "terminal_mcp.prompt_start_watcher:main"
 # Canonical name -- deliberately IDENTICAL to chatgpt_sidecar.SERVER_NAME, so
 # `ps`/`systemctl`/journal output names the same surface the connector itself
 terminal-mcp-chatgpt-v1 = "terminal_mcp.chatgpt_sidecar:main"
+terminal-mcp-registry-cleanup = "terminal_mcp.registry_cleanup:main"
 terminal-node-agent = "terminal_mcp.node_agent:main"
 terminal-windows-node-agent = "terminal_mcp.windows_agent:main"
 

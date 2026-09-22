@@ -24,6 +24,7 @@ from tests.conftest import find_node
 
 from terminal_mcp.dashboard import DASHBOARD_HTML, SESSIONS_ADMIN_HTML
 
+
 NODE = find_node()
 
 

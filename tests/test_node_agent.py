@@ -24,6 +24,8 @@ from terminal_mcp.config import (
 from terminal_mcp.core import TerminalService
 from terminal_mcp.node_agent import AGENT_GENERATION, _heartbeat_loop, build_node_agent, watch_for_shutdown
 
+from tests.conftest import tmux_cmd
+
 TOKEN = "test-node-token-abc123"
 
 
@@ -64,7 +66,7 @@ def agent_client(tmp_path):
     client.created = created
     yield client
     for name in created:
-        subprocess.run(["tmux", "kill-session", "-t", name], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", name], check=False, capture_output=True)
 
 
 def _auth(token: str = TOKEN) -> dict[str, str]:
@@ -216,7 +218,7 @@ def test_registry_reopen_round_trip_after_an_unexpected_drop(agent_client):
     # Simulate an UNEXPECTED drop (a node-agent restart, never an
     # explicit Kill) -- kill the real tmux session directly, bypassing
     # terminal_kill_session, so killed_sessions.py never learns about it.
-    subprocess.run(["tmux", "kill-session", "-t", "agent-reg"], check=False, capture_output=True)
+    subprocess.run([*tmux_cmd(), "kill-session", "-t", "agent-reg"], check=False, capture_output=True)
 
     # Another reconcile pass: notices it vanished, marks MISSING.
     listing2 = agent_client.get("/v1/sessions", headers=_auth())

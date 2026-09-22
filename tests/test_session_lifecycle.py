@@ -13,7 +13,7 @@ from dataclasses import replace
 
 import pytest
 
-import tmux_isolation
+from tests import tmux_isolation
 from starlette.testclient import TestClient
 
 from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig, SessionLifecycleConfig
@@ -22,9 +22,11 @@ from terminal_mcp.launcher_resolution import resolve_launcher
 from terminal_mcp.dashboard import register_dashboard
 from terminal_mcp.mcp_app import build_mcp
 
+from tests.conftest import tmux_cmd
+
 
 def _tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["tmux", *args], check=check, capture_output=True, text=True, timeout=10)
+    return subprocess.run([*tmux_cmd(), *args], check=check, capture_output=True, text=True, timeout=10)
 
 
 def _lifecycle_config(tmp_path, *, enabled: bool = True, protected=("terminal-mcp",),

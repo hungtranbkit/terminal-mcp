@@ -218,7 +218,9 @@ _RESET_IN = re.compile(
 # `[Opus 5 (1M context)]`, `[Sonnet 5]`, `claude-opus-5[1m]`. The bracketed
 # window statement is the same "provider stated its own window" signal
 # ai_context_window.parse_variant_window trusts, in the footer's spelling.
-_MODEL_BRACKET = re.compile(r"\[\s*([^\[\]|]{1,80}?)\s*\]")
+_MODEL_BRACKET = re.compile(
+    r"^\s*\[([^\[\]|\n]{1,80}?)\]\s*(?=[|·│]|Context\b|Usage\b)",
+    re.IGNORECASE | re.MULTILINE)
 # REAL false positive, found live 2026-09-19 right after deploy: a pane that
 # happened to be displaying this project's own source (`h["Mcp-Session-Id"]
 # = sid`) reported `model: "Mcp-Session-Id"`. "Any bracketed text containing a

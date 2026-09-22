@@ -24,6 +24,8 @@ from terminal_mcp.lease import PaneLeaseStore
 from terminal_mcp.mcp_app import build_mcp
 from terminal_mcp.session_registry import SessionRegistryStore
 
+from tests.conftest import tmux_cmd
+
 
 def _config(tmp_path, roots=None) -> AppConfig:
     return AppConfig(
@@ -57,7 +59,7 @@ def _service(tmp_path, roots=None) -> TerminalService:
 
 
 def _tmux(*args, check=True):
-    return subprocess.run(["tmux", *args], check=check, capture_output=True, text=True, timeout=10)
+    return subprocess.run([*tmux_cmd(), *args], check=check, capture_output=True, text=True, timeout=10)
 
 
 @pytest.fixture
@@ -65,7 +67,7 @@ def tmux_cleanup():
     created: list[str] = []
     yield created
     for name in created:
-        subprocess.run(["tmux", "kill-session", "-t", name], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", name], check=False, capture_output=True)
 
 
 # -- reconcile: create -> list picks it up ------------------------------------

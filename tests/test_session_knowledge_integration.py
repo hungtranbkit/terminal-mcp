@@ -27,9 +27,11 @@ from terminal_mcp.node_client import LocalNodeClient
 from terminal_mcp.node_registry import NodeRegistry
 from terminal_mcp.session_knowledge import SessionKnowledgeStore
 
+from tests.conftest import tmux_cmd
+
 
 def _tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["tmux", *args], check=check, capture_output=True, text=True, timeout=10)
+    return subprocess.run([*tmux_cmd(), *args], check=check, capture_output=True, text=True, timeout=10)
 
 
 def _config(tmp_path, *, patterns=("know-*",)) -> AppConfig:
@@ -230,7 +232,7 @@ def test_first_ever_capture_backfills_current_screen_for_a_preexisting_session(s
     _tmux("new-session", "-d", "-s", "know-1", "-c", str(tmp_path))
     _tmux("send-keys", "-t", "know-1", "echo preexisting-backfill-marker", "Enter")
     assert _wait_until(lambda: "preexisting-backfill-marker" in
-                       subprocess.run(["tmux", "capture-pane", "-p", "-t", "know-1"],
+                       subprocess.run([*tmux_cmd(), "capture-pane", "-p", "-t", "know-1"],
                                       capture_output=True, text=True).stdout)
     # This service has NEVER captured "know-1" before this point.
     service.terminal_list_sessions()

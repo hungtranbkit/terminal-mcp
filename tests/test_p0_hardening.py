@@ -13,6 +13,8 @@ from terminal_mcp.bindings import BindingStore
 from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig
 from terminal_mcp.core import TerminalService
 
+from tests.conftest import tmux_cmd
+
 
 def _service(tmp_path) -> TerminalService:
     config = AppConfig(
@@ -51,14 +53,14 @@ def test_send_bound_blocked_when_session_name_recycled(tmux_session_factory, tmp
     # Recycle the name: kill the original session, create a brand new,
     # unrelated one under the exact same tmux session *name*.
     import subprocess
-    subprocess.run(["tmux", "kill-session", "-t", session], check=True)
+    subprocess.run([*tmux_cmd(), "kill-session", "-t", session], check=True)
     time.sleep(0.2)
-    subprocess.run(["tmux", "new-session", "-d", "-s", session, "bash -lc 'echo recycled; sleep 30'"], check=True)
+    subprocess.run([*tmux_cmd(), "new-session", "-d", "-s", session, "bash -lc 'echo recycled; sleep 30'"], check=True)
     time.sleep(0.2)
 
     result = service.terminal_send_bound("agent", "hello", press_enter=True)
     assert result["error"] == "IDENTITY_MISMATCH"
-    subprocess.run(["tmux", "kill-session", "-t", session], check=False)
+    subprocess.run([*tmux_cmd(), "kill-session", "-t", session], check=False)
 
 
 def test_send_bound_blocked_when_pane_replaced_within_same_session(tmux_session_factory, tmp_path):
@@ -67,8 +69,8 @@ def test_send_bound_blocked_when_pane_replaced_within_same_session(tmux_session_
     service.terminal_bind("agent", session, input_enabled=True)
 
     import subprocess
-    subprocess.run(["tmux", "new-window", "-t", session], check=True)
-    subprocess.run(["tmux", "kill-window", "-t", f"{session}:0"], check=True)
+    subprocess.run([*tmux_cmd(), "new-window", "-t", session], check=True)
+    subprocess.run([*tmux_cmd(), "kill-window", "-t", f"{session}:0"], check=True)
     time.sleep(0.2)
 
     # session_id is unchanged (same session), only the pane was replaced --
@@ -88,9 +90,9 @@ def test_explicit_rebind_clears_identity_mismatch(tmux_session_factory, tmp_path
     service.terminal_bind("agent", session, input_enabled=True)
 
     import subprocess
-    subprocess.run(["tmux", "kill-session", "-t", session], check=True)
+    subprocess.run([*tmux_cmd(), "kill-session", "-t", session], check=True)
     time.sleep(0.2)
-    subprocess.run(["tmux", "new-session", "-d", "-s", session, "bash -lc 'read x; echo GOT:$x; sleep 30'"], check=True)
+    subprocess.run([*tmux_cmd(), "new-session", "-d", "-s", session, "bash -lc 'read x; echo GOT:$x; sleep 30'"], check=True)
     time.sleep(0.2)
     assert service.terminal_send_bound("agent", "hello", press_enter=True)["error"] == "IDENTITY_MISMATCH"
 
@@ -100,7 +102,7 @@ def test_explicit_rebind_clears_identity_mismatch(tmux_session_factory, tmp_path
     assert rebind["replaced"] is True
     result = service.terminal_send_bound("agent", "y", press_enter=True)
     assert result["sent"] is True
-    subprocess.run(["tmux", "kill-session", "-t", session], check=False)
+    subprocess.run([*tmux_cmd(), "kill-session", "-t", session], check=False)
 
 
 def test_legacy_binding_without_pin_fails_closed_on_input_until_rebound(tmux_session_factory, tmp_path):

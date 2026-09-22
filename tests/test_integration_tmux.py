@@ -3,12 +3,12 @@ from __future__ import annotations
 import pytest
 
 import time
-import subprocess
 
 from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig
 from terminal_mcp.core import TerminalService
 from terminal_mcp.bindings import BindingStore
 from terminal_mcp.tmux import TmuxClient
+from tests.conftest import tmux as conftest_tmux
 
 
 def test_real_tmux_list_tail_status_and_denial(read_config, tmux_session_factory):
@@ -167,9 +167,11 @@ def test_real_tmux_binding_remap_missing_and_cleanup(read_config, tmux_session_f
     assert service.terminal_bind("phase4-a", "test-bind-codex", replace=True)["replaced"]
     assert "BOUND_B_READY" in service.terminal_tail_bound("phase4-a")["output"]
 
-    subprocess.run(
-        ["tmux", "kill-session", "-t", "test-bind-codex"],
-        check=True, capture_output=True, text=True, timeout=10,
-    )
+    # conftest's helper, not a bare `tmux` argv: this must reach the same
+    # (isolated) server the session was created on. A bare call here also
+    # used to mean a literal `kill-session -t test-bind-codex` against
+    # this host's real, attended tmux server -- the exact class of
+    # accident tmux_session_factory's refuse-to-touch guard exists for.
+    conftest_tmux("kill-session", "-t", "test-bind-codex")
     assert service.terminal_status_bound("phase4-a")["state"] == "MISSING"
     assert service.terminal_unbind("phase4-a")["unbound"]

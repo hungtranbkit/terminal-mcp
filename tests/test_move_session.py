@@ -28,9 +28,11 @@ from terminal_mcp.host_metrics import NodeMetrics
 from terminal_mcp.node_client import LocalNodeClient, NodeClientError
 from terminal_mcp.node_registry import NodeRegistry
 
+from tests.conftest import tmux_cmd
+
 
 def _tmux_has_session(name: str) -> bool:
-    return subprocess.run(["tmux", "has-session", "-t", name], capture_output=True).returncode == 0
+    return subprocess.run([*tmux_cmd(), "has-session", "-t", name], capture_output=True).returncode == 0
 
 
 def _config(tmp_path) -> AppConfig:
@@ -93,7 +95,7 @@ def controller_with_fake_target(tmp_path):
                                   agent_types=("shell", "claude"), agent_version=None, labels=())
     yield controller, service
     for name in ("move-src",):
-        subprocess.run(["tmux", "kill-session", "-t", name], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", name], check=False, capture_output=True)
 
 
 def test_successful_move_creates_on_target_then_kills_real_source(controller_with_fake_target, tmp_path):

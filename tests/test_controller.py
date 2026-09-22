@@ -21,6 +21,8 @@ from terminal_mcp.node_models import CAPACITY_HEALTHY
 from terminal_mcp.node_registry import NodeRegistry
 from terminal_mcp.host_metrics import NodeMetrics
 
+from tests.conftest import tmux_cmd
+
 
 def _config(tmp_path, *, read=True, input=True) -> AppConfig:
     return AppConfig(
@@ -234,7 +236,7 @@ def test_local_only_create_tail_status_kill_reopen_roundtrip(tmp_path):
         assert reopened["node_id"] == "local"
     finally:
         import subprocess
-        subprocess.run(["tmux", "kill-session", "-t", "ctrl-rt"], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", "ctrl-rt"], check=False, capture_output=True)
 
 
 def test_permission_denial_preserved_through_routing(tmp_path):
@@ -254,7 +256,7 @@ def test_permission_denial_preserved_through_routing(tmp_path):
         assert result.get("error") == direct.get("error")
     finally:
         import subprocess
-        subprocess.run(["tmux", "kill-session", "-t", "ctrl-perm"], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", "ctrl-perm"], check=False, capture_output=True)
 
 
 def test_dry_run_send_text_routed_through_controller_never_actually_sends(tmp_path):
@@ -274,7 +276,7 @@ def test_dry_run_send_text_routed_through_controller_never_actually_sends(tmp_pa
         assert "should-not-appear" not in output
     finally:
         import subprocess
-        subprocess.run(["tmux", "kill-session", "-t", "ctrl-dry"], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", "ctrl-dry"], check=False, capture_output=True)
 
 
 def test_session_not_found_reported_cleanly(tmp_path):
@@ -327,7 +329,7 @@ def test_create_duplicate_name_across_controller_is_rejected(tmp_path):
         assert result["node_id"] == "local"
     finally:
         import subprocess
-        subprocess.run(["tmux", "kill-session", "-t", "ctrl-dup"], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", "ctrl-dup"], check=False, capture_output=True)
 
 
 # -- ambiguous session name across two nodes -------------------------------
@@ -364,7 +366,7 @@ def test_duplicate_session_name_on_two_nodes_is_ambiguous(tmp_path):
         assert qualified["node_id"] == "local"
     finally:
         import subprocess
-        subprocess.run(["tmux", "kill-session", "-t", "ctrl-amb"], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", "ctrl-amb"], check=False, capture_output=True)
 
 
 def test_qualified_name_to_unregistered_node_is_node_not_found(tmp_path):
@@ -420,7 +422,7 @@ def test_local_session_grant_routes_to_local_grants_store_unchanged(tmp_path):
         assert service.grants.get("ctrl-grant-local").read_enabled is True
     finally:
         import subprocess
-        subprocess.run(["tmux", "kill-session", "-t", "ctrl-grant-local"], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", "ctrl-grant-local"], check=False, capture_output=True)
 
 
 def test_remote_session_grant_reaches_the_remote_node_not_local(tmp_path):
@@ -505,7 +507,7 @@ def test_duplicate_session_name_grant_is_ambiguous_never_guessed(tmp_path):
         assert qualified["node_id"] == "local"
     finally:
         import subprocess
-        subprocess.run(["tmux", "kill-session", "-t", "ctrl-amb-grant"], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", "ctrl-amb-grant"], check=False, capture_output=True)
 
 
 def test_qualified_name_to_node_with_no_client_is_node_unreachable(tmp_path):
@@ -544,7 +546,7 @@ def test_offline_node_reported_in_unreachable_not_silently_dropped(tmp_path):
         assert any(n["node_id"] == "dark-node" and n["status"] == "offline" for n in result["unreachable_nodes"])
     finally:
         import subprocess
-        subprocess.run(["tmux", "kill-session", "-t", "ctrl-listed"], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", "ctrl-listed"], check=False, capture_output=True)
 
 
 def test_fleet_list_sessions_merges_online_nodes_with_node_tags(tmp_path):
@@ -571,7 +573,7 @@ def test_fleet_list_sessions_merges_online_nodes_with_node_tags(tmp_path):
         assert by_name["remote-sess"]["node_name"] == "Remote OK"
     finally:
         import subprocess
-        subprocess.run(["tmux", "kill-session", "-t", "ctrl-merge"], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", "ctrl-merge"], check=False, capture_output=True)
 
 
 # -- node management surface (dashboard/doctor) ----------------------------
@@ -624,7 +626,7 @@ def test_session_location_cache_hit_avoids_reprobe(tmp_path):
         assert result["node_id"] == "local"
     finally:
         import subprocess
-        subprocess.run(["tmux", "kill-session", "-t", "ctrl-cache"], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", "ctrl-cache"], check=False, capture_output=True)
 
 
 def test_invalidate_session_location_forces_reprobe(tmp_path):
@@ -637,7 +639,7 @@ def test_invalidate_session_location_forces_reprobe(tmp_path):
         assert result["node_id"] == "local"
     finally:
         import subprocess
-        subprocess.run(["tmux", "kill-session", "-t", "ctrl-inval"], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", "ctrl-inval"], check=False, capture_output=True)
 
 
 # ---------------------------------------------------------------------------
@@ -740,7 +742,7 @@ def test_create_never_duplicates_a_name_whose_node_could_not_be_probed(tmp_path)
     assert result["error"] == "SESSION_ALREADY_EXISTS"
     assert result["node_id"] == "flaky-node"
     import subprocess
-    assert subprocess.run(["tmux", "has-session", "-t", "ctrl-dup"],
+    assert subprocess.run([*tmux_cmd(), "has-session", "-t", "ctrl-dup"],
                           capture_output=True).returncode != 0
 
 
@@ -1239,4 +1241,4 @@ def test_registry_reopen_local_node_uses_the_real_session_registry(tmp_path):
         assert result["recreated_from_registry"] is True
     finally:
         import subprocess
-        subprocess.run(["tmux", "kill-session", "-t", "ctrl-reg-local"], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", "ctrl-reg-local"], check=False, capture_output=True)

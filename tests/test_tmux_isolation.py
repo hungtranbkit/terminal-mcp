@@ -17,8 +17,8 @@ import subprocess
 
 import pytest
 
-import tmux_isolation
-from tmux_isolation import (
+from tests import tmux_isolation
+from tests.tmux_isolation import (
     OWNED_RE, RUN_ID, is_mine, is_owned, owned_name, owning_pid, sweep_orphans,
 )
 
@@ -145,7 +145,7 @@ def real_owned_session():
     created: list[str] = []
     yield created.append
     for name in created:
-        subprocess.run(["tmux", "kill-session", "-t", name], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", name], check=False, capture_output=True)
 
 
 def test_sweep_against_real_tmux_removes_only_the_dead_runs_orphan(real_owned_session):
@@ -155,7 +155,7 @@ def test_sweep_against_real_tmux_removes_only_the_dead_runs_orphan(real_owned_se
     live = _other_run_name("real-live", pid=LIVE_PID)
     for name in (orphan, live):
         real_owned_session(name)
-        subprocess.run(["tmux", "new-session", "-d", "-s", name, "sleep 60"], check=True)
+        subprocess.run([*tmux_cmd(), "new-session", "-d", "-s", name, "sleep 60"], check=True)
 
     before = tmux_isolation.list_tmux_sessions()
     assert orphan in before and live in before
@@ -179,7 +179,7 @@ def test_a_stale_legacy_artifact_does_not_affect_a_run(real_owned_session):
     if legacy in tmux_isolation.list_tmux_sessions():
         pytest.skip("a real leftover by that name already exists on this host")
     real_owned_session(legacy)
-    subprocess.run(["tmux", "new-session", "-d", "-s", legacy, "sleep 60"], check=True)
+    subprocess.run([*tmux_cmd(), "new-session", "-d", "-s", legacy, "sleep 60"], check=True)
 
     assert is_owned(legacy) is False
     assert sweep_orphans() == [] or legacy not in sweep_orphans()
@@ -311,3 +311,5 @@ def test_a_concurrent_runs_sessions_are_never_swept():
                           pid_is_alive=lambda pid: pid == LIVE_PID, killer=killed.append)
     assert set(swept) == set(dead)
     assert not any(name in killed for name in live)
+
+from tests.conftest import tmux_cmd

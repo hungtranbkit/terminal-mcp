@@ -483,6 +483,53 @@ Full reference — data model, every tool with JSON examples, the routes,
 the security posture, backup/restore and the V1 limitations:
 [`docs/notes.md`](docs/notes.md).
 
+## Registry hygiene: test artifacts in `session_registry`
+
+The test suite creates **real** tmux sessions. Historically it created them on
+the host's **default** tmux server — the same one a running `terminal-mcp`
+service reconciles — so that service observed them and wrote them into the
+**production** `session_registry.db` as if they were real sessions.
+
+**Prevention (automatic, nothing to run).** `tests/conftest.py` gives each test
+run its own tmux server via `TERMINAL_MCP_TMUX_SOCKET` (`tmux -L <socket>`).
+Separate tmux servers share no sessions, so a production reconcile pass cannot
+see — and therefore cannot record — anything the suite creates. Production sets
+no socket and its `tmux` argv is unchanged. Held in place by
+`tests/test_tmux_socket_isolation.py`.
+
+**Cleaning up rows written before that fix** — `terminal-mcp-registry-cleanup`.
+It is **dry-run by default and never deletes without two explicit flags**:
+
+```bash
+# 1. Review. Writes nothing; opens the database read-only.
+terminal-mcp-registry-cleanup
+
+# 2. Read the plan. `--verbose` lists every row; `--json` is machine-readable.
+terminal-mcp-registry-cleanup --verbose
+
+# 3. Apply ONLY the plan you just reviewed. Both flags are required, and the
+#    count must still match exactly, or it refuses and changes nothing.
+terminal-mcp-registry-cleanup --apply --confirm-count <N from step 1>
+```
+
+A row is selected only if **all** of these hold:
+
+| Predicate | Why |
+|---|---|
+| name is an exact literal the tests pass *as a session name* (AST-mined) | resemblance (`test-*`) both misses real test rows and sweeps in real sessions |
+| `status` is `MISSING` or `KILLED` | `ACTIVE` is alive; `OFFLINE` means its fate is unknown; `DELETED` is already a tombstone |
+| no tmux session by that name is alive right now | never purge something running |
+| not in `session_lifecycle.protected_sessions` | `terminal-mcp` is both a test literal and the control session |
+| `conversation_id` is empty | a real agent session with resumable history |
+| `auto_recovery_enabled` is off | something is meant to bring it back |
+| `notes` is empty | a curated/backfilled record — the only surviving trace of a vanished real session |
+| older than `--min-age-days` (default 7) | a recent row may still be in play |
+
+Anything matching a test name but failing a guard is reported in a separate
+**needs review** list with the guard that held it back — never selected. Deletion
+goes through `SessionRegistryStore.purge()`, leaving a `DELETED` tombstone with
+who purged it and when, not a bare SQL `DELETE`.
+
 ## Known limitations
 
 - Status detection is heuristic and intentionally returns `UNKNOWN` when evidence is weak.

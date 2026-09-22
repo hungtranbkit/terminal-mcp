@@ -23,6 +23,8 @@ from terminal_mcp.mcp_app import build_mcp
 from terminal_mcp.queue_service import QueueService
 from terminal_mcp.queue_store import QueueStore
 
+from tests.conftest import tmux_cmd
+
 
 def _unique(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
@@ -252,7 +254,7 @@ def test_rename_session_is_reflected_immediately_in_the_task_board(rig):
         assert response.json()["summary"]["queued"] == 1
     finally:
         import subprocess
-        subprocess.run(["tmux", "kill-session", "-t", new], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", new], check=False, capture_output=True)
 
 
 def test_controller_restart_recovers_the_same_board_no_duplicate(rig, tmp_path):

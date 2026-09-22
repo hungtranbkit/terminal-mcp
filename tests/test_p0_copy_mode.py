@@ -21,6 +21,8 @@ from terminal_mcp.core import TerminalService
 from terminal_mcp.grants import SessionGrantStore
 from terminal_mcp.lease import PaneLeaseStore
 
+from tests.conftest import tmux_cmd
+
 
 def _service(tmp_path) -> TerminalService:
     config = AppConfig(
@@ -35,13 +37,13 @@ def _service(tmp_path) -> TerminalService:
 
 
 def _enter_copy_mode(session: str) -> None:
-    subprocess.run(["tmux", "copy-mode", "-t", session], check=True, capture_output=True, text=True, timeout=10)
+    subprocess.run([*tmux_cmd(), "copy-mode", "-t", session], check=True, capture_output=True, text=True, timeout=10)
 
 
 def _exit_copy_mode(session: str) -> None:
     # The out-of-band "operator" action the error message itself points
     # to -- never performed by terminal-mcp's own guarded pipeline.
-    subprocess.run(["tmux", "send-keys", "-t", session, "-X", "cancel"],
+    subprocess.run([*tmux_cmd(), "send-keys", "-t", session, "-X", "cancel"],
                    check=True, capture_output=True, text=True, timeout=10)
 
 
@@ -223,10 +225,10 @@ def test_exit_copy_mode_stale_binding_and_missing_session_fail_safe(tmux_session
     session = tmux_session_factory("test-copy-stale", "bash -lc 'sleep 20'")
     time.sleep(0.2)
     assert "error" not in service.terminal_bind("copy-stale", session, input_enabled=True)
-    subprocess.run(["tmux", "kill-session", "-t", session], check=True)
-    subprocess.run(["tmux", "new-session", "-d", "-s", session, "bash -lc 'sleep 20'"], check=True)
+    subprocess.run([*tmux_cmd(), "kill-session", "-t", session], check=True)
+    subprocess.run([*tmux_cmd(), "new-session", "-d", "-s", session, "bash -lc 'sleep 20'"], check=True)
     time.sleep(0.2)
     _enter_copy_mode(session)
     assert service.terminal_exit_copy_mode(binding="copy-stale")["error"] == "IDENTITY_MISMATCH"
-    subprocess.run(["tmux", "kill-session", "-t", session], check=True)
+    subprocess.run([*tmux_cmd(), "kill-session", "-t", session], check=True)
     assert service.terminal_exit_copy_mode(session=session)["error"] == "SESSION_NOT_FOUND"

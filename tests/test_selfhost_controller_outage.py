@@ -150,7 +150,7 @@ def test_local_session_lifecycle_works_while_the_controller_is_dead(orphaned_nod
         status = _call(port, f"/v1/sessions/{name}/status")
         assert status["exists"] is True
     finally:
-        subprocess.run(["tmux", "kill-session", "-t", name], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", name], check=False, capture_output=True)
 
 
 def test_local_recovery_works_while_the_controller_is_dead(orphaned_node):
@@ -164,7 +164,7 @@ def test_local_recovery_works_while_the_controller_is_dead(orphaned_node):
         records = {r["session_name"]: r for r in _call(port, "/v1/registry")["records"]}
         assert records[name]["status"] == "ACTIVE"
 
-        subprocess.run(["tmux", "kill-session", "-t", name], check=True, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", name], check=True, capture_output=True)
         _call(port, "/v1/sessions")  # a listing is what reconciles the registry
         records = {r["session_name"]: r for r in _call(port, "/v1/registry")["records"]}
         assert records[name]["status"] == "MISSING"
@@ -173,7 +173,7 @@ def test_local_recovery_works_while_the_controller_is_dead(orphaned_node):
         assert "error" not in reopened, reopened
         assert _call(port, f"/v1/sessions/{name}/status")["exists"] is True
     finally:
-        subprocess.run(["tmux", "kill-session", "-t", name], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", name], check=False, capture_output=True)
 
 
 def test_recovery_is_idempotent_and_never_duplicates(orphaned_node):
@@ -186,11 +186,11 @@ def test_recovery_is_idempotent_and_never_duplicates(orphaned_node):
     try:
         again = _call(port, f"/v1/sessions/{name}/registry-reopen", "POST", {})
         assert again.get("error") == "SESSION_ALREADY_EXISTS", again
-        listing = subprocess.run(["tmux", "ls", "-F", "#{session_name}"],
+        listing = subprocess.run([*tmux_cmd(), "ls", "-F", "#{session_name}"],
                                  capture_output=True, text=True, check=False).stdout.splitlines()
         assert listing.count(name) == 1
     finally:
-        subprocess.run(["tmux", "kill-session", "-t", name], check=False, capture_output=True)
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", name], check=False, capture_output=True)
 
 
 def test_health_reports_the_protocol_contract(orphaned_node):
@@ -216,3 +216,5 @@ def test_a_node_needs_no_whitelist_to_serve_itself(orphaned_node):
     would not start -- found by exactly this harness."""
     port, _ = orphaned_node
     assert _call(port, "/v1/health")["node_id"] == "selfhost-outage"
+
+from tests.conftest import tmux_cmd
