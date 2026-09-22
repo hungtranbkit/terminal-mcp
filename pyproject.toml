@@ -57,6 +57,7 @@ windows = ["pywinpty>=2,<3; sys_platform == 'win32'"]
 [project.scripts]
 terminal-mcp = "terminal_mcp.server:main"
 terminal-mcp-http = "terminal_mcp.server_http:main"
+terminal-mcp-observer = "terminal_mcp.observer_app:main"
 terminal-mcp-webauth = "terminal_mcp.webauth_cli:main"
 terminal-mcp-doctor = "terminal_mcp.doctor:main"
 terminal-mcp-node-doctor = "terminal_mcp.node_profile:main"

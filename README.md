@@ -9,6 +9,8 @@ config, schema, tests), see [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md).
 
 Terminal MCP lets an MCP client discover every tmux session on the host, then observe and, when explicitly enabled, send constrained input to whitelisted (or explicitly per-session-granted -- see "Dashboard session grants" below) tmux sessions. It supports local STDIO and a loopback-only Streamable HTTP transport intended to sit behind an authenticated HTTPS tunnel.
 
+A separate, deliberately tiny READ-ONLY surface (`terminal-mcp-observer`) exists for hosted clients that cannot be given a custom header or pass a Cloudflare Access check -- claude.ai in a browser, or the Claude phone app. It authenticates with OAuth and exposes fifteen tools that cannot change anything: five read tmux, ten read Git and source. See [`docs/claude-web-connector.md`](docs/claude-web-connector.md).
+
 ## Architecture
 
 ```text

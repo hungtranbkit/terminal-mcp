@@ -151,13 +151,25 @@ class SecurityHeadersMiddleware:
 
         async def send_wrapper(message):
             if message["type"] == "http.response.start":
+                headers = message.get("headers", [])
+                # A route that set its OWN Content-Security-Policy wins.
+                # Appending a second header does not relax anything -- a
+                # browser given two CSPs enforces the INTERSECTION -- so
+                # without this check a route cannot widen one directive it
+                # legitimately needs (observer_auth.py's OAuth login page
+                # needs form-action to permit the client's redirect origin,
+                # or the redirect back to the client is blocked) and cannot
+                # narrow the policy to its own stricter one either (see
+                # dashboard.py's sandboxed "default-src 'none'" route).
+                already_set = any(name.lower() == b"content-security-policy" for name, _ in headers)
                 extra = [
-                    (b"content-security-policy", self._CSP.encode("latin-1")),
                     (b"x-content-type-options", b"nosniff"),
                     (b"referrer-policy", b"no-referrer"),
                     (b"permissions-policy", b"geolocation=(), microphone=(), camera=()"),
                 ]
-                message["headers"] = [*message.get("headers", []), *extra]
+                if not already_set:
+                    extra.insert(0, (b"content-security-policy", self._CSP.encode("latin-1")))
+                message["headers"] = [*headers, *extra]
             await send(message)
 
         await self.app(scope, receive, send_wrapper)

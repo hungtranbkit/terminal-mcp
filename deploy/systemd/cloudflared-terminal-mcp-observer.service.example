@@ -1,0 +1,22 @@
+[Unit]
+Description=Cloudflare Tunnel for terminal-mcp read-only observer (watch.example.net)
+After=network-online.target terminal-mcp-observer.service
+# Wants=, NOT Requires=, for the observer: Requires propagates STOP, so a
+# plain `systemctl --user restart terminal-mcp-observer` would tear this
+# tunnel down and never bring it back, leaving watch.example.net answering
+# Cloudflare error 1033 until someone noticed. cloudflared handles a
+# briefly absent origin by itself.
+Wants=network-online.target terminal-mcp-observer.service
+
+[Service]
+Type=simple
+# Explicit --config on purpose: ~/.cloudflared/config.yml may belong to a
+# DIFFERENT tunnel, and cloudflared silently prefers its `tunnel:` key over a
+# tunnel named on the command line. That is how `tunnel route dns` first
+# pointed this hostname at the wrong tunnel on the first try.
+ExecStart=/usr/bin/cloudflared --no-autoupdate --config %h/.cloudflared/terminal-mcp-observer-config.yml tunnel run
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

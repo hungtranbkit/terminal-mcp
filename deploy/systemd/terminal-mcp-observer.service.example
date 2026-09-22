@@ -1,0 +1,60 @@
+[Unit]
+Description=Terminal MCP read-only observer endpoint (OAuth, for claude.ai)
+Documentation=file:///home/dell/workspace/terminal-mcp/docs/claude-web-connector.md
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/dell/workspace/terminal-mcp
+Environment=TERMINAL_MCP_CONFIG=/home/dell/workspace/terminal-mcp/config.yaml
+
+# REQUIRED, and must match exactly what the tunnel serves. This string is
+# the OAuth issuer identifier; RFC 8414 compares issuers by exact string,
+# so a trailing slash or a wrong subdomain does not degrade gracefully --
+# it produces a connector that fails at the last step of the flow with
+# nothing useful in the error. The process refuses to start without it
+# rather than guessing.
+Environment=TERMINAL_MCP_OBSERVER_PUBLIC_URL=https://watch.example.net
+# Loopback port the tunnel points at. 8767 by default; set it only to
+# avoid a collision.
+# Environment=TERMINAL_MCP_OBSERVER_PORT=8767
+
+ExecStart=/home/dell/workspace/terminal-mcp/.venv/bin/terminal-mcp-observer
+Restart=on-failure
+RestartSec=3
+
+# --- sandboxing -----------------------------------------------------------
+# Same shape, and the same host-specific caveats, as
+# terminal-mcp-http.service.example -- read that file's own long comment
+# block before adding any further Protect*=/Restrict*= directive, because
+# most of them cannot be granted under systemd --user on this host
+# (apparmor_restrict_unprivileged_userns) and fail the unit outright.
+#
+# PrivateTmp is deliberately NOT set here either: reading tmux at all needs
+# the real tmux server socket under /tmp.
+#
+# This process is smaller than the full controller -- no queue engine, no
+# supervisor loops, no dashboard -- so the ceilings are tighter. They are
+# meant to catch a runaway, not to constrain normal operation.
+MemoryMax=256M
+TasksMax=128
+CPUQuota=100%
+
+ProtectSystem=full
+# ProtectHome=read-only is enough for every tool on this surface -- they
+# all read. One thing to check on first start, though: `git status` may
+# want to refresh a repository's index, and under a read-only home it
+# cannot. Git degrades to a warning on stderr rather than failing, but if
+# repo_status ever answers GIT_COMMAND_FAILED on a large repo here and
+# works fine when run by hand, this line is the first suspect.
+ProtectHome=read-only
+# Writable state: the OAuth grant database and the node registry this
+# process refreshes its own local heartbeat into. Everything else it
+# touches (repositories, tmux) it only reads.
+ReadWritePaths=%h/.local/state/terminal-mcp
+
+NoNewPrivileges=yes
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=default.target
