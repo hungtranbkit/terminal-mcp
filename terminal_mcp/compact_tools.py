@@ -95,7 +95,7 @@ START_UNDERWAY_STATUSES = frozenset({
 #: the same repo/worktree") and the receipt still read "work is started and
 #: tracked server-side", which is how an orchestrator silently drops a task.
 START_NEEDS_HUMAN_STATUSES = frozenset({
-    "PAUSED", "BLOCKED", "NEEDS_HUMAN", "FAILED", "CANCELLED",
+    "PAUSED", "BLOCKED", "NEEDS_HUMAN", "NEEDS_REWORK", "FAILED", "CANCELLED",
 })
 #: Waiting on something the server itself will retry -- neither under way nor
 #: a human's problem yet.
@@ -1076,6 +1076,12 @@ class CompactTerminalTools:
         decision = task.get("coordinator_decision")
         if isinstance(decision, dict) and decision.get("reason"):
             reason = str(decision["reason"])
+            # QueueStore intentionally maps NEEDS_REWORK back to QUEUED so the
+            # background loop can re-review after the blocker is fixed.  A
+            # one-call start must not synchronously repeat that unchanged
+            # deterministic refusal until the sidecar times out.
+            if state == "QUEUED" and str(decision.get("status") or "") == "NEEDS_REWORK":
+                state = "NEEDS_REWORK"
         elif task.get("last_error"):
             reason = str(task["last_error"])
         return state, reason

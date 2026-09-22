@@ -1,0 +1,534 @@
+schema_version: 1
+plan: terminal-mcp-commercial-production-v1
+created_at: "2026-09-20"
+source_of_truth:
+  requirements: docs/REQUIREMENTS.md
+  live_tasks: terminal-mcp durable backlog/controller
+notes:
+  - "This file is an execution seed, not a replacement for the live backlog."
+  - "Reconcile against live backlog before importing; do not duplicate work already completed."
+  - "Split implementation tasks into 15-30 minute bounded queue items where practical."
+  - "DONE requires commit/test/live evidence as appropriate."
+release_gates:
+  - G0_BASELINE
+  - G1_CORE_RELIABILITY
+  - G2_SECURITY
+  - G3_INSTALL_UPGRADE
+  - G4_COMMERCIAL_CONTROL_PLANE
+  - G5_OBSERVABILITY_OPS
+  - G6_UX_DOCS
+  - G7_PILOT
+  - G8_GA
+work_packages:
+  - id: TMCP-PROD-001
+    title: Reconcile repository and release topology
+    priority: P0
+    gate: G0_BASELINE
+    depends_on: []
+    acceptance:
+      - Canonical production HEAD and remote HEAD identified
+      - Unique commits/worktrees inventoried without force-push/reset/clean
+      - Deployed SHA is reproducible and traceable
+      - Live backlog reconciled with repo projection
+
+  - id: TMCP-PROD-002
+    title: Close Windows node maintenance bundle
+    priority: P0
+    gate: G1_CORE_RELIABILITY
+    depends_on: [TMCP-PROD-001]
+    maps_existing:
+      - blg_f52a999971d9
+      - blg_7c61b4068f9a
+      - blg_dell5530_lost_sessions
+      - blg_1a13b19a5dba
+    acceptance:
+      - Node credential rotated and old credential rejected
+      - Windows service/Scheduled Task lifecycle is restartable
+      - Required sessions recovered according to documented semantics
+      - Direct-send live verification evidence captured
+
+  - id: TMCP-PROD-003
+    title: Enforce prompt delivery acceptance gate
+    priority: P0
+    gate: G1_CORE_RELIABILITY
+    depends_on: [TMCP-PROD-001]
+    maps_existing: [blg_39f82cd2fe3a]
+    acceptance:
+      - One acceptance vocabulary across direct send queue and supervisor paths
+      - DELIVERY_UNKNOWN never causes blind replay
+      - Duplicate submission test proves idempotency
+
+  - id: TMCP-PROD-004
+    title: Real remote-node auto-dispatch smoke
+    priority: P0
+    gate: G1_CORE_RELIABILITY
+    depends_on: [TMCP-PROD-003]
+    maps_existing: [blg_65725709747b]
+    acceptance:
+      - Persist-before-dispatch proven on a real remote node
+      - Reconnect does not duplicate task
+      - Task trace contains session branch commit and verification evidence
+
+  - id: TMCP-PROD-005
+    title: Enable one real integration and exact-SHA release lane
+    priority: P0
+    gate: G1_CORE_RELIABILITY
+    depends_on: [TMCP-PROD-001, TMCP-PROD-003]
+    maps_existing: [blg_283a4c0f09fe]
+    acceptance:
+      - Dogfood handoff wakes integration flow
+      - Verification gates merge and promotion
+      - Deploy records exact tested SHA
+
+  - id: TMCP-PROD-006
+    title: Worktree Janitor safe executor MVP
+    priority: P1
+    gate: G1_CORE_RELIABILITY
+    depends_on: [TMCP-PROD-001]
+    acceptance:
+      - Dirty worktree becomes BLOCKED
+      - Unmerged worktree becomes REVIEW or BLOCKED
+      - Active process or lease prevents deletion
+      - Only clean merged inactive worktree may become AUTO_SAFE
+      - Dry-run and audit precede auto-delete
+
+  - id: TMCP-PROD-007
+    title: Recovery and chaos suite
+    priority: P0
+    gate: G1_CORE_RELIABILITY
+    depends_on: [TMCP-PROD-003, TMCP-PROD-004, TMCP-PROD-005]
+    acceptance:
+      - Covers client reset controller restart node loss network partition and duplicate retry
+      - No destructive stage executes twice
+      - Recovery reaches deterministic state with machine-queryable evidence
+
+  - id: TMCP-SEC-001
+    title: Threat model and trust boundaries
+    priority: P0
+    gate: G2_SECURITY
+    depends_on: [TMCP-PROD-001]
+    acceptance:
+      - Covers client browser control plane node agent subprocess git and support/billing
+      - Documents assets attack paths controls and residual risk
+
+  - id: TMCP-SEC-002
+    title: Harden execution policy defaults
+    priority: P0
+    gate: G2_SECURITY
+    depends_on: [TMCP-SEC-001]
+    maps_existing: [blg_d24c11c71a35]
+    acceptance:
+      - Commercial defaults are least privilege
+      - Unsafe bypass modes are explicit opt-in
+      - Destructive actions require server-side policy or approval
+
+  - id: TMCP-SEC-003
+    title: Node authentication throttling
+    priority: P0
+    gate: G2_SECURITY
+    depends_on: [TMCP-SEC-001]
+    maps_existing: [blg_1f40adaadc46]
+    acceptance:
+      - Repeated failed auth is throttled
+      - Legitimate heartbeat is not throttled
+      - Lockout cannot permanently wedge valid node
+
+  - id: TMCP-SEC-004
+    title: Request and heartbeat replay protection
+    priority: P0
+    gate: G2_SECURITY
+    depends_on: [TMCP-SEC-001]
+    maps_existing: [blg_13988f78525d]
+    acceptance:
+      - Captured request cannot be replayed successfully
+      - Clock skew and nonce retention behavior documented
+
+  - id: TMCP-SEC-005
+    title: Enrollment and credential lifecycle
+    priority: P0
+    gate: G2_SECURITY
+    depends_on: [TMCP-SEC-003, TMCP-SEC-004]
+    acceptance:
+      - One-time short-lived enrollment credential
+      - Node credential rotates and revokes without reinstall
+      - Compromised node can be disabled immediately
+      - Credential absent from logs and diagnostics
+
+  - id: TMCP-SEC-006
+    title: Organization workspace project RBAC
+    priority: P0
+    gate: G2_SECURITY
+    depends_on: [TMCP-SEC-001, TMCP-CP-001]
+    acceptance:
+      - Owner Admin Operator Developer Viewer model enforced server-side
+      - Cross-project and cross-tenant isolation tests pass
+      - Membership removal revokes effective access
+
+  - id: TMCP-SEC-007
+    title: Central audit event pipeline
+    priority: P0
+    gate: G2_SECURITY
+    depends_on: [TMCP-CP-001]
+    maps_existing: [blg_178d7b6506b7]
+    acceptance:
+      - Central event stream covers auth node permission task terminal git deploy entitlement and support actions
+      - Actor tenant project node task and correlation IDs recorded
+      - Export and retention supported
+
+  - id: TMCP-SEC-008
+    title: Supply-chain and release security baseline
+    priority: P1
+    gate: G2_SECURITY
+    depends_on: [TMCP-PKG-004]
+    acceptance:
+      - SBOM generated
+      - Dependency and secret scan in CI
+      - Release artifact signed or checksum-attested
+      - Protected release workflow documented
+
+  - id: TMCP-CP-001
+    title: Commercial product data model
+    priority: P0
+    gate: G4_COMMERCIAL_CONTROL_PLANE
+    depends_on: [TMCP-PROD-001]
+    acceptance:
+      - User Organization Membership Workspace Project Node Credential Policy Entitlement Subscription UsageEvent AuditEvent modeled
+      - Tenant ownership explicit on every commercial resource
+
+  - id: TMCP-CP-002
+    title: Versioned auth and mutation API contract
+    priority: P0
+    gate: G4_COMMERCIAL_CONTROL_PLANE
+    depends_on: [TMCP-CP-001]
+    acceptance:
+      - Browser auth and node auth separated
+      - Mutations accept idempotency identity
+      - Stable error and correlation IDs defined
+
+  - id: TMCP-CP-003
+    title: Multi-tenant persistence isolation
+    priority: P0
+    gate: G4_COMMERCIAL_CONTROL_PLANE
+    depends_on: [TMCP-CP-001, TMCP-CP-002]
+    acceptance:
+      - Foreign tenant identifier enumeration returns no data
+      - Migrations and rollback preserve tenant ownership
+      - Isolation tests run in CI
+
+  - id: TMCP-CP-004
+    title: Outbound Internet node transport
+    priority: P0
+    gate: G3_INSTALL_UPGRADE
+    depends_on: [TMCP-SEC-005, TMCP-CP-002]
+    maps_existing: [blg_8b17cc479e6f]
+    acceptance:
+      - Node initiates secure outbound connection
+      - Reconnect uses bounded backoff and jitter
+      - Control messages are idempotent
+      - Control-plane outage cannot replay completed local work
+
+  - id: TMCP-CP-005
+    title: Fleet presence and version health
+    priority: P1
+    gate: G5_OBSERVABILITY_OPS
+    depends_on: [TMCP-CP-004]
+    acceptance:
+      - Online offline degraded and stale states have deterministic semantics
+      - Agent version active task count and upgrade eligibility visible
+
+  - id: TMCP-PKG-001
+    title: Linux production installer
+    priority: P0
+    gate: G3_INSTALL_UPGRADE
+    depends_on: [TMCP-SEC-005, TMCP-CP-004, TMCP-PKG-004]
+    acceptance:
+      - Clean supported host installs service and enrolls node
+      - Least-privilege filesystem permissions
+      - Doctor health check passes
+
+  - id: TMCP-PKG-002
+    title: Windows production installer
+    priority: P0
+    gate: G3_INSTALL_UPGRADE
+    depends_on: [TMCP-PROD-002, TMCP-SEC-005, TMCP-CP-004, TMCP-PKG-004]
+    acceptance:
+      - No manual Python or venv setup for ordinary customer
+      - ConPTY dependencies installed
+      - Reboot and service restart semantics tested
+
+  - id: TMCP-PKG-003
+    title: macOS production installer
+    priority: P1
+    gate: G3_INSTALL_UPGRADE
+    depends_on: [TMCP-SEC-005, TMCP-CP-004, TMCP-PKG-004]
+    acceptance:
+      - LaunchAgent lifecycle tested
+      - Enrollment and health parity with Linux
+
+  - id: TMCP-PKG-004
+    title: Versioning protocol compatibility and release channels
+    priority: P0
+    gate: G3_INSTALL_UPGRADE
+    depends_on: [TMCP-PROD-001]
+    acceptance:
+      - Semver policy defined
+      - Stable and beta channels defined
+      - Node/control-plane compatibility matrix enforced
+
+  - id: TMCP-PKG-005
+    title: Signed update and rollback
+    priority: P0
+    gate: G3_INSTALL_UPGRADE
+    depends_on: [TMCP-PKG-001, TMCP-PKG-002, TMCP-PKG-003, TMCP-PKG-004]
+    acceptance:
+      - Staged update supported
+      - Preflight checkpoint or backup
+      - Previous known-good version restored on rollback
+      - Durable task state preserved
+
+  - id: TMCP-PKG-006
+    title: Uninstall re-enroll and lost-node recovery
+    priority: P1
+    gate: G3_INSTALL_UPGRADE
+    depends_on: [TMCP-PKG-005]
+    acceptance:
+      - Uninstall data-retention choice documented
+      - Credential revoked on removal
+      - Replacement node flow tested
+
+  - id: TMCP-REL-001
+    title: Persistence inventory schema migration and rollback
+    priority: P0
+    gate: G5_OBSERVABILITY_OPS
+    depends_on: [TMCP-PROD-001]
+    acceptance:
+      - Every persistent store has owner schema version backup and migration rule
+      - Migrations tested from at least two prior supported versions
+
+  - id: TMCP-REL-002
+    title: Backup restore and disaster recovery
+    priority: P0
+    gate: G5_OBSERVABILITY_OPS
+    depends_on: [TMCP-REL-001]
+    acceptance:
+      - Required state backed up encrypted
+      - Restore drill records RPO and RTO evidence
+
+  - id: TMCP-REL-003
+    title: Global idempotency contract
+    priority: P0
+    gate: G1_CORE_RELIABILITY
+    depends_on: [TMCP-PROD-003]
+    acceptance:
+      - Dispatch send merge deploy enrollment and billing ingestion define idempotency identity
+      - Duplicate and partial-failure tests pass
+
+  - id: TMCP-REL-004
+    title: Wire live work-efficiency telemetry
+    priority: P1
+    gate: G5_OBSERVABILITY_OPS
+    depends_on: [TMCP-PROD-005]
+    acceptance:
+      - Runtime produces real per-task and aggregate telemetry
+      - Recovery and retry do not double count
+
+  - id: TMCP-REL-005
+    title: Remediate token efficiency benchmark
+    priority: P1
+    gate: G5_OBSERVABILITY_OPS
+    depends_on: [TMCP-REL-004]
+    acceptance:
+      - Release threshold frozen
+      - Benchmark rerun with evidence
+      - Redundant tool and status calls reduced
+
+  - id: TMCP-REL-006
+    title: Define and instrument SLOs and SLIs
+    priority: P0
+    gate: G5_OBSERVABILITY_OPS
+    depends_on: [TMCP-CP-005, TMCP-REL-004]
+    acceptance:
+      - Availability dispatch recovery duplicate and upgrade metrics measured
+      - GA targets selected from pilot evidence
+
+  - id: TMCP-REL-007
+    title: Alerts and production incident runbooks
+    priority: P0
+    gate: G5_OBSERVABILITY_OPS
+    depends_on: [TMCP-REL-006, TMCP-SEC-007]
+    acceptance:
+      - Runbooks cover controller tunnel node queue DB credential release billing and tenant-security incidents
+      - Alerts link to remediation and correlation context
+
+  - id: TMCP-COM-001
+    title: Edition and entitlement model
+    priority: P0
+    gate: G4_COMMERCIAL_CONTROL_PLANE
+    depends_on: [TMCP-CP-001]
+    acceptance:
+      - Community Pro Team Enterprise capability model documented
+      - Core execution consumes entitlements without hard-coded prices
+
+  - id: TMCP-COM-002
+    title: Entitlement service and offline grace
+    priority: P0
+    gate: G4_COMMERCIAL_CONTROL_PLANE
+    depends_on: [TMCP-COM-001, TMCP-CP-003]
+    acceptance:
+      - One entitlement decision service
+      - Temporary control-plane outage behavior deterministic
+      - Downgrade never corrupts existing task data
+
+  - id: TMCP-COM-003
+    title: Commercial usage metering
+    priority: P0
+    gate: G4_COMMERCIAL_CONTROL_PLANE
+    depends_on: [TMCP-COM-001, TMCP-SEC-007]
+    acceptance:
+      - Retry-safe deterministic usage events
+      - Customer-visible usage summary
+      - Metered units tied to product-owned resources
+
+  - id: TMCP-COM-004
+    title: Subscription billing integration
+    priority: P1
+    gate: G4_COMMERCIAL_CONTROL_PLANE
+    depends_on: [TMCP-COM-002, TMCP-COM-003]
+    acceptance:
+      - Checkout subscription cancellation and recovery
+      - Webhook signature verification and idempotency
+      - Billing state maps predictably to entitlement state
+
+  - id: TMCP-COM-005
+    title: Privacy Terms and security publication set
+    priority: P0
+    gate: G8_GA
+    depends_on: [TMCP-SEC-001, TMCP-COM-006]
+    acceptance:
+      - Terms Privacy Security retention and disclosure documents prepared
+      - Legal review completed before public GA
+
+  - id: TMCP-COM-006
+    title: Data export retention and deletion controls
+    priority: P0
+    gate: G4_COMMERCIAL_CONTROL_PLANE
+    depends_on: [TMCP-CP-003, TMCP-REL-002]
+    acceptance:
+      - Tenant export works
+      - Deletion workflow and backup expiry semantics documented and tested
+
+  - id: TMCP-UX-001
+    title: First-run onboarding
+    priority: P0
+    gate: G6_UX_DOCS
+    depends_on: [TMCP-PKG-001, TMCP-PKG-002, TMCP-CP-005]
+    acceptance:
+      - New user reaches healthy node and first safe task without internal operator knowledge
+
+  - id: TMCP-UX-002
+    title: Production dashboard information architecture
+    priority: P1
+    gate: G6_UX_DOCS
+    depends_on: [TMCP-CP-005, TMCP-COM-003]
+    acceptance:
+      - Projects Tasks Nodes Sessions Releases Audit Usage Billing Settings Security are navigable
+      - UI reuses canonical stores instead of duplicating state
+
+  - id: TMCP-UX-003
+    title: Error and remediation catalog
+    priority: P0
+    gate: G6_UX_DOCS
+    depends_on: [TMCP-CP-002]
+    acceptance:
+      - Common user errors have stable code meaning safe action and correlation ID
+
+  - id: TMCP-UX-004
+    title: Redacted diagnostics bundle
+    priority: P0
+    gate: G6_UX_DOCS
+    depends_on: [TMCP-SEC-007, TMCP-REL-007]
+    acceptance:
+      - One action collects version health config shape and bounded logs
+      - Secret redaction tests pass
+      - User can inspect bundle contents
+
+  - id: TMCP-UX-005
+    title: Commercial documentation set
+    priority: P0
+    gate: G6_UX_DOCS
+    depends_on: [TMCP-UX-001, TMCP-UX-003, TMCP-PKG-005]
+    acceptance:
+      - Quickstart platform connection enrollment permissions recovery update self-hosted security and troubleshooting docs complete
+
+  - id: TMCP-QA-001
+    title: Cross-platform CI matrix
+    priority: P0
+    gate: G7_PILOT
+    depends_on: [TMCP-PKG-001, TMCP-PKG-002, TMCP-PKG-003]
+    acceptance:
+      - Linux Windows macOS unit integration migration browser and install-smoke lanes run
+
+  - id: TMCP-QA-002
+    title: Commercial E2E golden-flow suite
+    priority: P0
+    gate: G7_PILOT
+    depends_on: [TMCP-PROD-007, TMCP-SEC-006, TMCP-PKG-005]
+    acceptance:
+      - Covers enrollment dispatch recovery approval merge deploy upgrade rollback and access revocation
+
+  - id: TMCP-QA-003
+    title: Security isolation test suite
+    priority: P0
+    gate: G7_PILOT
+    depends_on: [TMCP-SEC-002, TMCP-SEC-003, TMCP-SEC-004, TMCP-SEC-006, TMCP-SEC-007]
+    acceptance:
+      - Cross-tenant escalation replay throttling CSRF secret leakage and unsafe-action cases pass
+
+  - id: TMCP-QA-004
+    title: Load and soak qualification
+    priority: P1
+    gate: G7_PILOT
+    depends_on: [TMCP-REL-006, TMCP-QA-001]
+    acceptance:
+      - Supported node session task reconnect and audit limits derived from measured evidence
+
+  - id: TMCP-QA-005
+    title: Full release and rollback rehearsal
+    priority: P0
+    gate: G7_PILOT
+    depends_on: [TMCP-QA-001, TMCP-QA-002, TMCP-QA-003, TMCP-REL-002]
+    acceptance:
+      - Build sign migrate deploy smoke rollback and restore complete on clean environment
+
+  - id: TMCP-PILOT-001
+    title: Internal dogfood on Terminal MCP MESFlow and NovaRetail
+    priority: P0
+    gate: G7_PILOT
+    depends_on: [TMCP-QA-005, TMCP-UX-005]
+    acceptance:
+      - Real long task survives UI reset
+      - Real multi-node dispatch completes
+      - Exact-SHA deploy and rollback proven
+      - Audit reconstructs complete timeline
+
+  - id: TMCP-PILOT-002
+    title: Closed alpha and design-partner beta
+    priority: P0
+    gate: G7_PILOT
+    depends_on: [TMCP-PILOT-001, TMCP-COM-004]
+    acceptance:
+      - 3 to 5 independent pilot environments or equivalent
+      - Windows Linux and macOS coverage
+      - No open Sev-1 or Sev-2 production defect
+      - Upgrade rollback recovery and billing behavior verified
+
+  - id: TMCP-GA-001
+    title: Commercial Production V1 GA release
+    priority: P0
+    gate: G8_GA
+    depends_on: [TMCP-PILOT-002, TMCP-COM-005]
+    acceptance:
+      - Stable signed release tagged
+      - Changelog migration notes and rollback artifact published
+      - SLO dashboards and support ownership active
+      - GA acceptance report links every gate to real evidence

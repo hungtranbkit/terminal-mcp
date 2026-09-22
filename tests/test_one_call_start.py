@@ -412,6 +412,34 @@ def test_start_stops_ticking_at_the_first_refusal_instead_of_burning_the_budget(
     assert lane.ticks == 1
 
 
+def test_needs_rework_queued_task_settles_after_one_review_tick():
+    """The durable queue may stay QUEUED, but compact start must settle the
+    semantic NEEDS_REWORK refusal after one deterministic review."""
+    lane = FakeLane()
+
+    def rework_tick(session):
+        lane.ticks += 1
+        task = lane.tasks["task-1"]
+        task["status"] = "QUEUED"
+        task["coordinator_decision"] = {
+            "status": "NEEDS_REWORK",
+            "reason": "uncommitted changes present",
+        }
+        return {"session": session, "action": "QUEUED", "task_id": task["id"]}
+
+    lane.tick = rework_tick
+    result = _tools(lane).turn(action="start", target="worker", text="work")
+
+    assert result["dispatch_ticks"] == 1
+    assert result["task_state"] == "NEEDS_REWORK"
+    assert result["dispatched"] is False
+    assert result["needs_human"] is True
+    assert result["next_action"] == "resolve"
+    assert result["server_side_progress"]["following"] is False
+    assert "uncommitted changes present" in result["guidance"]
+    assert lane.ticks == 1
+
+
 def test_a_refused_task_is_not_handed_to_the_follower():
     lane = GatedLane()
     follower = StartedTaskFollower(lane.tick, lane.task_status,
