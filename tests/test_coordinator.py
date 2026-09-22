@@ -18,7 +18,7 @@ from terminal_mcp.coordinator import (
     BLOCKED, NEEDS_HUMAN, NEEDS_REWORK, READY, CoordinatorGate, OtherLaneSnapshot, RepoEvidenceError,
     SessionSnapshot, git_repo_evidence,
 )
-from terminal_mcp.queue_store import DISPATCHING, QueueStore, RUNNING, VERIFYING
+from terminal_mcp.queue_store import DISPATCHING, QUEUED, QueueStore, RUNNING, VERIFYING
 
 
 @pytest.fixture
@@ -209,6 +209,17 @@ def test_repeated_failure_gate_disabled_via_none_falls_back_to_raw_attempt_cap_o
 # ---------------------------------------------------------------------------
 # Previous-task evidence check (item 3's first bullet / item 11).
 # ---------------------------------------------------------------------------
+
+def test_urgent_task_can_precede_lower_priority_queued_task(store):
+    deploy, hotfix = store.set_tasks("lane-a", [
+        {"prompt": "deploy the existing application safely", "priority": 20},
+        {"prompt": "fix the blank screen before deployment", "priority": 100},
+    ])
+    task = store.claim_next_task("lane-a", claimed_by="engine-1")
+    assert task.id == hotfix
+    gate = CoordinatorGate(evidence_collector=_fake_collector_factory())
+    assert gate.review(task, store=store, session=_ok_session()).status == READY
+    assert store.get_task(deploy).status == QUEUED
 
 def test_previous_task_with_no_verification_evidence_needs_rework(store):
     ids = store.set_tasks("lane-a", [{"prompt": "first task here please"}, {"prompt": "second task here please"}])

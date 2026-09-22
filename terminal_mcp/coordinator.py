@@ -833,7 +833,7 @@ class CoordinatorGate:
         if previous is not None:
             if previous.status != COMPLETED:
                 # Should not normally be reachable (claim_next_task's own
-                # FIFO-per-lane invariant already guarantees this), but
+                # priority-then-position ordering already guarantees this), but
                 # checked independently anyway -- defense in depth, and
                 # fail-closed if that invariant is ever violated by a bug
                 # elsewhere.
@@ -1097,7 +1097,11 @@ class CoordinatorGate:
         lane."""
         lane = store.lane_status(task.session)
         candidates = [t for t in lane["tasks"]
-                     if t["position"] < task.position and t["status"] not in ("CANCELLED", "SKIPPED")]
+                     if t["position"] < task.position and t["status"] not in ("CANCELLED", "SKIPPED")
+                     # A lower-priority task still queued is not a prior
+                     # execution. Match the scheduler's priority ordering;
+                     # explicit dependencies remain enforced at claim time.
+                     and not (t["status"] == "QUEUED" and t["priority"] < task.priority)]
         if not candidates:
             return None
         best = max(candidates, key=lambda t: t["position"])
