@@ -528,7 +528,19 @@ class QueueService:
         task = self.store.get_task(task_id)
         if task is None:
             return {"error": "TASK_NOT_FOUND", "task_id": task_id}
-        return {"task": task.to_dict(), "queue_position": self.store.queue_position(task_id)}
+        result = {"task": task.to_dict(), "queue_position": self.store.queue_position(task_id)}
+        if task.status == "QUEUED":
+            lane = self.store.lane_status(task.session)
+            active = lane.get("current_task") or {}
+            if lane["paused"] or active:
+                result["dispatch_blocker"] = {
+                    "code": "LANE_PAUSED" if lane["paused"] else "LANE_OCCUPIED",
+                    "task_id": active.get("id"), "status": active.get("status"),
+                    "reason": lane.get("paused_reason") or active.get("last_error")
+                              or active.get("coordinator_reason") or "another task occupies this lane",
+                    "pause_origin": lane.get("paused_origin"),
+                }
+        return result
 
     # -- Analysis Gate (§20.6 Phase F, docs/AI_ANALYSIS_GATE.md) ----------
     # Deliberately NOT enforced at create/assign time, unlike DoR above.

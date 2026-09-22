@@ -209,6 +209,9 @@ class QueueLoop:
             self._last_active_recovery_at = time.monotonic()
             try:
                 recovery()
+                preflight = getattr(self.engine, "reconcile_resolved_preflight_pauses", None)
+                if preflight is not None:
+                    preflight()
             except Exception:
                 _LOGGER.exception("queue-loop: stale-active recovery failed, continuing")
         for lane in self.engine.store.list_all_lanes():

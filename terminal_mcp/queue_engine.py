@@ -54,10 +54,10 @@ import logging
 import hashlib
 import time
 from datetime import datetime, timedelta, timezone
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Protocol
 
-from .coordinator import CoordinatorGate, OtherLaneSnapshot, SessionSnapshot
+from .coordinator import CoordinatorGate, OtherLaneSnapshot, SessionSnapshot, PLAIN_SHELL_COMMANDS
 from . import delivery_gate, retry_recovery
 from .queue_store import (
     BLOCKED, COMPLETED, DISPATCH_UNCERTAIN, DISPATCHING, FAILED, PRECHECK, QUEUED, READY, RUNNING, VERIFYING,
@@ -394,6 +394,48 @@ class QueueEngine:
         self.on_completed = on_completed
         self.governor = governor
         self._inactive_active_observations: dict[str, tuple[tuple, float]] = {}
+
+    def reconcile_resolved_preflight_pauses(self) -> list[str]:
+        """Probe recoverable preflight pauses; never dispatch or override a user pause."""
+        candidates = []
+        for lane in self.store.list_all_lanes():
+            if not lane["paused"] or lane.get("paused_origin") != "coordinator":
+                continue
+            for row in lane["tasks"]:
+                if row["status"] != "PAUSED" or row["started_at"] or row["attempt_count"]:
+                    continue
+                reason = row.get("coordinator_reason") or ""
+                # Review budgets wrap the original dirty-repo reason. Read
+                # bounded audit history to identify that recoverable cause.
+                if "exceeded max coordinator review attempts" in reason:
+                    events = self.store.list_events(lane["session"], limit=100)
+                    reason = next((e.get("reason") or "" for e in events
+                                   if e.get("task_id") == row["id"]
+                                   and e.get("event_type") == "COORDINATOR_NEEDS_REWORK"), reason)
+                if "uncommitted changes present in " in reason or reason.startswith("AGENT_NOT_RUNNING:"):
+                    candidates.append(row["id"])
+        recovered = []
+        if not candidates:
+            return recovered
+        offset = getattr(self, "_preflight_probe_cursor", 0) % len(candidates)
+        selected = (candidates[offset:] + candidates[:offset])[:8]
+        self._preflight_probe_cursor = offset + len(selected)
+        for task_id in selected:
+            try:
+                task = self.store.get_task(task_id)
+                observed = self._status_bounded(task.session)
+                if observed.get("error") or observed.get("state") != "IDLE" or not observed.get("cwd"):
+                    continue
+                snapshot = SessionSnapshot(**{key: observed.get(key) for key in SessionSnapshot.__dataclass_fields__})
+                decision = self.coordinator.review(replace(task, coordinator_attempts=0),
+                                                   store=self.store, session=snapshot)
+                # Only re-open after the resolved condition passes all local
+                # gates. The normal claim/review still checks competing lanes.
+                if decision.status == READY and self.store.resume_resolved_preflight(task):
+                    recovered.append(task.id)
+            except Exception:
+                _LOGGER.exception("preflight recovery failed for task=%s", task_id)
+        return recovered
 
     def reconcile_stale_active_tasks(self) -> list[str]:
         """Release stale reservations without dispatching work on any lane.
@@ -793,6 +835,10 @@ class QueueEngine:
 
     def _dispatch(self, session: str, task_id: str) -> TickResult:
         task = self.store.get_task(task_id)
+        if task.metadata.get("execution_mode") != "shell":
+            observed = self._status_bounded(session)
+            if str(observed.get("current_command") or "").casefold() in PLAIN_SHELL_COMMANDS:
+                return self._review(session, task_id)
         nonce = self.store.ensure_verification_nonce(task_id)
         # STICKY idempotency key (item 8/9, and the real Phase 2 fix
         # this closes -- see queue_store.py's own dispatch_idempotency_

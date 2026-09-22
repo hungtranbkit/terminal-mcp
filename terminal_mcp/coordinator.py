@@ -536,6 +536,9 @@ def run_smoke_test_command(command: tuple[str, ...], cwd: str, timeout_seconds: 
                            returncode=result.returncode)
 
 
+PLAIN_SHELL_COMMANDS = frozenset({"bash", "zsh", "sh", "fish", "dash", "powershell", "pwsh", "cmd.exe"})
+
+
 @dataclass(frozen=True)
 class SessionSnapshot:
     """What the Coordinator observed about the task's OWN target session
@@ -868,6 +871,13 @@ class CoordinatorGate:
         #     queue_engine.py routes it to WAITING_SESSION before the
         #     coordinator gate ever runs), so this is specifically the
         #     "session IS reachable but not actually available" case.
+        if (str(session.current_command or "").casefold() in PLAIN_SHELL_COMMANDS
+                and task.metadata.get("execution_mode") != "shell"):
+            return CoordinatorDecision(
+                NEEDS_HUMAN, evidence={"blocker_code": "AGENT_NOT_RUNNING", "current_command": session.current_command},
+                reason="AGENT_NOT_RUNNING: target is a plain shell, not an AI agent",
+                required_actions=["Start the intended agent in this session, or set metadata.execution_mode=shell for an intentional shell task"],
+            )
         if session.input_required or session.state == "WAITING_INPUT":
             return CoordinatorDecision(
                 NEEDS_HUMAN, evidence={"session_state": session.state, "input_required": session.input_required},

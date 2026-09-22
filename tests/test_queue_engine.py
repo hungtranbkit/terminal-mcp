@@ -75,6 +75,94 @@ def _make_task(store, session="lane-a", prompt="please do the real work carefull
     return task_id
 
 
+@pytest.mark.parametrize("clean,user_pause,recovered", [(True, False, True), (False, False, False), (True, True, False)])
+def test_resolved_dirty_preflight_recovers_without_dispatch(store, ops, clean, user_pause, recovered):
+    task_id = _make_task(store)
+    store.claim_next_task("lane-a", claimed_by="test")
+    store.record_coordinator_decision(task_id, status="NEEDS_HUMAN",
+                                     reason="uncommitted changes present in '/repo/a' (2 line(s))")
+    if user_pause:
+        store.pause_lane("lane-a", reason="operator maintenance", origin="user")
+    gate = CoordinatorGate(evidence_collector=lambda cwd: RepoEvidence(branch="main", head="x", clean=clean,
+                                                                       status_lines=() if clean else ("?? artifact",)))
+    engine = QueueEngine(store, ops, coordinator=gate)
+    assert engine.reconcile_resolved_preflight_pauses() == ([task_id] if recovered else [])
+    assert store.get_task(task_id).status == (QUEUED if recovered else PAUSED)
+    assert not ops.sent
+
+
+def test_ai_task_is_not_sent_to_plain_shell(store, ops):
+    task_id = _make_task(store)
+    ops.set_status("lane-a", {"state": "IDLE", "cwd": "/repo/a", "current_command": "bash"})
+    engine = QueueEngine(store, ops, coordinator=_always_ready_gate())
+    engine.tick("lane-a")
+    engine.tick("lane-a")
+    assert store.get_task(task_id).status == PAUSED
+    assert "AGENT_NOT_RUNNING" in store.get_task(task_id).coordinator_reason
+    assert not ops.sent
+    ops.set_status("lane-a", {"state": "IDLE", "cwd": "/repo/a", "current_command": "claude"})
+    assert engine.reconcile_resolved_preflight_pauses() == [task_id]
+    for _ in range(3):
+        engine.tick("lane-a")
+    assert store.get_task(task_id).status == RUNNING
+    assert len(ops.sent) == 1
+
+
+def test_queued_receipt_exposes_lane_pause_and_blocking_task(store):
+    from terminal_mcp.queue_service import QueueService
+    old = _make_task(store)
+    store.claim_next_task("lane-a", claimed_by="test")
+    store.record_coordinator_decision(old, status="NEEDS_HUMAN", reason="AGENT_NOT_RUNNING: bash")
+    new = store.append_tasks("lane-a", [{"prompt": "audit the latest demo data"}])[0]
+    response = QueueService(store).task_status(new)
+    assert response["dispatch_blocker"]["task_id"] == old
+    assert response["dispatch_blocker"]["reason"]
+    assert response["dispatch_blocker"]["code"] == "LANE_PAUSED"
+
+
+def test_explicit_shell_task_is_still_allowed(store, ops):
+    task_id = store.append_tasks("lane-a", [{"prompt": "printf 'shell task complete'", "metadata": {"execution_mode": "shell"}}])[0]
+    ops.set_status("lane-a", {"state": "IDLE", "cwd": "/repo/a", "current_command": "bash"})
+    engine = QueueEngine(store, ops, coordinator=_always_ready_gate())
+    for _ in range(3):
+        engine.tick("lane-a")
+    assert store.get_task(task_id).status == RUNNING
+
+
+def test_agent_exit_between_review_and_dispatch_never_receives_prompt(store, ops):
+    task_id = _make_task(store)
+    engine = QueueEngine(store, ops, coordinator=_always_ready_gate())
+    engine.tick("lane-a")
+    engine.tick("lane-a")
+    ops.set_status("lane-a", {"state": "IDLE", "cwd": "/repo/a", "current_command": "bash"})
+    engine.tick("lane-a")
+    assert store.get_task(task_id).status == PAUSED
+    assert not ops.sent
+
+
+def test_recovery_does_not_override_a_concurrent_operator_pause(store, ops):
+    task_id = _make_task(store)
+    store.claim_next_task("lane-a", claimed_by="test")
+    store.record_coordinator_decision(task_id, status="NEEDS_HUMAN", reason="uncommitted changes present in '/repo/a'")
+    def evidence(cwd):
+        store.pause_lane("lane-a", reason="maintenance", origin="user")
+        return RepoEvidence(branch="main", head="x", clean=True, status_lines=())
+    engine = QueueEngine(store, ops, coordinator=CoordinatorGate(evidence_collector=evidence))
+    assert engine.reconcile_resolved_preflight_pauses() == []
+    assert store.get_task(task_id).status == PAUSED
+
+
+def test_dirty_pause_exhausted_review_budget_recovers_when_clean(store, ops):
+    task_id = _make_task(store)
+    store.claim_next_task("lane-a", claimed_by="test")
+    store.record_coordinator_decision(task_id, status="NEEDS_REWORK", reason="uncommitted changes present in '/repo/a'")
+    store.claim_next_task("lane-a", claimed_by="test")
+    store.record_coordinator_decision(task_id, status="NEEDS_HUMAN", reason="exceeded max coordinator review attempts (5)")
+    engine = QueueEngine(store, ops, coordinator=_always_ready_gate())
+    assert engine.reconcile_resolved_preflight_pauses() == [task_id]
+    assert store.get_task(task_id).coordinator_attempts == 0
+
+
 def _finished_worker(store, ops):
     task_id = _make_task(store)
     engine = QueueEngine(store, ops, coordinator=_always_ready_gate())

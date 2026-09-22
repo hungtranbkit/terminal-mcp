@@ -3001,6 +3001,28 @@ class QueueStore:
         return self.transition_task(task_id, WAITING_SESSION, event_type="WAITING_SESSION", reason=reason,
                                     extra_fields={"uncertain_or_waiting_since": iso_now()})
 
+    def resume_resolved_preflight(self, task: QueueTask) -> bool:
+        """CAS an unstarted coordinator pause after a fresh successful review."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task.id,)).fetchone()
+            lane = connection.execute("SELECT * FROM queue_lanes WHERE session = ?", (task.session,)).fetchone()
+            if (row is None or lane is None or row["status"] != PAUSED
+                    or row["updated_at"] != task.updated_at or row["started_at"]
+                    or row["attempt_count"] or row["dispatch_idempotency_key"]
+                    or pause_origin(lane["paused_origin"], lane["paused_reason"]) != PAUSE_ORIGIN_COORDINATOR):
+                return False
+            if connection.execute("SELECT 1 FROM queue_tasks WHERE session=? AND status=? AND id<>?",
+                                  (task.session, PAUSED, task.id)).fetchone():
+                return False
+            self._transition_locked(connection, task.id, PAUSED, QUEUED,
+                event_type="PREFLIGHT_BLOCKER_RESOLVED", reason="fresh preflight review passed; ready for a new claim",
+                extra_fields={"paused_from_status": None, "coordinator_attempts": 0,
+                              "claimed_by": None, "claim_token": None, "lease_expires_at": None})
+            connection.execute("UPDATE queue_lanes SET paused=0,paused_reason=NULL,paused_origin=NULL,updated_at=? WHERE session=?",
+                               (iso_now(), task.session))
+            return True
+
     def reconcile_stale_lane_pause(self, session: str | None = None) -> list[str]:
         """Clear a COORDINATOR lane pause that no longer guards anything.
 
