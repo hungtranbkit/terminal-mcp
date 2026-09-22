@@ -280,6 +280,31 @@ def test_delivery_unknown_reconciles_to_queued_not_a_resend(store, ops):
     assert store.get_task(task_id).status == QUEUED
 
 
+def test_delivery_unknown_completes_from_verified_worker_marker_without_resend(store, ops):
+    task_id = _make_task(store)
+    ops.set_status("lane-a", {"state": "IDLE", "node_id": "local", "cwd": "/repo/a"})
+
+    class UnknownOps(FakeOps):
+        def terminal_send_text(self, session, text, press_enter=False, dry_run=False, **kwargs):
+            self.sent.append({"session": session, "text": text})
+            return {"sent": True, "delivery_state": "DELIVERY_UNKNOWN"}
+
+    unknown_ops = UnknownOps()
+    unknown_ops.status_by_session = ops.status_by_session
+    engine = QueueEngine(store, unknown_ops, coordinator=_always_ready_gate())
+    engine.tick("lane-a")
+    engine.tick("lane-a")
+    assert engine.tick("lane-a").action == "DISPATCH_UNCERTAIN"
+    dispatched = unknown_ops.sent[0]["text"]
+    marker = dispatched.rstrip().splitlines()[-1]
+    unknown_ops.set_capture("lane-a", {"output": f"{dispatched}\nCANARY_OK\n{marker}\n"})
+
+    reconciled = engine.tick("lane-a")
+    assert reconciled.action == "COMPLETED"
+    assert store.get_task(task_id).status == COMPLETED
+    assert len(unknown_ops.sent) == 1
+
+
 # ---------------------------------------------------------------------------
 # Idempotency across a simulated restart -- a NEW engine/store re-dispatching
 # the same claimed task never sends twice for the same attempt.

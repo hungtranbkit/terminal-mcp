@@ -76,6 +76,12 @@ plan is worse than an error.
   deleted — adopting a teammate's committed backlog must never silently
   drop work only this controller knows about. `replace=True` is the
   deliberate destructive form.
+- `terminal_backlog_reconcile(path, dry_run=true)` is the migration-safe form
+  for adopting an older projection into a controller that already has newer
+  canonical work. Current scalar/state fields win conflicts; historical
+  evidence, history, tags, dependencies and acceptance criteria are additive.
+  Apply with `dry_run=false` and the preview's `revision` as
+  `expected_revision`. A second run is a no-op and does not bump revision.
 
 Hand-edits to a committed file are still supported; the repair now
 happens at the **import** boundary, and a corrupt or newer-schema file is

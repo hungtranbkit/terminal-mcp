@@ -17,6 +17,7 @@ include node_id/node_name để debug" -- never a breaking shape change).
 """
 from __future__ import annotations
 
+import concurrent.futures
 import tempfile
 import time
 from dataclasses import dataclass
@@ -25,7 +26,13 @@ from typing import TYPE_CHECKING, Any
 
 from . import contract, endpoint_policy, host_metrics
 from .node_client import LocalNodeClient, NodeClient, NodeClientError, RemoteNodeClient
-from .node_models import NODE_ONLINE, Node
+from .node_models import (
+    HEALTH_AUTH_UNAUTHORIZED,
+    HEALTH_DEGRADED,
+    HEALTH_EXECUTION_DOWN,
+    NODE_ONLINE,
+    Node,
+)
 from .node_health import NodeHealthPolicy, NodeHealthService
 from .node_registry import NodeRegistry
 from .session_resource import (ContextPolicy, build_resource_block,
@@ -664,8 +671,10 @@ class ControllerService:
     def terminal_detach_session(self, name: str) -> dict[str, Any]:
         return self._route(name, "detach", lambda client, bare: client.detach_session(bare))
 
-    def terminal_delete_session(self, name: str) -> dict[str, Any]:
-        return self._route(name, "delete", lambda client, bare: client.delete_session(bare))
+    def terminal_delete_session(self, name: str, *, confirm: bool = False,
+                                requested_by: str | None = None) -> dict[str, Any]:
+        return self._route(name, "delete", lambda client, bare: client.delete_session(
+            bare, confirm=confirm, requested_by=requested_by))
 
     def terminal_kill_session(self, name: str, confirm_name: str, *, requested_by: str | None = None) -> dict[str, Any]:
         return self._route(name, "kill", lambda client, bare: client.kill_session(
@@ -1273,6 +1282,7 @@ class ControllerService:
         empty list indistinguishable from "no sessions exist there")."""
         sessions: list[dict[str, Any]] = []
         unreachable: list[dict[str, Any]] = []
+        reachable: list[tuple[Node, NodeClient]] = []
         for node in self.list_nodes():
             if node.status != NODE_ONLINE:
                 unreachable.append({"node_id": node.id, "node_name": node.display_name, "status": node.status})
@@ -1281,11 +1291,28 @@ class ControllerService:
             if client is None:
                 unreachable.append({"node_id": node.id, "node_name": node.display_name, "status": "no_client"})
                 continue
+            reachable.append((node, client))
+
+        # Fleet reads are independent.  Serial fan-out made one ordinary
+        # list call pay the sum of every healthy node's latency (and could
+        # hold an MCP request for many seconds).  Keep deterministic node
+        # order while bounding wall time to the slowest node, not the sum.
+        def _list_one(item: tuple[Node, NodeClient]) -> tuple[Node, dict[str, Any] | NodeClientError]:
+            node, client = item
             try:
-                listing = client.list_sessions()
+                return node, client.list_sessions()
             except NodeClientError as exc:
+                return node, exc
+
+        if reachable:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(reachable))) as executor:
+                listings = list(executor.map(_list_one, reachable))
+        else:
+            listings = []
+        for node, listing in listings:
+            if isinstance(listing, NodeClientError):
                 unreachable.append({"node_id": node.id, "node_name": node.display_name, "status": "error",
-                                    "detail": str(exc)})
+                                    "detail": str(listing)})
                 continue
             for row in listing.get("sessions", []):
                 row = dict(row)
@@ -1342,10 +1369,16 @@ class ControllerService:
         result = []
         for node in self.registry.list():
             client = self._clients.get(node.id)
-            if client is None:
+            # A dedicated background NodeHealthLoop owns recovery probes for
+            # nodes already known degraded/down.  Re-probing those peers from
+            # an unrelated read path whenever their backoff expires caused
+            # multi-second MCP latency spikes.  UNKNOWN nodes still get their
+            # initial classification here for backward compatibility.
+            if (client is None or node.execution_state in {
+                    HEALTH_AUTH_UNAUTHORIZED, HEALTH_DEGRADED, HEALTH_EXECUTION_DOWN}):
                 result.append(self.node_health._cached(node))
-                continue
-            result.append(self.node_health.evaluate(node, client))
+            else:
+                result.append(self.node_health.evaluate(node, client))
         return result
 
     def node_status(self, node_id: str) -> Node | None:
@@ -1353,7 +1386,10 @@ class ControllerService:
         if node is None:
             return None
         client = self._clients.get(node_id)
-        return self.node_health.evaluate(node, client) if client is not None else self.node_health._cached(node)
+        if (client is None or node.execution_state in {
+                HEALTH_AUTH_UNAUTHORIZED, HEALTH_DEGRADED, HEALTH_EXECUTION_DOWN}):
+            return self.node_health._cached(node)
+        return self.node_health.evaluate(node, client)
 
     def node_health_status(self, node_id: str | None = None, *, force_probe: bool = False) -> dict[str, Any]:
         if node_id is not None:

@@ -552,9 +552,12 @@ class SupervisorStore:
         """Record a try that did NOT re-enable (still missing, backing
         off) so the backoff actually advances instead of retrying forever
         at the same interval."""
+        now = datetime.now(timezone.utc).isoformat()
         with self._connection() as connection:
-            connection.execute("UPDATE watches SET reconcile_attempts = ? WHERE watch_key = ?",
-                               (attempts, key))
+            connection.execute(
+                "UPDATE watches SET reconcile_attempts = ?, updated_at = ? WHERE watch_key = ?",
+                (attempts, now, key),
+            )
 
     def delete_watch(self, key: str) -> bool:
         with self._connection() as connection:
@@ -979,12 +982,27 @@ class SupervisorService:
                 since = (now - datetime.fromisoformat(row["updated_at"])).total_seconds()
             except (ValueError, TypeError):
                 since = 0.0
+            # Backoff/cap/intentional exclusions do not depend on target
+            # liveness.  Check them before touching tmux or a remote node;
+            # the old ordering performed every expensive liveness probe and
+            # only then discovered that the watch was not eligible yet.
+            preflight = scheduler_health.watch_recovery_action(
+                disabled_reason=row["disabled_reason"], target_alive=True,
+                attempts=attempts, seconds_since_disabled=since)
+            if not preflight.should_reenable:
+                skipped.append({"watch_key": row["watch_key"], "target": row["target"],
+                                "disabled_reason": row["disabled_reason"], "reason": preflight.reason})
+                continue
+            target_alive = self._target_alive(row)
             action = scheduler_health.watch_recovery_action(
-                disabled_reason=row["disabled_reason"],
-                target_alive=self._target_alive(row),
-                attempts=attempts,
-                seconds_since_disabled=since)
+                disabled_reason=row["disabled_reason"], target_alive=target_alive,
+                attempts=attempts, seconds_since_disabled=since)
             if not action.should_reenable:
+                # A failed due probe is a real attempt.  Persist both the
+                # counter and timestamp so the next 20-second supervisor
+                # cycle observes exponential backoff instead of probing the
+                # same missing/degraded target forever.
+                self.store.note_reconcile_attempt(row["watch_key"], attempts=attempts + 1)
                 skipped.append({"watch_key": row["watch_key"], "target": row["target"],
                                 "disabled_reason": row["disabled_reason"], "reason": action.reason})
                 continue

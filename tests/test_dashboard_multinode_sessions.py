@@ -115,7 +115,7 @@ class FakeNodeClient:
         self.calls.append(("detach_session", name))
         return {"session": name, "detached": True}
 
-    def delete_session(self, name):
+    def delete_session(self, name, *, confirm=False, requested_by=None):
         self.calls.append(("delete_session", name))
         self._sessions.pop(name, None)
         return {"session": name, "deleted": True}

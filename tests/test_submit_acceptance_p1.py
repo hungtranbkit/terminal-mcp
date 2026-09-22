@@ -56,6 +56,17 @@ def test_an_empty_sent_text_is_trivially_echoed():
     assert _sent_text_echoed(EMPTY_COMPOSER, PROMPT) is False
 
 
+def test_sent_text_echo_survives_blank_rows_in_multiline_composer():
+    prompt = "Reply with exactly CANARY_OK. Do no other work.\n\n---\nBefore coding: read requirements."
+    pane = [
+        "› Reply with exactly CANARY_OK. Do no other work.",
+        "",
+        "  ---",
+        "  Before coding: read requirements.",
+    ]
+    assert _sent_text_echoed(pane, prompt) is True
+
+
 def test_an_activate_only_send_attributes_the_composer_not_the_empty_text():
     """What the fix substitutes: the composer's own content."""
     assert sf.extract_composer_text(FULL_COMPOSER) == PROMPT

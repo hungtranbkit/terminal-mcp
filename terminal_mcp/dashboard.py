@@ -73,6 +73,8 @@ from .queue_service import QueueService
 from .queue_store import QueueStore
 from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
+from .run_journal import RunJournalStore
+from .session_deletion import deletion_preflight, delete_ui_blocker
 from .webauth import SESSION_COOKIE_NAME, WebAuthStore
 from .webterm import WebTerminalProcess, pump_websocket
 from .webterm_assets import ASSETS
@@ -240,6 +242,12 @@ INPUT_ERROR_STATUS = {
     "WEB_TERMINAL_DISABLED": 403,
     # Kill/Reopen (core.py's terminal_kill_session/terminal_reopen_session).
     "CONFIRMATION_MISMATCH": 400,
+    "CONFIRMATION_REQUIRED": 400,
+    "SESSION_ATTACHED": 409,
+    "SESSION_LEASED": 409,
+    "SESSION_RECOVERING": 409,
+    "SESSION_HAS_ACTIVE_TASK": 409,
+    "SESSION_HAS_ACTIVE_RUN": 409,
     "REOPEN_METADATA_INCOMPLETE": 422,
     # Nodes (multi-node session management, controller.py/node_registry.py).
     "NODE_NOT_FOUND": 404,
@@ -3372,9 +3380,10 @@ DASHBOARD_HTML = """<!doctype html>
       badge.hidden = !needsAttention;
 
       const isProtected = protectedSessions.has(row.name);
-      closeBtn.disabled = !sessionLifecycleEnabled || isProtected;
+      closeBtn.disabled = !sessionLifecycleEnabled || isProtected || !!row.delete_block_reason;
       closeBtn.title = !sessionLifecycleEnabled ? ''
         : isProtected ? 'Session này được bảo vệ, không thể kill qua dashboard'
+        : row.delete_block_reason ? `Không thể xóa: ${row.delete_block_reason}`
         : `Kill "${row.name}"`;
       // Re-bound every update (cheap) rather than captured once at build
       // time, so these always act on the CURRENT row (kill_reopen_ready
@@ -3383,7 +3392,7 @@ DASHBOARD_HTML = """<!doctype html>
       closeBtn.onclick = (event) => {
         event.stopPropagation();
         if (closeBtn.disabled) return;
-        openKillModal(row.name, row.kill_reopen_ready !== false);
+        openKillModal(row.name, row.kill_reopen_ready !== false, row.node_id);
       };
       const activate = () => selectSession(row.name);
       tab.onclick = activate;
@@ -3585,12 +3594,13 @@ DASHBOARD_HTML = """<!doctype html>
         if (row && !termRenameBtnEl.disabled) { closeAllMenus(); openRenameModal(row.name); }
       };
 
-      termKillBtnEl.disabled = !row || !sessionLifecycleEnabled || isProtected;
+      termKillBtnEl.disabled = !row || !sessionLifecycleEnabled || isProtected || !!(row && row.delete_block_reason);
       termKillBtnEl.title = !row || !sessionLifecycleEnabled ? ''
         : isProtected ? 'Session này được bảo vệ, không thể kill qua dashboard'
+        : row.delete_block_reason ? `Không thể xóa: ${row.delete_block_reason}`
         : 'Dừng & giải phóng process/RAM của session này (có thể mở lại sau)';
       termKillBtnEl.onclick = () => {
-        if (row && !termKillBtnEl.disabled) { closeAllMenus(); openKillModal(row.name, row.kill_reopen_ready !== false); }
+        if (row && !termKillBtnEl.disabled) { closeAllMenus(); openKillModal(row.name, row.kill_reopen_ready !== false, row.node_id); }
       };
     }
 
@@ -3666,12 +3676,14 @@ DASHBOARD_HTML = """<!doctype html>
     // confirm_name check is the real, server-enforced floor -- this is
     // only the human-facing half of it.
     let killModalName = null;
+    let killModalTarget = null;
     function closeKillModal() {
       document.body.classList.remove('kill-modal-visible');
-      killModalName = null; killConfirmInputEl.value = ''; killModalErrorEl.textContent = '';
+      killModalName = null; killModalTarget = null; killConfirmInputEl.value = ''; killModalErrorEl.textContent = '';
     }
-    function openKillModal(name, likelyReopenable) {
+    function openKillModal(name, likelyReopenable, nodeId) {
       killModalName = name;
+      killModalTarget = (nodeId && nodeId !== 'local') ? `${nodeId}/${name}` : name;
       killModalTitleEl.textContent = `Kill "${name}"`;
       killConfirmInputEl.value = ''; killModalErrorEl.textContent = '';
       killConfirmBtnEl.disabled = true;
@@ -3697,7 +3709,7 @@ DASHBOARD_HTML = """<!doctype html>
       killConfirmBtnEl.disabled = true;
       const response = await fetch('/dashboard/api/session/kill', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({name, confirm_name: killConfirmInputEl.value}),
+        body: JSON.stringify({name: killModalTarget || name, confirm_name: killConfirmInputEl.value}),
       });
       const result = await response.json().catch(() => ({}));
       if (result && result.error) {
@@ -5565,7 +5577,7 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     // just confirm()) matches the main dashboard's #killModal; this
     // screen uses a plain prompt() instead of a dedicated modal, since it
     // already has no modal chrome of its own beyond #permModal/#createModal.
-    async function killSessionReal(name, btn) {
+    async function killSessionReal(name, btn, nodeId) {
       const typed = window.prompt(
         `Kill (dừng & giải phóng RAM) session "${name}"?\n\nGõ chính xác tên session để xác nhận -- `
         + `không thể hoàn tác. Nếu đủ metadata, có thể Reopen lại sau từ danh sách "Đã kill" trên dashboard chính.`,
@@ -5577,7 +5589,8 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       try {
         const response = await fetch('/dashboard/api/session/kill', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({name, confirm_name: typed}),
+          body: JSON.stringify({name: (nodeId && nodeId !== 'local') ? `${nodeId}/${name}` : name,
+                                confirm_name: typed}),
         });
         const result = await response.json().catch(() => ({}));
         if (result && result.error) { alert(`Không kill được "${name}": ${clean(result.error)}`); }
@@ -5937,11 +5950,12 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
 
         const isProtected = protectedSessions.has(row.name);
         const killBtn = document.createElement('button'); killBtn.type = 'button'; killBtn.className = 'danger';
-        killBtn.textContent = '🗑 Kill';
-        killBtn.title = isProtected ? 'Session này được bảo vệ, không thể kill qua dashboard'
-          : 'Dừng & giải phóng RAM của session này (có thể Reopen lại sau nếu đủ metadata)';
-        killBtn.disabled = !sessionLifecycleEnabled || isProtected;
-        killBtn.onclick = () => killSessionReal(row.name, killBtn);
+        killBtn.textContent = '🗑 Xóa';
+        killBtn.title = isProtected ? 'Session này được bảo vệ, không thể xóa qua dashboard'
+          : row.delete_block_reason ? `Không thể xóa: ${row.delete_block_reason}`
+          : 'Dừng tmux session và giải phóng RAM; lịch sử/task result được giữ lại';
+        killBtn.disabled = !sessionLifecycleEnabled || isProtected || !!row.delete_block_reason;
+        killBtn.onclick = () => killSessionReal(row.name, killBtn, row.node_id);
         actions.appendChild(killBtn);
 
         tdActions.appendChild(actions);
@@ -13100,7 +13114,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                        agents: Any = None,
                        projects: Any = None,
                        harness: "HarnessService | None" = None,
-                       webauth: WebAuthStore | None = None) -> None:
+                       webauth: WebAuthStore | None = None,
+                       run_journal: RunJournalStore | None = None) -> None:
     if supervisor is None:
         supervisor = SupervisorService(terminal, SupervisorStore())
     if supervisor_v2 is None:
@@ -13147,6 +13162,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # terminal_queue_*/terminal_task_* tool surface share one real,
         # persistent store -- never two independently-drifting ones.
         queue = QueueService(QueueStore(ephemeral_db_path("queue", "queue.db")))
+    if run_journal is None:
+        run_journal = RunJournalStore(ephemeral_db_path("run-journal", "run_journal.db"))
     if integration is None:
         integration = IntegrationService(IntegrationStore(
             ephemeral_db_path("integration", "integration.db")))
@@ -15225,8 +15242,17 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             # queue lane at all (never queued anything) gets 0, not a
             # missing key, so the frontend never needs its own fallback.
             pending_counts = await anyio.to_thread.run_sync(queue.pending_counts)
+            delete_task_refs = await anyio.to_thread.run_sync(queue.deletion_reference_index)
+            delete_run_refs = await anyio.to_thread.run_sync(run_journal.active_session_index)
             for row in rows:
                 row["pending_count"] = pending_counts.get(row["name"], 0)
+                target = (f"{row.get('node_id')}/{row['name']}"
+                          if row.get("node_id") and row.get("node_id") != controller.local_node_id
+                          else row["name"])
+                task_refs = delete_task_refs.get(target, delete_task_refs.get(row["name"], []))
+                run_refs = delete_run_refs.get(target, delete_run_refs.get(row["name"], []))
+                row["delete_block_reason"] = delete_ui_blocker(
+                    row, queue_references=task_refs, journal_references=run_refs)
 
             # Stable multi-key sort applied least-significant-key first: name
             # (deterministic fallback for ties) -> activity descending (most
@@ -16827,13 +16853,22 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         except ValueError:
             body = {}
         name = body.get("name") if isinstance(body, dict) else None
-        if not isinstance(name, str) or not name:
+        confirm = body.get("confirm") if isinstance(body, dict) else False
+        if not isinstance(name, str) or not name or confirm is not True:
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
         _log.info("dashboard delete_session name=%s identity=%s", name, identity.email if identity else None)
         # Routed through controller (task item 10) -- see session_detach's
         # own comment just above.
-        result = await anyio.to_thread.run_sync(lambda: _routed(lambda: controller.terminal_delete_session(name)))
+        preflight = await anyio.to_thread.run_sync(
+            lambda: deletion_preflight(name, queue=queue, run_journal=run_journal, supervisor=supervisor))
+        if "error" in preflight:
+            terminal.audit.record(action="delete_session", session=name, result="BLOCKED",
+                                  reason=preflight["error"], actor=identity.email if identity else "dashboard")
+            return JSONResponse(preflight, status_code=409, headers={"Cache-Control": "no-store"})
+        result = await anyio.to_thread.run_sync(lambda: _routed(lambda: controller.terminal_delete_session(
+            name, confirm=True, requested_by=identity.email if identity else "dashboard")))
         if "error" not in result:
+            result.setdefault("references", {}).update(preflight["references"])
             await anyio.to_thread.run_sync(lambda: supervisor.unwatch(session=name, delete=False))
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
@@ -16857,6 +16892,12 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
         requested_by = identity.email if identity else "dashboard"
         _log.info("dashboard kill_session name=%s identity=%s", name, identity.email if identity else None)
+        preflight = await anyio.to_thread.run_sync(
+            lambda: deletion_preflight(name, queue=queue, run_journal=run_journal, supervisor=supervisor))
+        if "error" in preflight:
+            terminal.audit.record(action="kill_session", session=name, result="BLOCKED",
+                                  reason=preflight["error"], actor=requested_by)
+            return JSONResponse(preflight, status_code=409, headers={"Cache-Control": "no-store"})
         result = await anyio.to_thread.run_sync(
             # Routed through controller (task item 10) -- see
             # session_detach's own comment for why every dashboard
@@ -16864,6 +16905,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             lambda: _routed(lambda: controller.terminal_kill_session(name, confirm_name, requested_by=requested_by))
         )
         if "error" not in result:
+            result.setdefault("references", {}).update(preflight["references"])
             await anyio.to_thread.run_sync(lambda: supervisor.unwatch(session=name, delete=False))
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})

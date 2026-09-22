@@ -461,7 +461,10 @@ def _normalize_for_match(lines: list[str]) -> str:
     columns, each continuation line left-padded) match as one continuous
     string, the same way it reads as one logical line to a human looking
     at the pane."""
-    return " ".join(" ".join(line.split()) for line in lines)
+    # Collapse across line boundaries too. Blank rows in a multiline Codex
+    # composer must not introduce extra separators that make the exact same
+    # sent prompt fail its own prefix-evidence check.
+    return " ".join(" ".join(line.split()) for line in lines if line.split())
 
 
 def _sent_text_echoed(after: list[str], sent_text: str, *, prefix_chars: int = 80) -> bool:

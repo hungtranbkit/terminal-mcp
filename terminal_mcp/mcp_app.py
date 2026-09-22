@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+import time
 
 from mcp.server.mcpserver import MCPServer
 
@@ -64,11 +66,13 @@ from .repo_service import build_repo_service
 from .worker_registry import ALL_ROLES, WorkerRegistry
 
 _LOGGER = logging.getLogger(__name__)
+_LOCAL_HEARTBEAT_MIN_INTERVAL_SECONDS = 5.0
 from .queue_service import QueueService
 from .release_service import ReleaseService
 from .release_store import ReleaseStore
 from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
+from .session_deletion import deletion_preflight
 
 
 def _fleet_session_names(controller: "ControllerService") -> list[str]:
@@ -465,6 +469,8 @@ def build_mcp(service: TerminalService | None = None,
         tool_metrics.instrument(server, tool_metrics.ToolMetricsStore())
     except Exception:   # do luong khong bao gio duoc chan server khoi chay
         pass
+    _local_heartbeat_lock = threading.Lock()
+    _local_heartbeat_next_refresh = [0.0]
 
     def _refresh_local_heartbeat() -> None:
         # Cheap (a few /proc reads + one real tmux listing, no network) --
@@ -475,20 +481,35 @@ def build_mcp(service: TerminalService | None = None,
         # because nothing has explicitly heartbeated it yet -- the exact
         # failure mode this project's own multi-node test suite caught
         # during development (see docs/multi-node.md).
+        now = time.monotonic()
+        if now < _local_heartbeat_next_refresh[0]:
+            return
+        # Multiple MCP requests can arrive together.  One request refreshes
+        # the process-local heartbeat; the others must not queue behind the
+        # same tmux/procfs/SQLite work before doing their actual operation.
+        if not _local_heartbeat_lock.acquire(blocking=False):
+            return
         try:
-            items = terminal.tmux.list_sessions()
-        except Exception:  # noqa: BLE001 -- a metrics refresh must never break a tool call
-            items = []
-        agent_counts: dict[str, int] = {}
-        for item in items:
-            command = (item.pane_current_command or "").casefold()
-            if command:
-                agent_counts[command] = agent_counts.get(command, 0) + 1
-        agent_types = available_agent_types(terminal.config.session_lifecycle.launch_commands)
-        controller.refresh_local_heartbeat(
-            tmux_session_count=len(items), agent_counts=agent_counts,
-            agent_types=agent_types, agent_version=None,
-        )
+            now = time.monotonic()
+            if now < _local_heartbeat_next_refresh[0]:
+                return
+            try:
+                items = terminal.tmux.list_sessions()
+            except Exception:  # noqa: BLE001 -- a metrics refresh must never break a tool call
+                items = []
+            agent_counts: dict[str, int] = {}
+            for item in items:
+                command = (item.pane_current_command or "").casefold()
+                if command:
+                    agent_counts[command] = agent_counts.get(command, 0) + 1
+            agent_types = available_agent_types(terminal.config.session_lifecycle.launch_commands)
+            controller.refresh_local_heartbeat(
+                tmux_session_count=len(items), agent_counts=agent_counts,
+                agent_types=agent_types, agent_version=None,
+            )
+            _local_heartbeat_next_refresh[0] = time.monotonic() + _LOCAL_HEARTBEAT_MIN_INTERVAL_SECONDS
+        finally:
+            _local_heartbeat_lock.release()
 
     # AUTO-DISPATCH background loop (queue_loop.py) -- constructed here
     # (not started -- see server_http.py's own config.queue.enabled gate
@@ -1088,18 +1109,28 @@ def build_mcp(service: TerminalService | None = None,
                                             requested_by="mcp")
 
     @server.tool()
-    def terminal_delete_session(name: str) -> dict:
+    def terminal_delete_session(name: str, confirm: bool = False) -> dict:
         """Terminate and remove exactly one tmux session (never affects
         any other session, never uses tmux kill-server). The configured
+        `confirm` must be true; omission is refused server-side. The
         protected session(s) -- always including "terminal-mcp" itself --
         can never be deleted this way. Idempotent: a session already gone
         returns a success-shaped result, not an error. Cleans up any
-        binding/grant that pointed at this session; a still-enabled
+        binding/grant that pointed at this session. Attached, leased,
+        recovering, queued/running-task, and active-journal targets are
+        refused. A still-enabled
         supervisor watch on it is disabled (its history is kept, not
         deleted) rather than left pointing at a session that no longer
         exists."""
         _refresh_local_heartbeat()
-        result = controller.terminal_delete_session(name)
+        preflight = deletion_preflight(name, queue=queue, run_journal=run_journal, supervisor=supervisor)
+        if "error" in preflight:
+            terminal.audit.record(action="delete_session", session=name, result="BLOCKED",
+                                  reason=preflight["error"], actor="mcp")
+            return preflight
+        result = controller.terminal_delete_session(name, confirm=confirm, requested_by="mcp")
+        if "error" not in result:
+            result.setdefault("references", {}).update(preflight["references"])
         if "error" not in result:
             # Same wiring-layer coordination supervisor_watch/supervisor_
             # unwatch above already do for v1/v2 policy purge -- disable
@@ -1130,7 +1161,14 @@ def build_mcp(service: TerminalService | None = None,
         null -- nothing was actually killed by this call, so nothing new
         was captured), not an error."""
         _refresh_local_heartbeat()
+        preflight = deletion_preflight(name, queue=queue, run_journal=run_journal, supervisor=supervisor)
+        if "error" in preflight:
+            terminal.audit.record(action="kill_session", session=name, result="BLOCKED",
+                                  reason=preflight["error"], actor="mcp")
+            return preflight
         result = controller.terminal_kill_session(name, confirm_name, requested_by="mcp")
+        if "error" not in result:
+            result.setdefault("references", {}).update(preflight["references"])
         if "error" not in result:
             supervisor.unwatch(session=name, delete=False)
         return result
@@ -4753,6 +4791,18 @@ def build_mcp(service: TerminalService | None = None,
             added, and nothing local is deleted. Pass replace=true for the
             deliberate destructive form."""
             return backlog.import_file(path, replace=replace)
+
+        @server.tool()
+        def terminal_backlog_reconcile(path: str, dry_run: bool = True,
+                                       expected_revision: int | None = None) -> dict:
+            """Safely reconcile an older backlog projection into the canonical store.
+
+            Existing canonical state wins every scalar conflict (especially
+            DONE/CANCELLED and ownership fields); historical evidence/history/tags
+            are merged additively. Defaults to a no-write preview. Re-running an
+            applied reconciliation is a no-op with no revision bump."""
+            return backlog.reconcile_file(path, dry_run=dry_run,
+                                          expected_revision=expected_revision)
 
         @server.tool()
         def terminal_backlog_validate(path: str | None = None) -> dict:

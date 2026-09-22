@@ -8,6 +8,7 @@ without needing a real second host or even a real subprocess.
 """
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import pytest
@@ -810,6 +811,30 @@ def _register_fake_remote(controller: ControllerService, node_id: str, client: F
                             disk_free_bytes=99_000_000_000, disk_percent=1.0),
         tmux_session_count=0, agent_counts={}, agent_types=("shell", "claude"), agent_version=None, labels=(),
     )
+
+
+def test_fleet_session_listing_fans_out_in_parallel(tmp_path):
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+
+    class SlowClient(FakeNodeClient):
+        def list_sessions(self, *, timeout_seconds=None):
+            time.sleep(0.15)
+            return super().list_sessions(timeout_seconds=timeout_seconds)
+
+    for index in range(3):
+        _register_fake_remote(controller, f"slow-{index}", SlowClient({f"remote-{index}": {}}))
+    # Prime the normal execution-health cache outside the measurement.  The
+    # listing benchmark is about independent session reads, not the one-time
+    # UNKNOWN -> ONLINE classification of freshly registered test nodes.
+    controller.list_nodes()
+
+    started = time.monotonic()
+    result = controller.terminal_list_sessions()
+    elapsed = time.monotonic() - started
+
+    assert {row["name"] for row in result["sessions"]} >= {"remote-0", "remote-1", "remote-2"}
+    assert elapsed < 0.35, f"independent 150ms node reads were serialized: {elapsed:.3f}s"
 
 
 def test_reopen_finds_the_right_remote_node_via_its_own_killed_sessions_list(tmp_path):

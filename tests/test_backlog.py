@@ -308,6 +308,65 @@ def test_newer_schema_version_is_refused_not_downgraded(svc, repo):
     assert svc.import_file(str(repo))["error"] == "BACKLOG_UNREADABLE"
 
 
+def test_reconcile_is_dry_run_then_idempotent(svc, repo):
+    current_id = svc.add(str(repo), tasks=[{"title": "current"}])["created_ids"][0]
+    svc.export_file(str(repo))
+    path = store.backlog_path(repo)
+    doc = json.loads(path.read_text())
+    historical = store.normalise_item({
+        "id": "blg_historical", "title": "historical", "tags": ["z-last", "a-first"],
+        "history": [
+            {"at": "2021-01-01T00:00:00+00:00", "event": "updated"},
+            {"at": "2020-01-01T00:00:00+00:00", "event": "created"},
+        ],
+    })
+    doc["revision"] = 91
+    doc["items"].append(historical)
+    path.write_text(json.dumps(doc))
+
+    before = svc.get(str(repo))
+    project_before = svc.db.project(before["project"]["project_id"])
+    preview = svc.reconcile_file(str(repo), dry_run=True,
+                                 expected_revision=before["revision"])
+    assert preview["changed"] is True and preview["added_ids"] == ["blg_historical"]
+    assert preview["projection_revision"] == 91
+    assert svc.get(str(repo))["total"] == 1
+    assert svc.db.project(before["project"]["project_id"]) == project_before
+
+    applied = svc.reconcile_file(str(repo), dry_run=False,
+                                 expected_revision=before["revision"])
+    assert applied["before_total"] == 1 and applied["after_total"] == 2
+    assert {i["id"] for i in svc.get(str(repo))["items"]} == {current_id, "blg_historical"}
+    imported = next(i for i in svc.get(str(repo))["items"] if i["id"] == "blg_historical")
+    assert imported["tags"] == ["a-first", "z-last"]
+    second = svc.reconcile_file(str(repo), dry_run=False,
+                                expected_revision=applied["revision"])
+    assert second["changed"] is False and second["revision"] == applied["revision"]
+
+
+def test_reconcile_preserves_current_done_and_merges_historical_metadata(svc, repo):
+    task_id = svc.add(str(repo), tasks=[{"title": "canonical", "tags": ["current"]}])["created_ids"][0]
+    svc.complete(str(repo), task_id=task_id, commit="new-commit", note="current note")
+    current = svc.get(str(repo))["items"][0]
+    svc.export_file(str(repo))
+    path = store.backlog_path(repo)
+    doc = json.loads(path.read_text())
+    old = dict(doc["items"][0])
+    old.update({"title": "old title", "status": "BACKLOG", "tags": ["historical"]})
+    old["evidence"] = {"commits": ["old-commit"], "tests": [], "deploys": [], "notes": []}
+    old["history"] = [{"at": "2020-01-01T00:00:00+00:00", "event": "created", "by": "old"}]
+    doc["items"] = [old]
+    path.write_text(json.dumps(doc))
+
+    result = svc.reconcile_file(str(repo), dry_run=False)
+    merged = svc.get(str(repo))["items"][0]
+    assert merged["status"] == "DONE" and merged["title"] == current["title"]
+    assert merged["tags"] == ["current", "historical"]
+    assert merged["evidence"]["commits"] == ["new-commit", "old-commit"]
+    assert any(row["id"] == task_id and "status" in row["fields"] for row in result["conflicts"])
+    assert svc.reconcile_file(str(repo), dry_run=False)["changed"] is False
+
+
 # ------------------------------------------------------------ verified done
 def test_done_refused_without_evidence(svc, repo):
     tid = svc.add(str(repo), tasks=[{"title": "x"}])["created_ids"][0]

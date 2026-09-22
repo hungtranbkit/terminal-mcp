@@ -9,6 +9,7 @@ also exercise the MCP-tool-facing code path.
 from __future__ import annotations
 
 import subprocess
+from dataclasses import replace
 
 import pytest
 from starlette.testclient import TestClient
@@ -374,12 +375,64 @@ def test_detach_nonexistent_session_reports_not_found(tmp_path):
 
 # -- delete -----------------------------------------------------------------
 
+def test_delete_requires_explicit_confirmation(tmp_path, tmux_session_factory):
+    service = TerminalService(_lifecycle_config(tmp_path))
+    name = tmux_session_factory("lifecycle-confirm-required")
+    result = service.terminal_delete_session(name, requested_by="tester@example")
+    assert result == {"error": "CONFIRMATION_REQUIRED", "session": name}
+    assert service.tmux.get_session(name) is not None
+    event = service.audit.list(limit=1, session=name)[0]
+    assert event["result"] == "BLOCKED"
+    assert event["reason"] == "CONFIRMATION_REQUIRED"
+    assert event["actor"] == "tester@example"
+    assert event["node_id"] == service.REGISTRY_LOCAL_NODE_ID
+
+
+def test_delete_refuses_attached_session(tmp_path, tmux_session_factory, monkeypatch):
+    service = TerminalService(_lifecycle_config(tmp_path))
+    name = tmux_session_factory("lifecycle-attached-refusal")
+    real = service.tmux.get_session(name)
+    monkeypatch.setattr(service.tmux, "get_session", lambda target: replace(real, attached=True))
+    result = service.terminal_delete_session(name, confirm=True)
+    assert result == {"error": "SESSION_ATTACHED", "session": name}
+    monkeypatch.undo()
+    assert service.tmux.get_session(name) is not None
+
+
+def test_delete_refuses_live_pane_lease(tmp_path, tmux_session_factory):
+    service = TerminalService(_lifecycle_config(tmp_path))
+    name = tmux_session_factory("lifecycle-lease-refusal")
+    info = service.tmux.get_session(name)
+    key = f"{info.session_id}:{info.pane_id}"
+    assert service.leases.acquire(key, "test-owner", ttl_seconds=60)
+    result = service.terminal_delete_session(name, confirm=True)
+    assert result == {"error": "SESSION_LEASED", "session": name}
+    assert service.tmux.get_session(name) is not None
+    service.leases.release(key, "test-owner")
+
+
+def test_delete_denied_session_does_not_disclose_target(tmp_path, tmux_session_factory):
+    config = replace(
+        _lifecycle_config(tmp_path),
+        input_policy=InputPolicyConfig(
+            allowed_session_patterns=("lifecycle-*",),
+            denied_session_patterns=("lifecycle-private-*",),
+        ),
+    )
+    service = TerminalService(config)
+    name = tmux_session_factory("lifecycle-private-one")
+    result = service.terminal_delete_session(name, confirm=True)
+    assert result == {"error": "ACCESS_DENIED"}
+    assert service.tmux.get_session(name) is not None
+    event = service.audit.list(limit=1)[0]
+    assert event["session"] is None
+
 def test_delete_terminates_exact_target_only(tmp_path, tmux_session_factory):
     config = _lifecycle_config(tmp_path)
     service = TerminalService(config)
     victim = tmux_session_factory("lifecycle-victim")
     bystander = tmux_session_factory("lifecycle-bystander")
-    result = service.terminal_delete_session(victim)
+    result = service.terminal_delete_session(victim, confirm=True)
     assert result["deleted"] is True
     assert service.tmux.get_session(victim) is None
     assert service.tmux.get_session(bystander) is not None
@@ -388,7 +441,7 @@ def test_delete_terminates_exact_target_only(tmp_path, tmux_session_factory):
 def test_delete_missing_session_is_idempotent(tmp_path):
     config = _lifecycle_config(tmp_path)
     service = TerminalService(config)
-    result = service.terminal_delete_session("lifecycle-already-gone")
+    result = service.terminal_delete_session("lifecycle-already-gone", confirm=True)
     assert "error" not in result
     assert result["deleted"] is False
     assert result["action"] == "already_gone"
@@ -407,7 +460,7 @@ def test_delete_protected_session_is_refused(tmp_path, tmux_session_factory):
     config = _lifecycle_config(tmp_path, protected=(name,))
     service = TerminalService(config)
     tmux_session_factory(name)
-    result = service.terminal_delete_session(name)
+    result = service.terminal_delete_session(name, confirm=True)
     assert result["error"] == "SESSION_PROTECTED"
     assert service.tmux.get_session(name) is not None
 
@@ -424,7 +477,7 @@ def test_protected_set_always_includes_terminal_mcp_even_if_omitted(tmp_path):
     config = _lifecycle_config(tmp_path, protected=())  # operator config omits it entirely
     assert "terminal-mcp" in config.session_lifecycle.protected_sessions
     service = TerminalService(config)
-    result = service.terminal_delete_session("terminal-mcp")
+    result = service.terminal_delete_session("terminal-mcp", confirm=True)
     assert result["error"] == "SESSION_PROTECTED"
 
 
@@ -438,7 +491,7 @@ def test_delete_cleans_up_stale_binding_and_grant(tmp_path, tmux_session_factory
     assert service.bindings.get("lifecycle-cleanup-binding") is not None
     assert service.grants.get(name).read_enabled is True
 
-    result = service.terminal_delete_session(name)
+    result = service.terminal_delete_session(name, confirm=True)
     assert result["deleted"] is True
     # Binding removed outright -- never left pointing at a vanished session.
     assert service.bindings.get("lifecycle-cleanup-binding") is None
@@ -459,7 +512,7 @@ def test_delete_disables_supervisor_watch_without_losing_history(tmp_path, tmux_
     supervisor.watch(session=name)
     assert store.get_watch(watch_key("session", name)) is not None
 
-    result = service.terminal_delete_session(name)
+    result = service.terminal_delete_session(name, confirm=True)
     assert result["deleted"] is True
     # Mirrors mcp_app.py/dashboard.py's own post-delete coordination call.
     supervisor.unwatch(session=name, delete=False)
@@ -524,7 +577,7 @@ def test_dashboard_create_detach_delete_round_trip_refreshes_list(tmp_path, life
     assert detached.json()["attached"] is False
     assert service.tmux.get_session(name) is not None  # still there after detach
 
-    deleted = client.post("/dashboard/api/session/delete", json={"name": name})
+    deleted = client.post("/dashboard/api/session/delete", json={"name": name, "confirm": True})
     assert deleted.status_code == 200
     assert deleted.json()["deleted"] is True
     listed_after = client.get("/dashboard/api/sessions").json()
@@ -536,7 +589,7 @@ def test_dashboard_delete_route_refuses_protected_session(tmp_path, tmux_session
     config = _lifecycle_config(tmp_path, protected=(name,))
     client, service = _dashboard_client(config)
     tmux_session_factory(name)
-    response = client.post("/dashboard/api/session/delete", json={"name": name})
+    response = client.post("/dashboard/api/session/delete", json={"name": name, "confirm": True})
     assert response.status_code == 403
     assert response.json()["error"] == "SESSION_PROTECTED"
     assert service.tmux.get_session(name) is not None

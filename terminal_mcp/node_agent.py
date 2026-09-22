@@ -746,7 +746,13 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
     async def delete_session(request: Request) -> JSONResponse:
         if (blocked := require_auth(request)) is not None:
             return blocked
-        result = await anyio.to_thread.run_sync(lambda: client.delete_session(request.path_params["name"]))
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        result = await anyio.to_thread.run_sync(lambda: client.delete_session(
+            request.path_params["name"], confirm=body.get("confirm") is True,
+            requested_by=body.get("requested_by")))
         return JSONResponse(result)
 
     async def kill_session(request: Request) -> JSONResponse:

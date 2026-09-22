@@ -552,15 +552,17 @@ def main() -> None:
         retention_seconds=replay_cfg.retention_seconds,
         require_headers=replay_cfg.require_headers,
     )
+    from .run_journal import RunJournalStore
+    run_journal = RunJournalStore()
     server = build_mcp(terminal, supervisor, supervisor_v2, controller, queue=queue, integration=integration, pm=pm,
                        planner=planner, ai_usage=ai_usage, recovery=recovery, backlog=backlog, notes=notes,
-                       events=events, fleet=fleet)
+                       events=events, fleet=fleet, run_journal=run_journal)
     register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store,
                        queue=queue, integration=integration, pm=pm, planner=planner, ai_usage=ai_usage,
                        recovery=recovery, backlog=backlog, fleet=fleet, onboarding=onboarding,
-                       credentials=credentials, heartbeat_replay=heartbeat_replay,
-                       notes=notes, webauth=webauth)
-    register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2, controller)
+                       credentials=credentials, heartbeat_replay=heartbeat_replay, notes=notes, webauth=webauth, run_journal=run_journal)
+    register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2, controller,
+                               queue=queue, run_journal=run_journal)
     register_health(server, terminal, supervisor)
 
     # Periodic demand for execution probes means false-online prevention and

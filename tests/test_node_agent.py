@@ -368,7 +368,8 @@ def test_status_of_unknown_session_is_a_normal_200_not_a_transport_error(agent_c
 def test_delete_route_uses_http_delete_method(agent_client):
     agent_client.post("/v1/sessions", headers=_auth(), json={"name": "agent-del", "agent_type": "shell"})
     agent_client.created.append("agent-del")
-    response = agent_client.delete("/v1/sessions/agent-del", headers=_auth())
+    response = agent_client.request("DELETE", "/v1/sessions/agent-del", headers=_auth(),
+                                    json={"confirm": True, "requested_by": "test"})
     assert response.status_code == 200
 
 

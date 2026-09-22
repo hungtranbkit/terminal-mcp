@@ -196,3 +196,36 @@ def test_recovery_attempts_are_capped(tmp_path, worker):
     result = service.reconcile_watches()
     assert result["restored"] == []
     assert any("retried" in item["reason"] for item in result["skipped"])
+
+
+def test_reconcile_backoff_is_checked_before_liveness_probe(tmp_path, worker, monkeypatch):
+    service = _service(tmp_path)
+    service.watch(session=worker)
+    key = watch_key("session", worker)
+    service.store.set_enabled(key, False, disabled_reason="target_missing")
+
+    def unexpected_probe(_row):
+        raise AssertionError("backed-off watch must not touch tmux or a remote node")
+
+    monkeypatch.setattr(service, "_target_alive", unexpected_probe)
+    result = service.reconcile_watches()
+    assert result["restored"] == []
+    assert "backing off" in result["skipped"][0]["reason"]
+
+
+def test_failed_reconcile_probe_advances_durable_backoff(tmp_path, worker, monkeypatch):
+    service = _service(tmp_path)
+    service.watch(session=worker)
+    key = watch_key("session", worker)
+    service.store.set_enabled(key, False, disabled_reason="target_missing")
+    _age(service.store, key, 120)
+    calls = []
+    monkeypatch.setattr(service, "_target_alive", lambda _row: calls.append(True) or False)
+
+    first = service.reconcile_watches()
+    second = service.reconcile_watches()
+
+    assert first["restored"] == [] and second["restored"] == []
+    assert len(calls) == 1, "the immediate next cycle must observe backoff, not re-probe"
+    assert service.store.get_watch(key)["reconcile_attempts"] == 1
+    assert "backing off" in second["skipped"][0]["reason"]
