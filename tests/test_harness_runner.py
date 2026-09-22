@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -641,25 +642,100 @@ def test_the_prompt_is_included_verbatim_and_first():
 @pytest.mark.skipif(not os.environ.get("HARNESS_REAL_SESSION"),
                     reason="set HARNESS_REAL_SESSION=1 to drive a real tmux session")
 def test_real_session_smoke(tmp_path):
-    """One real session, one real send, one real artifact read back.
+    """One real session, opened in a real Harness worktree, really trusted.
 
-    Kept out of the default run because it opens a tmux session on this
-    machine. It is the only test in this file that touches anything real, and
-    it is the one that proves the fakes above are shaped correctly.
+    Kept out of the default run because it opens a tmux session and writes a
+    Claude Code config entry on this machine. It is the only test in this
+    file that touches anything real, and it is the one that proves the fakes
+    above are shaped correctly.
+
+    THE CONSTRUCTION MATTERS, AND THE PREVIOUS ONE WAS WRONG. This built a
+    bare `ControllerService()`, which is a PRIVATE per-call registry with no
+    node in it -- every spawn it attempted failed NO_ELIGIBLE_NODE, and the
+    test passed anyway because it accepted `pending OR infra_failure`. It was
+    asserting that something happened, not that the right thing did.
+
+    A local TerminalService satisfies the whole SessionOps slice by itself
+    (status/tail/send_text/list_sessions/create_session), which is what the
+    single-node path actually is. Using it means a failure here is a failure
+    of the runner rather than of the rig.
     """
-    from terminal_mcp.controller import ControllerService
+    from terminal_mcp.config import load_config
+    from terminal_mcp.core import TerminalService
+    from terminal_mcp.harness_trust import WorkspaceTrust, default_worktree_roots
 
-    controller = ControllerService()
-    store = HarnessStore(tmp_path / "queue.db")
-    runner = TerminalAgentRunner(controller, store, artifacts_root=tmp_path / "artifacts",
-                                 default_runtime="claude")
-    run = _run(store, task_id="SMOKE-1")
-    result = runner.run(role=policy.BUILDER, prompt=FakePrompt("say hello"), run=run,
-                        tier="economy", session_id=None, iteration=1)
-    assert result.pending or result.infra_failure
-    dispatch = store.latest_dispatch(run.id, iteration=1, role=policy.BUILDER)
-    assert dispatch is not None
-    assert dispatch["idempotency_key"].startswith("harness:")
+    config = load_config()
+    roots = default_worktree_roots(config.session_lifecycle.allowed_cwd_roots)
+    if not roots:
+        pytest.skip("no allowed_cwd_roots configured: nowhere a worktree may live")
+
+    repo = Path(__file__).resolve().parent.parent
+    worktree = Path(roots[0]) / "harness" / "REAL-SMOKE"
+    branch = "harness/real-smoke"
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "worktree", "add", "--force", "-B", branch,
+                    str(worktree), "HEAD"], cwd=repo, capture_output=True, check=True)
+    try:
+        store = HarnessStore(tmp_path / "queue.db")
+        run = _run(store, task_id="REAL-SMOKE")
+        store.patch_run(run.id, worktree_path=str(worktree), branch=branch)
+        # RE-READ. patch_run returns the updated row; reusing the object from
+        # create_run means the spawn gets cwd=None and lands in the workspace
+        # root -- which is ALREADY trusted, so the trust assertion below would
+        # pass while proving nothing. That is exactly what happened the first
+        # time this smoke was run by hand.
+        run = store.require_run(run.id)
+
+        trust = WorkspaceTrust(store=store, worktree_roots=roots)
+        assert trust.is_trusted(worktree) is False, "a fresh worktree starts untrusted"
+
+        ops = TerminalService(config)
+        runner = TerminalAgentRunner(ops, store, artifacts_root=tmp_path / "artifacts",
+                                     default_runtime="claude", trust=trust)
+        result = runner.run(role=policy.BUILDER, prompt=FakePrompt("say hello"),
+                            run=run, tier="economy", session_id=None, iteration=1)
+
+        # The spawn SUCCEEDED -- not "pending or infra_failure", which is the
+        # assertion that let an empty registry look like a pass.
+        assert result.infra_failure is False, result.error
+        assert result.pending is True
+        assert getattr(result, "needs_permission", False) is False, \
+            "a trusted worktree must not stop on a workspace-trust prompt"
+
+        dispatch = store.latest_dispatch(run.id, iteration=1, role=policy.BUILDER)
+        assert dispatch is not None
+        assert dispatch["idempotency_key"].startswith("harness:")
+        assert dispatch["session_id"], "a real session was opened"
+        assert dispatch["worktree_path"] == str(worktree)
+        assert trust.is_trusted(worktree) is True, \
+            "the runner registered trust before opening the directory"
+        try:
+            assert _pane_has_no_trust_dialog(dispatch["session_id"])
+        finally:
+            subprocess.run(["tmux", "kill-session", "-t", dispatch["session_id"]],
+                           capture_output=True)
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", str(worktree)],
+                       cwd=repo, capture_output=True)
+        subprocess.run(["git", "branch", "-D", branch], cwd=repo, capture_output=True)
+
+
+def _pane_has_no_trust_dialog(session: str) -> bool:
+    """The blocker, checked where it actually appears.
+
+    Claude Code paints "Do you trust the files in this folder?" into the
+    pane. Reading the pane is the only way to assert its ABSENCE -- the
+    runner cannot tell "settled at a prompt" from "settled on a question"
+    until the settle timeout, which is the whole reason this was expensive.
+    """
+    import time
+
+    time.sleep(8)  # let Claude Code paint its first frame
+    pane = subprocess.run(["tmux", "capture-pane", "-p", "-t", session],
+                          capture_output=True, text=True).stdout.lower()
+    for phrase in ("do you trust", "trust the files", "is this a project you trust"):
+        assert phrase not in pane, f"workspace-trust dialog appeared: {phrase!r}"
+    return True
 
 
 def test_an_artifact_carrying_this_dispatchs_nonce_completes_it_alone(store, artifacts):
@@ -887,3 +963,181 @@ def test_without_ops_the_engine_is_degraded_but_never_lies(store):
     with pytest.raises(HarnessError) as excinfo:
         engine.step(run.id)
     assert "no AgentRunner is configured" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# workspace trust, registered before the session opens the directory
+# ---------------------------------------------------------------------------
+
+class RecordingTrust:
+    """Stands in for WorkspaceTrust. Records what it was asked, nothing more.
+
+    Deliberately not the real thing: what is under test here is WHEN the
+    runner asks and what it does with the answer. harness_trust's own tests
+    cover whether the answer is right.
+    """
+
+    def __init__(self, granted=True, explode=False):
+        self.calls: list[dict] = []
+        self.granted = granted
+        self.explode = explode
+
+    def register(self, path, *, run_id=None, source="harness"):
+        self.calls.append({"path": path, "run_id": run_id, "source": source})
+        if self.explode:
+            raise RuntimeError("the trust service is down")
+        from terminal_mcp.harness_trust import TrustDecision
+        return TrustDecision(path=str(path), granted=self.granted,
+                             reason="registered" if self.granted else "not_harness_owned",
+                             run_id=run_id, source=source)
+
+
+def test_trust_is_registered_before_the_session_is_picked(store, artifacts):
+    """After the spawn is too late: Claude Code reads trust when it starts,
+    so a grant that lands afterwards leaves the session on the question."""
+    ops = FakeOps([FakeSession("harness-claude-a")])
+    trust = RecordingTrust()
+    runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts, trust=trust)
+    run = _run(store, worktree="/tmp/wt/MOB-1")
+
+    runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
+               tier="balanced", session_id=None, iteration=1)
+
+    assert len(trust.calls) == 1
+    assert trust.calls[0]["path"] == "/tmp/wt/MOB-1"
+    assert trust.calls[0]["run_id"] == run.id
+    assert trust.calls[0]["source"] == "harness-runner"
+
+
+def test_a_run_with_no_worktree_asks_for_no_trust(store, artifacts):
+    """Nothing was created, so there is nothing to vouch for."""
+    ops = FakeOps([FakeSession("harness-claude-a")])
+    trust = RecordingTrust()
+    runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts, trust=trust)
+
+    runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=_run(store),
+               tier="balanced", session_id=None, iteration=1)
+
+    assert trust.calls == []
+
+
+def test_a_refused_grant_does_not_stop_the_dispatch(store, artifacts):
+    """A refusal must not turn a recoverable human question into a hard stop
+    for every worktree this module does not recognise. The session is still
+    dispatched; if it asks, the existing PERMISSION_REQUIRED path reports it."""
+    ops = FakeOps([FakeSession("harness-claude-a")])
+    runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts,
+                                 trust=RecordingTrust(granted=False))
+    run = _run(store, worktree="/tmp/somebody-elses-directory")
+
+    result = runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
+                        tier="balanced", session_id=None, iteration=1)
+
+    assert result.pending is True
+    assert len(ops.sends) == 1
+
+
+def test_a_trust_service_that_throws_never_takes_the_run_with_it(store, artifacts):
+    """Without the service at all the run dispatches; with a broken one it
+    must do no worse."""
+    ops = FakeOps([FakeSession("harness-claude-a")])
+    runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts,
+                                 trust=RecordingTrust(explode=True))
+    run = _run(store, worktree="/tmp/wt/MOB-1")
+
+    result = runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
+                        tier="balanced", session_id=None, iteration=1)
+
+    assert result.pending is True
+    assert len(ops.sends) == 1
+
+
+def test_without_a_trust_service_the_behaviour_is_exactly_as_before(store, artifacts):
+    ops = FakeOps([FakeSession("harness-claude-a")])
+    runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
+    run = _run(store, worktree="/tmp/wt/MOB-1")
+
+    result = runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
+                        tier="balanced", session_id=None, iteration=1)
+
+    assert result.pending is True
+    assert runner.trust is None
+
+
+def test_re_dispatching_the_same_run_re_asserts_trust_cheaply(store, artifacts):
+    """Idempotent at the trust layer, so asking again on a later attempt
+    costs a config read and writes nothing."""
+    ops = FakeOps([FakeSession("harness-claude-a")])
+    trust = RecordingTrust()
+    runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts, trust=trust)
+    run = _run(store, worktree="/tmp/wt/MOB-1")
+
+    runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
+               tier="balanced", session_id=None, iteration=1)
+    runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
+               tier="balanced", session_id=None, iteration=2)
+
+    assert len(trust.calls) == 2, "asked per dispatch; the trust layer dedupes"
+
+
+# ---------------------------------------------------------------------------
+# a session that is GONE is not an error, and must not read as alive
+# ---------------------------------------------------------------------------
+
+class GoneOps(FakeOps):
+    """terminal_status for a killed session: no error, UNKNOWN, exists=False.
+
+    Copied from a real observation, not invented -- `tmux kill-session`
+    followed by terminal_status returns exactly this shape, because being
+    asked about a session that does not exist is a legitimate question with
+    a definite answer rather than a failure.
+    """
+
+    def terminal_status(self, session):
+        return {"session": session, "exists": False, "allowed": True,
+                "state": "UNKNOWN", "input_required": False,
+                "reason": "session does not exist", "last_output": ""}
+
+
+def test_a_killed_session_is_not_alive(store, artifacts):
+    """The defect: health() checked only `error`, so a destroyed session read
+    as ALIVE and a spawned Builder sat in awaiting_session until the stall
+    timeout instead of failing over at once."""
+    broker = SessionBroker(GoneOps([]), store)
+    health = broker.health("harness-builder-gone")
+    assert health["alive"] is False
+    assert health["unreachable"] is True
+    assert "does not exist" in health["reason"]
+
+
+def test_a_spawned_session_that_is_killed_fails_over_immediately(store, artifacts):
+    ops = FakeOps([FakeSession("harness-claude-a")])
+    runner = TerminalAgentRunner(ops, store, artifacts_root=artifacts)
+    run = _run(store, worktree="/tmp/wt/GONE-1")
+    runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run, tier="balanced",
+               session_id=None, iteration=1)
+    dispatch = store.open_dispatch_for(run.id)
+    store.update_dispatch(dispatch["id"], state="awaiting_session")
+
+    # The session is destroyed between one step and the next.
+    runner.ops = GoneOps([])
+    runner.broker.ops = GoneOps([])
+    result = runner.run(role=policy.BUILDER, prompt=FakePrompt(), run=run,
+                        tier="balanced", session_id=None, iteration=1)
+
+    assert result.infra_failure is True
+    assert "never came up" in (result.error or "") or "does not exist" in (result.error or "")
+    assert result.pending is not True
+
+
+def test_a_live_pane_reporting_UNKNOWN_is_still_alive(store, artifacts):
+    """UNKNOWN is also what a live pane reports when its activity cannot be
+    classified. Treating that as death would abandon sessions that are working."""
+    class UnclassifiableOps(FakeOps):
+        def terminal_status(self, session):
+            return {"session": session, "exists": True, "allowed": True,
+                    "state": "UNKNOWN", "input_required": False,
+                    "reason": "activity age is 3s", "last_output": ""}
+
+    broker = SessionBroker(UnclassifiableOps([]), store)
+    assert broker.health("harness-claude-a")["alive"] is True
