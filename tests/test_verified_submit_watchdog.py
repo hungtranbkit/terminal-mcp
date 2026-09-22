@@ -100,6 +100,29 @@ def test_stuck_submit_never_spams_more_than_two_enters(tmp_path: Path):
     assert result["recovery_enter_sent"] is True
 
 
+def test_pre_activation_working_evidence_cannot_false_confirm(tmp_path: Path):
+    """Stale adapter evidence must not confirm before any Enter is sent."""
+    store = SubmissionStore(tmp_path / "pre-activation.db")
+    watchdog = VerifiedSubmitWatchdog(store, WatchdogConfig(
+        poll_interval_seconds=.05, timeout_seconds=.25, max_enter_attempts=2,
+    ))
+    record, _ = store.create(idempotency_key="pre-activation", session="codex",
+                             agent_type="codex", prompt="idle draft")
+    enters: list[int] = []
+
+    def evidence(_lines, current):
+        if current.enter_count == 0:
+            return ACK_RUNNING, "stale_working_footer"
+        return "COMPOSER", "draft_still_in_composer"
+
+    result = watchdog.run(record.submission_id, capture=lambda: ["> idle draft"],
+                          inject=lambda _: None, send_enter=lambda: enters.append(1),
+                          evidence=evidence)
+    assert result["ack_state"] == ACK_STUCK
+    assert result["enter_count"] == 2
+    assert len(enters) == 2
+
+
 def test_verified_submit_stops_without_enter_when_pager_or_buffer_incomplete(tmp_path: Path):
     store = SubmissionStore(tmp_path / "pager.db")
     watchdog = VerifiedSubmitWatchdog(store, WatchdogConfig(poll_interval_seconds=.3,

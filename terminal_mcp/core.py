@@ -2490,6 +2490,11 @@ class TerminalService:
                 return "COMPOSER", "working_followup_requires_tab"
             if _codex_draft_in_composer(lines, text):
                 return "COMPOSER", "draft_still_in_composer"
+            if not has_submitted_enter:
+                # A stale working footer or adapter diff before this attempt's
+                # Enter cannot prove that this prompt executed. Wait for the
+                # composer to settle; never report SUBMIT_CONFIRMED yet.
+                return "INCOMPLETE", "pre_activation_evidence_withheld"
             if (has_submitted_enter and baseline is not None
                     and _codex_draft_in_composer(baseline, text)
                     and not _codex_composer_marker_present(lines)):

@@ -349,6 +349,11 @@ class VerifiedSubmitWatchdog:
                 unchanged_polls = 0
             last_lines = list(lines)
             state, reason = evidence(lines, current)
+            # Execution/ack evidence observed before any activation key is
+            # not attributable to this submission (it may be stale work from
+            # an earlier turn). Never let it become a false confirmation.
+            if current.enter_count == 0 and state in (ACK_ACCEPTED, ACK_RUNNING):
+                state, reason = "COMPOSER", "pre_activation_evidence_withheld"
             if current.enter_count == 0:
                 composer_before = "present" if state == "COMPOSER" else state.lower()
             if state == "COMPOSER":
