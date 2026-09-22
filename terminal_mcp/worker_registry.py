@@ -38,6 +38,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
+from .capability_profile import (
+    CandidateView, MATCH_OK, MATCH_MISSING, MATCH_UNKNOWN, declared_capability_set, diagnose,
+    match_capabilities,
+)
+
 ROLE_WORKER = "WORKER"
 ROLE_VERIFIER = "VERIFIER"
 ROLE_INTEGRATOR = "INTEGRATOR"
@@ -115,8 +120,15 @@ class Worker:
         """AND semantics, matching verify_queue's own matcher. With
         trust_declared=False only PROBED capability counts -- what a
         scheduler should use before sending work somewhere expensive."""
-        pool = set(self.capabilities if trust_declared else self.detected_capabilities)
-        return set(str(r) for r in required).issubset(pool)
+        return self.capability_match(required, trust_declared=trust_declared).ok
+
+    def capability_match(self, required: Sequence[str], *, trust_declared: bool = True):
+        """`can()` plus WHY. A worker with no profile answers MATCH_UNKNOWN
+        rather than a bare False, which is what lets a caller tell "cannot
+        do this" apart from "nobody ever said" (capability_profile.py)."""
+        return match_capabilities(required, declared=self.declared_capabilities,
+                                  detected=self.detected_capabilities,
+                                  has_profile=self.has_profile, trust_declared=trust_declared)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -222,6 +234,44 @@ class WorkerRegistry:
                 counts[role] = counts.get(role, 0) + 1
         return counts
 
+    def diagnose(self, *, required_capabilities: Sequence[str] = (), role: str | None = None,
+                 project_id: str | None = None, trust_declared: bool = True) -> dict[str, Any]:
+        """Why capability routing has no candidates right now -- the read
+        blg_orch_no_workers_declared exists for.
+
+        Answers with a code (NO_WORKERS_REGISTERED / NO_WORKERS_ONLINE /
+        WORKERS_BUSY / WORKERS_LACK_CAPABILITY / CAPABILITY_UNKNOWN /
+        WORKERS_INELIGIBLE / CANDIDATES_AVAILABLE) instead of an empty
+        list, so "the fleet cannot do this" is distinguishable from
+        "nobody has declared what the fleet can do". Pure read; declares,
+        changes and routes nothing."""
+        wanted_role = role.strip().upper() if role else None
+        views = []
+        for worker in self._assemble():
+            match = worker.capability_match(required_capabilities, trust_declared=trust_declared)
+            role_match = MATCH_OK
+            if wanted_role and not worker.has_role(wanted_role):
+                # An undeclared worker holds DEFAULT_ROLES by convention,
+                # not by declaration -- so a role it does not hold is
+                # UNKNOWN (declare it), while a declared profile that does
+                # not list the role genuinely lacks it.
+                role_match = MATCH_MISSING if worker.has_profile else MATCH_UNKNOWN
+            ineligible = None
+            if project_id and worker.project_affinity and worker.project_affinity != project_id:
+                ineligible = (f"project affinity mismatch: affine to "
+                              f"{worker.project_affinity!r}, not {project_id!r}")
+            busy = worker.status == WORKER_BUSY or (
+                worker.max_queued is not None and worker.queue_depth >= worker.max_queued)
+            views.append(CandidateView(
+                key=worker.key, online=worker.status != WORKER_OFFLINE, busy=busy,
+                has_profile=worker.has_profile, capability=match, role_match=role_match,
+                ineligible_reason=ineligible))
+        result = diagnose(views, required_capabilities=required_capabilities)
+        result["role"] = wanted_role
+        result["project_id"] = project_id
+        result["trust_declared"] = trust_declared
+        return result
+
     # -- assembly --------------------------------------------------------
 
     def _assemble(self) -> list[Worker]:
@@ -274,13 +324,15 @@ class WorkerRegistry:
             max_queued = None
             skills: tuple[dict[str, Any], ...] = ()
             if profile is not None:
-                declared = tuple(profile.runtime_tools or ())
                 roles = normalise_roles((profile.role or "").split(",")) or DEFAULT_ROLES
                 affinity = profile.project_affinity
                 max_queued = profile.max_queued
                 skills = tuple(profile.skills or ())
-                declared = tuple(dict.fromkeys(
-                    (*declared, *(str(s.get("name")) for s in skills if s.get("name")))))
+                # ONE definition of "declared", shared with pm_router --
+                # this used to be an inline merge here and a skills-only
+                # read there, which is exactly how they disagreed.
+                declared = declared_capability_set(
+                    runtime_tools=profile.runtime_tools, skills=skills)
             if node is not None and node_status != "online":
                 status = WORKER_OFFLINE
             elif node is None and self.node_registry is not None:

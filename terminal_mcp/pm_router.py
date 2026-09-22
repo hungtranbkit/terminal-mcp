@@ -45,6 +45,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .capability_profile import (
+    CandidateView, MATCH_MISSING, MATCH_OK, MATCH_UNKNOWN, declared_capability_set, diagnose,
+    match_capabilities,
+)
+
 ROUTED = "ROUTED"
 NO_ELIGIBLE_WORKER = "NO_ELIGIBLE_WORKER"
 BLOCKED = "BLOCKED"
@@ -69,12 +74,35 @@ class WorkerCandidate:
     queue_depth: int = 0
     picks_since_last_fairness_reset: int = 0  # higher = picked more often recently; lower gets a fairness boost
     max_queued: int | None = None  # WIP limit (§20.6 Phase A) -- None means unbounded, same as today
+    # blg_orch_no_workers_declared. `has_profile=False` is a session the
+    # runtime can SEE (it is running queue work) but which nobody ever
+    # declared. Default True because every candidate this module has ever
+    # been given came from a capability_profiles row -- so nothing about
+    # existing behaviour changes until a caller opts in by passing False.
+    has_profile: bool = True
+    # PROBED node capabilities, kept apart from the declared ones on
+    # purpose (see capability_profile.py). Empty for every existing
+    # caller, so it contributes nothing until someone wires a probe.
+    detected_capabilities: tuple[str, ...] = ()
 
     def key(self) -> str:
         return f"{self.node_id}/{self.session}"
 
     def skill_names(self) -> set[str]:
         return {str(skill.get("name", "")).casefold() for skill in self.skills if skill.get("name")}
+
+    def declared_capabilities(self) -> tuple[str, ...]:
+        """Skills AND runtime_tools. `skill_names()` is kept as it was --
+        it is what `_score_candidate` used to read and what the pm tests
+        assert on -- but eligibility now asks this, because a profile that
+        declared `runtime_tools=["playwright"]` was previously judged
+        unable to do playwright work (see capability_profile.py)."""
+        return declared_capability_set(runtime_tools=self.runtime_tools, skills=self.skills)
+
+    def capability_match(self, required: Any, *, trust_declared: bool = True):
+        return match_capabilities(required, declared=self.declared_capabilities(),
+                                  detected=self.detected_capabilities,
+                                  has_profile=self.has_profile, trust_declared=trust_declared)
 
 
 @dataclass(frozen=True)
@@ -84,6 +112,10 @@ class RoutingDecision:
     reason: str
     score_breakdown: dict[str, Any] = field(default_factory=dict)
     evidence: dict[str, Any] = field(default_factory=dict)
+    # Machine-readable "why is there nothing to route to" (see
+    # capability_profile.diagnose). Mirrored into `evidence` as well so it
+    # reaches pm_decisions without pm_store needing a new column.
+    diagnosis: dict[str, Any] = field(default_factory=dict)
 
 
 def _task_metadata(task: dict[str, Any]) -> dict[str, Any]:
@@ -112,12 +144,25 @@ def hard_gate_failure(task: dict[str, Any], candidate: WorkerCandidate) -> str |
         return f"OS mismatch: task requires {required_os!r}, candidate is {candidate.os!r}"
     required_capabilities = _as_str_list(metadata.get("required_capabilities"))
     if required_capabilities:
-        missing = [cap for cap in required_capabilities if cap.casefold() not in candidate.skill_names()]
-        if missing:
-            return f"missing required capabilities: {missing}"
+        # One matcher for declared+probed capability, shared with
+        # worker_registry (capability_profile.match_capabilities). An
+        # UNDECLARED candidate fails here with a DIFFERENT reason than one
+        # that is declared and genuinely lacks the tool -- and can never
+        # pass, because an empty pool satisfies no requirement.
+        failure = candidate.capability_match(required_capabilities).reason()
+        if failure is not None:
+            return failure
     required_role = metadata.get("required_role")
-    if required_role and candidate.role and str(required_role).casefold() != candidate.role.casefold():
-        return f"role mismatch: task requires {required_role!r}, candidate role is {candidate.role!r}"
+    if required_role:
+        if candidate.role and str(required_role).casefold() != candidate.role.casefold():
+            return f"role mismatch: task requires {required_role!r}, candidate role is {candidate.role!r}"
+        if not candidate.role and not candidate.has_profile:
+            # A declared profile that left `role` empty still passes, as it
+            # always has -- tightening that would make currently-routable
+            # tasks unroutable. An UNDECLARED session has no such history,
+            # so it is not silently granted every role.
+            return (f"role unknown: task requires {required_role!r} and this worker has no "
+                    "declared capability profile")
     project = metadata.get("project")
     if project and candidate.project_affinity and str(project).casefold() != candidate.project_affinity.casefold():
         return f"project affinity mismatch: task is {project!r}, candidate is affine to {candidate.project_affinity!r}"
@@ -132,6 +177,41 @@ def hard_gate_failure(task: dict[str, Any], candidate: WorkerCandidate) -> str |
     if candidate.max_queued is not None and candidate.queue_depth >= candidate.max_queued:
         return f"WIP limit reached: {candidate.queue_depth} queued >= max_queued {candidate.max_queued}"
     return None
+
+
+def candidate_view(task: dict[str, Any], candidate: WorkerCandidate) -> CandidateView:
+    """One candidate as the diagnosis walk sees it. Re-uses
+    `hard_gate_failure` rather than re-deriving eligibility, so a
+    candidate can never be reported eligible by one and ineligible by the
+    other."""
+    metadata = _task_metadata(task)
+    match = candidate.capability_match(_as_str_list(metadata.get("required_capabilities")))
+    required_role = metadata.get("required_role")
+    role_match = MATCH_OK
+    if required_role:
+        if candidate.role:
+            role_match = (MATCH_OK if str(required_role).casefold() == candidate.role.casefold()
+                          else MATCH_MISSING)
+        elif not candidate.has_profile:
+            role_match = MATCH_UNKNOWN
+    failure = hard_gate_failure(task, candidate)
+    return CandidateView(
+        key=candidate.key(), online=candidate.online, has_profile=candidate.has_profile,
+        # WIP is the only hard "busy" this router has: queue_depth alone is
+        # a soft-scoring nudge (see this module's docstring), so a worker is
+        # reported BUSY only once a configured max_queued is actually hit.
+        busy=(candidate.max_queued is not None and candidate.queue_depth >= candidate.max_queued),
+        capability=match, role_match=role_match, ineligible_reason=failure)
+
+
+def diagnose_candidates(task: dict[str, Any], candidates: list[WorkerCandidate]) -> dict[str, Any]:
+    """Why this task has nowhere to go -- NO_WORKERS_REGISTERED /
+    WORKERS_BUSY / WORKERS_LACK_CAPABILITY / CAPABILITY_UNKNOWN rather
+    than one sentence covering all four. Read-only and pure; safe to call
+    for an explainability read without routing anything."""
+    metadata = _task_metadata(task)
+    return diagnose([candidate_view(task, c) for c in candidates],
+                    required_capabilities=_as_str_list(metadata.get("required_capabilities")))
 
 
 def _score_candidate(task: dict[str, Any], candidate: WorkerCandidate) -> tuple[float, dict[str, Any]]:
@@ -151,8 +231,12 @@ def _score_candidate(task: dict[str, Any], candidate: WorkerCandidate) -> tuple[
 
     required_capabilities = _as_str_list(metadata.get("required_capabilities"))
     preferred_capabilities = _as_str_list(metadata.get("preferred_capabilities"))
-    matched_required = len(set(c.casefold() for c in required_capabilities) & candidate.skill_names())
-    matched_preferred = len(set(c.casefold() for c in preferred_capabilities) & candidate.skill_names())
+    # Everything this candidate can do from either source -- scoring reads
+    # the same pool eligibility does, so a runtime_tool that now makes a
+    # candidate eligible also earns it the match points it deserves.
+    capability_pool = set(candidate.declared_capabilities()) | set(candidate.detected_capabilities)
+    matched_required = len(set(c.casefold() for c in required_capabilities) & capability_pool)
+    matched_preferred = len(set(c.casefold() for c in preferred_capabilities) & capability_pool)
     if matched_required:
         breakdown["required_skill_match_count"] = matched_required
         score += matched_required * 3.0
@@ -222,11 +306,14 @@ def route_task(task: dict[str, Any], candidates: list[WorkerCandidate]) -> Routi
             failures[candidate.key()] = failure
 
     if not eligible:
+        diagnosis = diagnose_candidates(task, candidates)
         return RoutingDecision(
             NO_ELIGIBLE_WORKER, None,
-            reason="no candidate passed the hard-constraint gate -- stays UNASSIGNED, "
-                  "retried automatically once a capability profile changes or a node reconnects",
-            evidence={"candidates_considered": len(candidates), "hard_gate_failures": failures},
+            reason=f"{diagnosis['code']}: {diagnosis['reason']} -- stays UNASSIGNED, retried "
+                  "automatically once a capability profile changes or a node reconnects",
+            evidence={"candidates_considered": len(candidates), "hard_gate_failures": failures,
+                     "diagnosis": diagnosis},
+            diagnosis=diagnosis,
         )
 
     scored = [(candidate, *_score_candidate(task, candidate)) for candidate in eligible]
