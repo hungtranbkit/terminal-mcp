@@ -42,9 +42,41 @@ from typing import Any
 
 from .schema import Migration, apply_migrations
 
+
+def _add_v2_profile_source(connection: sqlite3.Connection) -> None:
+    """Provenance for a capability profile: who created it.
+
+    WHY THIS EXISTS. Phase 2 auto-declares a profile for every eligible live
+    session, because `capability_profiles` having zero rows is exactly why
+    `pm_router.route_task` returns NO_ELIGIBLE_WORKER for everything
+    (blg_orch_no_workers_declared). But auto-discovery re-running every tick
+    must never silently overwrite what a human declared -- an operator who
+    set `role=VERIFIER` and a curated skill list would otherwise watch it get
+    reset by the next reconcile pass.
+
+    So a row records whether it is auto-managed. Discovery only ever writes
+    rows it owns (`SOURCE_AUTO`); everything else it leaves completely alone.
+
+    ADDITIVE AND NULLABLE, AND NULL MEANS DECLARED. Every pre-existing row
+    reads back NULL, and NULL is treated as `SOURCE_DECLARED` -- the SAFE
+    default, not the convenient one: a profile whose origin we cannot prove
+    is treated as a human's and is never auto-touched. No backfill."""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(capability_profiles)")}
+    if "source" not in columns:
+        connection.execute("ALTER TABLE capability_profiles ADD COLUMN source TEXT")
+
+
 PM_MIGRATIONS: list[Migration] = [
     Migration(1, "baseline: capability_profiles + pm_decisions", lambda connection: None),
+    Migration(2, "capability_profiles.source -- auto-discovered vs human-declared provenance, so "
+                 "worker discovery can never overwrite a declared profile", _add_v2_profile_source),
 ]
+
+#: A profile a human (or any explicit caller) declared. NULL on an existing
+#: row means this too -- see _add_v2_profile_source.
+SOURCE_DECLARED = "declared"
+#: A profile worker_discovery.py created and is allowed to keep updating.
+SOURCE_AUTO = "auto"
 
 
 def default_pm_store_path() -> Path:
@@ -97,6 +129,10 @@ class CapabilityProfile:
     created_at: str
     updated_at: str
     max_queued: int | None = None  # WIP limit (§20.6 Phase A) -- None = unbounded, unchanged default
+    #: Provenance (migration 2). NULL/absent reads back as SOURCE_DECLARED --
+    #: never auto-managed, because an unprovable origin is treated as a
+    #: human's. Only SOURCE_AUTO rows are rewritten by worker discovery.
+    source: str = SOURCE_DECLARED
 
     def key(self) -> str:
         # Same "node_id/session" qualified-name shape controller.py's
@@ -110,6 +146,7 @@ class CapabilityProfile:
             "runtime_tools": list(self.runtime_tools), "project_affinity": self.project_affinity,
             "role": self.role, "skills": [dict(s) for s in self.skills],
             "permissions_note": self.permissions_note, "max_queued": self.max_queued,
+            "source": self.source,
             "created_at": self.created_at, "updated_at": self.updated_at,
         }
 
@@ -137,11 +174,24 @@ class PMDecision:
         }
 
 
+def _row_source(row: sqlite3.Row) -> str:
+    """NULL, missing column, or an unrecognised value all read back as
+    SOURCE_DECLARED. Unprovable origin is treated as a human's, so the
+    failure mode of this function is "discovery leaves it alone", never
+    "discovery overwrites it"."""
+    try:
+        value = row["source"]
+    except (IndexError, KeyError):
+        return SOURCE_DECLARED
+    return SOURCE_AUTO if value == SOURCE_AUTO else SOURCE_DECLARED
+
+
 def _profile_from_row(row: sqlite3.Row) -> CapabilityProfile:
     return CapabilityProfile(
         node_id=row["node_id"], session=row["session"], os=row["os"],
         runtime_tools=_load_list(row["runtime_tools"]), project_affinity=row["project_affinity"],
         role=row["role"], skills=_load_list(row["skills"]), permissions_note=row["permissions_note"],
+        source=_row_source(row),
         max_queued=row["max_queued"], created_at=row["created_at"], updated_at=row["updated_at"],
     )
 
@@ -224,7 +274,8 @@ class PMStore:
     def upsert_capability(self, node_id: str, session: str, *, os: str | None = None,
                           runtime_tools: list[str] | None = None, project_affinity: str | None = None,
                           role: str | None = None, skills: list[dict[str, Any]] | None = None,
-                          permissions_note: str | None = None, max_queued: int | None = None) -> CapabilityProfile:
+                          permissions_note: str | None = None, max_queued: int | None = None,
+                          source: str | None = SOURCE_DECLARED) -> CapabilityProfile:
         """INSERT-or-update, same shape as session_registry.py's own
         upsert_seen -- a repeat call for the same (node_id, session)
         updates the row in place (COALESCE-style: a field left None
@@ -269,10 +320,51 @@ class PMStore:
                  merged["permissions_note"], merged["max_queued"],
                  now if existing is None else existing["created_at"], now),
             )
+            if existing is None and source is not None:
+                # Provenance is set ONLY on creation. The ON CONFLICT clause
+                # above deliberately does not touch `source`, so an update
+                # never changes who owns a row.
+                connection.execute(
+                    "UPDATE capability_profiles SET source = ? WHERE node_id = ? AND session = ?",
+                    (source, node_id, session))
             row = connection.execute(
                 "SELECT * FROM capability_profiles WHERE node_id = ? AND session = ?", (node_id, session),
             ).fetchone()
         return _profile_from_row(row)
+
+    #: `upsert_discovered_capability` outcomes.
+    DISCOVERY_CREATED = "CREATED"
+    DISCOVERY_UPDATED = "UPDATED"
+    DISCOVERY_SKIPPED_DECLARED = "SKIPPED_DECLARED"
+
+    def upsert_discovered_capability(self, node_id: str, session: str,
+                                     **fields: Any) -> tuple[str, CapabilityProfile | None]:
+        """The ONLY write path worker discovery is allowed to use.
+
+        Returns `(outcome, profile)`. The contract that makes automatic
+        declaration safe to run on every tick:
+
+        * a row that does not exist is created with `source=SOURCE_AUTO`
+          (`DISCOVERY_CREATED`);
+        * a row already marked `SOURCE_AUTO` is refreshed (`DISCOVERY_UPDATED`);
+        * **anything else is left completely untouched**
+          (`DISCOVERY_SKIPPED_DECLARED`, profile returned unchanged) -- a
+          human-declared profile, and any pre-migration row whose `source` is
+          NULL, is never rewritten, never blanked, and never re-provenanced.
+
+        That last case is the whole point. Discovery runs repeatedly and
+        unattended; the cost of it being wrong once is an operator's curated
+        role/skills silently reverting, which they would most likely notice
+        only as a mis-route days later. So the check is on the stored row at
+        write time, not on what the caller believes about it."""
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT * FROM capability_profiles WHERE node_id = ? AND session = ?",
+                (node_id, session)).fetchone()
+        if existing is not None and _row_source(existing) != SOURCE_AUTO:
+            return self.DISCOVERY_SKIPPED_DECLARED, _profile_from_row(existing)
+        outcome = self.DISCOVERY_CREATED if existing is None else self.DISCOVERY_UPDATED
+        return outcome, self.upsert_capability(node_id, session, source=SOURCE_AUTO, **fields)
 
     def get_capability(self, node_id: str, session: str) -> CapabilityProfile | None:
         with self._connection() as connection:
