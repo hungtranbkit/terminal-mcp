@@ -887,19 +887,6 @@ def build_mcp(service: TerminalService | None = None,
         return result
 
     @server.tool()
-    def terminal_send_task(target: str, text: str, wait_for_accept: bool = True,
-                           timeout: float = 30, idempotency_key: str | None = None) -> dict:
-        """PREFERRED direct task submission for a session or binding. Reuses
-        the existing guarded, idempotent send state machine to write, activate,
-        and prove acceptance server-side without duplicate Enter. Returns only
-        SUBMIT_CONFIRMED, BLOCKED, or FAILED with concise receipt evidence.
-        Pass a stable idempotency_key when retrying after a lost response.
-        Use the durable queue instead when the task itself must survive a busy
-        worker or controller restart."""
-        _refresh_local_heartbeat()
-        return compact_tools.send_task(target, text, wait_for_accept, timeout, idempotency_key)
-
-    @server.tool()
     def terminal_send_keys(session: str, keys: list[str], confirm_sensitive: bool = False) -> dict:
         """Send only allowlisted tmux keys when terminal_input is enabled in local config."""
         _refresh_local_heartbeat()

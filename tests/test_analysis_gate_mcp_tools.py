@@ -13,6 +13,7 @@ import json
 import pytest
 
 from terminal_mcp.mcp_app import ANALYSIS_GATE_BOOTSTRAP, build_mcp
+from terminal_mcp import orchestration_policy
 from terminal_mcp.queue_service import QueueService
 from terminal_mcp.queue_store import QueueStore
 
@@ -125,4 +126,30 @@ def test_bootstrap_keeps_the_pre_existing_session_policy_line():
 
 def test_server_actually_publishes_the_bootstrap(tmp_path):
     server = build_mcp(queue=QueueService(QueueStore(tmp_path / "queue.db")))
-    assert server.instructions == ANALYSIS_GATE_BOOTSTRAP
+    assert server.instructions == (
+        orchestration_policy.server_instructions() + "\n\n" + ANALYSIS_GATE_BOOTSTRAP
+    )
+
+
+@pytest.mark.anyio
+async def test_compact_send_task_registers_once(tmp_path, caplog, monkeypatch):
+    from terminal_mcp.compact_tools import CompactTerminalTools
+
+    calls = []
+
+    def send_task(self, target, text, **kwargs):
+        calls.append((target, text, kwargs))
+        return {"status": "SUBMIT_CONFIRMED"}
+
+    monkeypatch.setattr(CompactTerminalTools, "send_task", send_task)
+    server = build_mcp(queue=QueueService(QueueStore(tmp_path / "queue.db")))
+    assert "Tool already exists" not in caplog.text
+    tools = await server.list_tools()
+    sends = [tool for tool in tools if tool.name == "terminal_send_task"]
+    assert len(sends) == 1
+    assert sends[0].input_schema["properties"]["timeout"]["default"] == 20
+    result = await _call(server, "terminal_send_task", target="lane", text="work")
+    assert result["status"] == "SUBMIT_CONFIRMED"
+    assert calls == [("lane", "work", {
+        "wait_for_accept": True, "timeout": 20, "idempotency_key": None,
+    })]

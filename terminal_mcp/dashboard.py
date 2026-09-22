@@ -12000,7 +12000,7 @@ GLOBAL_TASKS_HTML = """<!doctype html>
 # routes, exactly like GLOBAL_TASKS_HTML is a view over the task board.
 #
 # ADDRESSED BY PROJECT, NOT BY PATH. The panel's primary selector is a
-# picker over /dashboard/api/projects (canonical `git:host/org/repo` ids),
+# picker over /dashboard/api/backlog/projects (canonical `git:host/org/repo` ids),
 # because one project has checkouts on several machines -- a path
 # identifies a CHECKOUT, not a project, and typing one could only ever
 # reach a repo on the box running the controller. The path box remains as
@@ -12296,7 +12296,7 @@ BACKLOG_HTML = """<!doctype html>
 
   async function loadProjects() {
     try {
-      var data = await api('/dashboard/api/projects');
+      var data = await api('/dashboard/api/backlog/projects');
     } catch (e) {
       // A project list that cannot be fetched must not take the panel
       // down: the path fallback still works, so say so and carry on.
@@ -19256,7 +19256,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     # through _mutation_guard (Cloudflare Access / webauth identity) AND
     # the service's own allowed_cwd_roots path gate, so the browser
     # surface can never reach a project the MCP surface could not.
-    @server.custom_route("/dashboard/api/projects", methods=["GET"], include_in_schema=False)
+    @server.custom_route("/dashboard/api/backlog/projects", methods=["GET"], include_in_schema=False)
     async def backlog_projects(request: Request) -> JSONResponse:
         """Every project this controller holds a backlog for, PLUS every
         git project the fleet is actually working on -- so a project with

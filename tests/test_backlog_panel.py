@@ -107,8 +107,8 @@ def test_panel_talks_only_to_the_backlog_api(rig):
                     "/dashboard/api/backlog/dispatch", "/dashboard/api/backlog/add",
                     "/dashboard/api/backlog/complete",
                     # The project picker's own list -- read-only, and the
-                    # only non-backlog endpoint this page is allowed.
-                    "/dashboard/api/projects"}, urls
+                    # project identity discovery endpoint for this page.
+                    "/dashboard/api/backlog/projects"}, urls
 
 
 def test_panel_sends_expected_revision_on_every_write():
@@ -141,7 +141,7 @@ def test_panel_exposes_the_status_vocabulary():
 
 def test_panel_has_a_project_picker():
     assert 'id="projectPicker"' in BACKLOG_HTML
-    assert "/dashboard/api/projects" in BACKLOG_HTML
+    assert "/dashboard/api/backlog/projects" in BACKLOG_HTML
 
 
 def test_every_write_addresses_the_project_through_one_selector():

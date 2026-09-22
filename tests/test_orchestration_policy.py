@@ -15,6 +15,7 @@ import pytest
 
 from terminal_mcp import orchestration_policy as op
 from terminal_mcp.server import mcp
+from terminal_mcp.mcp_app import ANALYSIS_GATE_BOOTSTRAP
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -22,7 +23,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 def test_server_metadata_carries_the_orchestration_policy():
     """The built server's `instructions` -- what `initialize` returns -- IS the policy."""
-    assert mcp.instructions == op.SERVER_INSTRUCTIONS
+    assert mcp.instructions == op.SERVER_INSTRUCTIONS + "\n\n" + ANALYSIS_GATE_BOOTSTRAP
 
 
 @pytest.mark.parametrize("phrase", op.CRITICAL_INVARIANTS)

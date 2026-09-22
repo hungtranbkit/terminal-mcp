@@ -244,6 +244,9 @@ def test_execution_evidence_stops_and_sessions_are_isolated(tmp_path: Path):
     store = SubmissionStore(tmp_path / "isolation.db")
     first, _ = store.create(idempotency_key="first", session="codex-a", agent_type="codex", prompt="a")
     second, _ = store.create(idempotency_key="second", session="codex-b", agent_type="codex", prompt="b")
+    # A recovered submission already activated once; new execution evidence
+    # must stop recovery without another Enter or affecting another session.
+    store.reserve_enter(first.submission_id, cap=6, action="submit_enter")
     watchdog = VerifiedSubmitWatchdog(store, WatchdogConfig(poll_interval_seconds=.01, timeout_seconds=.1))
     started = watchdog.run(first.submission_id, capture=lambda: ["Working"], inject=lambda _: None,
                            send_enter=lambda: pytest.fail("no Enter after execution evidence"),
@@ -251,8 +254,8 @@ def test_execution_evidence_stops_and_sessions_are_isolated(tmp_path: Path):
     other = watchdog.run(second.submission_id, capture=lambda: ["> b"], inject=lambda _: None,
                          send_enter=lambda: None, evidence=lambda _lines, _record: ("COMPOSER", "draft"),
                          max_new_enters=1)
-    assert started["execution_started"] is True and started["enter_count"] == 0
-    assert other["enter_count"] == 1 and store.get(first.submission_id).enter_count == 0  # type: ignore[union-attr]
+    assert started["execution_started"] is True and started["enter_count"] == 1
+    assert other["enter_count"] == 1 and store.get(first.submission_id).enter_count == 1  # type: ignore[union-attr]
 
 
 def test_sweeper_ttl_and_remote_unavailable_fail_closed(tmp_path: Path):

@@ -365,12 +365,13 @@ def test_only_shells_are_guarded_against_embedded_newlines():
 # FAILED without ever starting the wait -- so the caller resent the command.
 # ---------------------------------------------------------------------------
 
-def test_quiet_shell_command_is_acknowledged_by_its_echoed_command_line():
+def test_fallback_echo_requires_foreground_shell_guard_to_confirm():
     adapter = select_adapter("bash")
     # A command that prints nothing yet leaves the pane byte-identical: the
     # command was already echoed onto the prompt line before Enter.
     pane = ["kimex@hp:~$ sleep 3; echo XONG2"]
-    assert adapter.submit_ack_evidence(pane, list(pane), "sleep 3; echo XONG2") is True
+    assert adapter.submit_ack_evidence(pane, list(pane), "sleep 3; echo XONG2") is False
+    assert select_adapter("python3").submit_ack_evidence(["y"], ["y"], "y") is False
 
 
 def test_shell_ack_still_confirms_on_a_plain_pane_change():

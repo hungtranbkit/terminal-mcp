@@ -110,10 +110,10 @@ def test_no_backlog_route_returns_500_on_a_bad_body(rig):
 def test_projects_route_registered_and_lists_projects(rig):
     server, repo, backlog = rig
     backlog.add(str(repo), tasks=[{"title": "one", "priority": "P1"}])
-    assert "/dashboard/api/projects" in _paths(server)
+    assert "/dashboard/api/backlog/projects" in _paths(server)
 
     client = TestClient(server.streamable_http_app())
-    response = client.get("/dashboard/api/projects")
+    response = client.get("/dashboard/api/backlog/projects")
     assert response.status_code in (200, 401, 403)
     if response.status_code == 200:
         body = response.json()
@@ -130,7 +130,7 @@ def test_projects_route_503s_without_a_backlog_service(tmp_path):
     server = build_mcp(terminal)
     register_dashboard(server, terminal)
     client = TestClient(server.streamable_http_app())
-    response = client.get("/dashboard/api/projects")
+    response = client.get("/dashboard/api/backlog/projects")
     assert response.status_code in (503, 401, 403)
 
 
@@ -211,3 +211,16 @@ def test_dispatch_session_is_the_target_not_project_resolution(rig):
     item = backlog.get(project_id=project_id)["items"][0]
     assert item["queue_task_id"], "dispatch must have created a real queue task"
     assert item["session"] == "lane-target"
+
+
+def test_runtime_and_backlog_project_routes_are_distinct(rig):
+    server, repo, backlog = rig
+    backlog.add(str(repo), tasks=[{"title": "backlog only"}])
+    routes = [r.path for r in server._custom_starlette_routes
+              if "GET" in getattr(r, "methods", ())]
+    assert routes.count("/dashboard/api/projects") == 1
+    assert routes.count("/dashboard/api/backlog/projects") == 1
+    client = TestClient(server.streamable_http_app())
+    runtime = client.get("/dashboard/api/projects")
+    assert runtime.status_code == 200
+    assert runtime.json()["projects"] == []
