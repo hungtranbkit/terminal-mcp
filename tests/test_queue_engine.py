@@ -95,6 +95,19 @@ def test_contract_refusal_is_bounded_and_releases_claim(store, ops):
     assert "STALE_CONTRACT_VERSION" in task.last_error
     assert task.claim_token is None
     assert len(ops.sent) == 1
+    store.reevaluate_ai_owned_blocked(now="2099-01-01T00:00:00Z")
+    assert store.get_task(task_id).status == BLOCKED
+
+
+def test_transient_node_disconnect_keeps_dispatched_attempt(store, ops):
+    engine, task_id = _finished_worker(store, ops)
+    ops.set_status("lane-a", {"error": "NODE_UNREACHABLE"})
+    engine.tick("lane-a")
+    assert store.get_task(task_id).status == VERIFYING
+    ops.set_status("lane-a", {"state": "IDLE"})
+    assert engine.tick("lane-a").action == COMPLETED
+    assert store.get_task(task_id).attempt_count == 1
+    assert len(ops.sent) == 1
 
 
 def test_restart_sweep_finishes_existing_task_without_dispatch_opt_in(store, ops):

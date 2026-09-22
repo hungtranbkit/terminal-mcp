@@ -3147,6 +3147,10 @@ class QueueStore:
             ).fetchall()
             for row in rows:
                 task = dict(row)
+                if str(task.get("last_error") or "").startswith("VERIFICATION_"):
+                    # This worker already finished. Missing verification
+                    # evidence must be reconciled, not replayed as new work.
+                    continue
                 if approval_class_for_task(task) is not None:
                     continue  # a human owns this one
                 attempts = max(int(task.get("coordinator_attempts") or 0),

@@ -1026,13 +1026,12 @@ class QueueEngine:
         status_response = self.ops.terminal_status(session)
         error = status_response.get("error")
         if error in SESSION_UNREACHABLE_ERRORS:
-            # P0 item 9: the session/node vanished mid-flight -- WAITING_
-            # SESSION (auto-recoverable), never FAILED (a real execution
-            # failure) and never silently dropped.
-            self.store.mark_waiting_session(task_id, reason=error)
-            if self.store.long_task_watch(task_id):
-                self.store.update_long_task_watch(task_id, state="BLOCKED", blocker="NODE_UNAVAILABLE", reason=error)
-            return TickResult(session, "WAITING_SESSION", task_id=task_id, detail=error)
+            # A node-agent reload does not stop the CLI. Requeueing here
+            # incremented the attempt while idempotency retained the OLD
+            # prompt, so its eventual marker could never verify. Preserve
+            # execution identity; the fleet stale-active sweep handles a
+            # genuinely prolonged outage using its bounded timeout.
+            return TickResult(session, "OBSERVATION_UNAVAILABLE", task_id=task_id, detail=error)
         if error:
             self.store.transition_task(task_id, FAILED, event_type="FAILED",
                                        reason=f"could not read session status: {error}")
