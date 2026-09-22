@@ -1,0 +1,30 @@
+# Periodic capacity/health check for a terminal-mcp node agent.
+#
+# Exists because the failure this watches for is silent: on dell-linux
+# 2026-09-21 the node ran out of cgroup tasks and answered HTTP 500 for
+# every request for hours, and the only visible symptom was the
+# controller calling it "flaky connectivity". Nothing on the node said a
+# word. This makes the node say it, in the journal, before it happens.
+#
+# Install (user scope, same as terminal-node-agent.service):
+#   cp terminal-node-agent-health.{service,timer}.example \
+#      ~/.config/systemd/user/terminal-node-agent-health.{service,timer}
+#   # edit ExecStart's path to your checkout
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now terminal-node-agent-health.timer
+#
+# Read it with:  journalctl --user -u terminal-node-agent-health -f
+[Unit]
+Description=terminal-mcp node agent health/capacity check
+Documentation=file:%h/workspace/terminal-mcp/scripts/node-agent-health.sh
+
+[Service]
+Type=oneshot
+# --quiet prints only WARN/CRIT, so a healthy node stays silent in the
+# journal and anything logged is worth reading.
+ExecStart=%h/workspace/terminal-mcp/scripts/node-agent-health.sh --quiet
+# The script exits 1 on WARN and 2 on CRIT, which is the signal, not a
+# crash -- do not let systemd render a real warning as a unit failure.
+SuccessExitStatus=0 1 2
+Nice=10
+IOSchedulingClass=idle

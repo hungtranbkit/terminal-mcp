@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+
+from . import composer
 from collections.abc import Mapping
 from typing import Any
 from abc import ABC, abstractmethod
@@ -525,6 +527,21 @@ class ClaudeAdapter(AgentAdapter):
             return TARGET_COMPOSER
         if _match_any(_WORKING_PATTERNS, tail):
             return TARGET_RUNNING
+        # An idle Claude pane is not UNKNOWN -- it is sitting at its composer,
+        # which is a fact this pane states plainly: composer.is_chrome matches
+        # the box border and the `⏵⏵ auto mode on ...` footer that Claude Code
+        # draws only when it is ready for the next prompt. Returning UNKNOWN
+        # here threw that evidence away, and every caller that asks "is this
+        # worker free yet" had nothing left but a timer. Measured 2026-09-21 on
+        # this host: all ten live nova-claude-* sessions sat idle at their
+        # composer and identify_target_state answered "unknown" for every one.
+        #
+        # Narrow on purpose: the WORKING/WAITING tests above still win, so this
+        # can never mask a turn in flight or a permission prompt, and a pane
+        # with no composer chrome (a redraw mid-flight, a pager, a crashed CLI)
+        # still falls through to UNKNOWN exactly as before.
+        if any(composer.is_chrome(line) for line in lines[-6:]):
+            return TARGET_COMPOSER
         return TARGET_UNKNOWN
 
     def can_submit_now(self, lines: list[str]) -> bool:

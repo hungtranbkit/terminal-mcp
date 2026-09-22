@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 import time
 
+from . import adapters
+from .adapters import normalize_command, select_adapter
 from .models import SessionInfo
 
 
@@ -50,6 +52,8 @@ WAIT_PATTERNS = tuple(
         # by the patterns above.
     )
 )
+_AGENT_COMMANDS = {"claude", "codex"}
+
 ACTIVE_COMMANDS = {"claude", "codex", "python", "python3", "pytest", "node", "npm", "bash", "zsh"}
 
 
@@ -176,7 +180,7 @@ def classify_status(session: SessionInfo, output: str, now: int | None = None) -
     if session.pane_dead:
         return "IDLE", False, "tmux reports the active pane is dead"
     age = max(0, (now if now is not None else int(time.time())) - session.activity_epoch)
-    command = session.pane_current_command.casefold()
+    command = normalize_command(session.pane_current_command)
     # Checked BEFORE the activity-age rules below, not after: the pane's own
     # footer is direct evidence of what the target is doing right now, while
     # activity_epoch is an unreliable proxy that is wrong in both directions
@@ -193,6 +197,12 @@ def classify_status(session: SessionInfo, output: str, now: int | None = None) -
     # agent pane is still classified by its own footer first.
     if command in _SHELLS and shell_prompt_is_back(output):
         return "IDLE", False, "shell prompt is back at the bottom of the pane; the command has finished"
+    if command in _AGENT_COMMANDS:
+        target = select_adapter(command).identify_target_state(output.splitlines())
+        if target == adapters.TARGET_RUNNING:
+            return "RUNNING", False, f"{command} adapter reports a turn in flight"
+        if target == adapters.TARGET_COMPOSER:
+            return "IDLE", False, f"{command} is back at its composer; the turn has finished"
     if command in ACTIVE_COMMANDS and age <= 60:
         return "RUNNING", False, f"current command is {command!r}; tmux activity age is {age}s"
     if command in {"bash", "zsh", "sh", "fish"} and age > 60:
