@@ -129,6 +129,8 @@ file count from `ls tests/*.py`), not recalled from memory.
 | Fleet audit aggregation read path (blg_178d7b6506b7) | TESTING (35 tests green; no real 2-node run, not deployed) |
 
 | Runbook Registry retrieval from the worker dispatch flow | TESTING (39 unit+integration tests green; not yet exercised on a live lane, not deployed) |
+
+| Supervisor node-aware watch identity/routing (P1) | TESTING (24 new + 152 adjacent tests green; live read-only routing check on hp-linux) |
 | Unified Task System §20 (Kanban/PM/Planner/git isolation/Phase A-E) | VERIFIED — see §20 itself for the exact per-slice scope |
 | Work Mode: a planner claim briefs itself (similar-bug retrieval + module context pack, paths verified) | VERIFIED (V1) |
 | Work Mode: the budget and the gate constrain a REAL run (dogfood, `dogfood` runbook) | VERIFIED (dogfood; see its own "what is not claimed" note) |
@@ -4782,6 +4784,91 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
 - **Follow-up/backlog:** have the coordinator write `failure_fingerprint`
   when it classifies a failure; surface RUNBOOK_* events in the
   Supervisor/Coordinator dashboard panel.
+
+### Supervisor watch identity + routing across nodes (P1)
+
+- **Live evidence this fixes (2026-09-14, from the controller):**
+  `terminal_list_sessions` sees `hp-work`/`hp1`/`hp2`/`hp3-work` on
+  `node_id=hp-linux` and `win2` on `node_id=dell-5530`, but
+  `supervisor_watch(session=<name>)` followed by `supervisor_run_once`
+  marked each of those watches `target_missing` and disabled it
+  immediately. Local watches (`gatefix2-work`, `mcp-work`) resolved fine.
+- **Root cause:** `SupervisorService` resolved and polled through the
+  LOCAL `TerminalService` only — `self.terminal.terminal_status(target)`
+  in `_poll_one`, `self.terminal.tmux.get_session` in `watch()`,
+  `self.terminal.tmux.list_sessions()` in `_sync_config_watches` — never
+  through the multi-node router `terminal_list_sessions`/
+  `terminal_status` already use. A session on another node is absent from
+  this host's tmux, so the poll saw MISSING and took the permanent
+  `target_missing` disable path. Nothing was wrong with the router; the
+  Supervisor simply was not using it.
+- **Canonical watch identity: `(node_id, session_name)`.** The key STRING
+  is `session:<name>` when the node is the local node or unknown, and
+  `session:<node_id>/<name>` only when the target genuinely lives
+  elsewhere. That keeps every persisted legacy row loading and
+  addressable, keeps `supervisor_unwatch(session=...)` finding what it
+  always found, and still gives two same-named sessions on two nodes two
+  distinct watches. The qualified form reuses the `node/session`
+  convention `controller.resolve_session` already accepts and documents
+  as "never ambiguous by construction" — not a second addressing scheme.
+- **API behaviour:**
+  - A bare name that resolves to exactly one node is bound to that node
+    and the `node_id` is persisted with the watch.
+  - A bare name on MORE than one node returns
+    `{"error": "AMBIGUOUS_SESSION", "nodes": [...], "detail": ...}` and
+    creates NO watch. The detail always names a concrete qualified form
+    to re-issue with; guessing a node would silently watch the wrong
+    machine.
+  - A name that resolves nowhere keeps today's behaviour: a local,
+    unpinned watch (watching a session that does not exist yet is
+    existing, deliberate behaviour).
+  - `node_id` is additive on every watch view — `None` for bindings,
+    legacy rows and local sessions.
+- **Routing:** polls go through `SupervisorService._status_for`, the one
+  place a watch reads its target. Remote watches use
+  `controller.terminal_status("<node_id>/<name>")` — the SAME remote-aware
+  adapter, addressed by the qualified name so it cannot re-resolve into a
+  different node later. Bindings, legacy rows and local sessions keep
+  using the local `TerminalService` unchanged. No node RPC logic is
+  duplicated here; only `resolve_session` and `terminal_status` are used.
+- **Node offline is recoverable:** `NODE_UNREACHABLE`/`NODE_OFFLINE`/
+  `NODE_NOT_FOUND` produce a new additive event type
+  `watch_target_unavailable` and leave the watch ENABLED with its
+  `node_id` intact, so the node returning resumes the same watch. Only a
+  session the node itself reports MISSING still takes the permanent
+  `target_missing` path. `AMBIGUOUS_SESSION` is deliberately not in that
+  recoverable set.
+- **Security:** the read check runs BEFORE any node resolution, on the
+  bare name, so a caller who may not read a name never learns which nodes
+  hold it. The node enforces its own allowlist/grants on every routed
+  status call, exactly as for any other remote read.
+- **Compatibility/migration:** one additive `watches.node_id TEXT` column
+  through the existing idempotent `PRAGMA table_info` + `ALTER TABLE`
+  loop — NULL on every pre-existing row, no backfill, restart-safe. Both
+  `upsert_watch` UPDATE branches use `COALESCE(?, node_id)` so a legacy
+  re-watch never clobbers a resolved identity with NULL.
+  `manual_unwatch` semantics unchanged. Binding watches unchanged.
+- **Wiring:** `SupervisorService.controller` is duck-typed and set
+  post-construction (same posture as `autonomous_check`); left `None`
+  every code path falls back to exactly the previous local behaviour, so
+  a v1-only/single-node deployment is unaffected.
+- **Tests:** `tests/test_supervisor_node_routing.py` (24) plus 152
+  adjacent supervisor/controller/server regressions.
+- **Live verification (read-only):** against the real hp-linux node agent
+  over a real `RemoteNodeClient`, `resolve_session("hp2")` returned
+  `{node_id: hp-linux}`, the watch was created as
+  `session:hp-linux/hp2` with `node_id=hp-linux`, and after
+  `run_once()` it stayed `enabled=True, disabled_reason=None`. NOTE: this
+  host IS hp-linux, so that run cannot reproduce the original
+  `target_missing` (the "remote" node is the same machine) — it confirms
+  the new routing works end to end, not the old failure.
+- **Known limitations / not in scope:** (1) the original failure was not
+  reproduced live, only from the reported controller evidence; (2)
+  `_sync_config_watches` still enumerates local sessions only, so
+  config-pattern watches remain local-node-scoped; (3) `rename_target`
+  remains local-only; (4) the separate max_iterations/watch-lifetime work
+  and the input-submit acceptance bug are noted as dependencies only and
+  are deliberately untouched here.
 
 ---
 

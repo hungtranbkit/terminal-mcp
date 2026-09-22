@@ -86,6 +86,11 @@ EVENT_TYPES = (
     # Recorded as its own type so "coverage was lost and restored" is
     # visible in the event stream rather than inferred from a gap.
     "watch_reconciled",
+    # Additive (P1 node-aware watch routing): the recoverable sibling of
+    # watch_target_missing. "We could not reach the node", never "the
+    # target is gone" -- consumers that only know the older list see an
+    # unfamiliar event_type, not a wrong one.
+    "watch_target_unavailable",
 )
 _ATTENTION_EVENT_TYPES = {
     "WAITING_INPUT": "attention_required",
@@ -107,7 +112,45 @@ def default_supervisor_db_path() -> Path:
     return base / "terminal-mcp" / "supervisor.db"
 
 
-def watch_key(kind: str, target: str) -> str:
+LOCAL_NODE_ID = "local"
+"""Mirrors controller.LOCAL_NODE_ID. Duplicated as a literal rather than
+imported because supervisor.py must keep working in a deployment that has
+no controller wired at all (v1-only), and importing controller.py here
+would make the multi-node layer a hard dependency of the local one."""
+
+NODE_UNAVAILABLE_ERRORS = frozenset({"NODE_UNREACHABLE", "NODE_OFFLINE", "NODE_NOT_FOUND"})
+"""Routing errors that mean "the NODE could not be asked right now",
+never "the session is gone". A watch hitting one of these keeps its
+identity and stays ENABLED -- the node coming back must resume the same
+watch. Distinct from SESSION_NOT_FOUND/MISSING, which really are the
+target being gone and keep their existing disable behaviour.
+
+AMBIGUOUS_SESSION is deliberately NOT here: a watch that resolved to a
+node stores that node_id and polls a qualified name, which cannot go
+ambiguous later. Seeing it would mean a genuine identity problem, and
+falling through to the existing error branch is the honest response."""
+
+
+def watch_key(kind: str, target: str, node_id: str | None = None) -> str:
+    """The canonical watch identity.
+
+    A session watch is identified by (node_id, session_name), but the key
+    STRING stays byte-identical to the pre-multi-node one for anything
+    local: `session:<name>` when the node is the local node or unknown,
+    `session:<node_id>/<name>` only when the target genuinely lives on
+    another node. That is what lets every persisted legacy row keep
+    loading, keeps `supervisor_unwatch(session=...)` finding the row it
+    always found, and still gives two same-named sessions on two
+    different nodes two distinct watches.
+
+    The qualified form reuses the `node/session` convention
+    controller.resolve_session already accepts and documents as "never
+    ambiguous by construction" -- this is not a second addressing scheme.
+
+    Binding keys are untouched: bindings remain local-node-scoped (see
+    docs/multi-node.md's own Phase A/B limitation)."""
+    if kind == "session" and node_id and node_id != LOCAL_NODE_ID:
+        return f"{kind}:{node_id}/{target}"
     return f"{kind}:{target}"
 
 
@@ -192,6 +235,13 @@ class SupervisorStore:
             # bindings.py's pinned_* columns.
             existing_columns = {row[1] for row in connection.execute("PRAGMA table_info(watches)").fetchall()}
             for column, declaration in (
+                # Node-aware watch identity (P1: supervisor remote-session
+                # watch identity/routing). NULL on every pre-existing row
+                # and on every purely-local watch, which is exactly what
+                # makes this additive: a NULL node_id means "resolve the
+                # way this always did", so a legacy database keeps behaving
+                # identically after the upgrade with no backfill step.
+                ("node_id", "TEXT"),
                 ("pinned_session_id", "TEXT"),
                 ("pinned_pane_id", "TEXT"),
                 ("pinned_created_epoch", "INTEGER"),
@@ -381,7 +431,8 @@ class SupervisorStore:
     def upsert_watch(self, kind: str, target: str, *, source: str, enabled: bool = True,
                      pinned_session_id: str | None = None, pinned_pane_id: str | None = None,
                      pinned_created_epoch: int | None = None,
-                     required_verifiers: tuple[str, ...] | None = None) -> tuple[dict[str, Any], bool]:
+                     required_verifiers: tuple[str, ...] | None = None,
+                     node_id: str | None = None) -> tuple[dict[str, Any], bool]:
         """Create a watch, or re-enable/replace source on an existing one.
         Never resets state/iteration/failure bookkeeping on an existing row —
         only creation or an explicit re-enable touches those. A re-enable
@@ -399,7 +450,7 @@ class SupervisorStore:
         *fresh* watch simply stores the clear generic default of no
         required verifiers. Pass an explicit tuple (including ()) to set
         or clear it outright."""
-        key = watch_key(kind, target)
+        key = watch_key(kind, target, node_id)
         now = datetime.now(timezone.utc).isoformat()
         nonce = secrets.token_urlsafe(18)
         verifiers_json = json.dumps(list(required_verifiers)) if required_verifiers is not None else "[]"
@@ -414,10 +465,11 @@ class SupervisorStore:
                      iteration_count, same_failure_count, disabled_reason, created_at, updated_at,
                      pinned_session_id, pinned_pane_id, pinned_created_epoch,
                      completion_nonce, completion_attempt, completion_nonce_consumed_at,
-                     required_verifiers)
-                    VALUES (?, ?, ?, ?, 1, 'UNKNOWN', ?, NULL, NULL, NULL, 0, 0, NULL, ?, ?, ?, ?, ?, ?, 1, NULL, ?)""",
+                     required_verifiers, node_id)
+                    VALUES (?, ?, ?, ?, 1, 'UNKNOWN', ?, NULL, NULL, NULL, 0, 0, NULL, ?, ?, ?, ?, ?, ?, 1, NULL,
+                            ?, ?)""",
                     (key, kind, target, source, now, now, now,
-                     pinned_session_id, pinned_pane_id, pinned_created_epoch, nonce, verifiers_json),
+                     pinned_session_id, pinned_pane_id, pinned_created_epoch, nonce, verifiers_json, node_id),
                 )
                 created = True
             elif required_verifiers is None:
@@ -425,9 +477,9 @@ class SupervisorStore:
                     """UPDATE watches SET enabled = 1, disabled_reason = NULL, updated_at = ?,
                        pinned_session_id = ?, pinned_pane_id = ?, pinned_created_epoch = ?,
                        completion_nonce = ?, completion_attempt = completion_attempt + 1,
-                       completion_nonce_consumed_at = NULL
+                       completion_nonce_consumed_at = NULL, node_id = COALESCE(?, node_id)
                        WHERE watch_key = ?""",
-                    (now, pinned_session_id, pinned_pane_id, pinned_created_epoch, nonce, key),
+                    (now, pinned_session_id, pinned_pane_id, pinned_created_epoch, nonce, node_id, key),
                 )
                 created = False
             else:
@@ -435,9 +487,11 @@ class SupervisorStore:
                     """UPDATE watches SET enabled = 1, disabled_reason = NULL, updated_at = ?,
                        pinned_session_id = ?, pinned_pane_id = ?, pinned_created_epoch = ?,
                        completion_nonce = ?, completion_attempt = completion_attempt + 1,
-                       completion_nonce_consumed_at = NULL, required_verifiers = ?
+                       completion_nonce_consumed_at = NULL, required_verifiers = ?,
+                       node_id = COALESCE(?, node_id)
                        WHERE watch_key = ?""",
-                    (now, pinned_session_id, pinned_pane_id, pinned_created_epoch, nonce, verifiers_json, key),
+                    (now, pinned_session_id, pinned_pane_id, pinned_created_epoch, nonce, verifiers_json,
+                     node_id, key),
                 )
                 created = False
             row = connection.execute("SELECT * FROM watches WHERE watch_key = ?", (key,)).fetchone()
@@ -750,6 +804,19 @@ class SupervisorService:
     # Fleet-wide session names for config-pattern seeding, same wiring and
     # same None-means-local default.
     fleet_sessions: Callable[[], list[str]] | None = None
+    # Node-aware watch routing (P1: supervisor remote-session watch
+    # identity/routing). Duck-typed and set post-construction by whoever
+    # wires the multi-node layer (mcp_app/server_http/dashboard), the same
+    # posture as autonomous_check below and for the same reason: a v1-only
+    # or single-node deployment must keep working with this left as None,
+    # in which case every code path below falls back to exactly the local
+    # TerminalService behaviour it had before.
+    #
+    # Only two methods are ever used: resolve_session(name) and
+    # terminal_status(name). That is deliberately the SAME remote-aware
+    # read adapter terminal_list_sessions/terminal_status already go
+    # through -- this module must never grow its own node RPC.
+    controller: Any = None
     autonomous_check: Callable[[str], bool] | None = None
     # Called when an autonomous watch's completion gate resolves to FAILED
     # or BLOCKED (see _handle_completion_candidate) -- v2 wires this to
@@ -811,6 +878,72 @@ class SupervisorService:
 
     # -- watch management (supervisor_watch / _unwatch / _list_watches) ---
 
+    def _resolve_watch_node(self, session: str) -> tuple[str | None, str, dict[str, Any] | None]:
+        """(node_id, bare_name, error) for a session a caller wants watched.
+
+        Returns node_id=None to mean "behave exactly as before" -- no
+        controller wired, or the name does not resolve anywhere right now.
+        The second case is deliberate and preserves a real existing
+        behaviour: watching a session that does not exist YET is allowed
+        today (the watch simply stays unpinned until its first successful
+        poll), and making that an error would be a regression.
+
+        An AMBIGUOUS_SESSION resolution is returned as an error and NO
+        watch is created -- picking one of two same-named sessions on two
+        different nodes would silently watch the wrong machine."""
+        if self.controller is None:
+            return None, session, None
+        if "/" in session:
+            # Already qualified: unambiguous by construction, and the
+            # caller's explicit answer to a previous ambiguity error.
+            node_id, _, bare = session.partition("/")
+            return node_id, bare, None
+        try:
+            resolution = self.controller.resolve_session(session)
+        except Exception:  # noqa: BLE001 -- resolution is an enhancement; never fail a watch over it
+            _LOGGER.warning("supervisor: node resolution failed for %r", session, exc_info=True)
+            return None, session, None
+        error = resolution.get("error")
+        if error == "AMBIGUOUS_SESSION":
+            nodes = list(resolution.get("nodes", []))
+            # The hint is composed HERE rather than passed through from the
+            # router's own detail: this is the one message whose whole job
+            # is to tell the caller how to answer, so it must always name a
+            # concrete qualified form even if the router phrased its own
+            # detail differently.
+            example = f"{nodes[0]}/{session}" if nodes else f"<node_id>/{session}"
+            return None, session, {
+                "error": "AMBIGUOUS_SESSION", "session": session, "nodes": nodes,
+                "detail": (f"session {session!r} exists on more than one node ({nodes or 'unknown'}) -- "
+                           f"no watch was created. Re-issue it with a qualified name, e.g. {example!r}."),
+                "router_detail": resolution.get("detail"),
+            }
+        if error is not None:
+            # SESSION_NOT_FOUND and friends: fall through to the legacy
+            # local behaviour rather than refusing the watch.
+            return None, session, None
+        return resolution.get("node_id"), resolution.get("session", session), None
+
+    def _status_for(self, row: dict[str, Any]) -> dict[str, Any]:
+        """The ONE place a watch reads its target's status.
+
+        Routed through the controller for a watch that carries a remote
+        node identity, and through the local TerminalService for
+        everything else -- which is every binding watch, every legacy row
+        (node_id NULL) and every local session, so their behaviour is
+        unchanged byte for byte.
+
+        The remote read uses the QUALIFIED name, so it addresses the node
+        the watch was bound to rather than re-resolving a bare name that
+        could since have become ambiguous or moved."""
+        kind, target = row["kind"], row["target"]
+        if kind == "binding":
+            return self.terminal.terminal_status_bound(target)
+        node_id = row.get("node_id")
+        if self.controller is not None and node_id and node_id != LOCAL_NODE_ID:
+            return self.controller.terminal_status(f"{node_id}/{target}")
+        return self._fleet_status_for(kind, target)
+
     def watch(self, binding: str | None = None, session: str | None = None,
              required_verifiers: list[str] | None = None,
              source: str = "manual") -> dict[str, Any]:
@@ -832,7 +965,7 @@ class SupervisorService:
         if binding is not None:
             if self.terminal.bindings.get(binding) is None:
                 return {"error": "BINDING_NOT_FOUND", "binding": binding}
-            kind, target = "binding", binding
+            kind, target, node_id = "binding", binding, None
             # No separate pin here -- a binding-kind watch defers entirely
             # to the binding's own pinned identity (bindings.py), checked
             # at send time via terminal_send_bound.
@@ -842,15 +975,31 @@ class SupervisorService:
             # grant) -- a watch can never be created for a session outside
             # both, but a granted-only session (never in the static
             # whitelist) is now watchable too, same as it is readable.
-            if not self.terminal._read_authorized(bare_session_name(session)):
-                return {"error": "ACCESS_DENIED", "session": session}
-            kind, target = "session", session
+            # Node resolution happens AFTER the read check below, never
+            # before: resolving probes every online node's session list,
+            # so answering "which nodes hold this name" for a caller who
+            # is not allowed to read it would leak other nodes' session
+            # inventory. Authorise the bare name first, then resolve.
+            bare_name = session.partition("/")[2] if "/" in session else session
+            if not self.terminal._read_authorized(bare_name):
+                return {"error": "ACCESS_DENIED", "session": bare_name}
+            node_id, target, ambiguity = self._resolve_watch_node(session)
+            if ambiguity is not None:
+                # Explicitly NO watch is created here -- an ambiguous name
+                # must be answered by the caller, not guessed at.
+                return ambiguity
+            kind = "session"
             # P0-2: pin identity at (re-)watch time -- best-effort; a
             # session that doesn't exist yet (or a transient tmux error)
             # just leaves it unpinned, lazily adopted on the watch's next
             # successful poll instead of failing the watch call itself.
             try:
-                info = self.terminal.tmux.get_session(bare_session_name(session))
+                # Local tmux only -- a remote session's identity is pinned
+                # by its own node, and probing this host's tmux for a name
+                # that lives elsewhere would either miss or, worse, match a
+                # DIFFERENT local session that happens to share the name.
+                info = (None if (node_id and node_id != LOCAL_NODE_ID)
+                        else self.terminal.tmux.get_session(target))
             except TmuxError:
                 info = None
             if info is not None:
@@ -858,13 +1007,43 @@ class SupervisorService:
                       "pinned_created_epoch": info.created_epoch}
         verifiers = tuple(required_verifiers) if required_verifiers is not None else None
         row, created = self.store.upsert_watch(kind, target, source=source,
-                                                required_verifiers=verifiers, **pin)
+                                                required_verifiers=verifiers,
+                                                node_id=node_id if kind == "session" else None, **pin)
         return {**self._watch_view(row), "created": created}
+
+    def _existing_watch_key(self, kind: str, target: str) -> str:
+        """The key of an ALREADY-PERSISTED watch, for callers that address
+        it by name (unwatch, completion token).
+
+        Legacy first, always: `session:<name>` is tried before any node
+        resolution, so an existing local row -- including every row
+        written before this feature existed -- is found by exactly the
+        lookup that always found it, with no controller call at all. Only
+        when no such row exists is the name resolved to a node and the
+        qualified key tried, which is what lets `supervisor_unwatch(
+        session="win2")` still address a watch that lives on dell-5530.
+
+        Falls back to the legacy key when nothing matches, so the caller
+        gets the same WATCH_NOT_FOUND (naming the key it looked for) that
+        it got before."""
+        legacy = watch_key(kind, target)
+        if kind == "binding" or self.store.get_watch(legacy) is not None:
+            return legacy
+        if "/" in target:
+            node_id, _, bare = target.partition("/")
+            return watch_key(kind, bare, node_id)
+        node_id, bare, ambiguity = self._resolve_watch_node(target)
+        if ambiguity is None and node_id:
+            qualified = watch_key(kind, bare, node_id)
+            if self.store.get_watch(qualified) is not None:
+                return qualified
+        return legacy
 
     def unwatch(self, binding: str | None = None, session: str | None = None, delete: bool = False) -> dict[str, Any]:
         if (binding is None) == (session is None):
             return {"error": "EXACTLY_ONE_TARGET_REQUIRED"}
-        key = watch_key("binding", binding) if binding is not None else watch_key("session", session)
+        key = (self._existing_watch_key("binding", binding) if binding is not None
+               else self._existing_watch_key("session", session))
         if delete:
             if not self.store.delete_watch(key):
                 return {"error": "WATCH_NOT_FOUND", "watch_key": key}
@@ -899,7 +1078,8 @@ class SupervisorService:
         with a fresh, unconsumed token."""
         if (binding is None) == (session is None):
             return {"error": "EXACTLY_ONE_TARGET_REQUIRED"}
-        key = watch_key("binding", binding) if binding is not None else watch_key("session", session)
+        key = (self._existing_watch_key("binding", binding) if binding is not None
+               else self._existing_watch_key("session", session))
         row = self.store.get_watch(key)
         if row is None:
             return {"error": "WATCH_NOT_FOUND", "watch_key": key}
@@ -1039,7 +1219,7 @@ class SupervisorService:
         try:
             if row["kind"] == "binding" and self.terminal.bindings.get(row["target"]) is None:
                 return False
-            result = self._status_for(row["kind"], row["target"])
+            result = self._status_for(row)
         except Exception:  # noqa: BLE001 -- a probe that raises is simply "not alive yet"
             return False
         if "error" in result:
@@ -1135,7 +1315,7 @@ class SupervisorService:
             if any(fnmatch.fnmatchcase(name, pattern) for pattern in self.config.watched_session_patterns):
                 self.store.upsert_watch("session", name, source="config_pattern")
 
-    def _status_for(self, kind: str, target: str) -> dict[str, Any]:
+    def _fleet_status_for(self, kind: str, target: str) -> dict[str, Any]:
         """The ONE place a watch's target is observed.
 
         Both polling and reconciliation go through here, deliberately: when
@@ -1196,7 +1376,21 @@ class SupervisorService:
             # verifier never looks at the pane at all).
             return self._run_verification(row, now_iso, iteration_count)
 
-        result = self._status_for(kind, target)
+        result = self._status_for(row)
+
+        if result.get("error") in NODE_UNAVAILABLE_ERRORS:
+            # The NODE could not be asked -- that says nothing about
+            # whether the session still exists, so this must never disable
+            # the watch or drop its node identity. The row stays ENABLED
+            # with its node_id intact, so the very next poll after the node
+            # comes back resumes this same watch rather than needing it to
+            # be re-created (and re-resolved, which would be impossible
+            # while the node is down).
+            return self._transition(row, now_iso, iteration_count, new_state="UNKNOWN",
+                                     event_type="watch_target_unavailable",
+                                     reason=f"{result['error']}: node temporarily unavailable, watch retained "
+                                            f"({result.get('detail', 'no detail')})",
+                                     output="", output_hash=row["last_output_hash"])
 
         if "error" in result:
             # Stop observing, but record WHY in a way reconciliation can act on.
@@ -1566,6 +1760,11 @@ class SupervisorService:
     def _watch_view(self, row: dict[str, Any]) -> dict[str, Any]:
         return {
             "watch_key": row["watch_key"], "kind": row["kind"], "target": row["target"],
+            # Node-aware identity. NULL/absent for a binding watch, a
+            # legacy row and a purely-local session -- so an existing
+            # consumer sees the same fields it always did, plus one that
+            # is None exactly where it used to have no concept at all.
+            "node_id": row.get("node_id"),
             "source": row["source"], "enabled": bool(row["enabled"]), "state": row["state"],
             # Explicit legacy adapter (status.py's to_legacy_state) -- see
             # _event_from_row's identical field for why this exists rather
