@@ -157,7 +157,7 @@ def test_valid_completion_marker_survives_idle_timeout(tmp_path, monkeypatch, st
     engine.reconcile_stale_active_tasks()
     monkeypatch.setattr("terminal_mcp.queue_engine.time.monotonic", lambda: 901.0)
     engine.reconcile_stale_active_tasks()
-    assert store.get_task(task_id).status == state
+    assert store.get_task(task_id).status == ("COMPLETED" if state == "VERIFYING" else state)
     assert not ops.sent
 
 

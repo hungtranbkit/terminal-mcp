@@ -75,6 +75,62 @@ def _make_task(store, session="lane-a", prompt="please do the real work carefull
     return task_id
 
 
+def _finished_worker(store, ops):
+    task_id = _make_task(store)
+    engine = QueueEngine(store, ops, coordinator=_always_ready_gate())
+    for _ in range(4):
+        engine.tick("lane-a")
+    marker = ops.sent[0]["text"].rstrip().splitlines()[-1]
+    ops.set_capture("lane-a", {"output": "Implemented and tested.\n" + marker})
+    return engine, task_id
+
+
+def test_contract_refusal_is_bounded_and_releases_claim(store, ops):
+    engine, task_id = _finished_worker(store, ops)
+    store.set_requirement_contract(task_id, requirements=[{"id": "coverage", "text": "Independent test evidence"}])
+    result = engine.tick("lane-a")
+    assert result.action == "BLOCKED"
+    task = store.get_task(task_id)
+    assert task.status == BLOCKED
+    assert "STALE_CONTRACT_VERSION" in task.last_error
+    assert task.claim_token is None
+    assert len(ops.sent) == 1
+
+
+def test_restart_sweep_finishes_existing_task_without_dispatch_opt_in(store, ops):
+    _, task_id = _finished_worker(store, ops)
+    restarted = QueueEngine(QueueStore(store.path), ops, coordinator=_always_ready_gate())
+    assert task_id in restarted.reconcile_stale_active_tasks()
+    assert store.get_task(task_id).status == COMPLETED
+    assert restarted.reconcile_stale_active_tasks() == []
+    assert len(ops.sent) == 1
+    next_id = store.append_tasks("lane-a", [{"prompt": "run the next correction safely"}])[0]
+    for _ in range(3):
+        restarted.tick("lane-a")
+    assert store.get_task(next_id).status == RUNNING
+    assert len(ops.sent) == 2
+
+
+def test_restart_sweep_does_not_complete_wrong_nonce(store, ops):
+    _, task_id = _finished_worker(store, ops)
+    marker = ops.capture_by_session["lane-a"]["output"]
+    ops.set_capture("lane-a", {"output": marker.replace(store.get_task(task_id).verification_nonce, "wrong")})
+    restarted = QueueEngine(QueueStore(store.path), ops, coordinator=_always_ready_gate())
+    assert restarted.reconcile_stale_active_tasks() == []
+    assert store.get_task(task_id).status == VERIFYING
+    assert len(ops.sent) == 1
+
+
+def test_verifier_exception_is_visible_and_does_not_hold_active_claim(store, ops, monkeypatch):
+    engine, task_id = _finished_worker(store, ops)
+    def fail(*args, **kwargs):
+        raise RuntimeError("verifier unavailable")
+    monkeypatch.setattr(store, "completion_decision", fail)
+    assert engine.tick("lane-a").action == "BLOCKED"
+    assert store.get_task(task_id).claim_token is None
+    assert "VERIFICATION_ERROR" in store.get_task(task_id).last_error
+
+
 # ---------------------------------------------------------------------------
 # IDLE / PAUSED
 # ---------------------------------------------------------------------------

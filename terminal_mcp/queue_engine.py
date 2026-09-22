@@ -61,7 +61,7 @@ from .coordinator import CoordinatorGate, OtherLaneSnapshot, SessionSnapshot
 from . import delivery_gate, retry_recovery
 from .queue_store import (
     BLOCKED, COMPLETED, DISPATCH_UNCERTAIN, DISPATCHING, FAILED, PRECHECK, QUEUED, READY, RUNNING, VERIFYING,
-    WAITING_SESSION, QueueStore, QueueTask, iso_now,
+    WAITING_SESSION, QueueStore, QueueTask, RequirementsNotCoveredError, iso_now,
 )
 from .status import COMPLETION_MARKER_RE, parse_completion_marker, verify_completion_marker
 from .request_governor import RequestGovernor
@@ -419,6 +419,14 @@ class QueueEngine:
                 observation = self.ops.terminal_status(task.session)
                 error = observation.get("error")
                 state = str(observation.get("state") or "").upper()
+                if not error and state == "IDLE" and task.status == VERIFYING:
+                    # Finish already-dispatched work even after a follower
+                    # restart or on a lane not opted into NEW dispatch.
+                    result = self._check_completion(task.session, task.id, VERIFYING)
+                    if result.action in {COMPLETED, BLOCKED}:
+                        recovered.append(task.id)
+                        self._inactive_active_observations.pop(task.id, None)
+                        continue
                 if error in SESSION_UNREACHABLE_ERRORS:
                     self._inactive_active_observations.pop(task.id, None)
                     updated = datetime.fromisoformat(task.updated_at.replace("Z", "+00:00"))
@@ -1115,7 +1123,25 @@ class QueueEngine:
             nonce_consumed=False,
         )
         if verified:
-            completed = self.store.mark_completed_with_evidence(task_id, evidence={"completion_marker": marker})
+            try:
+                completed = self.store.mark_completed_with_evidence(task_id, evidence={"completion_marker": marker})
+            except Exception as exc:
+                # A deterministic contract refusal used to escape to the
+                # follower, which retried it forever while holding capacity.
+                # Preserve the gate and expose the blocker, never replay work
+                # or turn a verifier error into successful completion.
+                if isinstance(exc, RequirementsNotCoveredError):
+                    reason = f"VERIFICATION_REQUIREMENTS: {exc}"
+                else:
+                    _LOGGER.exception("completion verification failed for %s", task_id)
+                    reason = f"VERIFICATION_ERROR: {type(exc).__name__}"
+                changed = self.store.recover_stale_active_task(task, to_status=BLOCKED, reason=reason)
+                if changed is None:
+                    current = self.store.get_task(task_id)
+                    return TickResult(session, current.status, task_id=task_id, detail="concurrent verification update")
+                if watch:
+                    self.store.update_long_task_watch(task_id, state="BLOCKED", blocker=reason, reason=reason)
+                return TickResult(session, BLOCKED, task_id=task_id, detail=reason)
             if watch:
                 self.store.update_long_task_watch(task_id, state="DONE", first_checkpoint_at=watch.get("first_checkpoint_at") or iso_now(),
                                                   last_progress_at=iso_now(), reason="verified_completion")
