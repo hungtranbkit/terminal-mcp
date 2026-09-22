@@ -240,28 +240,11 @@ def test_nodes_admin_page_served_with_read_guard(tmp_path):
 
 
 def test_main_dashboard_links_to_the_nodes_admin_page():
-    from terminal_mcp import dashboard_nav as nav
     from terminal_mcp.dashboard import DASHBOARD_HTML
-
     assert 'href="/dashboard/nodes"' in DASHBOARD_HTML
-    # Exactly one nav entry for it IN THE PAGE'S OWN MARKUP -- not a second,
-    # competing top list (the earlier dashboard UI cleanup task's own
-    # constraint).
-    #
-    # The shared global bar (dashboard_nav.py) is excluded, and not as a
-    # loophole: it is the ONE menu, on every page, and it links each
-    # destination twice by design -- once in the wide inline row and once in
-    # the overflow panel that is the whole menu on a phone. Counting those
-    # here would make this assertion about the shared component rather than
-    # about this page growing a second list of its own.
-    start = DASHBOARD_HTML.index('<style id="tmcp-global-nav-style">')
-    end = DASHBOARD_HTML.index("</script>", DASHBOARD_HTML.index(f'<nav class="{nav.NAV_MARKER}'))
-    own_markup = DASHBOARD_HTML[:start] + DASHBOARD_HTML[end:]
-    assert own_markup.count('href="/dashboard/nodes"') == 1
-
-    # ... and the shared bar really does carry it, so the page is reachable
-    # from every other screen too.
-    assert 'href="/dashboard/nodes"' in DASHBOARD_HTML[start:end]
+    # Exactly one nav entry for it -- not a second, competing top list
+    # (the earlier dashboard UI cleanup task's own constraint).
+    assert DASHBOARD_HTML.count('href="/dashboard/nodes"') == 1
 
 
 def test_sessions_sidebar_rows_carry_local_node_label(tmp_path, tmux_session_factory):

@@ -10110,6 +10110,19 @@ AI_USAGE_HTML = """<!doctype html>
     html, body { height:100%; margin:0 }
     body { font:14px/1.5 var(--mono); background:var(--bg); color:var(--text);
            display:grid; grid-template-columns:196px 1fr; grid-template-rows:auto 1fr }
+    /* THIS PAGE'S BODY IS A CSS GRID, and the shared global bar and its
+       breadcrumb are injected as its first children -- so the browser
+       auto-places them into the grid's own cells. Measured before this rule:
+       the bar rendered 196px wide and 161px tall instead of 44, the page grew
+       a third implicit column, and its 196px sidebar was squeezed to 17px.
+       Placing them by hand would mean this page's row numbers and the shell's
+       markup having to agree forever, so instead both are taken OUT of the
+       grid: fixed to the top, with the body reserving the space. Every other
+       page carries the bar in normal flow and needs none of this. */
+    body > .tmcp-nav, body > .tmcp-crumbs {
+      position:fixed; top:0; left:0; right:0; z-index:9999 }
+    body > .tmcp-crumbs { top:var(--tmcp-nav-h) }
+    body { padding-top:calc(var(--tmcp-nav-h) + 26px) }
     a { color:var(--accent) }
     header { grid-column:1/-1; display:flex; align-items:center; gap:12px; flex-wrap:wrap;
              padding:12px max(16px, env(safe-area-inset-right)) 12px max(16px, env(safe-area-inset-left));
@@ -13275,6 +13288,8 @@ for _page_name in ("DASHBOARD_HTML", "SESSIONS_ADMIN_HTML"):
         raise AssertionError(f"{_page_name} lost its /*__NODE_GROUP_JS__*/ marker")
     globals()[_page_name] = _page.replace("/*__NODE_GROUP_JS__*/", NODE_GROUP_JS, 1)
 del _page_name, _page
+
+
 
 
 def register_dashboard(server: MCPServer, terminal: TerminalService,

@@ -126,6 +126,20 @@ DESTRUCTIVE_PROMPT_PATTERNS = tuple(
         r"\bgit clean\b",
         r"merge (to |into )?main\b",
         r"push (to |origin )?main\b",
+        # Found by tests/test_coordinator_sensitive_patterns.py: each of
+        # these is an instruction to destroy or publish, in the same
+        # imperative shape as the eight above, and each one passed the
+        # gate untouched. Additions to this tier, never a relaxation of it.
+        r"\btruncate\s+table\b",
+        r"\bdd\s+if=",                    # dd if=/dev/zero of=/dev/sda
+        r"\bmkfs(?:\.\w+)?\b",
+        r"\bchmod\s+(?:-[a-zA-Z]+\s+)?777\b",
+        r"\bdeploy(?:ing|s)?\s+(?:it\s+)?to\s+(?:prod\b|production\b)",
+        # A credential FILE, which the tier-2 nouns deliberately do not
+        # name: ".env" is a path, not a word, so \b never anchors to it.
+        r"\bcommit(?:s|ting)?\b[^.\n]{0,24}\.env\b",
+        r"\.env\b[^.\n]{0,24}\b(?:into|in|to)\b[^.\n]{0,20}\b"
+        r"(?:git|repo(?:sitory)?|commit|source)",
     )
 )
 
@@ -162,14 +176,38 @@ SECRET_PROMPT_PATTERNS = (
 
 SENSITIVE_PROMPT_PATTERNS = DESTRUCTIVE_PROMPT_PATTERNS + SECRET_PROMPT_PATTERNS
 
+#: The NOUN-BASED screen, for scanning CONTENT rather than a REQUEST.
+#:
+#: These are the patterns the prompt screen above used to be. They were not
+#: wrong -- they were right for a different job, and deleting them took a
+#: working gate down with them.
+#:
+#: A task PROMPT is a person DESCRIBING work, where "token" and "credential"
+#: are ordinary vocabulary; that is what the action-shaped patterns above
+#: exist for. A DIFF is CONTENT: a bare `API_KEY = "sk-..."` in it is the
+#: finding itself, and there is no verb to look for. integration_reviewer.py
+#: reads a real diff, so it screens with these.
+#:
+#: Found by test: after the prompt screen became action-shaped,
+#: tests/test_integration_reviewer.py::test_sensitive_content_in_the_real_
+#: diff_blocks started returning READY for a commit that adds
+#: `API_KEY = "sk-super-secret-value"` -- the merge gate had silently stopped
+#: blocking secrets, because it was borrowing a list that had been re-aimed
+#: at a different kind of text.
 SENSITIVE_CONTENT_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
         r"enter (your |the )?password",
         r"api[_ -]?key",
         r"credential",
-        r"\bsecret\b",
-        r"\btoken\b",
+        # `\b` never anchors inside a SCREAMING_SNAKE name, because `_` is a
+        # word character -- so GITHUB_TOKEN and DB_SECRET read straight past a
+        # bare \btoken\b. In a diff those are exactly the shape to catch.
+        r"(?:\b|_)secrets?\b",
+        r"(?:\b|_)tokens?\b",
+        # In CONTENT, unlike in a request, a bare credential noun beside an
+        # assignment IS the finding; there is no verb to wait for.
+        r"(?:\b|_)passwords?\b",
         r"private[_ -]?key",
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
         r"force[ -]push",

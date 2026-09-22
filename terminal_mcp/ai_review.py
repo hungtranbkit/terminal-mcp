@@ -121,6 +121,7 @@ _PATTERN_APPROVAL_CLASS: tuple[tuple[str, str], ...] = (
     ("credential", APPROVAL_CREDENTIALS),
     (r"\bsecret\b", APPROVAL_CREDENTIALS),
     (r"\btoken\b", APPROVAL_CREDENTIALS),
+    (".env", APPROVAL_CREDENTIALS),            # the credential FILE, not a noun
     # -- destructive actions ------------------------------------------------
     ("force[ -]push", APPROVAL_DESTRUCTIVE),
     (r"\brm -rf\b", APPROVAL_DESTRUCTIVE),
@@ -142,6 +143,7 @@ _PATTERN_APPROVAL_CLASS: tuple[tuple[str, str], ...] = (
     ("push (to |origin )?main", APPROVAL_PROTECTED_DEPLOY),
     ("(?:main|master)", APPROVAL_PROTECTED_DEPLOY),
     ("(?:prod|production)", APPROVAL_PROTECTED_DEPLOY),
+    ("deploy", APPROVAL_PROTECTED_DEPLOY),
 )
 
 #: An explicit, deliberate marker a task (or a coordinator decision) can carry
