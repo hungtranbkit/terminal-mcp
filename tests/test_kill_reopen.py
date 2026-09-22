@@ -15,6 +15,8 @@ import time
 
 import pytest
 
+import tmux_isolation
+
 from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig, SessionLifecycleConfig
 from terminal_mcp.core import TerminalService
 
@@ -45,19 +47,53 @@ def _create_and_settle(service: TerminalService, name: str, agent_type: str, cwd
     return result
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _tmux_janitor():
+    """Recovers sessions from runs that could NOT clean up after
+    themselves (SIGKILL, crashed interpreter, reboot mid-suite) -- the
+    only leak class per-test teardown cannot reach.
+
+    Only ever touches names carrying this suite's ownership marker whose
+    creating process is gone; a user's session, another suite's leftover
+    (`test-http-secure`), and a concurrently-running lane's sessions are
+    all skipped. See tests/tmux_isolation.py."""
+    tmux_isolation.sweep_orphans()
+    yield
+    tmux_isolation.sweep_orphans()
+
+
 @pytest.fixture
 def cleanup_tmux():
+    """Registers a session name for teardown. Register BEFORE creating,
+    so an assertion failure/error/interrupt between registration and the
+    end of the test still cleans up -- fixture teardown runs on failure,
+    a statement at the end of a test body does not."""
     created: list[str] = []
     yield created.append
     for name in created:
-        subprocess.run(["tmux", "kill-session", "-t", name], check=False, capture_output=True)
+        tmux_isolation.kill_session(name)
 
 
-def test_kill_disposable_session_frees_tmux_and_saves_metadata(tmp_path, cleanup_tmux):
+@pytest.fixture
+def session_name(cleanup_tmux):
+    """Mints a session name unique to THIS run and registers it for
+    teardown in one step.
+
+    Unique because fixed names were the original defect: one leftover
+    `lifecycle-smoke-kill-1` made every later run fail with
+    SESSION_ALREADY_EXISTS, and two lanes running this suite at once
+    would fight over the same name."""
+    def make(slug: str) -> str:
+        name = tmux_isolation.owned_name(slug)
+        cleanup_tmux(name)
+        return name
+    return make
+
+
+def test_kill_disposable_session_frees_tmux_and_saves_metadata(tmp_path, session_name):
     config = _config(tmp_path)
     service = TerminalService(config, killed_sessions=_isolated_killed_store(tmp_path))
-    name = "lifecycle-smoke-kill-1"
-    cleanup_tmux(name)
+    name = session_name("smoke-kill-1")
     _create_and_settle(service, name, "shell", tmp_path)
     assert service.tmux.get_session(name) is not None
 
@@ -71,11 +107,10 @@ def test_kill_disposable_session_frees_tmux_and_saves_metadata(tmp_path, cleanup
     assert service.tmux.get_session(name) is None
 
 
-def test_kill_requires_confirm_name_match(tmp_path, cleanup_tmux):
+def test_kill_requires_confirm_name_match(tmp_path, session_name):
     config = _config(tmp_path)
     service = TerminalService(config, killed_sessions=_isolated_killed_store(tmp_path))
-    name = "lifecycle-smoke-kill-confirm"
-    cleanup_tmux(name)
+    name = session_name("smoke-kill-confirm")
     _create_and_settle(service, name, "shell", tmp_path)
 
     result = service.terminal_kill_session(name, "not-the-right-name")
@@ -84,11 +119,12 @@ def test_kill_requires_confirm_name_match(tmp_path, cleanup_tmux):
     assert service.tmux.get_session(name) is not None
 
 
-def test_kill_refuses_protected_session_even_with_correct_confirm(tmp_path, cleanup_tmux):
-    config = _config(tmp_path, protected=("lifecycle-protected-sim",))
+def test_kill_refuses_protected_session_even_with_correct_confirm(tmp_path, session_name):
+    # The name is minted FIRST: it is unique per run, so the protected
+    # list has to be built from it rather than from a literal.
+    name = session_name("protected-sim")
+    config = _config(tmp_path, protected=(name,))
     service = TerminalService(config, killed_sessions=_isolated_killed_store(tmp_path))
-    name = "lifecycle-protected-sim"
-    cleanup_tmux(name)
     subprocess.run(["tmux", "new-session", "-d", "-s", name, "bash"], check=True)
     time.sleep(0.2)
 
@@ -110,10 +146,11 @@ def test_terminal_mcp_itself_cannot_be_accidentally_killed(tmp_path):
     assert result == {"error": "SESSION_PROTECTED", "session": "terminal-mcp"}
 
 
-def test_kill_already_gone_is_idempotent_and_saves_no_metadata(tmp_path):
+def test_kill_already_gone_is_idempotent_and_saves_no_metadata(tmp_path, session_name):
     config = _config(tmp_path)
     service = TerminalService(config, killed_sessions=_isolated_killed_store(tmp_path))
-    result = service.terminal_kill_session("lifecycle-never-existed", "lifecycle-never-existed")
+    name = session_name("never-existed")
+    result = service.terminal_kill_session(name, name)
     assert result["deleted"] is False
     assert result["action"] == "already_gone"
     assert result["reopen_metadata"] is None
@@ -121,11 +158,10 @@ def test_kill_already_gone_is_idempotent_and_saves_no_metadata(tmp_path):
 
 # -- Reopen -----------------------------------------------------------------
 
-def test_reopen_from_saved_metadata_recreates_same_name_cwd_agent(tmp_path, cleanup_tmux):
+def test_reopen_from_saved_metadata_recreates_same_name_cwd_agent(tmp_path, session_name):
     config = _config(tmp_path)
     service = TerminalService(config, killed_sessions=_isolated_killed_store(tmp_path))
-    name = "lifecycle-smoke-reopen-1"
-    cleanup_tmux(name)
+    name = session_name("smoke-reopen-1")
     _create_and_settle(service, name, "shell", tmp_path)
     killed = service.terminal_kill_session(name, name)
     assert killed["reopen_metadata"]["metadata_complete"] is True
@@ -138,11 +174,10 @@ def test_reopen_from_saved_metadata_recreates_same_name_cwd_agent(tmp_path, clea
     assert service.tmux.get_session(name) is not None
 
 
-def test_reopen_is_a_new_process_not_a_resurrection(tmp_path, cleanup_tmux):
+def test_reopen_is_a_new_process_not_a_resurrection(tmp_path, session_name):
     config = _config(tmp_path)
     service = TerminalService(config, killed_sessions=_isolated_killed_store(tmp_path))
-    name = "lifecycle-smoke-reopen-identity"
-    cleanup_tmux(name)
+    name = session_name("smoke-reopen-identity")
     _create_and_settle(service, name, "shell", tmp_path)
     before = service.tmux.get_session(name)
     service.terminal_kill_session(name, name)
@@ -154,11 +189,10 @@ def test_reopen_is_a_new_process_not_a_resurrection(tmp_path, cleanup_tmux):
     assert after.pane_pid != before.pane_pid
 
 
-def test_reopen_clears_metadata_after_success(tmp_path, cleanup_tmux):
+def test_reopen_clears_metadata_after_success(tmp_path, session_name):
     config = _config(tmp_path)
     service = TerminalService(config, killed_sessions=_isolated_killed_store(tmp_path))
-    name = "lifecycle-smoke-reopen-clear"
-    cleanup_tmux(name)
+    name = session_name("smoke-reopen-clear")
     _create_and_settle(service, name, "shell", tmp_path)
     service.terminal_kill_session(name, name)
     assert service.killed_sessions.get(name) is not None
@@ -166,31 +200,40 @@ def test_reopen_clears_metadata_after_success(tmp_path, cleanup_tmux):
     assert service.killed_sessions.get(name) is None
 
 
-def test_reopen_without_metadata_and_no_override_fails_clearly_not_a_guess(tmp_path):
+def test_reopen_without_metadata_and_no_override_fails_clearly_not_a_guess(tmp_path, session_name):
     config = _config(tmp_path)
     service = TerminalService(config, killed_sessions=_isolated_killed_store(tmp_path))
-    result = service.terminal_reopen_session("lifecycle-never-killed")
-    assert result == {"error": "REOPEN_METADATA_INCOMPLETE", "session": "lifecycle-never-killed",
+    name = session_name("never-killed")
+    result = service.terminal_reopen_session(name)
+    assert result == {"error": "REOPEN_METADATA_INCOMPLETE", "session": name,
                       "missing": ["agent_type"]}
 
 
-def test_reopen_with_agent_type_but_no_cwd_reports_missing_cwd(tmp_path):
+def test_reopen_with_agent_type_but_no_cwd_reports_missing_cwd(tmp_path, session_name):
     config = _config(tmp_path)
     service = TerminalService(config, killed_sessions=_isolated_killed_store(tmp_path))
-    result = service.terminal_reopen_session("lifecycle-partial", agent_type="claude")
-    assert result == {"error": "REOPEN_METADATA_INCOMPLETE", "session": "lifecycle-partial",
+    name = session_name("partial")
+    result = service.terminal_reopen_session(name, agent_type="claude")
+    assert result == {"error": "REOPEN_METADATA_INCOMPLETE", "session": name,
                       "missing": ["working_directory"]}
 
 
-def test_reopen_shell_needs_no_cwd_override(tmp_path):
+def test_reopen_shell_needs_no_cwd_override(tmp_path, session_name):
+    # This test is where the whole isolation defect came from: it creates
+    # a REAL session and used to clean it up with a bare statement at the
+    # END of the body, under a FIXED name. Any failure skipped the
+    # cleanup, and the leaked session then made this same test fail
+    # SESSION_ALREADY_EXISTS on every subsequent run -- self-perpetuating.
+    # Registering the (now unique) name up front puts the kill in fixture
+    # teardown, which runs on failure too.
     config = _config(tmp_path)
     service = TerminalService(config, killed_sessions=_isolated_killed_store(tmp_path))
-    result = service.terminal_reopen_session("lifecycle-shell-only", agent_type="shell")
+    name = session_name("shell-only")
+    result = service.terminal_reopen_session(name, agent_type="shell")
     assert result.get("state") == "READY"
-    subprocess.run(["tmux", "kill-session", "-t", "lifecycle-shell-only"], check=False, capture_output=True)
 
 
-def test_reopen_with_explicit_override_bypasses_incomplete_saved_metadata(tmp_path, cleanup_tmux):
+def test_reopen_with_explicit_override_bypasses_incomplete_saved_metadata(tmp_path, session_name):
     # Simulate a "legacy"/unmanaged session: created directly via raw tmux
     # (never through terminal_create_session), running a command that
     # matches no known launcher and isn't a plain shell -- pane_current_
@@ -198,8 +241,7 @@ def test_reopen_with_explicit_override_bypasses_incomplete_saved_metadata(tmp_pa
     # metadata (this is exactly the "unknown/legacy session" scenario).
     config = _config(tmp_path)
     service = TerminalService(config, killed_sessions=_isolated_killed_store(tmp_path))
-    name = "lifecycle-legacy-unmanaged"
-    cleanup_tmux(name)
+    name = session_name("legacy-unmanaged")
     subprocess.run(["tmux", "new-session", "-d", "-s", name, "-c", str(tmp_path), "sleep 300"], check=True)
     time.sleep(0.3)
 
@@ -221,11 +263,10 @@ def test_reopen_with_explicit_override_bypasses_incomplete_saved_metadata(tmp_pa
 
 # -- listing / self-healing --------------------------------------------------
 
-def test_list_killed_sessions_shows_entry_until_reopened(tmp_path, cleanup_tmux):
+def test_list_killed_sessions_shows_entry_until_reopened(tmp_path, session_name):
     config = _config(tmp_path)
     service = TerminalService(config, killed_sessions=_isolated_killed_store(tmp_path))
-    name = "lifecycle-smoke-list-1"
-    cleanup_tmux(name)
+    name = session_name("smoke-list-1")
     _create_and_settle(service, name, "shell", tmp_path)
     service.terminal_kill_session(name, name)
 
@@ -237,11 +278,10 @@ def test_list_killed_sessions_shows_entry_until_reopened(tmp_path, cleanup_tmux)
     assert not any(entry["name"] == name for entry in listed_after["killed_sessions"])
 
 
-def test_list_killed_sessions_self_heals_when_name_reused_outside_reopen(tmp_path, cleanup_tmux):
+def test_list_killed_sessions_self_heals_when_name_reused_outside_reopen(tmp_path, session_name):
     config = _config(tmp_path)
     service = TerminalService(config, killed_sessions=_isolated_killed_store(tmp_path))
-    name = "lifecycle-smoke-reused"
-    cleanup_tmux(name)
+    name = session_name("smoke-reused")
     _create_and_settle(service, name, "shell", tmp_path)
     service.terminal_kill_session(name, name)
     assert service.killed_sessions.get(name) is not None
@@ -319,8 +359,8 @@ def test_dashboard_kill_route_requires_cloudflare_access_when_configured():
     assert response.json()["error"] == "CLOUDFLARE_ACCESS_VERIFICATION_FAILED"
 
 
-def test_dashboard_kill_route_refuses_protected_session(tmp_path):
-    name = "lifecycle-protected-dashboard-kill"
+def test_dashboard_kill_route_refuses_protected_session(tmp_path, session_name):
+    name = session_name("protected-dashboard-kill")
     config = _config(tmp_path, protected=(name,))
     client, service = _dashboard_client(config)
     import subprocess, time
@@ -332,14 +372,13 @@ def test_dashboard_kill_route_refuses_protected_session(tmp_path):
         assert response.json()["error"] == "SESSION_PROTECTED"
         assert service.tmux.get_session(name) is not None
     finally:
-        subprocess.run(["tmux", "kill-session", "-t", name], check=False, capture_output=True)
+        tmux_isolation.kill_session(name)
 
 
-def test_dashboard_kill_route_requires_matching_confirm_name(tmp_path, cleanup_tmux):
+def test_dashboard_kill_route_requires_matching_confirm_name(tmp_path, session_name):
     config = _config(tmp_path)
     client, service = _dashboard_client(config)
-    name = "lifecycle-dashboard-confirm"
-    cleanup_tmux(name)
+    name = session_name("dashboard-confirm")
     _create_and_settle(service, name, "shell", tmp_path)
     response = client.post("/dashboard/api/session/kill", json={"name": name, "confirm_name": "typo"})
     assert response.status_code == 400
@@ -347,11 +386,10 @@ def test_dashboard_kill_route_requires_matching_confirm_name(tmp_path, cleanup_t
     assert service.tmux.get_session(name) is not None
 
 
-def test_dashboard_kill_then_reopen_round_trip(tmp_path, cleanup_tmux):
+def test_dashboard_kill_then_reopen_round_trip(tmp_path, session_name):
     config = _config(tmp_path)
     client, service = _dashboard_client(config)
-    name = "lifecycle-dashboard-roundtrip"
-    cleanup_tmux(name)
+    name = session_name("dashboard-roundtrip")
     _create_and_settle(service, name, "shell", tmp_path)
 
     killed = client.post("/dashboard/api/session/kill", json={"name": name, "confirm_name": name})
@@ -385,28 +423,27 @@ def test_dashboard_rename_route_rejects_cross_origin_request(tmp_path):
     assert response.json()["error"] == "ORIGIN_NOT_ALLOWED"
 
 
-def test_dashboard_rename_route_refuses_protected_session(tmp_path):
-    name = "lifecycle-protected-dashboard-rename"
+def test_dashboard_rename_route_refuses_protected_session(tmp_path, session_name):
+    name = session_name("protected-dashboard-rename")
     config = _config(tmp_path, protected=(name,))
     client, service = _dashboard_client(config)
     import subprocess, time
     subprocess.run(["tmux", "new-session", "-d", "-s", name, "bash"], check=True)
     time.sleep(0.2)
     try:
-        response = client.post("/dashboard/api/session/rename", json={"name": name, "new_name": "lifecycle-newname"})
+        response = client.post("/dashboard/api/session/rename", json={"name": name, "new_name": session_name("newname")})
         assert response.status_code == 403
         assert response.json()["error"] == "SESSION_PROTECTED"
         assert service.tmux.get_session(name) is not None
-        assert service.tmux.get_session("lifecycle-newname") is None
+        assert service.tmux.get_session(tmux_isolation.owned_name("newname")) is None
     finally:
-        subprocess.run(["tmux", "kill-session", "-t", name], check=False, capture_output=True)
+        tmux_isolation.kill_session(name)
 
 
-def test_dashboard_rename_route_rejects_missing_new_name(tmp_path, cleanup_tmux):
+def test_dashboard_rename_route_rejects_missing_new_name(tmp_path, session_name):
     config = _config(tmp_path)
     client, service = _dashboard_client(config)
-    name = "lifecycle-dashboard-rename-invalid"
-    cleanup_tmux(name)
+    name = session_name("dashboard-rename-invalid")
     _create_and_settle(service, name, "shell", tmp_path)
     response = client.post("/dashboard/api/session/rename", json={"name": name})
     assert response.status_code == 400
@@ -414,13 +451,13 @@ def test_dashboard_rename_route_rejects_missing_new_name(tmp_path, cleanup_tmux)
     assert service.tmux.get_session(name) is not None
 
 
-def test_dashboard_rename_route_round_trip(tmp_path, cleanup_tmux):
+def test_dashboard_rename_route_round_trip(tmp_path, session_name):
     config = _config(tmp_path)
     client, service = _dashboard_client(config)
-    name = "lifecycle-dashboard-rename-src"
-    new_name = "lifecycle-dashboard-rename-dst"
-    cleanup_tmux(name)
-    cleanup_tmux(new_name)
+    name = session_name("dashboard-rename-src")
+    # Registered too: after a successful rename the session exists under
+    # the NEW name, so that is what teardown has to be able to kill.
+    new_name = session_name("dashboard-rename-dst")
     _create_and_settle(service, name, "shell", tmp_path)
 
     response = client.post("/dashboard/api/session/rename", json={"name": name, "new_name": new_name})
