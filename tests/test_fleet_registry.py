@@ -337,6 +337,62 @@ def test_no_pane_text_or_prompt_is_projected(store):
     assert "dangerously" not in flat
 
 
+def test_legacy_local_session_projection_keeps_canonical_owner_after_adoption(tmp_path):
+    """Regression for the HP fleet-loop traceback seen on 2026-09-19.
+
+    The registry migration has already adopted this machine's old
+    ``owner_node="local"`` rows as ``hp-linux``. A still-legacy session
+    registry record must not try to take that object back as owner ``local``.
+    """
+    path = tmp_path / "fleet.db"
+    legacy = FleetRegistryStore(path, local_node_id="local")
+    record = _Record(node_id="local", stable_session_id="uuid-legacy",
+                     session_name="legacy", status="ACTIVE")
+    project_sessions(legacy, [record])
+    assert legacy.get(KIND_SESSION, "session:local:uuid-legacy").owner_node == "local"
+
+    canonical = FleetRegistryStore(path, local_node_id="hp-linux")
+    adopted = canonical.get(KIND_SESSION, "session:local:uuid-legacy")
+    assert adopted.owner_node == "hp-linux"
+
+    assert project_sessions(canonical, [record], local_node_id="hp-linux") == 1
+    after = canonical.get(KIND_SESSION, "session:local:uuid-legacy")
+    assert after.owner_node == "hp-linux"
+    assert after.object_id == "session:local:uuid-legacy", \
+        "keeping the legacy id avoids creating a duplicate session"
+
+
+def test_controller_session_projection_skips_foreign_sessions_and_deletes(tmp_path):
+    """A fleet-wide listing is read-only evidence for sessions owned by peers."""
+    store = FleetRegistryStore(tmp_path / "fleet.db", local_node_id="hp-linux")
+    foreign = _Record(node_id="dell-linux", stable_session_id="remote-1",
+                      session_name="remote", status="ACTIVE")
+    assert project_sessions(store, [foreign], local_node_id="hp-linux") == 0
+    assert store.get(KIND_SESSION, "session:dell-linux:remote-1") is None
+
+    store.publish(KIND_SESSION, "session:dell-linux:remote-1",
+                  {"stable_session_id": "remote-1", "node_id": "dell-linux",
+                   "session_name": "remote"}, owner_node="dell-linux")
+    foreign.status = "DELETED"
+    assert project_sessions(store, [foreign], local_node_id="hp-linux") == 0
+    assert store.get(KIND_SESSION, "session:dell-linux:remote-1").deleted is False
+
+
+def test_fleet_refresh_handles_legacy_local_session_without_projector_error(tmp_path):
+    path = tmp_path / "fleet.db"
+    legacy = FleetRegistryStore(path, local_node_id="local")
+    record = _Record(node_id="local", stable_session_id="uuid-legacy",
+                     session_name="legacy", status="ACTIVE")
+    project_sessions(legacy, [record])
+
+    store = FleetRegistryStore(path, local_node_id="hp-linux")
+    service = FleetService(store, local_node_id="hp-linux")
+    summary = service.refresh_local(sessions=[record], include_ssh_config=False, network={})
+
+    assert summary["sessions"] == 1
+    assert "sessions" not in summary.get("errors", {})
+    assert store.get(KIND_SESSION, "session:local:uuid-legacy").owner_node == "hp-linux"
+
 # -- sync ---------------------------------------------------------------------
 
 def _pair(tmp_path):
