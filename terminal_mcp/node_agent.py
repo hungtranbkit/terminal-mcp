@@ -938,6 +938,23 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
         ))
         return JSONResponse(result)
 
+    async def audit_list(request: Request) -> JSONResponse:
+        # Same require_auth gate as every other node route -- a fleet
+        # audit read is exactly as privileged as reading this node's own
+        # audit locally, and aggregation must not become a way around
+        # that. Returns what TerminalService already returns: sanitized
+        # previews and fingerprints, never raw prompt text.
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        params = request.query_params
+        limit_raw = params.get("limit")
+        result = await anyio.to_thread.run_sync(lambda: client.audit_list(
+            limit=int(limit_raw) if limit_raw else 50,
+            binding=params.get("binding"), session=params.get("session"),
+            at_or_before=params.get("at_or_before"),
+        ))
+        return JSONResponse(result)
+
     async def watchdog_events(request: Request) -> JSONResponse:
         if (blocked := require_auth(request)) is not None:
             return blocked
@@ -1070,6 +1087,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
         Route("/v1/knowledge/timeline/{name}", knowledge_timeline, methods=["GET"]),
         Route("/v1/knowledge/recover/{name}", knowledge_recover, methods=["GET"]),
         Route("/v1/knowledge/checkpoint/{name}", knowledge_checkpoint, methods=["POST"]),
+        Route("/v1/audit", audit_list, methods=["GET"]),
         Route("/v1/watchdog/events", watchdog_events, methods=["GET"]),
         Route("/v1/watchdog/acknowledge/{event_id}", watchdog_acknowledge, methods=["POST"]),
         Route("/v1/internal/shutdown", internal_shutdown, methods=["POST"]),

@@ -83,7 +83,7 @@ def test_repeated_idle_polls_reach_stall_timeout(store, tmp_path, monkeypatch):
     runner.run(**args)
     ops.sessions["harness-local"].state = "IDLE"
     clock = [0.0]
-    monkeypatch.setattr("terminal_mcp.harness_runner.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("time.monotonic", lambda: clock[0])
     for now in (0.0, 30.0, 59.0):
         clock[0] = now
         assert runner.run(**args).pending
@@ -104,7 +104,7 @@ def test_progress_or_uncertainty_resets_idle_timeout(store, tmp_path, monkeypatc
     session = ops.sessions["harness-local"]
     session.state = "IDLE"
     clock = [0.0]
-    monkeypatch.setattr("terminal_mcp.harness_runner.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("time.monotonic", lambda: clock[0])
     assert runner.run(**args).pending
     clock[0] = 59.0
     if progress == "output":

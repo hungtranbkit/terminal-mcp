@@ -125,6 +125,8 @@ file count from `ls tests/*.py`), not recalled from memory.
 | AI Usage (read-only, local AI Usage Monitor integration) | VERIFIED_LIVE (real browser smoke, real live data) |
 | Work efficiency telemetry (per-task counters + aggregation/savings) | IMPLEMENTED_NOT_LIVE_VERIFIED (runtime-driven rows + tests; not yet attached in a live deployment — the attach call is the coordinator's central wiring) |
 | Token-efficiency benchmark (18 real bugs from git + 2 synthetic) | MEASURED, 2026-09-14 — headline verdict **FAIL** against its own pre-registered bar; see `docs/TOKEFF_BENCHMARK.md` |
+
+| Fleet audit aggregation read path (blg_178d7b6506b7) | TESTING (35 tests green; no real 2-node run, not deployed) |
 | Unified Task System §20 (Kanban/PM/Planner/git isolation/Phase A-E) | VERIFIED — see §20 itself for the exact per-slice scope |
 | Work Mode: a planner claim briefs itself (similar-bug retrieval + module context pack, paths verified) | VERIFIED (V1) |
 | Work Mode: the budget and the gate constrain a REAL run (dogfood, `dogfood` runbook) | VERIFIED (dogfood; see its own "what is not claimed" note) |
@@ -4576,6 +4578,81 @@ and was correctly left `KEY_NOT_ALLOWED` rather than widened for this.
   number for it would have been worse than saying so (see Backlog);
   (4) the corpus is one repository's history, so nothing here generalises
   beyond it.
+
+### Fleet audit aggregation (read-only, blg_178d7b6506b7)
+
+- **Goal / user value:** answer "who sent what, where" across the fleet in
+  one call instead of opening N per-node `audit.db` files.
+- **Status:** TESTING (2026-09-14). 35 tests green. NOT run against a real
+  second node and NOT deployed — every multi-node assertion here uses a
+  FakeNodeClient, so the real HTTP path is covered only by an in-process
+  Starlette TestClient.
+- **Audit first.** `input_audit.id` is a per-node `AUTOINCREMENT`, so id 41
+  exists on every node and means something different on each — ids alone
+  can neither identify nor dedupe a fleet row. The fleet transport and the
+  per-node-failure convention already existed
+  (`controller.terminal_knowledge_search_fleet`), including the documented
+  trap that a remote node reports its own rows as `node_id: "local"` and a
+  `setdefault` silently mislabels them. There was no audit RPC, so exactly
+  one read method was added to the existing transport.
+- **Architecture: pull, not replication.** Nothing is copied, shipped or
+  mirrored; each node's `audit.db` stays its own source of truth and this
+  path never writes. A read-time scatter-gather answers the question
+  without inheriting an aggregation store's retention/backfill/drift
+  problems. `fleet_audit.py` holds the pure merge (ordering, dedupe,
+  cursors) so it is testable without a controller or a network.
+- **Identity/provenance:** every row carries `node_id` (the controller's
+  id for the serving node, always an OVERWRITE), `node_row_id` (the
+  node's own id, preserved) and `audit_uid` (`"node:rowid"`).
+- **Dedupe/idempotency:** keyed on `audit_uid`. The same node answering
+  twice contributes each row once; two different nodes both holding local
+  id 41 contribute two distinct rows — the case a dedupe on `id` would
+  silently destroy.
+- **Ordering:** `(timestamp DESC, node_id ASC, node_row_id DESC)` — a
+  total order, so the same fleet state always yields the same page
+  regardless of which node answered first.
+- **Pagination:** opaque cursor over that same key (offset paging over an
+  append-heavy table returns duplicates and holes). A FULL page always
+  returns a cursor; only a short page proves exhaustion, so a caller loops
+  until `next_cursor` is null and pays one final empty request.
+- **Partial results:** an offline/unreachable/erroring node contributes
+  zero rows, is named in `nodes`/`node_errors`, and flips
+  `complete: false` — it never fails the read. A partial page that looks
+  complete is the failure mode being engineered against.
+- **Freshness:** per-node `fetched_at`. A fleet read is N point-in-time
+  reads of N independent databases, never a consistent snapshot, and this
+  is reported rather than implied.
+- **Auth:** the node route `GET /v1/audit` sits behind the SAME
+  `require_auth` bearer gate as every other node route, and the local node
+  is served through `TerminalService.terminal_list_input_audit` — the same
+  code path and the same limit validation as a local read, so aggregation
+  is never a way around either.
+- **No secret payload expansion:** the delta is exactly three provenance
+  fields. What travels is what `AuditStore.list()` already returned —
+  `text_preview` (redacted and truncated at write time by
+  `sanitized_preview`) and `text_sha256`. A test asserts the aggregated
+  field set is the local set plus those three, and nothing else.
+- **Files:** `terminal_mcp/fleet_audit.py` (new),
+  `controller.terminal_audit_fleet`, `node_client.audit_list` (Protocol +
+  Local + Remote), `node_agent` `GET /v1/audit`, `AuditStore.list`'s
+  optional `at_or_before`, `core.terminal_list_input_audit` passthrough,
+  MCP tool `terminal_list_input_audit_fleet` (tool count 202 -> 203).
+- **Acceptance/tests:** `tests/test_fleet_audit.py` (17) and
+  `tests/test_fleet_audit_controller.py` (18) — 2+ nodes, duplicate ids
+  across nodes, offline/unreachable/erroring nodes, cursor paging across
+  nodes, local-only compatibility, deterministic ordering independent of
+  response order, auth refusal, payload shape.
+- **Known limitations:** (1) ordering uses each node's own wall clock, so
+  clock skew between nodes reorders rows at the boundary — there is no
+  logical clock in `input_audit` to use instead; (2) an offline node's
+  rows are simply absent, and no history is retained for it (the case that
+  would justify a real aggregation store later); (3) `input_audit` has no
+  index on `timestamp`, so the paging filter is a scan — fine at the 500-
+  row cap, worth an index if this becomes a hot path; (4) no dashboard
+  surface yet, MCP tool only; (5) not exercised against a real remote
+  node.
+
+---
 
 ## Backlog (explicitly not done yet — tracked here so it isn't re-discovered)
 

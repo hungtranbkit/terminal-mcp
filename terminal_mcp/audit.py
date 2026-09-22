@@ -291,17 +291,18 @@ class AuditStore:
         return json.loads(row["result_json"])
 
     def list(self, limit: int = 50, binding: str | None = None,
-             session: str | None = None) -> list[dict[str, Any]]:
+             session: str | None = None, *, at_or_before: str | None = None) -> list[dict[str, Any]]:
         """The original, unchanged signature -- every existing caller keeps
         working. `search()` below is the one operators should use."""
-        return self.search(limit=limit, binding=binding, session=session)["events"]
+        return self.search(limit=limit, binding=binding, session=session,
+                           until=at_or_before, timestamp_order=at_or_before is not None)["events"]
 
     def search(self, *, limit: int = 50, offset: int = 0, binding: str | None = None,
                session: str | None = None, actor: str | None = None,
                action: str | None = None, result: str | None = None,
                node_id: str | None = None, since: str | None = None,
                until: str | None = None, query: str | None = None,
-               denied_only: bool = False) -> dict[str, Any]:
+               denied_only: bool = False, timestamp_order: bool = False) -> dict[str, Any]:
         """Find the rows that explain an incident.
 
         Without this the log was a 50-row reverse-chronological list with no
@@ -353,7 +354,8 @@ class AuditStore:
             total = connection.execute(
                 "SELECT COUNT(*) FROM input_audit" + where, params).fetchone()[0]
             rows = connection.execute(
-                "SELECT * FROM input_audit" + where + " ORDER BY id DESC LIMIT ? OFFSET ?",
+                "SELECT * FROM input_audit" + where +
+                (" ORDER BY timestamp DESC, id DESC" if timestamp_order else " ORDER BY id DESC") + " LIMIT ? OFFSET ?",
                 (*params, limit, offset)).fetchall()
         events = []
         for row in rows:
