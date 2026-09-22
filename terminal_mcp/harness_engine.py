@@ -101,6 +101,23 @@ class AgentResult:
     infra_failure: bool = False
     error: str | None = None
     completion_tokens_estimate: int = 0
+    #: The work is IN FLIGHT. The engine records that and returns; it does
+    #: not wait, sleep or loop. A real agent takes minutes, and a blocking
+    #: call holds a thread across a controller restart it cannot survive --
+    #: after which "a builder is running" is gone and the recovery is to send
+    #: the prompt again, to an agent that is still working.
+    pending: bool = False
+    dispatch_id: str | None = None
+    artifact_path: str | None = None
+    session_reused: bool = False
+    #: The blocker is a person, not the fleet. Retrying spawns another session
+    #: that asks the same question, so this goes straight to the human list
+    #: instead of through the infra-failure counter.
+    needs_permission: bool = False
+    #: True only on the send that actually went out. A poll of work already
+    #: dispatched sets it False, which is what stops one LLM call being
+    #: charged once per observation.
+    newly_dispatched: bool = False
 
 
 class AgentRunner(Protocol):
@@ -113,7 +130,15 @@ class AgentRunner(Protocol):
     """
 
     def run(self, *, role: str, prompt: "ctx.Prompt", run: Any, tier: str,
-            session_id: str | None, iteration: int) -> AgentResult: ...
+            session_id: str | None, iteration: int) -> AgentResult:
+        """Dispatch, or resolve what this stage already has in flight.
+
+        MUST be idempotent per (run, iteration, role). The engine may step the
+        same stage any number of times -- a restart, an operator, a tick --
+        and only the first of those may send a prompt. A runner that sends on
+        every call duplicates work into an agent that is still running.
+        """
+        ...
 
 
 @dataclass
@@ -294,6 +319,10 @@ class StepOutcome:
     action: str
     detail: dict[str, Any] = field(default_factory=dict)
     llm_called: bool = False
+    #: An agent is working. `drive()` stops on this rather than stepping
+    #: again -- stepping a pending stage only re-reads a pane, and doing that
+    #: in a tight loop is the polling this design exists to avoid.
+    pending: bool = False
 
     @property
     def done(self) -> bool:
@@ -304,7 +333,8 @@ class StepOutcome:
     def to_dict(self) -> dict[str, Any]:
         return {"run_id": self.run_id, "from_stage": self.from_stage,
                 "to_stage": self.to_stage, "action": self.action,
-                "llm_called": self.llm_called, "detail": self.detail}
+                "llm_called": self.llm_called, "pending": self.pending,
+                "detail": self.detail}
 
 
 class HarnessEngine:
@@ -436,7 +466,7 @@ class HarnessEngine:
         for _ in range(max_steps):
             outcome = self.step(run_id)
             outcomes.append(outcome)
-            if outcome.action == "idle" or outcome.done:
+            if outcome.action == "idle" or outcome.done or outcome.pending:
                 break
         return outcomes
 
@@ -479,9 +509,12 @@ class HarnessEngine:
                                ambiguous=bool(run.policy.get("critical_areas")))
         result = self.runner.run(role=policy.PLANNER, prompt=prompt, run=run,
                                  tier=tier, session_id=None, iteration=0)
-        self.assembler.charge(run.id, prompt,
-                              completion_estimate=result.completion_tokens_estimate)
+        self._charge(run, prompt, result)
+        if result.pending:
+            return self._awaiting(run, policy.PLANNER, result, 0)
         if result.infra_failure:
+            if result.needs_permission:
+                return self.record_permission_blocker(run.id, result.error or "")
             return self.record_infra_failure(run.id, result.error or "planner failed")
         try:
             contract = self._contract_from_payload(run, result.payload, acceptance, checks)
@@ -586,19 +619,28 @@ class HarnessEngine:
         result = self.runner.run(role=policy.BUILDER, prompt=prompt, run=run, tier=tier,
                                  session_id=run.builder_session_id if reused else None,
                                  iteration=iteration)
-        self.assembler.charge(run.id, prompt,
-                              completion_estimate=result.completion_tokens_estimate)
-        self.store.bump_efficiency(
-            run.id, session_reused=1 if reused else 0,
-            sessions_spawned=0 if reused else 1,
-            decision=("builder session reused (delta prompt)" if prompt.delta
-                      else "builder session fresh (full prompt)"))
+        self._charge(run, prompt, result)
+        if result.dispatch_id is None or result.newly_dispatched:
+            # Counted where the decision was actually taken. A real runner
+            # reports what it DID with the session, which can differ from what
+            # the prompt shape assumed -- it may have found the bound session
+            # unhealthy and spawned instead.
+            actually_reused = result.session_reused if result.dispatch_id else reused
+            self.store.bump_efficiency(
+                run.id, session_reused=1 if actually_reused else 0,
+                sessions_spawned=0 if actually_reused else 1,
+                decision=("builder session reused (delta prompt)" if prompt.delta
+                          else "builder session fresh (full prompt)"))
+        if result.pending:
+            return self._awaiting(run, policy.BUILDER, result, iteration)
         if result.session_id:
             self.store.patch_run(run.id, builder_session_id=result.session_id,
                                  builder_agent=result.agent or run.builder_agent)
         if result.commit:
             self.store.patch_run(run.id, result_commit=result.commit)
         if result.infra_failure:
+            if result.needs_permission:
+                return self.record_permission_blocker(run.id, result.error or "")
             return self.record_infra_failure(run.id, result.error or "builder failed")
 
         # A checkpoint after EVERY build, not only before a rollover. The
@@ -723,10 +765,14 @@ class HarnessEngine:
         # session would buy the saving by destroying the thing being paid for.
         result = self.runner.run(role=policy.EVALUATOR, prompt=prompt, run=run,
                                  tier=tier, session_id=None, iteration=iteration)
-        self.assembler.charge(run.id, prompt,
-                              completion_estimate=result.completion_tokens_estimate)
-        self.store.bump_efficiency(run.id, sessions_spawned=1)
+        self._charge(run, prompt, result)
+        if result.dispatch_id is None or result.newly_dispatched:
+            self.store.bump_efficiency(run.id, sessions_spawned=1)
+        if result.pending:
+            return self._awaiting(run, policy.EVALUATOR, result, iteration)
         if result.infra_failure:
+            if result.needs_permission:
+                return self.record_permission_blocker(run.id, result.error or "")
             return self.record_infra_failure(run.id, result.error or "evaluator failed")
         try:
             evaluation = parse_verdict(
@@ -895,6 +941,26 @@ class HarnessEngine:
     # =====================================================================
     # interruption, checkpoints and session replacement
     # =====================================================================
+    def record_permission_blocker(self, run_id: str, error: str) -> StepOutcome:
+        """Something only a person can unblock. Asked once, not retried.
+
+        Distinct from an infra failure because the infra counter assumes
+        retrying might work: three attempts, then escalate. Here the first
+        attempt already established that a human is being waited on, and the
+        second would spawn another session that waits on the same human.
+        """
+        run = self.store.require_run(run_id)
+        self.store.patch_run(run_id, last_error=error)
+        run = self.store.require_run(run_id)
+        self.store.open_decision(
+            reason=policy.PERMISSION_REQUIRED, run_id=run.id, task_id=run.task_id,
+            project_id=run.project_id,
+            question=f"{run.title or run.task_id}: {error}",
+            detail={"error": error, "worktree": run.worktree_path,
+                    "session": run.builder_session_id})
+        return self._to(run, state.BLOCKED, action="permission_required",
+                        reason=error, detail={"error": error})
+
     def record_infra_failure(self, run_id: str, error: str) -> StepOutcome:
         """The machinery broke; the work did not.
 
@@ -1026,6 +1092,33 @@ class HarnessEngine:
     # =====================================================================
     # helpers
     # =====================================================================
+    def _charge(self, run: Any, prompt: ctx.Prompt, result: AgentResult) -> None:
+        """Bill one LLM call, exactly once, for a prompt that really went out.
+
+        A synchronous runner (a test double, the pilot's dry run) reports no
+        dispatch id and is charged on completion. A real runner is charged on
+        the send and never again, however many times its dispatch is polled.
+        """
+        if result.dispatch_id is None or result.newly_dispatched:
+            self.assembler.charge(
+                run.id, prompt, completion_estimate=result.completion_tokens_estimate)
+
+    def _awaiting(self, run: Any, role: str, result: AgentResult,
+                  iteration: int) -> StepOutcome:
+        """An agent is working. Record where, and stop."""
+        if result.session_id and role == policy.BUILDER:
+            self.store.patch_run(run.id, builder_session_id=result.session_id,
+                                 builder_agent=result.agent or run.builder_agent)
+        elif result.session_id and role == policy.EVALUATOR:
+            self.store.patch_run(run.id, evaluator_session_id=result.session_id)
+        return StepOutcome(run_id=run.id, from_stage=run.stage, to_stage=run.stage,
+                           action=f"awaiting_{role}", pending=True,
+                           llm_called=result.newly_dispatched,
+                           detail={"dispatch_id": result.dispatch_id,
+                                   "session": result.session_id,
+                                   "iteration": iteration,
+                                   "session_reused": result.session_reused})
+
     def _pack_for(self, run: Any, contract: ExecutionContract | None = None
                   ) -> tuple[ctx.ContextPack | None, bool]:
         modules = list(contract.affected_areas if contract else ())

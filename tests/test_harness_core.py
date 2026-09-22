@@ -33,6 +33,14 @@ from terminal_mcp.harness_contract import (ExecutionContract,
 from terminal_mcp.harness_engine import (AgentResult, CheckResult, HarnessEngine,
                                          partition_checks, run_checks)
 from terminal_mcp.harness_schema import HARNESS_SCHEMA_VERSION, HARNESS_TABLES
+
+from terminal_mcp.harness_schema import (HARNESS_MIGRATIONS, HARNESS_SCHEMA_VERSION,
+                                         HARNESS_TABLES)
+
+#: The version a fully migrated database lands on. Derived from the ladder
+#: rather than written down, so adding a migration cannot leave these tests
+#: asserting a version the code no longer produces.
+LATEST_HARNESS_VERSION = max(m.version for m in HARNESS_MIGRATIONS)
 from terminal_mcp.harness_store import HarnessStore, LeaseNotHeld, RunNotFound
 from terminal_mcp.queue_store import QueueStore
 
@@ -43,6 +51,7 @@ from terminal_mcp.queue_store import QueueStore
 # module's result depends on which machine runs it, which is how ten of these
 # went red on a failover that changed no engine code.
 pytestmark = pytest.mark.usefixtures("declared_toolchain")
+
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +139,8 @@ def test_migration_lands_harness_tables_in_the_queue_database(tmp_path):
     assert set(HARNESS_TABLES) <= tables
     assert connection.execute("PRAGMA user_version").fetchone()[0] == HARNESS_SCHEMA_VERSION
 
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == LATEST_HARNESS_VERSION
+
 
 def test_either_store_migrates_the_file_identically(tmp_path):
     harness_first, queue_first = tmp_path / "a.db", tmp_path / "b.db"
@@ -152,6 +163,8 @@ def test_migrating_twice_is_a_no_op(tmp_path):
     QueueStore(path)
     after = sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0]
     assert before == after == HARNESS_SCHEMA_VERSION
+
+    assert before == after == LATEST_HARNESS_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -937,3 +950,17 @@ def test_prose_checks_never_reach_the_shell(store, repo):
     assert seen, "the engine must actually have run the runnable check"
     for batch in seen:
         assert "component tests" not in batch
+
+
+
+def test_a_cached_pack_reports_the_same_project_as_a_fresh_one(store, repo):
+    """project_id identifies the ASKER, not the content, so it is not part of
+    the cached body -- and must therefore be passed back in on a hit."""
+    assembler = ctx.ContextAssembler(store, repo_root=repo)
+    fresh, hit_first = assembler.build_pack(project_id="urbanflow",
+                                            modules=["src/header.css"])
+    cached, hit_second = assembler.build_pack(project_id="urbanflow",
+                                              modules=["src/header.css"])
+    assert (hit_first, hit_second) == (False, True)
+    assert cached.project_id == fresh.project_id == "urbanflow"
+    assert cached.render() == fresh.render()

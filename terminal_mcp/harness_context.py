@@ -363,7 +363,13 @@ class ContextAssembler:
             payload = cached.get("payload") or {}
             if run_id is not None:
                 self.store.bump_efficiency(run_id, reused_context_hits=1)
-            return self._pack_from_payload(key, payload, selected_skills), True
+            # project_id is passed back in rather than read from the payload:
+            # it identifies the ASKER, not the content, so it is deliberately
+            # not part of the cached body. Without this a pack served from
+            # cache would report a different project than the identical pack
+            # served on a miss.
+            return self._pack_from_payload(key, payload, selected_skills,
+                                           project_id=project_id), True
 
         files: list[PackFile] = []
         omitted: list[str] = []
@@ -405,9 +411,10 @@ class ContextAssembler:
 
     @staticmethod
     def _pack_from_payload(key: str, payload: dict[str, Any],
-                           skills: Sequence[SkillRef]) -> ContextPack:
+                           skills: Sequence[SkillRef],
+                           project_id: str | None = None) -> ContextPack:
         return ContextPack(
-            cache_key=key, project_id=payload.get("project_id"),
+            cache_key=key, project_id=project_id,
             modules=tuple(payload.get("modules") or ()),
             files=tuple(PackFile(path=f["path"], content_hash=f["content_hash"],
                                  body=f["body"], truncated=bool(f.get("truncated")))

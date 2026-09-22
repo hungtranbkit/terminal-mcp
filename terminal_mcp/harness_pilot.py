@@ -553,7 +553,12 @@ class Pilot:
         #: see PILOT_CHECK_MAP for why that is a Planner's output and not a
         #: liberty being taken with the definition.
         self.check_map = {k: tuple(v) for k, v in (check_map or {}).items()}
-        self.worktree_root = "/tmp/harness-pilot"
+        # The repository's own convention (git_isolation_service):
+        # <repo>/../.terminal-mcp-worktrees. NOT /tmp -- a session may only be
+        # opened under config.session_lifecycle.allowed_cwd_roots, and a
+        # worktree the agent cannot cd into is a worktree no agent can work in.
+        self.worktree_root = str(Path(repo_root).resolve().parent
+                                 / ".terminal-mcp-worktrees" / "harness")
         self._worktrees: list[tuple[str, str]] = []
         self.outcomes: list[TaskOutcome] = []
         self.human_queue: list[dict[str, Any]] = []
