@@ -52,6 +52,7 @@ from .queue_engine import QueueEngine
 from .queue_task_follower import StartedTaskFollower
 from .request_governor import RequestGovernor
 from .queue_event_drain import QueueEventDrain
+from .project_dispatch_bridge import ProjectDispatchBridge
 from .queue_loop import QueueLoop
 from .agent_registry import AgentRegistryStore
 from .agent_service import AgentService
@@ -558,8 +559,13 @@ def build_mcp(service: TerminalService | None = None,
     # drain that claims events and then cannot act on them.
     _event_drain = None
     if terminal.config.queue.drain_enabled and events is not None:
+        _project_bridge = None
+        if terminal.config.queue.project_dispatch_rules:
+            _project_bridge = ProjectDispatchBridge(
+                queue, terminal.config.queue.project_dispatch_rules)
         _event_drain = QueueEventDrain(
-            events, queue_engine, batch_size=terminal.config.queue.drain_batch_size)
+            events, queue_engine, batch_size=terminal.config.queue.drain_batch_size,
+            project_bridge=_project_bridge)
     _project_feeder = None
     if terminal.config.queue.project_feeds:
         # Use the controller's authoritative fleet listing (including remote

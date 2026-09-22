@@ -75,6 +75,7 @@ ACTION_LANE_NOT_ENABLED = "LANE_NOT_ENABLED"
 ACTION_NOT_ACTIONABLE = "NOT_ACTIONABLE"
 ACTION_ALREADY_TICKED = "ALREADY_TICKED"
 ACTION_FAILED = "FAILED"
+ACTION_PROJECT_BRIDGE_FAILED = "PROJECT_BRIDGE_FAILED"
 
 
 class QueueEventDrain:
@@ -82,12 +83,14 @@ class QueueEventDrain:
 
     def __init__(self, bus: Any, engine: Any, *, consumer: str = DEFAULT_CONSUMER,
                  batch_size: int = DEFAULT_BATCH_SIZE,
-                 project_id: str | None = None) -> None:
+                 project_id: str | None = None,
+                 project_bridge: Any | None = None) -> None:
         self.bus = bus
         self.engine = engine
         self.consumer = consumer
         self.batch_size = max(1, int(batch_size))
         self.project_id = project_id
+        self.project_bridge = project_bridge
         # Guards one INSTANCE against re-entry (the loop thread plus a manual
         # `terminal_queue_drain_once` call, say). Cross-process/cross-instance
         # exclusion is the bus's own claim lease, not this lock -- two drains
@@ -159,9 +162,23 @@ class QueueEventDrain:
             return {**outcome, "action": ACTION_FAILED, "detail": f"{type(exc).__name__}: {exc}"}
 
         ticked_lanes.add(session)
+        bridge_result = None
+        if self.project_bridge is not None:
+            try:
+                bridge_result = self.project_bridge.handle(claimed)
+            except Exception as exc:  # noqa: BLE001 -- event retry/dead-letter owns recovery
+                _LOGGER.exception("queue-drain: project bridge failed for lane %r", session)
+                self._fail(event_id, token, f"project bridge: {type(exc).__name__}: {exc}")
+                detail = result.to_dict() if hasattr(result, "to_dict") else {"result": str(result)}
+                return {**outcome, "action": ACTION_PROJECT_BRIDGE_FAILED,
+                        "tick": detail, "detail": f"{type(exc).__name__}: {exc}"}
+
         self._ack(event_id, token)
         detail = result.to_dict() if hasattr(result, "to_dict") else {"result": str(result)}
-        return {**outcome, "action": ACTION_TICKED, "tick": detail}
+        response = {**outcome, "action": ACTION_TICKED, "tick": detail}
+        if bridge_result is not None:
+            response["project_bridge"] = bridge_result
+        return response
 
     @staticmethod
     def _session_of(claimed: dict[str, Any]) -> str | None:
