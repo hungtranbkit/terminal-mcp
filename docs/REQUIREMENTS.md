@@ -2052,6 +2052,54 @@ written down (docs/AI_ANALYSIS_GATE.md §10a) and enforced by
   intended end state and a deliberate flip, never the default.
 - **Tools**: `terminal_task_check_analysis`, `terminal_task_set_analysis`.
 
+#### Fleet-aware session registry (task blg_84f09bbc1798, 2026-09-14, branch `feat/fleet-aware-registry`)
+
+**Status: IMPLEMENTED — unit/integration verified against fake node
+clients; NO live multi-node run performed** (49 merge/controller tests +
+25 controller/MCP tests green, full suite 2824 passed with only the two
+failures that are already red on `origin/main` @ `695b31c`). **NOT
+deployed** — isolated branch, nothing restarted, no real remote node was
+contacted.
+
+`session_registry.py` is per-node-agent-process-local (each node has its
+own `session_registry.db`), so `terminal_registry_list/_search` could
+only ever answer "where is my session?" for ONE node. `fleet_registry.py`
+(pure: no network, no store, no implicit clock) is the merge layer;
+`ControllerService.registry_list_fleet/registry_search_fleet` do the
+fan-out.
+
+Rules, all pinned by tests:
+- **Authoritative identity.** A raw registry row records its own
+  `node_id` as `"local"`, which collides across a fleet. In a fleet read
+  `node_id`/`node_name` become the answering node's real values and the
+  originals survive as `source_node_id`/`source_node_name`.
+- **Dedupe on (owning node, session name).** Two nodes may each have a
+  session called `work`; that is not a duplicate. The controller's own
+  node is read exactly once (skipped in the client loop) rather than read
+  twice and deduped after.
+- **Never invent remote data.** An unreachable node contributes NO
+  records and is listed in `unavailable_nodes` with the real error, so
+  "could not look" never renders as "nothing there".
+- **UNKNOWN/stale never looks active.** A record from a node that is not
+  confirmed fresh keeps its raw `status` verbatim but reports
+  `effective_status: "UNKNOWN"`. Staleness never upgrades a dead session.
+- **Permissions.** `read_granted`/`input_granted` are carried verbatim,
+  never defaulted; remote rows are already filtered by the remote node's
+  own policy. Registry records are metadata only — this adds no new path
+  that carries pane output.
+
+**API compatibility.** `TerminalService.terminal_registry_list/_search`,
+`/v1/registry`, `LocalNodeClient.registry_list` and the dashboard
+endpoints are UNCHANGED and stay local-only — making the local read
+fleet-aware would be a recursion bug, since `/v1/registry` is served by
+`LocalNodeClient.registry_list` and every node would fan out to every
+other node on every controller poll. The MCP tools
+`terminal_registry_list`/`terminal_registry_search` now default to
+`scope="fleet"` and accept `scope="local"` for the exact pre-existing
+shape; every pre-existing record field survives a fleet read unchanged
+and local records are emitted first, in their existing
+`last_seen_at DESC` order.
+
 ### 20.7 New API/tools (PLANNED names, for future implementation —
 none of these exist yet)
 
