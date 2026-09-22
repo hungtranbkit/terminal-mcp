@@ -27,6 +27,7 @@ from .integration_loop import IntegrationLoop
 from .task_migration import TaskMigrationPlanner
 from .integration_service import IntegrationService
 from .integration_store import publish_handoff_for_completed_task
+from .analysis_gate import check_analysis_gate
 from .dor_gate import check_definition_of_ready
 from .git_isolation_service import GitIsolationService
 from .harness_service import HarnessService
@@ -188,6 +189,34 @@ def _build_browser_gateway(terminal: TerminalService, controller: ControllerServ
     """Construct the local, opt-in Playwright gateway without launching Chromium."""
     return BrowserGateway.from_config(terminal.config.browser)
 
+
+
+#: Agent bootstrap (docs/AI_ANALYSIS_GATE.md, §20.6 Phase F). This is the
+#: MCP server's `instructions` field -- the one agent-instruction channel
+#: this project already has (there is no AGENTS.md/CLAUDE.md loader here,
+#: and inventing a second mechanism for four sentences would be worse than
+#: using the one that every MCP client already reads). Deliberately SHORT
+#: and deliberately not a copy of the doc: duplicated rules drift, and the
+#: doc is the versioned source of truth. It says where to look and states
+#: only the handful of invariants an agent must not violate before it has
+#: read anything.
+ANALYSIS_GATE_BOOTSTRAP = (
+    "Only access explicitly allowed tmux sessions. Input is disabled by default.\n"
+    "\n"
+    "Understand First, Code Second (docs/AI_ANALYSIS_GATE.md -- read it before "
+    "planning or writing code for any implementation/feature/fix task):\n"
+    "1. Gather evidence yourself first -- MCP tools, the repo, the live runtime -- "
+    "before asking the user anything. Ask only for business/UX decisions that "
+    "genuinely cannot be derived safely.\n"
+    "2. Never invent business behaviour. UNKNOWN beats a confident guess.\n"
+    "3. Any HIGH/CRITICAL-impact assumption still unresolved means NOT "
+    "Implementation Ready -- return ANALYSIS/NEEDS_CLARIFICATION instead of "
+    "proceeding on a guess.\n"
+    "4. Never silently reinterpret a requirement. If the contract is missing, "
+    "ambiguous, or high-impact, say so and stop.\n"
+    "5. Permission to act is not the same as being the right owner; mock or "
+    "unit-level output is not live proof."
+)
 
 def build_mcp(service: TerminalService | None = None,
               supervisor: SupervisorService | None = None,
@@ -4226,6 +4255,40 @@ def build_mcp(service: TerminalService | None = None,
         if "error" in status:
             return status
         return check_definition_of_ready(status["task"])
+
+    # -- Analysis Gate: "Understand First, Code Second" (§20.6 Phase F,
+    # docs/AI_ANALYSIS_GATE.md). Enforced automatically at the
+    # PRECHECK -> READY dispatch gate in coordinator.py; these two tools
+    # are how an agent reads what is still missing and records the
+    # analysis it actually did.
+
+    @server.tool()
+    def terminal_task_check_analysis(task_id: str) -> dict:
+        """Analysis Gate verdict for one task, read-only -- exactly the
+        check the Coordinator will run at dispatch time. Reports READY or
+        NEEDS_CLARIFICATION plus `missing_fields`, `unresolved_assumptions`
+        (HIGH/CRITICAL-impact assumptions with no recorded resolution),
+        `critic_required_categories`, `profile` and `gate_version`.
+
+        A task that declares no implementation/feature/fix class reports
+        READY with profile "none": the gate is opt-in per task and is
+        never applied retroactively to legacy work."""
+        status = queue.task_status(task_id)
+        if "error" in status:
+            return status
+        return check_analysis_gate(status["task"])
+
+    @server.tool()
+    def terminal_task_set_analysis(task_id: str, analysis: dict, merge: bool = True) -> dict:
+        """Record the analysis / Feature Contract for a task and get back
+        the gate verdict it now produces. `merge=True` (default) patches
+        the existing object, so answering one open question at a time
+        never requires resending the whole contract.
+
+        Write what you actually established, never a placeholder: the
+        gate treats an empty field as missing on purpose, and marking an
+        assumption RESOLVED without a `resolution` does not satisfy it."""
+        return queue.set_analysis(task_id, analysis, merge=merge)
 
     # -- Incident lane (§20.6 Phase B). NOT a parallel queue -- a real
     # task in the SAME lane, fast-tracked by priority, still subject to

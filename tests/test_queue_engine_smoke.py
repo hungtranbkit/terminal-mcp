@@ -197,6 +197,31 @@ def _drive_concurrently(engine, sessions, *, deadline_seconds=90, poll_interval=
     return results
 
 
+
+def _drive_until_task_settles(engine, store, session, task_id, *, deadline_seconds=90,
+                              poll_interval=0.5, controller=None):
+    """Like _run_task_to_completion, but watches the TASK ROW rather than
+    the tick action.
+
+    Needed because a Coordinator refusal surfaces as the tick action
+    `COORDINATOR_BLOCKED` (see _review), after which the lane simply
+    reports NO_OP forever -- a real, stable outcome that the action-based
+    helper above never recognises as an ending. Settling is therefore
+    defined by the task's own status, which is what the Analysis Gate
+    assertions are actually about."""
+    settled = {BLOCKED, COMPLETED, "PAUSED", "CANCELLED", "SKIPPED"}
+    deadline = time.monotonic() + deadline_seconds
+    last = None
+    while time.monotonic() < deadline:
+        _reheartbeat(controller)
+        last = engine.tick(session)
+        task = store.get_task(task_id)
+        if task is not None and task.status in settled:
+            return last, task
+        time.sleep(poll_interval)
+    return last, store.get_task(task_id)
+
+
 # ---------------------------------------------------------------------------
 # Item B: two independent queues, strict per-lane ordering, real completion.
 # ---------------------------------------------------------------------------
@@ -437,3 +462,110 @@ def test_stale_duplicate_queue_set_never_runs_the_superseded_batch(rig):
     result = _run_task_to_completion(engine, "queue-smoke-a", controller=rig["controller"])
     assert store.get_task(second_ids[0]).status == COMPLETED
     assert store.get_task(first_ids[0]).status == "CANCELLED"  # still never ran
+
+
+# ---------------------------------------------------------------------------
+# Analysis Gate dogfood (§20.6 Phase F, docs/AI_ANALYSIS_GATE.md).
+#
+# Deliberately NOT a mocked coordinator: a real QueueStore, the real
+# CoordinatorGate (real git evidence collector, real sensitive-prompt
+# screen), a real disposable tmux worker in a real git repo, driven by
+# the real engine.tick() loop. "mock != live proof" is one of the rules
+# this very feature ships, so proving the feature with a mock alone
+# would be self-refuting.
+# ---------------------------------------------------------------------------
+
+_DOGFOOD_CONTRACT = {
+    "profile": "full",
+    "problem_statement": "an implementation task can be dispatched before anyone understood the problem",
+    "user_observable_goal": "a feature task with no Feature Contract never reaches a worker",
+    "source_of_truth": "coordinator.py review() -- the only PRECHECK -> READY edge in the queue",
+    "evidence": [
+        "read coordinator.py review() check order",
+        "read queue_store.VALID_TRANSITIONS: PRECHECK -> READY is the only dispatch path",
+    ],
+    "invariants": [
+        "a task that declares no implementation class keeps dispatching exactly as before",
+        "no new queue status and no new transition edge is introduced",
+    ],
+    "assumptions": [],
+    "acceptance_tests": [
+        "incomplete contract on a real feature task -> BLOCKED, never dispatched",
+        "complete contract on the same real task -> dispatches and completes",
+    ],
+    "live_verification": "this test: a real tmux worker, a real engine.tick() loop",
+}
+
+
+def test_analysis_gate_blocks_a_real_task_then_lets_it_through_once_the_contract_is_complete(rig):
+    """The dogfood acceptance test, in two halves against ONE real task.
+
+    Half 1: a genuinely incomplete contract (no invariants, no evidence)
+    on a real `feature` task must stop at BLOCKED and must never have
+    been sent to the real worker.
+
+    Half 2: the SAME task, contract completed, must then really
+    dispatch -- proving the gate is a gate and not a wall."""
+    rig["make_worker"]("queue-smoke-gate")
+    store, engine = rig["store"], rig["engine"]
+
+    incomplete = {key: value for key, value in _DOGFOOD_CONTRACT.items()
+                  if key not in ("invariants", "evidence")}
+    (task_id,) = store.set_tasks("queue-smoke-gate", [{
+        "title": "analysis gate dogfood",
+        "prompt": "implement the analysis gate",
+        "metadata": {"task_class": "feature"},
+        "analysis": incomplete,
+    }])
+
+    outcome, blocked = _drive_until_task_settles(engine, store, "queue-smoke-gate", task_id,
+                                                deadline_seconds=60, controller=rig["controller"])
+    assert blocked.status == BLOCKED, f"expected BLOCKED, got {blocked.status} (last tick {outcome.action})"
+    assert outcome.action == "COORDINATOR_BLOCKED", outcome.action
+    # Never dispatched: no send was ever attempted for this task.
+    assert blocked.dispatch_idempotency_key is None
+    assert blocked.started_at is None
+
+    # The refusal is machine-readable, persisted, and names exactly what
+    # is missing -- not just a human sentence.
+    gate_result = blocked.coordinator_decision["evidence"]["analysis_gate"]
+    assert gate_result["status"] == "NEEDS_CLARIFICATION"
+    assert gate_result["profile"] == "full"
+    assert set(gate_result["missing_fields"]) == {"invariants", "evidence"}
+    assert "analysis gate" in blocked.coordinator_reason
+
+    # -- half 2: complete the contract and retry the SAME task ----------
+    store.set_task_analysis(task_id, {"invariants": _DOGFOOD_CONTRACT["invariants"],
+                                      "evidence": _DOGFOOD_CONTRACT["evidence"]})
+    assert store.get_task(task_id).analysis["invariants"]
+    store.retry_task(task_id)
+    assert store.get_task(task_id).status == QUEUED
+
+    final, after = _drive_until_task_settles(engine, store, "queue-smoke-gate", task_id,
+                                            deadline_seconds=120, controller=rig["controller"])
+    assert after.status != BLOCKED, (
+        f"a complete contract must not be blocked by the analysis gate "
+        f"(status={after.status}, reason={after.coordinator_reason!r})")
+    assert after.coordinator_decision.get("status") == "READY", after.coordinator_decision
+    # It really was sent to the real worker this time.
+    assert after.dispatch_idempotency_key is not None
+    assert final.action in ("COMPLETED", "IDLE") or after.status in (RUNNING, COMPLETED), (
+        f"expected the task to progress past dispatch, got action={final.action} status={after.status}")
+
+
+def test_analysis_gate_never_blocks_a_real_legacy_task(rig):
+    """The backward-compatibility guarantee, proven live rather than only
+    in a unit test: a task shaped exactly like every pre-existing row in
+    a real queue (no task_class, no analysis) runs to real COMPLETED
+    through the real gate."""
+    rig["make_worker"]("queue-smoke-legacy")
+    store, engine = rig["store"], rig["engine"]
+    (task_id,) = store.set_tasks("queue-smoke-legacy", [{
+        "title": "legacy task", "prompt": "echo a legacy line"}])
+
+    outcome = _run_task_to_completion(engine, "queue-smoke-legacy", deadline_seconds=90,
+                                     controller=rig["controller"])
+    task = store.get_task(task_id)
+    assert task.status != BLOCKED, f"legacy task was blocked: {task.coordinator_reason!r}"
+    assert task.coordinator_decision.get("status") == "READY"
+    assert outcome.action in ("COMPLETED", "IDLE") or task.status in (RUNNING, COMPLETED)

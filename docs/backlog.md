@@ -342,3 +342,87 @@ Design points worth keeping:
   for session creation — never a second, looser policy. It is lazily
   constructed rather than a constructor argument, so no other caller (or
   test) has to know the backlog exists.
+
+---
+
+## Efficiency Measurement program — filed items (2026-09-14)
+
+Design of record: **`docs/EFFICIENCY_MEASUREMENT_CONTRACT.md`**. These are
+filed, not started. Q2 below is a **CRITICAL-impact open assumption and
+blocks the whole token-accounting slice** — per the Analysis Gate's own
+rule, nothing in the `EM-TOKEN-*` group may start until it is resolved
+with evidence.
+
+| id | P | type | title | blocked by |
+|---|---|---|---|---|
+| `EM-Q2` | P0 | research | **Can per-turn provider token usage be captured for CLI-driven workers?** No API response object exists for a Claude Code / Codex process in tmux. If no, §5 is infeasible as specified and the program falls back to turn-count + wall-clock outcomes. | — |
+| `EM-Q1` | P0 | research | Decide which host owns the measurement store. HP is a **node**; the real queue lives on the fed-controller (`100.117.214.87`). Building the instrument on HP would instrument an empty queue. | — |
+| `EM-TURN-1` | P1 | feature | Populate `trace_id`/`parent_turn_id`/`depth` on the **real dispatch path**. Columns and plumbing already exist (`audit.py` migration 3, `core.py` → `node_client.py` → `node_agent.py`); only `bridge.py` writes them today. | EM-Q1 |
+| `EM-TURN-2` | P1 | fix | Turn counting must collapse on `dispatch_idempotency_key`, never use `attempt_count` (which bumps on reconcile-and-reclaim). Ship with the regression test that proves N reclaim cycles ⇒ 1 turn. | EM-TURN-1 |
+| `EM-LEDGER-1` | P1 | feature | **Question Ledger** — `CLARIFICATION_RAISED`/`CLARIFICATION_ANSWERED` events with question, impact, resolution. Closes a real gap between `AI_ANALYSIS_GATE.md` §5 (which describes it as existing) and the code (where it does not). Worth doing on its own merits. | — |
+| `EM-GATE-1` | P1 | feature | Make `ANALYSIS_UPDATED` carry **what changed** and **the resulting gate verdict**, and append gate verdicts instead of overwriting `coordinator_decision`. Anti-gaming prerequisite. | — |
+| `EM-REENTRY-1` | P2 | feature | Typed reentry reasons (`CONTRACT_GAP`, `IMPLEMENTATION_DEFECT`, `VERIFICATION_FAILED`, `USER_CHANGED_REQUIREMENT`, `ENVIRONMENT_FAILURE`, `STALE_CONTEXT`); untyped ⇒ `UNCLASSIFIED_REENTRY`, never dropped. | — |
+| `EM-TOKEN-1` | P2 | feature | Per-turn token rows: four raw counts + cache-write TTL split + `model_id` + `price_table_version`. Cost-weighted, never `input + cache_write`. | **EM-Q2** |
+| `EM-TOKEN-2` | P2 | feature | Phase attribution (`ANALYSIS`/`IMPLEMENTATION`/`VERIFICATION`) on every token row — without it the central question cannot be computed. | **EM-Q2** |
+| `EM-PROFILE-1` | P2 | feature | Stamp task profile (FAST_FIX/STANDARD/HIGH_RISK, from existing `risk_level` + categories) and `decision_budget` (HIGH/MEDIUM/LOW) **before first dispatch**, immutable thereafter. | — |
+| `EM-CTX-1` | P3 | feature | Record `cache_read` volume and repo `HEAD` per turn, so stale-context rework is not misattributed to contract quality. | EM-TOKEN-1 |
+| `EM-CONC-1` | P3 | feature | Record lease/lock holders per turn; exclude concurrency-contaminated tasks from primary analysis and report the contamination rate. | — |
+
+**Deliberately not filed:** a before/after comparison against history. There
+is no history — `queue.db` holds 0 tasks and 0 events, and lacks the
+`analysis` column entirely. Before/after is also confounded by codebase
+drift and task-mix shift, so it could not support a causal claim even if
+the data existed (`EFFICIENCY_MEASUREMENT_CONTRACT.md` §7.2).
+
+### Cross-lane conformance items (2026-09-14)
+
+Checked against `feat/work-efficiency-telemetry` @ `473a629`. Detail in
+`EFFICIENCY_MEASUREMENT_CONTRACT.md` §13.
+
+| id | P | type | title |
+|---|---|---|---|
+| `EM-C1` | P1 | fix | Add `STALE_CONTEXT` to the `telemetry_reentries.reason` CHECK set. Today the store **rejects** it and the row lands in `OTHER` — the generic bucket the reason taxonomy exists to avoid. The benchmark lane already reports the category with no source behind it. |
+| `EM-C2` | P1 | feature | Clarification/Question Ledger has no representation in the telemetry store at all. Until it exists, "raised no clarification" in first-pass success cannot be evaluated. Same item as `EM-LEDGER-1`, now with a second consumer blocked on it. |
+| `EM-C3` | P1 | fix | `telemetry_tasks.first_pass_success` is written by the reporter, not derived. Have the report recompute it from turns/reentries/evidence and flag disagreement with the stored value. |
+| `EM-C4` | P2 | feature | No `decision_budget` / task profile / risk class on `telemetry_tasks`; stratification depends on an unrecorded join to queue metadata. Stamp it per task at creation. |
+| `EM-C5` | P1 | research | **Differential measurement on FPS**: the HIGH arm is required to carry a live-verification plan, so it is more likely to be scoreable at all — the treatment changes the denominator. Report FPS coverage per arm as a first-class result; prefer turn count as headline where coverage differs. |
+
+**Status, 2026-09-14.** The benchmark lane reports all five closed on its own
+side at `bf61bcb` (per-source reason-vocabulary declaration rendering
+`UNAVAILABLE` rather than `0`; recomputed FPS taking precedence over the
+stored scalar with per-task disagreement flagged; the three-condition FPS
+caveat stated in every risk class; `profile_source` provenance in the header;
+`first_pass_coverage` as a first-class field that switches the headline to
+`worker_turn_count` past a 10-point per-arm gap). **Reported, not verified** —
+that branch is not on this host or on origin.
+
+Upstream status, verified against `feat/work-efficiency-telemetry` @ `473a629`:
+
+- `EM-C1` — **open**. `STALE_CONTEXT` is still absent from the
+  `telemetry_reentries.reason` CHECK set. Relayed to the telemetry lane with
+  the directional argument (the arm carrying more analysis carries a larger
+  cached prefix, so misfiling staleness charges a cache-coherence failure to
+  analysis quality — against the hypothesis under test).
+- `model_id` — **already done, no action.** Present since migration 2 with its
+  own index; the benchmark lane asked for it without checking. `cost_units` is
+  priceable as soon as rows exist.
+- `EM-C2`/`EM-C4` — open, unchanged; both are genuinely upstream.
+- `EM-C3`/`EM-C5` — addressed in the consuming lane, which is the right place
+  for them; no upstream change required.
+
+**`EM-C1` — landing (2026-09-14, uncommitted).** `STALE_CONTEXT` is present in
+the telemetry lane's working tree as **Migration 3**, which *rebuilds*
+`telemetry_reentries` rather than editing the v1 CHECK literal — the v1 literal
+is deliberately left alone so that replaying the migration list from scratch
+reproduces the same sequence of real schema states it did in history. That is
+the right construction: SQLite cannot ALTER a CHECK constraint, and editing the
+v1 literal in place would silently change what already-migrated databases were
+validated against while leaving `user_version` unmoved. Not yet committed, so
+this is *observed in a working tree*, not shipped. When it lands, the benchmark
+lane's `UNAVAILABLE` row flips to real counts with no change on its side.
+
+With that, every cross-lane item is closed or landing, and the measurement
+programme's remaining blockers are the ones that were always upstream of all
+three lanes: `EM-Q2` (can per-turn provider usage be captured at all for
+CLI-driven workers), `EM-C2`/`EM-LEDGER-1` (no clarification concept exists),
+and `EM-C4` (no per-task snapshot of the stratification key).

@@ -49,6 +49,10 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from .analysis_gate import (
+    READY as ANALYSIS_READY, AnalysisGatePolicy,
+    DEFAULT_POLICY as DEFAULT_ANALYSIS_POLICY, check_analysis_gate,
+)
 from .core import RECOVERY_STATE_RESUMED_OK
 from . import worktree_cleanup
 from .contract import CAP_REPO_EVIDENCE
@@ -625,6 +629,7 @@ class CoordinatorGate:
                 evidence_collector: RepoEvidenceCollector = git_repo_evidence,
                 scope_reasoner: ScopeReasoner = _default_scope_reasoner,
                 smoke_test_runner: SmokeTestRunner = run_smoke_test_command,
+                analysis_policy: AnalysisGatePolicy = DEFAULT_ANALYSIS_POLICY,
                 max_review_attempts: int = DEFAULT_MAX_REVIEW_ATTEMPTS,
                 require_approval_for_risk_levels: tuple[str, ...] = (),
                 repeated_failure_threshold: int | None = DEFAULT_REPEATED_FAILURE_THRESHOLD) -> None:
@@ -632,6 +637,11 @@ class CoordinatorGate:
         self.evidence_collector = evidence_collector
         self.scope_reasoner = scope_reasoner
         self.smoke_test_runner = smoke_test_runner
+        # Analysis Gate (§20.6 Phase F). The default policy gates ONLY
+        # tasks that classify themselves as implementation/feature/fix
+        # work, so constructing a CoordinatorGate() exactly as every
+        # existing caller already does changes no existing task's fate.
+        self.analysis_policy = analysis_policy
         self.max_review_attempts = max_review_attempts
         # Agent failure policy (§20.6 Phase E): ON by default (unlike
         # the risk-level gate above) -- this is a real EXTENSION of the
@@ -775,6 +785,44 @@ class CoordinatorGate:
             return CoordinatorDecision(
                 NEEDS_HUMAN, reason=scope_reason,
                 required_actions=["a human clarifies or expands the task prompt"],
+            )
+
+        # 2b. Analysis Gate -- "Understand First, Code Second"
+        #     (docs/AI_ANALYSIS_GATE.md, §20.6 Phase F). Placed here on
+        #     purpose: it is the same family of question as check 2 (is
+        #     this task understood well enough to act on?), and it is
+        #     pure/local, so it runs BEFORE the expensive environmental
+        #     checks below -- a task with no Feature Contract should
+        #     never cost a session read, a git subprocess, or a smoke-
+        #     test run to reject.
+        #
+        #     BLOCKED rather than NEEDS_REWORK: a missing contract is
+        #     not something a retry can fix, and NEEDS_REWORK's own
+        #     PRECHECK -> QUEUED edge would spin this task around the
+        #     lane until the attempt budget killed it. BLOCKED stops
+        #     cleanly and waits for someone to actually fill the
+        #     contract in (queue_store's BLOCKED -> QUEUED edge is the
+        #     supported way back).
+        #
+        #     The queue's own decision vocabulary is deliberately NOT
+        #     extended with a fifth status: NEEDS_CLARIFICATION travels
+        #     inside `evidence.analysis_gate` (machine-readable) while
+        #     `reason` carries the human-readable account. A new
+        #     CoordinatorDecision status would have meant new edges in
+        #     VALID_TRANSITIONS and a change for every consumer that
+        #     switches on the existing four.
+        analysis_result = check_analysis_gate(task.to_dict(), policy=self.analysis_policy)
+        if analysis_result["status"] != ANALYSIS_READY:
+            return CoordinatorDecision(
+                BLOCKED,
+                evidence={"analysis_gate": analysis_result},
+                blockers=tuple(str(item) for item in analysis_result.get("missing_fields", ())),
+                reason=analysis_result["reason"],
+                required_actions=[
+                    "complete the Feature Contract in the task's `analysis` object "
+                    "(see docs/AI_ANALYSIS_GATE.md) and resolve every HIGH/CRITICAL-impact "
+                    "assumption with real evidence before this task is dispatched",
+                ],
             )
 
         # 3. Previous-task-really-done check (item 3's first bullet) --

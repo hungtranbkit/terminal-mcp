@@ -338,6 +338,9 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_worktree_janitor_report",
         # Delivery discipline: Definition of Ready (§20.6 Phase A).
         "terminal_task_check_dor",
+        # Analysis Gate: "Understand First, Code Second" (§20.6 Phase F).
+        "terminal_task_check_analysis",
+        "terminal_task_set_analysis",
         # Incident lane (§20.6 Phase B).
         "terminal_task_create_incident",
         "terminal_list_active_incidents",

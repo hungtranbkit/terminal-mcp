@@ -31,6 +31,7 @@ import logging
 import sqlite3
 from typing import Any, Callable
 
+from .analysis_gate import AnalysisGatePolicy, DEFAULT_POLICY as DEFAULT_ANALYSIS_POLICY, check_analysis_gate
 from .dor_gate import check_definition_of_ready
 from .permissions import valid_session_name
 from .verify_queue import VerifyQueue
@@ -528,6 +529,43 @@ class QueueService:
         if task is None:
             return {"error": "TASK_NOT_FOUND", "task_id": task_id}
         return {"task": task.to_dict(), "queue_position": self.store.queue_position(task_id)}
+
+    # -- Analysis Gate (§20.6 Phase F, docs/AI_ANALYSIS_GATE.md) ----------
+    # Deliberately NOT enforced at create/assign time, unlike DoR above.
+    # The two gates answer questions at different moments: DoR asks "is
+    # this task filed well enough to be assigned", which is answerable
+    # the instant someone files it. The Analysis Gate asks "is the
+    # problem understood well enough to write code", and the whole
+    # REQUEST -> CONTEXT_GATHERING -> ... -> IMPLEMENTATION_READY flow
+    # says that understanding is produced AFTER the request exists --
+    # a task IS the request. Blocking creation on a completed Feature
+    # Contract would make it impossible to file work before analysing
+    # it, which is backwards. Enforcement therefore lives at exactly one
+    # place, the PRECHECK -> READY dispatch gate in coordinator.py; the
+    # two methods below are the read/write surface for getting a task
+    # through it.
+
+    def check_analysis(self, task_id: str, *,
+                       policy: AnalysisGatePolicy = DEFAULT_ANALYSIS_POLICY) -> dict[str, Any]:
+        """Read-only Analysis Gate verdict for one task -- the same call
+        the Coordinator will make at dispatch time, so a caller can see
+        the exact blockers before queueing anything."""
+        task = self.store.get_task(task_id)
+        if task is None:
+            return {"error": "TASK_NOT_FOUND", "task_id": task_id}
+        return {"task_id": task_id, **check_analysis_gate(task.to_dict(), policy=policy)}
+
+    def set_analysis(self, task_id: str, analysis: dict[str, Any] | None, *,
+                     merge: bool = True,
+                     policy: AnalysisGatePolicy = DEFAULT_ANALYSIS_POLICY) -> dict[str, Any]:
+        """Write/patch the task's analysis object and return the gate
+        verdict it now produces, so one call both records the work and
+        reports whether it was enough."""
+        updated = self.store.set_task_analysis(task_id, analysis, merge=merge)
+        if updated is None:
+            return {"error": "TASK_NOT_FOUND", "task_id": task_id}
+        return {"task_id": task_id, "analysis": updated.analysis,
+                "gate": check_analysis_gate(updated.to_dict(), policy=policy)}
 
     def metrics(self, session: str) -> dict[str, Any]:
         if error := self._validate_session(session):
