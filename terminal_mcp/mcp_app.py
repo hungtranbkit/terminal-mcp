@@ -730,7 +730,7 @@ def build_mcp(service: TerminalService | None = None,
           create_session | create  `target` is the new name; `agent_type`,
                     `working_directory`, `initial_prompt`, `grant_mode`,
                     `binding`, `node` apply
-          delete_session | delete  `target` is the name
+          delete_session | delete  `target` is the name; args={confirm: true} required
           enqueue_task  | enqueue  durable, restart-safe task for `target`
                     with prompt `text`; `title`/`priority`/`metadata`/
                     `request_key` apply
@@ -6392,7 +6392,7 @@ def build_mcp(service: TerminalService | None = None,
     # engine refuses and `_drive` reports that refusal as a result. A harness
     # that could spend tokens before anyone has wired an AgentRunner would be
     # a harness nobody chose to turn on.
-    harness = HarnessService(
+    harness = getattr(queue, "harness", None) or HarnessService(
         queue=queue,
         # The janitor's configured roots are the only declared "repositories
         # this server may touch" in the config. Reusing that list means the
@@ -6401,6 +6401,7 @@ def build_mcp(service: TerminalService | None = None,
         repo_root=next(iter(terminal.config.worktree_janitor.repo_roots), None),
         runner=None,
         owner=f"mcp-{os.getpid()}")
+    queue.harness = harness
 
     # One-tool surface wiring (see compact_tools.TURN_HANDLER_ACTIONS): the
     # discovery/lifecycle/queue actions terminal_turn routes are bound to the

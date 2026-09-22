@@ -1254,6 +1254,11 @@ class CompactTerminalTools:
                 status = "FAILED"
             return {"status": status, "action": action, "result": result}
 
+        if action == "delete_session" and args is not None:
+            if not isinstance(args, dict) or set(args) - {"confirm"} or type(args.get("confirm", False)) is not bool:
+                return {"status": "FAILED", "error": "INVALID_ARGUMENT", "action": action,
+                        "detail": "delete args must contain only boolean confirm"}
+
         calls: dict[str, Callable[[], Any]] = {
             # Not routed through `args`: the payload is large and the path is
             # security-relevant, so both are first-class arguments that the
@@ -1273,7 +1278,8 @@ class CompactTerminalTools:
                 target.strip(), agent_type=agent_type, working_directory=working_directory,
                 initial_prompt=initial_prompt, grant_mode=grant_mode, binding=binding,
                 node=node),
-            "delete_session": lambda: handler(target.strip()),
+            "delete_session": lambda: (handler(target.strip(), confirm=args["confirm"])
+                                        if args and "confirm" in args else handler(target.strip())),
             "enqueue_task": lambda: handler(
                 target.strip(), text, title=title, priority=priority,
                 metadata=metadata, request_key=request_key),

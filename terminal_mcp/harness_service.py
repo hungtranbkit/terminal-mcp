@@ -287,7 +287,7 @@ class HarnessService:
             for _ in range(int(steps)):
                 outcome = engine.step(run_id)
                 outcomes.append(outcome.to_dict())
-                if outcome.action == "idle" or outcome.done:
+                if outcome.action == "idle" or outcome.done or outcome.pending:
                     break
         except Exception as exc:  # noqa: BLE001 -- reported, never swallowed
             return outcomes, f"{type(exc).__name__}: {exc}"

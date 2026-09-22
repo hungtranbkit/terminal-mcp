@@ -115,3 +115,10 @@ def test_progress_or_uncertainty_resets_idle_timeout(store, tmp_path, monkeypatc
     clock[0] = 61.0
     session.state = "IDLE"
     assert runner.run(**args).pending
+
+
+def test_direct_terminal_service_uses_configured_registry_node(store):
+    ops = FakeOps([FakeSession("harness-local", node_id="configured-local")])
+    ops.REGISTRY_LOCAL_NODE_ID = "configured-local"
+    pick = SessionBroker(ops, store).pick(run=_run(store), role=policy.BUILDER, allow_spawn=False)
+    assert pick.session == "harness-local"

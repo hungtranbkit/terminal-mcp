@@ -59,6 +59,7 @@ import json
 import os
 import re
 import secrets
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -180,7 +181,16 @@ class SessionBroker:
         self.default_runtime = default_runtime
         self.reuse_ceiling = reuse_ceiling
         self.session_prefix = session_prefix
-        self.spawn_node = spawn_node
+        # Artifacts and declared checks are controller-local files/processes.
+        # Pin both creation and reuse until remote artifact transport exists.
+        self.local_node_id = getattr(ops, "local_node_id", getattr(ops, "REGISTRY_LOCAL_NODE_ID", "local"))
+        self._direct_local_ops = not hasattr(ops, "local_node_id")
+        if spawn_node not in ("auto", self.local_node_id):
+            raise ValueError("harness artifacts require a local spawn node")
+        self.spawn_node = self.local_node_id
+
+    def is_local_node(self, node_id: str | None) -> bool:
+        return node_id == self.local_node_id or (node_id is None and self._direct_local_ops)
 
     # -- health --------------------------------------------------------------
     def context_percent(self, session: str) -> float | None:
@@ -228,6 +238,7 @@ class SessionBroker:
                     "reason": str(status.get("reason") or "session does not exist")}
         state = str(status.get("state") or "").upper()
         return {"alive": True, "state": state,
+                "output_hash": hashlib.sha256(str(status.get("last_output") or "").encode()).hexdigest(),
                 "busy": state in BUSY_STATES,
                 "awaiting_human": state in HUMAN_STATES or bool(status.get("input_required")),
                 "node_id": status.get("node_id")}
@@ -264,6 +275,8 @@ class SessionBroker:
         health = self.health(session)
         if not health.get("alive"):
             return False, f"session unreadable: {health.get('reason')}", None
+        if not self.is_local_node(health.get("node_id")):
+            return False, "session is not on the local artifact node", None
         if health.get("awaiting_human"):
             return False, "session is waiting on a human", None
         percent = self.context_percent(session)
@@ -338,12 +351,14 @@ class SessionBroker:
             ok, why, percent = self.healthy_for_reuse(run.builder_session_id)
             if ok:
                 return SessionPick(session=run.builder_session_id,
-                                   node_id=run.node_id, runtime=wanted, reused=True,
+                                   node_id=self.local_node_id, runtime=wanted, reused=True,
                                    context_percent=percent,
                                    reason=f"builder session reused: {why}")
 
         for candidate in self._candidates():
             name = candidate["session"]
+            if not self.is_local_node(candidate.get("node_id")):
+                continue
             if name in blocked or not self.owns(name):
                 continue
             if candidate.get("node_online") is False:
@@ -394,6 +409,8 @@ class SessionBroker:
         if response.get("error"):
             raise NoSessionAvailable(
                 f"could not spawn a {runtime} session for {role}: {response['error']}")
+        if not self.is_local_node(response.get("node_id")):
+            raise NoSessionAvailable("spawn returned a non-local artifact node")
         return SessionPick(session=response.get("session") or name,
                            node_id=response.get("node_id"), runtime=runtime,
                            reused=False, spawned=True,
@@ -468,7 +485,9 @@ from .queue_engine import _target_state_from_status  # noqa: E402
 class TerminalAgentRunner:
     """A real AgentRunner over real sessions. No mock, no second queue.
 
-    It owns no state of its own. Everything it needs to survive a restart is
+    Dispatch ownership survives a restart in durable rows. Conservative
+    inactivity observations restart their timeout when this object restarts.
+    Everything needed to avoid duplicate sends is
     in `harness_dispatches`, everything about the run is in `harness_runs`,
     and the sessions belong to the controller. Losing this object loses
     nothing: a new one reads the open dispatch row and carries on observing
@@ -501,7 +520,8 @@ class TerminalAgentRunner:
         self.ops = ops
         self.store = store
         self.trust = trust
-        self.artifacts_root = Path(artifacts_root)
+        self.artifacts_root = Path(artifacts_root).expanduser().resolve()
+        self._idle_observations: dict[str, tuple[tuple, float]] = {}
         self.broker = broker or SessionBroker(ops, store, router=router,
                                               default_runtime=default_runtime)
         self.runtime_for_role = dict(runtime_for_role or {})
@@ -524,8 +544,14 @@ class TerminalAgentRunner:
         """
         from .harness_engine import AgentResult
 
+        if run.node_id is not None and not self.broker.is_local_node(run.node_id):
+            return AgentResult(infra_failure=True, error="harness execution requires the local artifact node")
         existing = self.store.latest_dispatch(run.id, iteration=iteration, role=role)
         if existing is not None:
+            if not self.broker.is_local_node(existing.get("node_id")):
+                # Preserve the open dispatch: remote work may still be live,
+                # and marking it failed would permit a duplicate local send.
+                return AgentResult(infra_failure=True, error="dispatch requires a non-local artifact node")
             if existing["state"] == "awaiting_session":
                 return self._send_when_ready(existing, prompt, run, role, iteration)
             if existing["state"] in self.store.OPEN_DISPATCH_STATES:
@@ -619,6 +645,8 @@ class TerminalAgentRunner:
 
         session = dispatch["session_id"]
         health = self.broker.health(session)
+        if health.get("alive") and not self.broker.is_local_node(health.get("node_id")):
+            return AgentResult(infra_failure=True, error="session moved off the local artifact node")
         if not health.get("alive"):
             self.store.update_dispatch(dispatch["id"], state="failed",
                                        error=f"spawned session never came up: "
@@ -765,8 +793,14 @@ class TerminalAgentRunner:
                                        error="dispatch has no session")
             return AgentResult(infra_failure=True, error="dispatch has no session")
 
+        if not self.broker.is_local_node(dispatch.get("node_id")):
+            return AgentResult(infra_failure=True, error="dispatch requires a non-local artifact node")
         health = self.broker.health(session)
+        if health.get("alive") and not self.broker.is_local_node(health.get("node_id")):
+            self._idle_observations.pop(dispatch_id, None)
+            return AgentResult(infra_failure=True, error="session moved off the local artifact node")
         if not health.get("alive"):
+            self._idle_observations.pop(dispatch_id, None)
             reason = str(health.get("reason"))
             self.store.update_dispatch(dispatch_id, state="failed", error=reason,
                                        last_observed_at=iso_now())
@@ -775,6 +809,7 @@ class TerminalAgentRunner:
 
         self.store.update_dispatch(dispatch_id, last_observed_at=iso_now())
         if health.get("awaiting_human"):
+            self._idle_observations.pop(dispatch_id, None)
             # Not stalled and not done. Reported as infrastructure so the run
             # checkpoints and resumes rather than burning a product iteration
             # on an agent that is sitting at a prompt.
@@ -784,12 +819,22 @@ class TerminalAgentRunner:
         finished = self._read_completion(dispatch, session)
         if finished is not None:
             return finished
-        if health.get("busy"):
+        if health.get("busy") or health.get("state") != "IDLE":
+            self._idle_observations.pop(dispatch_id, None)
             return AgentResult(pending=True, dispatch_id=dispatch_id,
                                session_id=session)
 
-        age = _age_seconds(dispatch.get("last_observed_at") or dispatch.get("created_at"))
+        # Observation is not progress. Updating last_observed_at on each poll
+        # must not postpone the stall deadline indefinitely.
+        now = time.monotonic()
+        signature = (health.get("state"), health.get("output_hash"))
+        previous = self._idle_observations.get(dispatch_id)
+        if previous is None or previous[0] != signature:
+            previous = (signature, now)
+            self._idle_observations[dispatch_id] = previous
+        age = now - previous[1]
         if age >= self.stall_seconds:
+            self._idle_observations.pop(dispatch_id, None)
             self.store.update_dispatch(
                 dispatch_id, state="stalled",
                 error=f"quiet for {int(age)}s with no completion marker")
@@ -853,6 +898,7 @@ class TerminalAgentRunner:
     def _complete(self, dispatch: Mapping[str, Any], session: str, payload: Any) -> Any:
         from .harness_engine import AgentResult
 
+        self._idle_observations.pop(dispatch["id"], None)
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         self.store.update_dispatch(
             dispatch["id"], state="completed", completed_at=iso_now(),

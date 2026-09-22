@@ -560,7 +560,8 @@ def main() -> None:
     register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store,
                        queue=queue, integration=integration, pm=pm, planner=planner, ai_usage=ai_usage,
                        recovery=recovery, backlog=backlog, fleet=fleet, onboarding=onboarding,
-                       credentials=credentials, heartbeat_replay=heartbeat_replay, notes=notes, webauth=webauth, run_journal=run_journal)
+                       credentials=credentials, heartbeat_replay=heartbeat_replay, notes=notes, webauth=webauth,
+                       run_journal=run_journal, harness=queue.harness)
     register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2, controller,
                                queue=queue, run_journal=run_journal)
     register_health(server, terminal, supervisor)
