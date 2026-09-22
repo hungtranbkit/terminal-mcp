@@ -107,6 +107,7 @@ def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_sessio
                      project_plan, project_bootstrap, project_list, project_get,
                      project_update, project_archive, project_phase_status,
                      project_advance, project_reconcile_team, project_start,
+                     project_recover,
                      browser_status, browser_verify, browser_screenshot,
                      browser_run_task, browser_stop, dispatch_tick,
                      follow_task, harness_start, harness_status, harness_resume,
@@ -151,6 +152,7 @@ def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_sessio
         "project_advance": project_advance,
         "project_reconcile_team": project_reconcile_team,
         "project_start": project_start,
+        "project_recover": project_recover,
         "task_status": task_status,
         "task_batch_status": task_batch_status,
         # May be None on a build with no browser gateway wired. The router
@@ -3507,6 +3509,28 @@ def build_mcp(service: TerminalService | None = None,
         from .stale_sessions import cleanup_candidates
         return cleanup_candidates(queue.router, config=terminal.config, limit=limit)
 
+    @server.tool()
+    def terminal_session_cleanup(session: str, requested_by: str | None = None) -> dict:
+        """Delete ONE session an operator has confirmed is stale.
+
+        The precondition is re-derived from a FRESH fleet read immediately
+        before the delete, not taken from whatever report the caller was
+        looking at: a session that has since gone busy, taken a task, or
+        turned out to still have its working directory is refused with
+        NOT_A_CANDIDATE and nothing is deleted.
+
+        Protected/admin sessions are never candidates, so this can never
+        remove one. Everything the ordinary delete enforces -- grants, audit,
+        the killed-session record -- still applies; this adds a precondition,
+        never a privilege."""
+        if queue.router is None:
+            return {"error": "ROUTER_UNAVAILABLE"}
+        if controller is None:
+            return {"error": "CONTROLLER_UNAVAILABLE"}
+        from .stale_sessions import cleanup_session
+        return cleanup_session(queue.router, session, controller=controller,
+                               config=terminal.config, requested_by=requested_by)
+
     # -- Project runtime (TMCP-PROJECT-BOOTSTRAP-001) -----------------------
 
     @server.tool()
@@ -3627,6 +3651,25 @@ def build_mcp(service: TerminalService | None = None,
                                       capabilities=capabilities or (), approval=approval,
                                       agent_id=agent_id, priority=priority, metadata=metadata,
                                       request_key=request_key, target=target)
+
+    @server.tool()
+    def terminal_project_recover(project_id: str | None = None, limit: int = 25,
+                                 dry_run: bool = False) -> dict:
+        """PM recovery: give stalled work a working runtime again.
+
+        A task bound to a session on a node that has gone offline -- or one
+        holding a runtime it never started on -- looks perfectly assigned and
+        is going nowhere. Neither the rescue sweep nor the bound-task drive
+        picks it up, because both read it as "already placed".
+
+        This releases ONLY the runtime binding (execution session/node and the
+        routing state) and re-runs the Agent/Session router. The project,
+        agent, pinned skills, prompt, priority and evidence are untouched, and
+        every decision is appended to the task's own durable handoff history.
+
+        `dry_run=True` shows what would be recovered and changes nothing.
+        Omit `project_id` to sweep the whole fleet."""
+        return project_runtime.recover_stalled(project_id, limit=limit, dry_run=dry_run)
 
     # -- Agent + Skill runtime (TMCP-AGENT-RUNTIME-001 Phase B) -------------
 
@@ -5386,12 +5429,44 @@ def build_mcp(service: TerminalService | None = None,
             return {"error": "CONTROLLER_UNAVAILABLE"}
         wanted = tuple(required or ())
         nodes = controller.registry.nodes_with_capabilities(wanted, online_only=online_only)
+        # WHY a runtime is missing, for THIS node only. A remote node's PATH
+        # is not readable from here, so the evidence block is attached to the
+        # local node and nothing is invented for the others -- "unknown" is
+        # the honest answer and matches the same rule agent_availability.py
+        # was written to protect: a capability is probed where it lives.
+        from .agent_availability import agent_type_evidence
+
+        local_evidence: dict = {}
+        try:
+            local_evidence = agent_type_evidence(
+                tuple(terminal.config.session_lifecycle.launch_commands))
+        except Exception:  # noqa: BLE001 -- evidence is an enhancement, never a gate
+            local_evidence = {}
+        spawn_enabled = bool(getattr(getattr(queue, "router", None), "spawn_enabled", False))
+        matches = []
+        for n in nodes:
+            row = {"node_id": n.id, "platform": n.platform, "status": n.status,
+                   "capabilities": list(n.capabilities),
+                   "agent_types": list(n.agent_types),
+                   # A runtime the node advertises is one the ROUTER may place
+                   # work on. Whether it may CREATE a session with it is a
+                   # separate, operator-owned decision (router.spawn_enabled),
+                   # and conflating the two is how "the node has claude" gets
+                   # read as "the router will spawn claude here".
+                   "router_may_spawn": spawn_enabled and bool(n.agent_types)}
+            if n.id == controller.local_node_id and local_evidence:
+                row["agent_type_evidence"] = local_evidence
+            else:
+                row["agent_type_evidence"] = None
+                row["agent_type_evidence_detail"] = (
+                    "probed on the node itself and reported in agent_types; this controller "
+                    "cannot read another node's PATH")
+            matches.append(row)
         return {
             "required": list(wanted),
             "online_only": online_only,
-            "matches": [{"node_id": n.id, "platform": n.platform, "status": n.status,
-                         "capabilities": list(n.capabilities),
-                         "agent_types": list(n.agent_types)} for n in nodes],
+            "router_spawn_enabled": spawn_enabled,
+            "matches": matches,
             "match_count": len(nodes),
         }
 
@@ -6220,6 +6295,7 @@ def build_mcp(service: TerminalService | None = None,
         project_advance=terminal_project_advance,
         project_reconcile_team=terminal_project_reconcile_team,
         project_start=terminal_project_start,
+        project_recover=terminal_project_recover,
         task_status=terminal_task_status,
         task_batch_status=terminal_task_batch_status,
         browser_status=browser_handlers.get("browser_status"),

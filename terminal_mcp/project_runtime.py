@@ -641,6 +641,37 @@ class ProjectRuntimeService:
                 "agent_selection_reason": rationale.get("reason"),
                 "agent_candidates": rationale.get("candidates", [])}
 
+    # -- PM recovery ---------------------------------------------------------
+
+    def recover_stalled(self, project_id: str | None = None, *, limit: int = 25,
+                        dry_run: bool = False) -> dict[str, Any]:
+        """The PM's own recovery pass: stalled runtimes back to the router.
+
+        This is the PM acting, not reporting. A project whose execution
+        session died has tasks that look perfectly assigned and are going
+        nowhere, and nothing else in the system picks them up -- see
+        pm_recovery.py for why routable_tasks and bound_unstarted_tasks both
+        miss exactly this case.
+
+        Durable ownership (project, agent, skills, evidence) is preserved
+        throughout; only the runtime binding is released and re-decided.
+        """
+        from .pm_recovery import ProjectPMRecovery
+
+        if project_id:
+            project = self.store.get_project(project_id)
+            if project is None:
+                return {"error": "PROJECT_NOT_FOUND", "project_id": project_id}
+        router = getattr(self.queue, "router", None)
+        controller = getattr(router, "controller", None)
+        recovery = ProjectPMRecovery(self.queue.store, router=router, controller=controller)
+        result = recovery.sweep(project_id=project_id, limit=limit, dry_run=dry_run)
+        if project_id:
+            project = self.store.get_project(project_id)
+            result["pm_agent_id"] = getattr(project, "pm_agent_id", None)
+            result["phase"] = getattr(project, "phase", None)
+        return result
+
     @staticmethod
     def _infer_capabilities(prompt: str, phase: str) -> list[str]:
         """What this task needs, from its own words plus the current phase.

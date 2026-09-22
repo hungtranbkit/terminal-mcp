@@ -1,6 +1,6 @@
-"""Sessions that look retired -- as a REPORT, never as an action.
+"""Sessions that look retired -- a report, and ONE confirmed action.
 
-WHY THIS ONLY EVER REPORTS
+WHY THE REPORT NEVER ACTS BY ITSELF
 
 The fleet accumulates idle sessions whose worktrees were deleted weeks ago.
 They are noise in every listing and, before the router existed, they were
@@ -13,8 +13,22 @@ Somebody, not something. An automatic delete here would be a process that
 destroys a real session on the strength of a heuristic, and the failure mode
 is unrecoverable: a session killed while its agent was mid-task loses work
 that exists nowhere else. Every candidate below is therefore evidence for a
-human decision, and this module has no delete path at all -- not a disabled
-one, not one behind a flag.
+human decision. Nothing sweeps, nothing schedules, nothing runs on a timer.
+
+THE ONE ACTION, AND WHY IT RE-CHECKS EVERYTHING
+
+`cleanup_session` exists so an operator who has read the evidence can act on
+it from the same screen instead of copying a session name into a different
+tool. It is a named, one-session, explicitly-requested delete -- and it
+RE-DERIVES the whole candidacy decision immediately before deleting, from a
+freshly refreshed fleet read.
+
+That re-check is the point, not ceremony. The report an operator is looking at
+is seconds old at best; a session that was idle when the page rendered may be
+running work by the time they click. So the operator's click authorizes
+deleting a session that is STILL a candidate, never a session that merely was
+one. A session that stopped qualifying comes back NOT_A_CANDIDATE with the
+reason, and nothing is deleted.
 
 WHAT MAKES A CANDIDATE
 
@@ -128,3 +142,64 @@ def cleanup_candidates(router: Any, *, config: Any = None, limit: int = 50,
         "note": ("This is a report. Nothing here has been or will be deleted automatically -- "
                  "confirm each session with its owner before removing it."),
     }
+
+
+#: Why a confirmed cleanup was refused. Each one is the exact exclusion rule
+#: from `cleanup_candidates`, re-evaluated at delete time rather than trusted
+#: from the report the operator was reading.
+CLEANUP_REFUSED = "NOT_A_CANDIDATE"
+
+
+def cleanup_session(router: Any, session: str, *, controller: Any = None,
+                    config: Any = None, protected: Sequence[str] = (),
+                    requested_by: str | None = None) -> dict[str, Any]:
+    """Delete ONE named session, but only if it is still a stale candidate.
+
+    `router` supplies the fleet view (refreshed, never cached -- a stale view
+    is the one input that could make this destructive). `controller` performs
+    the delete through the same path every other delete uses, so protected
+    sessions, grants, audit and the killed-session record all apply unchanged;
+    this function adds a precondition, it does not add a privilege.
+
+    Returns the delete result on success, or `{"error": CLEANUP_REFUSED,
+    "reason": ...}` when the session is no longer safe to remove.
+    """
+    if not session or not str(session).strip():
+        return {"error": "SESSION_REQUIRED"}
+    name = str(session).strip()
+    if controller is None:
+        return {"error": "CONTROLLER_UNAVAILABLE",
+                "detail": "no controller is wired here, so nothing can be deleted"}
+
+    report = cleanup_candidates(router, config=config, limit=10_000, protected=protected)
+    if report.get("error"):
+        # A fleet we could not read is a fleet we must not delete from.
+        return {"error": "FLEET_READ_FAILED", "detail": report.get("detail"),
+                "session": name}
+    candidates = {row["session"]: row for row in report.get("candidates", [])}
+    if name not in candidates:
+        excluded = next((row for row in report.get("excluded", []) if row.get("session") == name), None)
+        return {
+            "error": CLEANUP_REFUSED,
+            "session": name,
+            "reason": (f"{excluded['reason']}: {excluded.get('detail')}" if excluded
+                       else "this session is not a stale-cleanup candidate right now "
+                            "(it may have become busy, taken a task, or its working "
+                            "directory may exist after all)"),
+            "excluded": excluded,
+            "note": "nothing was deleted",
+        }
+
+    candidate = candidates[name]
+    # The same delete every other caller uses. `requested_by` is passed when
+    # the controller accepts one (it is an audit attribution, not a
+    # permission) and omitted otherwise -- never a second delete path.
+    try:
+        result = controller.terminal_delete_session(name, requested_by=requested_by)
+    except TypeError:
+        result = controller.terminal_delete_session(name)
+    if isinstance(result, dict) and result.get("error"):
+        return {**result, "session": name, "candidate": candidate}
+    return {"deleted": True, "session": name, "node_id": candidate.get("node_id"),
+            "evidence": candidate.get("evidence"), "result": result,
+            "requested_by": requested_by}

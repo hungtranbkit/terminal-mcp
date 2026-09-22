@@ -162,6 +162,27 @@ SECRET_PROMPT_PATTERNS = (
 
 SENSITIVE_PROMPT_PATTERNS = DESTRUCTIVE_PROMPT_PATTERNS + SECRET_PROMPT_PATTERNS
 
+SENSITIVE_CONTENT_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"enter (your |the )?password",
+        r"api[_ -]?key",
+        r"credential",
+        r"\bsecret\b",
+        r"\btoken\b",
+        r"private[_ -]?key",
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
+        r"force[ -]push",
+        r"\brm -rf\b",
+        r"drop (table|database)",
+        r"\bsudo\b",
+        r"reset --hard",
+        r"\bgit clean\b",
+        r"merge (to |into )?main\b",
+        r"push (to |origin )?main\b",
+    )
+)
+
 DEFAULT_MAX_REVIEW_ATTEMPTS = 5
 """Item: "Coordinator có... max review attempts, không loop vô hạn." A
 task that keeps landing back in PRECHECK (NEEDS_REWORK, over and over)

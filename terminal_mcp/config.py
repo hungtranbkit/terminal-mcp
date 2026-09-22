@@ -191,6 +191,21 @@ class RouterConfig:
     #: while good runtimes sit unexamined, which it now reports rather than
     #: mislabelling as "nothing eligible".
     probe_limit: int = 8
+    #: WALL-CLOCK CEILING ON THE FLEET SNAPSHOT ALONE, carved out of
+    #: dispatch_budget_seconds rather than added to it. Measured live on
+    #: hp-linux (2026-09-20) against a five-node fleet: a serial session
+    #: listing took 3.6s-25.4s and consumed the entire 12s dispatch budget, so
+    #: project_start returned with dispatch_ticks=0 and the task never started
+    #: synchronously. Looking at the fleet is a means; starting the task is the
+    #: end, so the snapshot is capped at this OR half the dispatch budget,
+    #: whichever is smaller, and the rest is left for real dispatch ticks.
+    snapshot_budget_seconds: float = 4.0
+    #: How old a fallback fleet snapshot may be when a fresh listing comes back
+    #: empty because nodes timed out. Routing on a recent snapshot risks a
+    #: candidate that has since gone busy -- which the live probe re-checks and
+    #: the atomic bind refuses outright. Routing on NOTHING defers the whole
+    #: queue on one slow node, which nothing downstream corrects.
+    stale_snapshot_max_age_seconds: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -2067,6 +2082,14 @@ def _load_router_config(router_raw: object) -> RouterConfig:
     probe_limit = int(router_raw.get("probe_limit", RouterConfig.probe_limit))
     if not 1 <= probe_limit <= 25:
         raise ValueError("router.probe_limit must be between 1 and 25")
+    snapshot_budget = float(router_raw.get("snapshot_budget_seconds",
+                                           RouterConfig.snapshot_budget_seconds))
+    if not 0.5 <= snapshot_budget <= 30.0:
+        raise ValueError("router.snapshot_budget_seconds must be between 0.5 and 30")
+    stale_snapshot = float(router_raw.get("stale_snapshot_max_age_seconds",
+                                          RouterConfig.stale_snapshot_max_age_seconds))
+    if not 0.0 <= stale_snapshot <= 3600.0:
+        raise ValueError("router.stale_snapshot_max_age_seconds must be between 0 and 3600")
     return RouterConfig(
         enabled=bool(router_raw.get("enabled", RouterConfig.enabled)),
         rescue_enabled=bool(router_raw.get("rescue_enabled", RouterConfig.rescue_enabled)),
@@ -2077,6 +2100,8 @@ def _load_router_config(router_raw: object) -> RouterConfig:
         rescue_batch_size=batch,
         dispatch_budget_seconds=budget,
         probe_limit=probe_limit,
+        snapshot_budget_seconds=snapshot_budget,
+        stale_snapshot_max_age_seconds=stale_snapshot,
     )
 
 

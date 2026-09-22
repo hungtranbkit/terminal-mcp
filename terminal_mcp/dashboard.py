@@ -8164,10 +8164,18 @@ TERMINAL_WALL_HTML = r"""<!doctype html>
       header { padding:8px 12px; gap:6px } h1 { font-size:15px }
       .btn { padding:6px 9px; min-height:36px }
       /* The badges already say RUNNING/IDLE/..., so the status line goes
-         first, then the back-link's label (the arrow still reads as "back"). */
+         first. The back link goes ENTIRELY: the shared global bar above is
+         on every page now and its Home entry is the same destination, so a
+         second one here is a duplicate that costs a whole wrapped header
+         row on a 390px screen. See dashboard_nav.py. */
       #status { display:none }
-      #backLink { font-size:0 }
-      #backLink::before { content:'← '; font-size:13px }
+      #backLink { display:none }
+      /* The title moves into the shared bar's breadcrumb, which is visible
+         at every width -- so orientation is kept and a 23px row of the
+         page's own header is not spent repeating it. Measured on a
+         390x844 phone: the first tile came back from y=357 to inside its
+         330px budget. */
+      header > h1 { display:none }
       .bar { display:grid; grid-template-columns:1fr 1fr; gap:6px; padding:8px 12px 2px }
       main { padding:8px 12px 22px }
       #wall { gap:14px }
@@ -8222,6 +8230,11 @@ TERMINAL_WALL_HTML = r"""<!doctype html>
   </main>
   <script>
     const $ = (s) => document.querySelector(s);
+    // Where you are, in the shared bar rather than in a row of this page's
+    // own chrome. The bar is on every page and visible at every width; the
+    // h1 below it is hidden on a phone, where the wall needs the pixels for
+    // the thing it exists to show.
+    if (window.tmcpBreadcrumb) window.tmcpBreadcrumb([{ label: 'Terminal wall' }]);
     const state = {boxes: [], nodes: [], paused: false, activeOnly: false, cols: 3,
                    tokens: new Map(), collapsed: new Set()};
 
@@ -10917,9 +10930,9 @@ PROJECTS_HTML = """<!doctype html>
     <div style="display:flex;align-items:center;gap:8px">
       <button class="btn primary" id="newBtn" type="button">+ New Project</button>
       <button class="btn" id="refreshBtn" type="button">&#10227;</button>
-      <a class="btn" href="/dashboard/agents">&#129302; Agents</a>
-      <a class="btn" href="/dashboard/tasks">&#128451; Tasks</a>
-      <a class="btn" href="/dashboard">&#8592; Terminal</a>
+      <!-- Agents / Tasks / Terminal used to live here as one-way links.
+           They are in the global bar now (dashboard_nav.py), on every page
+           rather than on the two that happened to remember them. -->
       <span class="live" id="liveBadge">&#9679; LIVE</span>
     </div>
   </header>
@@ -11203,16 +11216,150 @@ PROJECTS_HTML = """<!doctype html>
       }
       history_.append(ht);
       root.append(history_);
+
+      renderRuntimeHealth(project.id);
+    }
+
+    // ---- runtime health (admin) -----------------------------------------
+    // The two things that make a project look assigned and go nowhere:
+    // a task bound to a runtime that has died, and a fleet full of idle
+    // sessions whose worktrees were deleted weeks ago. Both were MCP-tool
+    // only, so an operator looking at a stalled project had to leave the
+    // page to act on it.
+    function renderRuntimeHealth(projectId) {
+      const card = el('div', 'card');
+      card.append(el('h2', null, '\u2699 Runtime health'));
+      const note = el('div', 'muted');
+      note.style.fontSize = '11px';
+      note.textContent = 'Reads are a dry run \u2014 opening this panel never moves anybody\u2019s work.';
+      card.append(note);
+      const host = el('div');
+      card.append(host);
+      const err = el('div', 'err');
+      card.append(err);
+      root.append(card);
+
+      const paint = (data) => {
+        host.replaceChildren();
+        const stalled = (data.stalled_runtimes || {});
+        const rows = stalled.results || [];
+        const stalledBox = el('div');
+        stalledBox.append(el('h2', null, 'Stalled runtimes (' + rows.length + ')'));
+        if (!rows.length) {
+          const ok = el('div', 'muted');
+          ok.textContent = stalled.error
+            ? clean(stalled.error)
+            : 'Every bound task still has a live runtime.';
+          stalledBox.append(ok);
+        } else {
+          for (const row of rows) {
+            const line = el('div');
+            line.style.padding = '5px 0';
+            line.style.borderBottom = '1px solid var(--line)';
+            const label = el('div');
+            label.append(chip(clean(row.released_session), 'warn'),
+                         document.createTextNode('  ' + clean(row.agent_id || 'no agent')));
+            const why = el('div', 'muted');
+            why.style.fontSize = '11px';
+            why.textContent = clean(row.reason);
+            line.append(label, why);
+            stalledBox.append(line);
+          }
+          const actions = el('div', 'row');
+          const recoverBtn = el('button', 'btn primary',
+                                'Recover ' + rows.length + ' stalled task(s)');
+          recoverBtn.onclick = async () => {
+            err.textContent = '';
+            recoverBtn.disabled = true;
+            try {
+              await api('/dashboard/api/runtime-health/recover', { method: 'POST',
+                body: JSON.stringify({ project_id: projectId }) });
+              refresh();
+            } catch (error) { err.textContent = clean(error.message); }
+            recoverBtn.disabled = false;
+          };
+          actions.append(recoverBtn);
+          stalledBox.append(actions);
+        }
+        host.append(stalledBox);
+
+        const stale = (data.stale_sessions || {});
+        const candidates = stale.candidates || [];
+        const staleBox = el('div');
+        staleBox.style.marginTop = '10px';
+        staleBox.append(el('h2', null, 'Stale sessions (' + candidates.length + ')'));
+        if (!candidates.length) {
+          const ok = el('div', 'muted');
+          ok.textContent = stale.error ? clean(stale.error)
+            : 'Nothing in the fleet looks retired.';
+          staleBox.append(ok);
+        }
+        for (const candidate of candidates) {
+          const line = el('div');
+          line.style.padding = '5px 0';
+          line.style.borderBottom = '1px solid var(--line)';
+          const label = el('div');
+          label.append(chip(clean(candidate.session)),
+                       chip(clean(candidate.node_name || candidate.node_id)),
+                       chip(clean(candidate.state), 'off'));
+          const why = el('div', 'muted');
+          why.style.fontSize = '11px';
+          // WHY it is stale, in the report's own words. A cleanup button with
+          // no reason beside it is a button nobody should press.
+          why.textContent = (candidate.evidence || []).join(' \u00b7 ');
+          const remove = el('button', 'btn', 'Clean up');
+          remove.style.marginTop = '4px';
+          remove.onclick = async () => {
+            err.textContent = '';
+            remove.disabled = true;
+            try {
+              await api('/dashboard/api/runtime-health/cleanup', { method: 'POST',
+                body: JSON.stringify({ session: candidate.session }) });
+              refresh();
+            } catch (error) { err.textContent = clean(error.message); remove.disabled = false; }
+          };
+          line.append(label, why, remove);
+          staleBox.append(line);
+        }
+        const excluded = (stale.excluded || []).length;
+        if (excluded) {
+          const skipped = el('div', 'muted');
+          skipped.style.fontSize = '11px';
+          skipped.style.marginTop = '6px';
+          skipped.textContent = excluded + ' session(s) deliberately excluded (busy, waiting for '
+            + 'input, holding tasks, or protected).';
+          staleBox.append(skipped);
+        }
+        host.append(staleBox);
+      };
+
+      const refresh = async () => {
+        try {
+          paint(await api('/dashboard/api/runtime-health?project_id=' +
+                          encodeURIComponent(projectId)));
+        } catch (error) { err.textContent = clean(error.message); }
+      };
+      refresh();
     }
 
     async function load() {
-      if (wizard) { renderWizard(); return; }
+      if (wizard) {
+        window.tmcpBreadcrumb([{ label: 'Projects', href: '/dashboard/projects' },
+                               { label: 'New' }]);
+        renderWizard();
+        return;
+      }
       try {
         if (currentId) {
           const body = await api('/dashboard/api/projects/detail?project_id=' +
                                  encodeURIComponent(currentId));
+          // Breadcrumb, not a back button: the global bar already gets you
+          // anywhere, so this only has to say where you ARE.
+          window.tmcpBreadcrumb([{ label: 'Projects', href: '/dashboard/projects' },
+                                 { label: clean(body.project.name || body.project.id) }]);
           renderDetail(body.project);
         } else {
+          window.tmcpBreadcrumb([]);
           const body = await api('/dashboard/api/projects');
           renderList(body.projects || []);
         }
@@ -11272,8 +11419,8 @@ AGENTS_HTML = """<!doctype html>
     <div><h1>&#129302; Agents</h1><div class="muted">Durable agent identity &#183; disposable session runtime</div></div>
     <div style="display:flex;align-items:center;gap:10px">
       <button class="back" id="refreshBtn" type="button">&#10227; Refresh</button>
-      <a class="back" href="/dashboard/tasks">&#128451; Global Tasks</a>
-      <a class="back" href="/dashboard">&#8592; Terminal</a>
+      <!-- Global Tasks / Terminal used to live here as one-way links. They
+           are in the global bar now (dashboard_nav.py), on every page. -->
       <span class="live" id="liveBadge">&#9679; LIVE</span>
     </div>
   </header>
@@ -11312,6 +11459,29 @@ AGENTS_HTML = """<!doctype html>
         }
         const id = document.createElement('span'); id.className = 'chip';
         id.textContent = '#' + clean(agent.id); head.append(id);
+        // ROLE first, then how it sits in the pipeline. An agent card that
+        // says only "ACTIVE" does not tell you whether you are looking at the
+        // project manager or the fourth UI specialist.
+        if (agent.role) {
+          const role = document.createElement('span');
+          role.className = 'chip ' + (agent.cross_phase ? 'skill' : '');
+          role.textContent = clean(agent.role);
+          head.append(role);
+        }
+        if (agent.cross_phase) {
+          const pm = document.createElement('span'); pm.className = 'chip skill';
+          pm.textContent = 'cross-phase PM'; head.append(pm);
+        } else if ((agent.phases || []).length) {
+          const ph = document.createElement('span'); ph.className = 'chip';
+          ph.textContent = (agent.phases || []).join(' \u00b7 '); head.append(ph);
+        }
+        if (agent.project_id) {
+          const link = document.createElement('a');
+          link.className = 'chip';
+          link.href = '/dashboard/projects?project_id=' + encodeURIComponent(agent.project_id);
+          link.textContent = '\u2197 ' + clean(agent.project_id);
+          head.append(link);
+        }
         for (const skill of (agent.skills || [])) {
           const sk = document.createElement('span'); sk.className = 'chip skill';
           sk.textContent = clean(skill.skill_id) + '@' + clean(skill.version) +
@@ -11354,11 +11524,25 @@ AGENTS_HTML = """<!doctype html>
       }
     }
 
+    const params = new URLSearchParams(location.search);
+    const projectFilter = params.get('project_id') || '';
+
     async function load() {
       try {
-        const response = await fetch('/dashboard/api/agents', { headers: { 'Accept': 'application/json' } });
+        const query = projectFilter
+          ? '?project_id=' + encodeURIComponent(projectFilter) : '';
+        const response = await fetch('/dashboard/api/agents' + query,
+                                     { headers: { 'Accept': 'application/json' } });
         if (!response.ok) throw new Error('HTTP ' + response.status);
         const body = await response.json();
+        // Breadcrumb rather than a back button: the global bar already reaches
+        // everywhere, so this only has to say where you are.
+        window.tmcpBreadcrumb(projectFilter
+          ? [{ label: 'Projects', href: '/dashboard/projects' },
+             { label: projectFilter,
+               href: '/dashboard/projects?project_id=' + encodeURIComponent(projectFilter) },
+             { label: 'Agents' }]
+          : []);
         render(body.agents || []);
         liveBadge.classList.remove('offline');
       } catch (error) {
@@ -14680,6 +14864,99 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         return JSONResponse(result, status_code=200 if "error" not in result else 400,
                             headers={"Cache-Control": "no-store"})
 
+    # -- Runtime health: the two admin actions a stalled project needs -------
+    #
+    # Both existed only as MCP tools, which means an operator looking at a
+    # stalled project on the dashboard had to leave it, open a different
+    # client, and know the tool's name. They are admin surfaces, so both sit
+    # behind the SAME guards as every other route here: reads through
+    # _read_guard, the two actions through _mutation_guard (mutations_enabled
+    # + same-origin CSRF + CF Access).
+
+    @server.custom_route("/dashboard/api/runtime-health", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_api_runtime_health(request: Request) -> JSONResponse:
+        """What is stuck, and what is abandoned -- for one project or the fleet.
+
+        Report only. `stale_sessions` is the existing candidate report; the
+        recovery half runs as a dry run, so opening the panel never moves
+        anybody's work."""
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        project_id = request.query_params.get("project_id") or None
+
+        def _collect() -> dict[str, Any]:
+            answer: dict[str, Any] = {"project_id": project_id}
+            if queue is not None and getattr(queue, "router", None) is not None:
+                from .stale_sessions import cleanup_candidates
+
+                answer["stale_sessions"] = cleanup_candidates(
+                    queue.router, config=terminal.config, limit=50)
+            else:
+                answer["stale_sessions"] = {"error": "ROUTER_UNAVAILABLE",
+                                            "candidates": [], "excluded": []}
+            if projects is not None:
+                answer["stalled_runtimes"] = projects.recover_stalled(
+                    project_id, limit=25, dry_run=True)
+            else:
+                answer["stalled_runtimes"] = {"error": "PROJECT_RUNTIME_UNAVAILABLE",
+                                              "results": []}
+            return answer
+
+        result = await anyio.to_thread.run_sync(_collect)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/runtime-health/recover", methods=["POST"],
+                         include_in_schema=False)
+    async def dashboard_api_runtime_recover(request: Request) -> JSONResponse:
+        """PM recovery, for real this time. Releases only the runtime binding
+        of tasks whose runtime is demonstrably gone and re-runs the router."""
+        blocked, _identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        if projects is None:
+            return JSONResponse({"error": "PROJECT_RUNTIME_UNAVAILABLE"}, status_code=404)
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        project_id = (body.get("project_id") or None) if isinstance(body, dict) else None
+        result = await anyio.to_thread.run_sync(
+            lambda: projects.recover_stalled(project_id, limit=25, dry_run=False))
+        return JSONResponse(result, status_code=200 if "error" not in result else 400,
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/runtime-health/cleanup", methods=["POST"],
+                         include_in_schema=False)
+    async def dashboard_api_runtime_cleanup(request: Request) -> JSONResponse:
+        """Delete ONE session an operator has confirmed is stale.
+
+        The candidacy check is re-derived from a fresh fleet read inside
+        `cleanup_session`, so a session that went busy between the panel
+        rendering and the click is refused rather than deleted."""
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        if queue is None or getattr(queue, "router", None) is None:
+            return JSONResponse({"error": "ROUTER_UNAVAILABLE"}, status_code=404)
+        if controller is None:
+            return JSONResponse({"error": "CONTROLLER_UNAVAILABLE"}, status_code=404)
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        session = body.get("session") if isinstance(body, dict) else None
+        if not isinstance(session, str) or not session.strip():
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        from .stale_sessions import cleanup_session
+
+        result = await anyio.to_thread.run_sync(lambda: cleanup_session(
+            queue.router, session.strip(), controller=controller, config=terminal.config,
+            requested_by=(identity.email if identity else "dashboard")))
+        return JSONResponse(result, status_code=200 if "error" not in result else 409,
+                            headers={"Cache-Control": "no-store"})
+
     @server.custom_route("/dashboard/agents", methods=["GET"], include_in_schema=False)
     async def dashboard_agents(request: Request) -> HTMLResponse | JSONResponse:
         # Same read guard as every other admin page. A VIEW over the agent
@@ -14720,8 +14997,11 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             session_name = current.get("session")
             if session_name:
                 try:
+                    # BOUNDED. This page polls every five seconds and probes one
+                    # session per busy agent; an unbounded read per agent turns a
+                    # view into a fleet-wide wait the moment one node is slow.
                     status = await anyio.to_thread.run_sync(
-                        controller.terminal_status, session_name)
+                        lambda name=session_name: controller.terminal_status_bounded(name, 2.0))
                     resource = status.get("resource") if isinstance(status, dict) else None
                     context = (resource or {}).get("context") or {}
                     view["context_percent"] = context.get("percent")

@@ -143,6 +143,13 @@ HTML = """<!doctype html><meta name=viewport content='width=device-width,initial
 <script>const $=id=>document.getElementById(id);let data;function esc(x){return String(x??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}function render(){let c=data.config;project.value=c.project_id;mode.value=c.mode;dispatcher.innerHTML=data.sessions.map(x=>`<option>${esc(x.session)}</option>`).join('');dispatcher.value=c.dispatcher_session;roots.value=c.allowed_roots.join('\n');bindings.value=JSON.stringify(c.bindings,null,2);workers.innerHTML=c.workers.map(x=>`<span class=pill>${esc(x)} <button data-r='${esc(x)}'>Remove</button></span>`).join('');sessions.innerHTML=data.sessions.map(x=>`<span class=pill>${esc(x.session)} <button data-a='${esc(x.session)}'>Add</button></span>`).join('');document.querySelectorAll('[data-a]').forEach(b=>b.onclick=()=>{if(!data.config.workers.includes(b.dataset.a)&&b.dataset.a!==dispatcher.value)data.config.workers.push(b.dataset.a);render()});document.querySelectorAll('[data-r]').forEach(b=>b.onclick=()=>{data.config.workers=data.config.workers.filter(x=>x!==b.dataset.r);render()})}async function load(){let r=await fetch('/dashboard/api/ops/dispatch-settings?project=novaretail');data=await r.json();render()}save.onclick=async()=>{try{let r=await fetch('/dashboard/api/ops/dispatch-settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project_id:project.value,dispatcher_session:dispatcher.value,workers:data.config.workers,mode:mode.value,allowed_roots:roots.value.split('\n').map(x=>x.trim()).filter(Boolean),bindings:JSON.parse(bindings.value||'{}')})});let j=await r.json();msg.textContent=r.ok?'Saved for next watchdog tick':(j.error||'Save failed');if(r.ok){data.config=j.config;render()}}catch(e){msg.textContent=e}};reset.onclick=load;load()</script>"""
 
 
+# The SAME global bar every other dashboard page carries. An ops screen is not
+# a lesser page: before this it was a one-way street whose only exits were a
+# single "Back to Monitor" link and the browser's own Back button. See
+# dashboard_nav.py.
+
+
+
 def register(server, read_guard, mutation_guard, config_path: Path = CONFIG):
     @server.custom_route("/dashboard/ops/dispatch-settings", methods=["GET"], include_in_schema=False)
     async def page(request: Request):

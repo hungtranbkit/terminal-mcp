@@ -47,6 +47,7 @@ that automatic loop would start.
 """
 from __future__ import annotations
 
+import logging
 import re
 
 import hashlib
@@ -140,8 +141,23 @@ COMPLETION_INSTRUCTION_SENTENCE = (
 #: Hard ceilings on injected skill text. A skill is standing guidance, not a
 #: payload: past these limits the agent's own prompt starts competing with the
 #: briefing for attention, and the briefing wins by being first.
+#: Named here rather than reached for ad hoc. `_skills_preamble` already
+#: referenced `_LOGGER` in its own except handler while the module defined
+#: none, so a skill store that raised turned into a NameError raised OUT of
+#: the handler meant to swallow it -- and blocked the dispatch it promises
+#: never to block. See tests/test_skill_injection_bounds.py.
+_LOGGER = logging.getLogger(__name__)
+
 MAX_SKILL_PREAMBLE_CHARS = 8_000
 MAX_SKILLS_INJECTED = 4
+
+#: How many OTHER active lanes one coordinator review will spend a live status
+#: read on. See _review: the enrichment is a heuristic input, the dispatch it
+#: was starving is not.
+MAX_OTHER_LANE_PROBES = 6
+#: Per-probe ceiling for that enrichment, when the ops object offers a bounded
+#: status read at all.
+OTHER_LANE_PROBE_SECONDS = 1.5
 
 
 def build_dispatch_text(task: QueueTask, *, nonce: str, continuation_text: str | None = None,
@@ -381,6 +397,17 @@ class QueueEngine:
 
     # -- coordinator review ------------------------------------------------
 
+    def _status_bounded(self, session: str) -> dict[str, Any]:
+        """A status read for best-effort enrichment, with a ceiling.
+
+        Falls back to the plain call for an ops object that has no bounded
+        form (every test double, and the local-only TerminalService where the
+        read is a tmux call rather than a network round trip)."""
+        bounded = getattr(self.ops, "terminal_status_bounded", None)
+        if bounded is None:
+            return self.ops.terminal_status(session)
+        return bounded(session, OTHER_LANE_PROBE_SECONDS)
+
     def _review(self, session: str, task_id: str) -> TickResult:
         task = self.store.get_task(task_id)
         status_response = self.ops.terminal_status(session)
@@ -411,13 +438,24 @@ class QueueEngine:
             if lane["session"] != session and lane["current_task"] is not None
         )
         # Cheaply enrich other_active with a real observed cwd ONLY for
-        # lanes that actually have something in flight right now (bounded
-        # by however many OTHER lanes exist -- never unbounded, never
-        # touches a lane with nothing active).
+        # lanes that actually have something in flight right now.
+        #
+        # HARD CAP, because "however many OTHER lanes exist" is not a bound.
+        # Found live on hp-linux (2026-09-20): a 78-session fleet had enough
+        # concurrently-active lanes that this loop alone -- one routed,
+        # cross-node terminal_status per lane, in series -- could outlast the
+        # router's whole synchronous dispatch budget, so a PRECHECK review
+        # performed during route_start never finished and the task came back
+        # not-started. The enrichment only feeds a cwd-overlap heuristic, so
+        # missing it degrades a scope check; missing the dispatch does not
+        # degrade anything, it loses the dispatch.
         enriched = []
-        for other in other_active:
+        for index, other in enumerate(other_active):
+            if index >= MAX_OTHER_LANE_PROBES:
+                enriched.append(other)
+                continue
             try:
-                other_status = self.ops.terminal_status(other.session)
+                other_status = self._status_bounded(other.session)
                 enriched.append(OtherLaneSnapshot(session=other.session, node_id=other_status.get("node_id"),
                                                   cwd=other_status.get("cwd")))
             except Exception:  # noqa: BLE001 -- best-effort enrichment only; never blocks this task's own review
