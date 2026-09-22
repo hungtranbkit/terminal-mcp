@@ -691,6 +691,18 @@ class WindowsSessionBackend:
     buffer -- see this module's own docstring for exactly what
     "persistent" does and does not mean here."""
 
+    #: capture_lines(..., ansi=True) is a documented NO-OP on this
+    #: backend: pyte has already resolved every escape sequence into
+    #: plain text by the time it is read, and pyte does not model SGR 2
+    #: (faint) at all, so there is no dim attribute left to detect.
+    #: composer.read_composer therefore reports COMPOSER_UNKNOWN here and
+    #: every caller degrades to "cannot tell" -- never to a false
+    #: NOT_ACTIVATED and never to a false SUBMIT_CONFIRMED. Making a real
+    #: ghost-vs-draft verdict possible on Windows means teaching the pyte
+    #: screen to track SGR 2 per cell; that is deliberately out of scope
+    #: here and is recorded as remaining risk in this fix's REPORT.md.
+    ansi_capture_supported = False
+
     def __init__(self, *, shell: str = DEFAULT_SHELL, history_lines: int = DEFAULT_HISTORY_LINES,
                 process_factory: ProcessFactory | None = None,
                 foreground_command_resolver: ForegroundCommandResolver | None = None,

@@ -475,6 +475,123 @@ added or changed — a retry is an ordinary, fresh `sendInput()` call, made
 safe against an accidental double-submit by the existing
 `idempotency_key` mechanism, not by any new frontend logic.
 
+## P0 (2026-09-11) — composer evidence: the dim ghost suggestion
+
+### The live root cause
+
+Claude Code renders a **dim ghost suggestion** inside an **empty**
+composer — a greyed-out proposed reply drawn with SGR 2 (faint):
+
+```
+ESC[39m ❯ \xa0 ESC[2m yes, publish the report ESC[0m
+                     ^^^^^ SGR 2 = faint
+```
+
+A genuinely pending draft carries no SGR 2:
+
+```
+ESC[39m ❯ \xa0 REAL_TYPED_DRAFT
+```
+
+`tmux capture-pane -p` (no `-e`) **strips every SGR attribute**, so both
+render as the byte-identical plain string `❯ <text>`. Every consumer that
+asked "is a prompt still sitting in the composer?" — `adapters._sent_text_
+echoed`, `core._extract_composer_text`, `core._codex_draft_in_composer` —
+and every human/orchestrator reading `terminal_tail` was therefore
+structurally unable to tell *"my prompt was never submitted"* from *"the
+composer is empty and the CLI is merely suggesting a reply"*.
+
+The failure loop this produced, verified end to end against the real
+audit log and the real panes (hp-linux node, Claude Code 2.1.267,
+sessions `hp1`/`hp2`, 2026-09-10):
+
+1. Claude finishes a turn; the composer is empty; Claude draws a dim
+   ghost suggestion into it.
+2. An operator/orchestrator reads the pane, sees `❯ yes, publish the
+   report`, and concludes its prompt is stuck unsubmitted.
+3. It calls `terminal_send_keys(["Enter"])`. The Enter reaches a
+   genuinely **empty** composer, so Claude correctly does nothing and
+   emits **zero bytes**.
+4. The pane is byte-identical before and after, so the verifier reports
+   `DELIVERY_UNKNOWN` / `SUBMIT_UNCONFIRMED` — which *reads* like "Enter
+   was swallowed" and reinforces the false belief at step 2.
+
+The real audit row from the incident:
+
+```
+send_keys hp1 ["Enter"] -> SENT_UNCONFIRMED
+"the pane looked identical to its pre-send state throughout the
+ verification window"
+```
+
+Everything below the misread was working correctly. `tmux send-keys
+Enter`, `C-m`, a literal `\r` and `send-keys -H 0d` were all verified on
+the wire to deliver the identical single byte `0x0d`; the pane's tty was
+in raw mode; `TIOCINQ` was 0, proving Claude had *read* the byte; and its
+event loop was advancing. Nothing was wrong with Enter delivery.
+
+### What changed
+
+`terminal_mcp/composer.py` (new) reads the composer from an
+**ANSI-preserving** capture (`capture_lines(..., ansi=True)`) and returns
+one of three states — `DRAFT`, `EMPTY` (blank, or ghost-only), or
+`UNKNOWN`. Three-valued on purpose: *"I can see there is nothing to
+submit"* and *"I cannot tell"* are different facts, and collapsing them is
+the bug.
+
+Two new delivery states split what `DELIVERY_UNKNOWN` used to absorb:
+
+| state | meaning | caller action |
+| --- | --- | --- |
+| `NOT_ACTIVATED` | Positively established: **nothing to submit** (composer empty/ghost). | Find out why the text never arrived. Never press Enter again. |
+| `ACTIVATION_UNCERTAIN` | A **real draft** was there, exactly one Enter went out, no positive evidence in the grace window. | Genuinely ambiguous — never resend the text. |
+| `DELIVERY_UNKNOWN` | *(unchanged)* Enter went out, evidence inconclusive, and the composer could not be read at all. | Honest fallback. |
+
+`submit_status` keeps its exact legacy vocabulary — all three still map to
+`SUBMIT_UNCONFIRMED` — so no existing caller changes behaviour. The new
+precision lives in `delivery_state` and `submit_reason`.
+
+Concrete behaviour changes:
+
+* **`terminal_send_keys(["Enter"])` is composer-gated.** If the composer
+  positively reads `EMPTY` (confirmed by two independent reads a settle
+  window apart) and the target is not showing a menu/approval widget,
+  **no keystroke is sent at all** and the result is `NOT_ACTIVATED`, with
+  the ghost text quoted back so the caller understands what it was
+  looking at. This is the direct fix for the loop above.
+* **Composer evidence adds a gate and a veto.** A positively observed
+  draft still present after Enter vetoes confirmation. An empty composer
+  alone never confirms delivery: the canonical adapter acknowledgment is
+  still required, protecting staged editors and busy-without-echo redraws.
+  Successful receipts include `ADAPTER_ACK`, and may also include
+  `COMPOSER_RELEASED`.
+* **Canonical submission protections remain authoritative.** Unicode/plain
+  composer parsing, stable-draft checks, activation nudges, staged-editor
+  submit keys, identity checks, and Codex's verified watchdog remain in place.
+  `SubmitPolicy` describes each adapter's composer capability; Codex retry
+  limits continue to come from its bounded watchdog configuration.
+* **Bounded, configurable, deterministic timing.**
+  `submit.<agent>.settle_ms` (default 80 — the historical value) is the
+  single fixed wait between the text write and Enter;
+  `submit.<agent>.composer_grace_ms` (default 3000) bounds how long a
+  submit waits for positive evidence before reporting
+  `ACTIVATION_UNCERTAIN`. Both are one deadline and one poll interval —
+  never a retry loop, and neither ever causes an extra keystroke.
+
+### Backend honesty
+
+`capture_lines(..., ansi=True)` genuinely preserves SGR on tmux
+(`capture-pane -e`), and is a documented **no-op** on the Windows ConPTY
+backend, whose pyte screen has already resolved every escape sequence
+away and does not model SGR 2 at all. That capability is now declared
+explicitly (`SessionBackend.ansi_capture_supported`) rather than inferred
+from a capture — inference is wrong in exactly the case that matters,
+because the moment a real draft replaces the ghost the row carries no SGR
+either. On a backend that cannot report attributes, `read_composer`
+returns `UNKNOWN`, the Enter is still delivered, and the verdict degrades
+to the pre-existing `DELIVERY_UNKNOWN` — never a false `NOT_ACTIVATED`,
+never a false `SUBMIT_CONFIRMED`.
+
 ## Not done in this phase
 
 - No `ask_chatgpt` MCP tool, no ChatGPT-Web browser automation, no

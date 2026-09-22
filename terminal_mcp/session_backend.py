@@ -60,6 +60,14 @@ class SessionBackend(Protocol):
 
     def get_session(self, name: str) -> SessionInfo | None: ...
 
+    #: Whether capture_lines(..., ansi=True) genuinely returns SGR
+    #: attributes. True for tmux (`capture-pane -e`); False for the
+    #: Windows ConPTY backend, whose pyte screen has already resolved
+    #: every escape sequence away (and does not model SGR 2 at all).
+    #: composer.read_composer needs this stated rather than inferred --
+    #: see its own docstring for why inference is wrong here.
+    ansi_capture_supported: bool
+
     def capture_lines(self, session: str, lines: int, *, ansi: bool = False) -> list[str]: ...
 
     def send_text(self, session: str, text: str, press_enter: bool) -> None: ...

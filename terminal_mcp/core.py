@@ -14,7 +14,9 @@ from pathlib import Path
 from typing import Any
 
 from . import composer, submit_flow
-from .adapters import (DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_STALLED, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_TEXT_SENT,
+from .composer import (COMPOSER_DRAFT, COMPOSER_EMPTY, COMPOSER_UNKNOWN,
+                       ComposerSnapshot, draft_contains, read_composer)
+from .adapters import (DELIVERY_NOT_ACTIVATED, DELIVERY_ACTIVATION_UNCERTAIN, DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_STALLED, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_TEXT_SENT,
                        DELIVERY_UNKNOWN, TARGET_WAITING, SHELL_COMMANDS, _sent_text_echoed,
                        enter_is_safe_after_command_change, select_adapter,
                        to_legacy_submit_status)
@@ -370,52 +372,10 @@ def _redacted_capture(lines: "list[str]") -> str:
     return text + ("\n" + marker if marker else "")
 
 
-def _codex_composer_buffer_complete(snapshot: list[str], text: str) -> bool:
-    """Recognize Codex's own bracketed-paste acknowledgement.
-
-    Codex intentionally replaces a long pasted draft with
-    ``[Pasted Content N chars]`` instead of rendering all text.  That marker
-    is stronger than a viewport substring check and is the only long-buffer
-    shortcut accepted by the verified-submit path; pager/unknown output does
-    not qualify.
-    """
-    if _sent_text_echoed(snapshot, text):
-        return True
-    visible = " ".join(snapshot)
-    match = re.search(r"\[Pasted Content\s+(\d+)\s+chars\]", visible, re.IGNORECASE)
-    return bool(match and int(match.group(1)) >= len(text))
 
 
-def _codex_draft_in_composer(snapshot: list[str], text: str) -> bool:
-    """Return true only when this submission is still in Codex's composer."""
-    normalized_prefix = " ".join(text.split())[:80]
-    marker_indexes = [index for index, line in enumerate(snapshot)
-                      if re.match(r"^\s*[>›]\s*", line.strip())]
-    if not marker_indexes:
-        return False
-    last_marker = marker_indexes[-1]
-    if any(re.search(r"SUBMITTED\[|esc to interrupt", line, re.IGNORECASE)
-           for line in snapshot[last_marker + 1:]):
-        return False
-    body = re.sub(r"^[>›]\s*", "", snapshot[last_marker].strip())
-    if normalized_prefix and normalized_prefix in " ".join(body.split()):
-        return True
-    match = re.search(r"\[Pasted Content\s+(\d+)\s+chars\]", body, re.IGNORECASE)
-    return bool(match and int(match.group(1)) >= len(text))
 
 
-def _codex_composer_marker_present(snapshot: list[str]) -> bool:
-    """Whether a live-looking Codex composer marker remains in the pane."""
-    markers = [index for index, line in enumerate(snapshot)
-               if re.match(r"^\s*[>›]\s*", line.strip())]
-    if not markers:
-        return False
-    last = markers[-1]
-    body = re.sub(r"^\s*[>›]\s*", "", snapshot[last].strip()).strip()
-    if not body or body.casefold().startswith("ask codex to do anything"):
-        return False
-    return not any(re.search(r"SUBMITTED\[|esc to interrupt", line, re.IGNORECASE)
-                   for line in snapshot[last + 1:])
 
 
 class TerminalService:
@@ -1981,7 +1941,15 @@ class TerminalService:
         # Same fixed settle window tmux.send_text itself uses for a
         # press_enter=True call -- imported, not duplicated, so there is
         # exactly one place that value is decided.
-        time.sleep(SEND_TEXT_ENTER_SETTLE_SECONDS)
+        time.sleep(_settle_seconds(self.config, adapter.name))
+        composer_before = ComposerSnapshot(COMPOSER_UNKNOWN)
+        if adapter.submit_policy.uses_composer_evidence:
+            composer_before = self._read_composer(session)
+            if (text and composer_before.state == COMPOSER_EMPTY
+                    and self._ansi_attributes_available() is True):
+                composer_before = self._poll_for_composer_draft(
+                    session, deadline=time.monotonic() + min(1.0, _verify_timeout_seconds(self.config, adapter.name)))
+            result.update(self._composer_fields(composer_before, composer_before))
 
         # P0 Part A.3: the *second* revalidation point, immediately before
         # the Enter keystroke. Abort (never send Enter, never retarget by
@@ -2025,6 +1993,11 @@ class TerminalService:
                           f"{command_at_enter!r}, which is not this pane's own shell")
             result["submit_reason"] = (f"{detail} between the text send and the Enter send -- "
                                        "Enter was withheld")
+            return result
+
+        empty_receipt = self._empty_composer_receipt(session, adapter, composer_before, typed_snapshot)
+        if empty_receipt is not None:
+            result.update(empty_receipt)
             return result
 
         # VERIFY_TEXT, and it belongs HERE -- before ACTIVATE, not after it.
@@ -2082,8 +2055,7 @@ class TerminalService:
         # here rather than recomputed from command_at_enter, which the
         # identity-match check just above already guarantees is identical
         # (this method returns before reaching here otherwise).
-        verify_timeout = (RECOVERY_VERIFY_TIMEOUT_SECONDS if adapter.name in WIDE_VERIFY_ADAPTERS
-                          else SEND_VERIFY_TIMEOUT_SECONDS)
+        verify_timeout = _verify_timeout_seconds(self.config, adapter.name)
 
         _, after, reason = self._poll_for_submission(session, typed_snapshot, timeout=verify_timeout)
 
@@ -2301,9 +2273,14 @@ class TerminalService:
         confirmed, after = self._poll_for_ack_evidence(session, typed_snapshot, after, adapter,
                                                        expected_echo,
                                                        deadline=time.monotonic() + verify_timeout)
+        composer_after = self._read_composer(session) if adapter.submit_policy.uses_composer_evidence else ComposerSnapshot(COMPOSER_UNKNOWN)
+        result.update(self._composer_fields(composer_before, composer_after))
         if confirmed:
             result["delivery_state"] = DELIVERY_SUBMIT_CONFIRMED
             result["submit_status"] = to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED)
+            result["evidence"] = ["ADAPTER_ACK"]
+            if composer_before.has_draft and composer_after.is_empty:
+                result["evidence"].append("COMPOSER_RELEASED")
             result["submit_reason"] = ("confirmed via adapter ack evidence"
                                        + ("" if text else " (echo attributed to the composer's own "
                                                           "content, not to an empty sent text)"))
@@ -2323,6 +2300,12 @@ class TerminalService:
             verify_timeout=verify_timeout)
         if staged is not None:
             return staged
+        if composer_before.has_draft and draft_contains(composer_after, composer_before.draft_text):
+            result.update(delivery_state=DELIVERY_ACTIVATION_UNCERTAIN,
+                          submit_status=to_legacy_submit_status(DELIVERY_ACTIVATION_UNCERTAIN),
+                          evidence=["COMPOSER_STILL_HOLDS_DRAFT"],
+                          submit_reason="one Enter was delivered but the draft is still present; do not resend text")
+            return result
 
         result["delivery_state"] = DELIVERY_UNKNOWN
         result["submit_status"] = to_legacy_submit_status(DELIVERY_UNKNOWN)
@@ -2610,6 +2593,105 @@ class TerminalService:
             ),
         }
 
+    def _read_composer(self, session: str) -> ComposerSnapshot:
+        """Read the target's composer from an ANSI-PRESERVING capture.
+
+        `ansi=True` is the whole point: `tmux capture-pane -p` without
+        `-e` strips every SGR attribute, which is exactly what made a dim
+        ghost suggestion indistinguishable from a real pending draft and
+        produced the live incident this fix exists for. Backend-neutral --
+        capture_lines(..., ansi=...) is on the SessionBackend Protocol and
+        implemented by both TmuxClient and the Windows ConPTY backend
+        (where `ansi` is a documented no-op, so read_composer correctly
+        degrades to COMPOSER_UNKNOWN rather than guessing).
+
+        Never raises: a capture failure is COMPOSER_UNKNOWN, which every
+        caller must treat as "cannot tell", never as "nothing to submit".
+        """
+        lines = self._safe_ansi_capture(session)
+        if lines is None:
+            return ComposerSnapshot(COMPOSER_UNKNOWN)
+        return read_composer(lines, attributes_available=self._ansi_attributes_available())
+
+    def _poll_for_composer_draft(self, session: str, *, deadline: float) -> ComposerSnapshot:
+        """Bounded wait for the composer to show a REAL draft after a text
+        write. Returns as soon as one is visible, or the last reading at
+        the deadline (EMPTY/UNKNOWN, both of which the caller treats as
+        "no composer evidence available" rather than as a verdict).
+
+        Bounded and deterministic: one deadline, one poll interval, no
+        retry of anything -- not one extra byte is written to the target
+        by this method.
+        """
+        snapshot = self._read_composer(session)
+        while snapshot.state != COMPOSER_DRAFT and time.monotonic() < deadline:
+            time.sleep(SEND_VERIFY_POLL_INTERVAL_SECONDS)
+            snapshot = self._read_composer(session)
+        return snapshot
+
+    @staticmethod
+    def _composer_fields(before: ComposerSnapshot, after: ComposerSnapshot) -> dict[str, Any]:
+        """The before/after composer evidence attached to every receipt of
+        a composer-evidence send. Deliberately includes `ghost_text`: an
+        operator staring at a pane that appears to show their prompt needs
+        to be told, in the receipt itself, that what they are looking at
+        is the CLI's own dim suggestion and not their pending text --
+        otherwise the receipt is technically correct and still leads
+        straight back to the false conclusion that caused the incident."""
+        fields: dict[str, Any] = {
+            "composer_before": before.state,
+            "composer_after": after.state,
+        }
+        if before.draft_text:
+            fields["composer_draft_before"] = before.draft_text[:200]
+        if after.draft_text:
+            fields["composer_draft_after"] = after.draft_text[:200]
+        ghost = after.ghost_text or before.ghost_text
+        if ghost:
+            fields["composer_ghost_text"] = ghost[:200]
+        return fields
+
+    def _safe_ansi_capture(self, session: str) -> list[str] | None:
+        """ANSI-preserving capture that never raises -- None when
+        unavailable. The TypeError guard covers a third-party/test backend
+        whose capture_lines predates the `ansi` keyword: degrading to
+        "cannot tell" is strictly better than crashing a send on it."""
+        try:
+            return self.tmux.capture_lines(session, SEND_VERIFY_LINES, ansi=True)
+        except (TmuxError, TypeError):
+            return None
+
+    def _ansi_attributes_available(self) -> bool | None:
+        """Whether this backend's ANSI capture really carries SGR runs --
+        asked of the backend, never inferred from the capture (see
+        composer.read_composer's docstring for why inference is wrong).
+        None for a backend that does not declare the capability at all, in
+        which case read_composer falls back to its own auto-detection."""
+        return getattr(self.tmux, "ansi_capture_supported", None)
+
+    def _empty_composer_receipt(self, session: str, adapter: Any,
+                                before: ComposerSnapshot, plain: list[str] | None) -> dict[str, Any] | None:
+        """Withhold activation only after two positive empty readings."""
+        if (not adapter.submit_policy.require_draft_before_enter
+                or before.state != COMPOSER_EMPTY
+                or adapter.identify_target_state(plain or []) == TARGET_WAITING):
+            return None
+        time.sleep(_settle_seconds(self.config, adapter.name))
+        confirm = self._read_composer(session)
+        if confirm.state != COMPOSER_EMPTY:
+            return None
+        return {
+            "enter_sent": False, "enter_count": 0, "attempts": 0,
+            "delivery_state": DELIVERY_NOT_ACTIVATED,
+            "submit_status": to_legacy_submit_status(DELIVERY_NOT_ACTIVATED),
+            "evidence": ["COMPOSER_EMPTY"],
+            "submit_outcome": submit_flow.NOTHING_TO_SUBMIT,
+            "submit_reason": "no Enter was sent: the composer is empty; send the prompt text itself"
+                + (f"; {confirm.ghost_text[:120]!r} is a dim suggestion, not pending input"
+                   if confirm.ghost_text else ""),
+            **self._composer_fields(before, confirm),
+        }
+
     def _poll_for_ack_evidence(self, session: str, typed_snapshot: list[str], first_after: list[str] | None,
                                adapter: Any, text: str, *, deadline: float) -> tuple[bool, list[str] | None]:
         """Keeps checking `adapter.submit_ack_evidence(typed_snapshot,
@@ -2625,8 +2707,16 @@ class TerminalService:
         -- last_capture is always the most recent one seen, for the
         caller's own DELIVERY_UNKNOWN evidence even on a genuine
         timeout."""
+        def acknowledged(lines: list[str]) -> bool:
+            if not adapter.submit_ack_evidence(typed_snapshot, lines, text):
+                return False
+            if adapter.name != "codex" and adapter.submit_policy.uses_composer_evidence:
+                if draft_contains(self._read_composer(session), text):
+                    return False
+            return True
+
         after = first_after
-        if after is not None and adapter.submit_ack_evidence(typed_snapshot, after, text):
+        if after is not None and acknowledged(after):
             return True, after
         while time.monotonic() < deadline:
             time.sleep(SEND_VERIFY_POLL_INTERVAL_SECONDS)
@@ -2634,7 +2724,7 @@ class TerminalService:
                 after = self.tmux.capture_lines(session, SEND_VERIFY_LINES)
             except TmuxError:
                 return False, after
-            if adapter.submit_ack_evidence(typed_snapshot, after, text):
+            if acknowledged(after):
                 return True, after
         return False, after
 
@@ -2805,6 +2895,13 @@ class TerminalService:
         except TmuxError:
             typed_snapshot = None
 
+        composer_before = (self._read_composer(session) if adapter.submit_policy.uses_composer_evidence
+                           else ComposerSnapshot(COMPOSER_UNKNOWN))
+        empty_receipt = self._empty_composer_receipt(session, adapter, composer_before, typed_snapshot)
+        if empty_receipt is not None:
+            return {"session": session, "sent": False, "keys": keys, "correlation_id": correlation_id,
+                    "agent_type": adapter.name, **empty_receipt}
+
         # P0 2026-09-14 (fix/submit-enter-deadlock): a bare Enter on an
         # ALREADY-VISIBLE Claude prompt reaches the pty and Claude Code does
         # nothing with it -- observed on wtest/win1 and local m1, while
@@ -2848,6 +2945,8 @@ class TerminalService:
         self.tmux.send_keys(session, keys)
         result: dict[str, Any] = {"session": session, "sent": True, "keys": keys,
                                   "correlation_id": correlation_id, "agent_type": adapter.name}
+        result.update(enter_sent=True, enter_count=1, attempts=1)
+        result.update(self._composer_fields(composer_before, composer_before))
         if submit_plan is not None:
             result["submission_id"] = submit_plan.submission_id
         if typed_snapshot is None:
@@ -2870,13 +2969,18 @@ class TerminalService:
         # there is no other source for it.
         expected_text = _extract_composer_text(typed_snapshot)
 
-        verify_timeout = (RECOVERY_VERIFY_TIMEOUT_SECONDS if adapter.name in WIDE_VERIFY_ADAPTERS
-                          else SEND_VERIFY_TIMEOUT_SECONDS)
+        verify_timeout = _verify_timeout_seconds(self.config, adapter.name)
         deadline = time.monotonic() + verify_timeout
         _, first_after, _reason = self._poll_for_submission(session, typed_snapshot, timeout=verify_timeout)
         confirmed, after = self._poll_for_ack_evidence(session, typed_snapshot, first_after, adapter, expected_text,
                                                        deadline=deadline)
+        composer_after = (self._read_composer(session) if adapter.submit_policy.uses_composer_evidence
+                          else ComposerSnapshot(COMPOSER_UNKNOWN))
+        result.update(self._composer_fields(composer_before, composer_after))
         if confirmed:
+            result["evidence"] = ["ADAPTER_ACK"]
+            if composer_before.has_draft and composer_after.is_empty:
+                result["evidence"].append("COMPOSER_RELEASED")
             result["delivery_state"] = DELIVERY_SUBMIT_CONFIRMED
             result["submit_status"] = to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED)
             result["submit_reason"] = "confirmed via adapter ack evidence"
@@ -4990,128 +5094,30 @@ class TerminalService:
             })
         return {"killed_sessions": entries}
 
-    def terminal_put_file(self, path: str, content_b64: str, *, overwrite: bool = False,
-                          mode: str | None = None,
-                          requested_by: str | None = None) -> dict[str, Any]:
-        """Write ONE caller-supplied file onto this node, decoded from base64.
 
-        Exists because the only payload carrier on the MCP surface is a text
-        argument, so the alternative is pushing base64 through a tmux pane one
-        chunk at a time. Measured 2026-09-21: that tops out around 43 KB/s and
-        one "Called tool" row per 18 KB, and -- worse -- a chunk much over
-        24,000 characters is TRUNCATED BY TMUX SILENTLY while `base64 -d` still
-        exits 0, producing a valid file with the wrong contents. This path
-        never touches a pane, so neither limit applies and the returned sha256
-        lets the caller prove the bytes landed.
 
-        Safety, in order:
-        - OFF unless this host opts in: `session_lifecycle.allow_put_file`
-          where that field exists, else TERMINAL_MCP_ALLOW_PUT_FILE=1.
-        - The PARENT directory goes through lifecycle.resolve_cwd, the same
-          allowed_cwd_roots gate (symlinks resolved BEFORE containment) that
-          governs session creation. The final segment must be a plain file
-          name, so `..` cannot walk out after the gate has run.
-        - An existing symlink at the destination is refused outright rather
-          than followed, or an attacker-planted link would redirect the write
-          past a gate that has already passed.
-        - base64 is decoded with validate=True: a payload containing anything
-          outside the alphabet is an error, never silently skipped -- that is
-          the exact shape of the tmux truncation bug above.
-        - The write is atomic (temp file in the same directory + os.replace),
-          so a reader never sees a half-written file and a failure cannot
-          destroy an existing one.
-        """
-        action = "put_file"
-        lifecycle = self.config.session_lifecycle
-        # Read through getattr + environment rather than a hard config field.
-        # The three deployments of this repo have DIVERGED (dell, hp and m910
-        # each carry a different SessionLifecycleConfig), so a new dataclass
-        # field cannot be patched in uniformly -- anchoring on neighbouring
-        # lines applied on some hosts and not others, which is exactly how a
-        # partial, inconsistent rollout happens. A host that HAS the field
-        # wins; one that does not falls back to its own unit environment,
-        # which is per-host and explicit either way.
-        allow = getattr(lifecycle, "allow_put_file", None)
-        if allow is None:
-            allow = os.environ.get("TERMINAL_MCP_ALLOW_PUT_FILE", "") == "1"
-        max_bytes = getattr(lifecycle, "max_put_file_bytes", None)
-        if max_bytes is None:
-            try:
-                max_bytes = int(os.environ.get("TERMINAL_MCP_MAX_PUT_FILE_BYTES", "") or 8 * 1024 * 1024)
-            except ValueError:
-                max_bytes = 8 * 1024 * 1024
-        max_bytes = max(1, min(int(max_bytes), 256 * 1024 * 1024))
+def _settle_seconds(config: Any, agent_type: str) -> float:
+    """Per-agent settle delay (seconds) between the text write and Enter --
+    config submit.<agent>.settle_ms, falling back to the historical
+    tmux.SEND_TEXT_ENTER_SETTLE_SECONDS for any config predating it."""
+    profile = _submit_profile_for(config, agent_type)
+    settle_ms = getattr(profile, "settle_ms", None)
+    return (settle_ms / 1000.0) if settle_ms else SEND_TEXT_ENTER_SETTLE_SECONDS
 
-        def blocked(error: str, **extra: Any) -> dict[str, Any]:
-            self.audit.record(action=action, session=None, result="BLOCKED", reason=error,
-                              actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
-            return {"error": error, **extra}
 
-        if not allow:
-            return blocked("PUT_FILE_DISABLED")
-        if not isinstance(path, str) or not path.strip():
-            return blocked("INVALID_PATH")
-        if mode is not None and (not isinstance(mode, str) or not re.fullmatch(r"[0-7]{3,4}", mode)):
-            return blocked("INVALID_MODE", detail="mode must be an octal string such as '644'")
-
-        candidate = Path(path.strip()).expanduser()
-        if not candidate.is_absolute():
-            return blocked("INVALID_PATH", detail="path must be absolute")
-        name = candidate.name
-        if not name or name in (".", "..") or "\x00" in name:
-            return blocked("INVALID_PATH", detail="the last path segment must be a plain file name")
-
-        parent, error = resolve_cwd(str(candidate.parent), self.config)
-        if error is not None:
-            self.audit.record(action=action, session=None, result="BLOCKED",
-                              reason=str(error.get("error")), actor=requested_by,
-                              node_id=self.REGISTRY_LOCAL_NODE_ID)
-            return error
-        target = parent / name
-
-        if not isinstance(content_b64, str) or not content_b64.strip():
-            return blocked("INVALID_BASE64", detail="content_b64 must be a non-empty string")
-        packed = "".join(content_b64.split())
-        # Bound the ENCODED length first so an oversized payload is refused
-        # without decoding it into memory. 4/3 is base64's inflation.
-        if len(packed) > (max_bytes * 4 // 3) + 8:
-            return blocked("FILE_TOO_LARGE", max_bytes=max_bytes)
-        try:
-            blob = base64.b64decode(packed, validate=True)
-        except (binascii.Error, ValueError):
-            return blocked("INVALID_BASE64")
-        if len(blob) > max_bytes:
-            return blocked("FILE_TOO_LARGE", bytes=len(blob),
-                           max_bytes=max_bytes)
-
-        if target.is_symlink():
-            return blocked("PATH_IS_SYMLINK", path=str(target))
-        if target.is_dir():
-            return blocked("PATH_IS_DIRECTORY", path=str(target))
-        existed = target.exists()
-        if existed and not overwrite:
-            return blocked("FILE_EXISTS", path=str(target))
-
-        digest = hashlib.sha256(blob).hexdigest()
-        temporary = target.with_name(f".{name}.tmcp-put-{uuid.uuid4().hex}")
-        try:
-            with open(temporary, "wb") as handle:
-                handle.write(blob)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(temporary, int(mode, 8) if mode is not None else 0o644)
-            os.replace(temporary, target)
-        except OSError as exc:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
-            return blocked("WRITE_FAILED", detail=type(exc).__name__)
-
-        self.audit.record(action=action, session=None, result="OK", actor=requested_by,
-                          node_id=self.REGISTRY_LOCAL_NODE_ID)
-        return {"path": str(target), "bytes": len(blob), "sha256": digest,
-                "overwritten": existed, "node_id": self.REGISTRY_LOCAL_NODE_ID}
+def _verify_timeout_seconds(config: Any, agent_type: str) -> float:
+    """Per-agent BOUNDED grace window for submit verification. Keeps the
+    pre-existing shape exactly -- the wider window only ever applied to
+    WIDE_VERIFY_ADAPTERS, since an LLM-backed CLI genuinely takes longer
+    to visibly respond than a plain shell -- and only makes that window's
+    length configurable (submit.<agent>.composer_grace_ms). A longer
+    window can never cause an extra keystroke: nothing in the Claude path
+    sends one, it only delays an honest "uncertain" verdict."""
+    if agent_type not in WIDE_VERIFY_ADAPTERS:
+        return SEND_VERIFY_TIMEOUT_SECONDS
+    profile = _submit_profile_for(config, agent_type)
+    grace_ms = getattr(profile, "composer_grace_ms", None)
+    return (grace_ms / 1000.0) if grace_ms else RECOVERY_VERIFY_TIMEOUT_SECONDS
 
 
 def _submit_profile_for(config: Any, agent_type: str) -> Any:
