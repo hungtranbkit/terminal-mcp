@@ -411,7 +411,11 @@ def _print_nodes_human(result: dict) -> None:
     print("Terminal MCP node fleet")
     for row in result["nodes"]:
         marker = "*" if row["id"] == "local" else " "
-        os_icon = "win" if row["platform"] == "windows" else "linux"
+        # blg_20dc778df7ac: was `"win" if windows else "linux"`, which
+        # labelled a macOS node "linux". Unknown platforms print their own
+        # reported name rather than being absorbed into linux.
+        os_icon = {"windows": "win", "linux": "linux", "macos": "macos"}.get(
+            row["platform"], row["platform"] or "linux")
         print(f"  [{marker}] {row['id']} ({row['display_name']}) [{os_icon}/{row['session_backend']}]: "
              f"status={row['status']} capacity={row['capacity_status']} sessions={row['tmux_session_count']} "
              f"cpu={row['cpu_percent']} ram={row['ram_percent']} draining={row['draining']}")

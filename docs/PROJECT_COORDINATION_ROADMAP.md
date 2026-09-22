@@ -215,8 +215,10 @@ lane that exists, and there is no flag to forget to leave off.
   capabilities plus `platform`/`session_backend`/`shell_capabilities`. Nothing
   inferred; no application name special-cased. Including `platform` makes
   `windows` route to dell-5530 without redeploying its pre-P0.3 agent.
-  `macos` is deliberately NOT routable (the node agent has no Darwin branch,
-  so the MacBook reports `platform=linux`) — stated rather than papered over.
+  `macos` became routable in blg_20dc778df7ac (the node agent now detects
+  `sys.platform` instead of defaulting to `linux`); a macOS node no longer
+  matches a `required_platform="linux"` request, which it only ever did
+  because it was mislabelled.
 - **Evidence-gated pass:** more than a self-report, and not self-contradicted
   (`exit_code != 0` / `passed: false` / `tests_failed > 0` refused).
 - **Lease reuse:** P0.4 semantics exactly — token + expiry, `BEGIN IMMEDIATE`,

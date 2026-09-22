@@ -60,7 +60,7 @@ from .recovery_engine import RecoveryEngine
 from .harness_service import HarnessService
 from .integration_service import IntegrationService
 from .integration_store import IntegrationStore
-from .node_models import NODE_ONLINE, SESSION_BACKEND_TMUX, node_to_dict
+from .node_models import NODE_ONLINE, SESSION_BACKEND_TMUX, canonical_platform, node_to_dict
 from .notes_service import NotesService
 from .notes_store import NotesError, NotesStore
 from .permissions import input_session_allowed, session_allowed, valid_session_name
@@ -5412,7 +5412,7 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       return version !== '' && !version.startsWith('windows-setup/');
     }
     function nodeSummaryLabel(node) {
-      const os = node.platform === 'windows' ? 'Windows' : 'Linux';
+      const os = osLabel(node);
       const health = node.status !== 'online' ? 'Offline'
         : node.capacity_status === 'overloaded' ? 'Overloaded'
         : node.capacity_status === 'busy' ? 'Busy'
@@ -6537,7 +6537,17 @@ NODES_ADMIN_HTML = """<!doctype html>
       return { ok: response.ok, status: response.status, data };
     }
 
-    function osIcon(node) { return node.platform === 'windows' ? '🪟' : '🐧'; }
+    // blg_20dc778df7ac: these used to be `windows ? X : Linux`, which drew
+    // every macOS node as a penguin called Linux. An unknown platform now
+    // shows its own reported name rather than being absorbed into Linux --
+    // the same mistake one level up.
+    const OS_LABELS = { windows: 'Windows', linux: 'Linux', macos: 'macOS' };
+    const OS_ICONS = { windows: '🪟', linux: '🐧', macos: '🍎' };
+    function osLabel(node) {
+      const platform = node.platform || 'linux';
+      return OS_LABELS[platform] || platform;
+    }
+    function osIcon(node) { return OS_ICONS[node.platform || 'linux'] || '💻'; }
     function capabilityLine(node) {
       const parts = [node.session_backend || '—'];
       if (node.claude_available) parts.push('claude ✓');
@@ -18392,7 +18402,12 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                 agent_counts=dict(body.get("agent_counts") or {}),
                 agent_types=tuple(body.get("agent_types") or ()),
                 agent_version=body.get("agent_version"), labels=tuple(body.get("labels") or ()),
-                platform=body.get("platform") or "linux", session_backend=body.get("session_backend") or "tmux",
+                # canonical_platform maps darwin->macos and leaves an
+                # absent value as "linux" (an agent too old to report
+                # one), i.e. exactly the previous behaviour for every
+                # agent that already worked -- blg_20dc778df7ac.
+                platform=canonical_platform(body.get("platform")),
+                session_backend=body.get("session_backend") or "tmux",
                 shell_capabilities=tuple(body.get("shell_capabilities") or ()),
                 # P0.3: an older agent simply omits this and gets () --
                 # never assumed capable.

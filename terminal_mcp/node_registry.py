@@ -35,6 +35,7 @@ from .node_models import (
     CAPACITY_OVERLOADED,
     CAPACITY_UNKNOWN,
     PLATFORM_LINUX,
+    canonical_platform,
     SESSION_BACKEND_TMUX,
     HEALTH_OFFLINE,
     HEALTH_TRANSPORT_ONLINE,
@@ -363,9 +364,21 @@ class NodeRegistry:
         load duration trackers, recomputes capacity_status/
         overload_reasons, and returns the resulting Node -- all in one
         transaction, so a concurrent get() never observes a half-updated
-        row. Returns None if `node_id` was never register()ed."""
+        row. Returns None if `node_id` was never register()ed.
+
+        `platform` is normalised through canonical_platform on the way IN
+        (blg_20dc778df7ac) -- this is the single write path for the
+        column, so normalising here means an agent reporting `darwin`
+        and one reporting `macos` cannot produce two different stored
+        values for one OS. Deliberately NOT done on the way out: a row
+        written before this existed keeps reading back exactly the string
+        it was stored with, and self-corrects on that node's next
+        heartbeat. Rewriting stored rows would mean deciding which
+        historical `linux` rows were really macOS, which is unknowable
+        without guessing from the hostname."""
         now = now or _now()
         now_iso = _iso(now)
+        platform = canonical_platform(platform)
         thresholds = self.overload_thresholds
 
         with self._connection() as connection:

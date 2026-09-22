@@ -374,7 +374,9 @@ class ControllerService:
         TerminalService-shaped method in this project. platform/
         session_backend/shell_capabilities/wsl_available (multi-node
         Windows support) are whatever the pushing node agent itself
-        reported -- this method never infers or overrides them."""
+        reported -- this method never infers or overrides them (the
+        registry normalises `darwin`/`macos` spelling on write; that is
+        a rename of one reported value, not an inference of a new one)."""
         return self.registry.heartbeat(node_id, metrics=metrics, tmux_session_count=tmux_session_count,
                                        agent_counts=agent_counts, agent_types=agent_types,
                                        agent_version=agent_version, labels=labels, platform=platform,

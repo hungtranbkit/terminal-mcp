@@ -148,8 +148,10 @@ statuses and zero transition edges — asserted structurally by a test.
 - `require_independent` refuses a job whose implementer is the claimant.
 - No capable verifier is a **visible hold** with a routability reason, never a
   silent pass and never a dropped task.
-- **Known limitation:** `macos` is not routable — the node agent has no Darwin
-  branch, so the MacBook reports `platform=linux`.
+- **`macos` is routable** as of blg_20dc778df7ac. Previously the node agent
+  had no Darwin branch and the MacBook reported `platform=linux`; it now
+  detects `sys.platform`. A macOS node therefore no longer matches a
+  `required_platform="linux"` request.
 
 ## 7. Events
 

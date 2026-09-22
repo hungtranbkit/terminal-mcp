@@ -226,10 +226,13 @@ sessions bringing up dell-5530/m910/macbook — see `docs/multi-node.md`).
   `TerminalService`) on another host — "the local node is a node like
   any other; only its transport differs" is this project's own explicit
   design note.
-- **macOS worker node:** registers as `PLATFORM_LINUX` (real tmux + POSIX
-  shell, no separate backend needed), onboarded via a LaunchAgent instead
-  of systemd — brought up live (rumraisin's MacBook Pro, see git history
-  `50c3f0d`).
+- **macOS worker node:** registers as `PLATFORM_MACOS` (`"macos"`), real
+  tmux + POSIX shell so no separate backend is needed, onboarded via a
+  LaunchAgent instead of systemd — brought up live (rumraisin's MacBook
+  Pro, see git history `50c3f0d`). It registered as `PLATFORM_LINUX`
+  until blg_20dc778df7ac: `node_agent.py` defaulted the reported platform
+  to `"linux"` and macOS runs that same POSIX agent, so the value was a
+  plausible-looking wrong answer rather than a missing one.
 - **Windows native/ConPTY backend:** `windows_backend.py`'s
   `WindowsSessionBackend` — a real ConPTY child process per session, a
   background reader thread feeding a `pyte.HistoryScreen` (real VT100
@@ -1291,8 +1294,9 @@ isolation/Merge-Agent/Phase A-E sections remain entirely PLANNED.
   came back `BLOCKED` with an explicit reason, never silently rerouted
   to the otherwise-perfectly-eligible alternative also present; AUTO
   mode correctly assigned a project/skill-matched task immediately; a
-  task requiring a nonexistent OS (`macos`) correctly stayed
-  `NO_ELIGIBLE_WORKER`/UNASSIGNED, never dropped; `terminal_pm_explain`
+  task requiring an OS no node reported at the time (`macos` — see
+  blg_20dc778df7ac, macOS nodes reported `linux` until that fix)
+  correctly stayed `NO_ELIGIBLE_WORKER`/UNASSIGNED, never dropped; `terminal_pm_explain`
   correctly showed the full 2-entry decision history (SUGGESTED then
   APPROVED_AND_ASSIGNED) for the first task. Disposable sessions/state
   cleaned up after.
@@ -6003,10 +6007,11 @@ build WebView2. Arbitrary capabilities (`webview2`, `browser`) become routable
 when a node probes them via `TERMINAL_MCP_CAPABILITY_PROBES`; no application
 name is special-cased. Including `platform` means `windows` routes to
 dell-5530 today even though that node still reports an empty probed list.
-**Known limitation:** `macos` is not routable — the node agent has no Darwin
-branch (only `windows_agent.py` sets a platform), so the MacBook reports
-`platform=linux`. Fixing that changes what `choose_node(required_platform=...)`
-matches for existing callers and is therefore out of P0.5's scope.
+**Fixed in blg_20dc778df7ac:** `macos` is routable. The node agent now
+detects its platform from `sys.platform` instead of defaulting to `linux`.
+The behaviour change this carries: a macOS node no longer matches
+`choose_node(required_platform="linux")`, which it only ever did because it
+was mislabelled.
 
 **Evidence gate.** `VERIFIED_PASS` requires evidence that is more than an agent
 self-report (`summary`/`message`/`note`/... alone are refused) and is not
