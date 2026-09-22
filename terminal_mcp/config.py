@@ -205,6 +205,7 @@ class LLMGovernorConfig:
     codex_max_concurrency: int = 2
     claude_max_concurrency: int = 1
     queue_wait_timeout_seconds: float = 900.0
+    stale_active_timeout_seconds: float = 900.0
     retry_max_attempts: int = 4
     retry_base_delay_seconds: float = 2.0
     retry_max_delay_seconds: float = 32.0
@@ -1638,6 +1639,8 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             "LLM_CLAUDE_MAX_CONCURRENCY", governor_defaults.claude_max_concurrency),
         queue_wait_timeout_seconds=_env_float(
             "LLM_QUEUE_WAIT_TIMEOUT_SEC", governor_defaults.queue_wait_timeout_seconds, minimum=0.1),
+        stale_active_timeout_seconds=_env_float(
+            "LLM_STALE_ACTIVE_TIMEOUT_SEC", governor_defaults.stale_active_timeout_seconds, minimum=1.0),
         retry_max_attempts=_env_int(
             "LLM_RETRY_MAX_ATTEMPTS", governor_defaults.retry_max_attempts),
         retry_base_delay_seconds=_env_float(

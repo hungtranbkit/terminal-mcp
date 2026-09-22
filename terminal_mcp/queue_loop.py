@@ -110,6 +110,7 @@ class QueueLoop:
         self._last_drain: dict | None = None
         self._last_feed: dict | None = None
         self._last_error: dict[str, str] | None = None
+        self._last_active_recovery_at = float("-inf")
         self._lock = threading.Lock()
 
     def is_alive(self) -> bool:
@@ -201,6 +202,15 @@ class QueueLoop:
                 self.heartbeat_refresher()
             except Exception:  # noqa: BLE001 -- a heartbeat refresh glitch must never stop dispatch entirely
                 _LOGGER.exception("queue-loop: heartbeat refresh failed, continuing anyway")
+        # Admission counts active tasks from every lane. Reconcile their live
+        # session state even when that lane has opted out of NEW dispatch.
+        recovery = getattr(self.engine, "reconcile_stale_active_tasks", None)
+        if recovery is not None and time.monotonic() - self._last_active_recovery_at >= 30.0:
+            self._last_active_recovery_at = time.monotonic()
+            try:
+                recovery()
+            except Exception:
+                _LOGGER.exception("queue-loop: stale-active recovery failed, continuing")
         for lane in self.engine.store.list_all_lanes():
             if not lane.get("auto_dispatch_enabled"):
                 continue

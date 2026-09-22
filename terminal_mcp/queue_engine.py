@@ -48,6 +48,7 @@ that automatic loop would start.
 from __future__ import annotations
 
 import re
+import logging
 
 import hashlib
 import time
@@ -67,6 +68,7 @@ from .request_governor import RequestGovernor
 DEFAULT_CLAIMED_BY = "queue-engine"
 DEFAULT_LEASE_SECONDS = 300.0
 DEFAULT_UNCERTAIN_GRACE_SECONDS = 60.0
+_LOGGER = logging.getLogger(__name__)
 
 SESSION_UNREACHABLE_ERRORS = frozenset({"SESSION_NOT_FOUND", "NODE_UNREACHABLE", "AMBIGUOUS_SESSION",
                                         # resolve_session's "the nodes that
@@ -337,6 +339,78 @@ class QueueEngine:
         # COMPLETED transition if the callback itself raises.
         self.on_completed = on_completed
         self.governor = governor
+        self._inactive_active_observations: dict[str, tuple[tuple, float]] = {}
+
+    def reconcile_stale_active_tasks(self) -> list[str]:
+        """Release stale reservations without dispatching work on any lane.
+
+        Missing sessions use task age. Reachable sessions require a full
+        interval of unchanged inactivity, not merely a long task runtime.
+        This conservative observation clock resets after a controller restart.
+        """
+        timeout = self.governor.config.stale_active_timeout_seconds if self.governor else 900.0
+        now = datetime.now(timezone.utc)
+        observed_at = time.monotonic()
+        recovered = []
+        tasks = self.store.tasks_with_statuses((RUNNING, VERIFYING))
+        active_ids = {task.id for task in tasks}
+        self._inactive_active_observations = {
+            key: value for key, value in self._inactive_active_observations.items() if key in active_ids
+        }
+        for task in tasks:
+            try:
+                if self.store.has_live_verification(task.id):
+                    self._inactive_active_observations.pop(task.id, None)
+                    continue
+                observation = self.ops.terminal_status(task.session)
+                error = observation.get("error")
+                state = str(observation.get("state") or "").upper()
+                if error in SESSION_UNREACHABLE_ERRORS:
+                    self._inactive_active_observations.pop(task.id, None)
+                    updated = datetime.fromisoformat(task.updated_at.replace("Z", "+00:00"))
+                    if updated.tzinfo is None or (now - updated).total_seconds() < timeout:
+                        continue
+                    target = WAITING_SESSION
+                    reason = f"STALE_ACTIVE_TIMEOUT: {error}; released admission after {timeout:g}s"
+                elif not error and state in {"IDLE", "WAITING_INPUT", "WAITING_APPROVAL", "PAGER"}:
+                    signature = (task.status, task.updated_at, task.attempt_count, task.claim_token,
+                                 state, hashlib.sha256(str(observation.get("last_output") or "").encode()).hexdigest())
+                    previous = self._inactive_active_observations.get(task.id)
+                    if previous is None or previous[0] != signature:
+                        self._inactive_active_observations[task.id] = (signature, observed_at)
+                        continue
+                    if observed_at - previous[1] < timeout:
+                        continue
+                    # A quiet terminal may contain a real completion. Leave it
+                    # to the existing evidence/requirements verification path.
+                    capture = self.ops.terminal_tail(task.session, 200)
+                    if capture.get("error"):
+                        self._inactive_active_observations.pop(task.id, None)
+                        continue
+                    marker = parse_completion_marker(worker_output_after_prompt(str(capture.get("output") or "")))
+                    if verify_completion_marker(marker, task_id=task.id, attempt=task.attempt_count,
+                                                nonce=task.verification_nonce, nonce_consumed=False):
+                        self._inactive_active_observations.pop(task.id, None)
+                        continue
+                    target = BLOCKED
+                    reason = f"STALE_ACTIVE_TIMEOUT: session is {state}; no progress or completion for {timeout:g}s"
+                else:
+                    # Live work and uncertain observations break the inactivity
+                    # interval; neither proves a task stopped making progress.
+                    self._inactive_active_observations.pop(task.id, None)
+                    continue
+                changed = self.store.recover_stale_active_task(task, to_status=target, reason=reason)
+                self._inactive_active_observations.pop(task.id, None)
+                if changed is not None:
+                    recovered.append(task.id)
+                    if self.store.long_task_watch(task.id):
+                        self.store.update_long_task_watch(task.id, state="BLOCKED", blocker=reason, reason=reason)
+                    _LOGGER.warning("stale-active recovery task=%s session=%s %s -> %s: %s",
+                                    task.id, task.session, task.status, target, reason)
+            except Exception:
+                self._inactive_active_observations.pop(task.id, None)
+                _LOGGER.exception("stale-active recovery probe failed for task=%s", task.id)
+        return recovered
 
     def tick(self, session: str) -> TickResult:
         """One full reconciliation step for `session`'s lane. Always

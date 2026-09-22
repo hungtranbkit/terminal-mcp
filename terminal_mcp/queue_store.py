@@ -2352,6 +2352,44 @@ class QueueStore:
                 return False
         return True
 
+    @staticmethod
+    def _has_live_verification_locked(connection: sqlite3.Connection, task_id: str) -> bool:
+        return connection.execute(
+            "SELECT 1 FROM verify_jobs WHERE task_id = ? "
+            "AND status IN ('VERIFY_CLAIMED', 'VERIFY_RUNNING') "
+            "AND julianday(lease_expires_at) > julianday(?) LIMIT 1",
+            (task_id, iso_now()),
+        ).fetchone() is not None
+
+    def has_live_verification(self, task_id: str) -> bool:
+        """A verifier can be working while the implementer's session is idle."""
+        with self._connection() as connection:
+            return self._has_live_verification_locked(connection, task_id)
+
+    def recover_stale_active_task(self, task: QueueTask, *, to_status: str, reason: str) -> QueueTask | None:
+        """Release an observed inactive reservation without overwriting a newer task state.
+
+        Session probes run outside the transaction. Compare the observed snapshot
+        again while holding the write lock; a concurrent completion/cancel wins.
+        """
+        if task.status not in (RUNNING, VERIFYING) or to_status not in (WAITING_SESSION, BLOCKED):
+            raise ValueError("invalid stale active recovery")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task.id,)).fetchone()
+            if (row is None or row["status"] != task.status or row["updated_at"] != task.updated_at
+                    or row["attempt_count"] != task.attempt_count or row["claim_token"] != task.claim_token):
+                return None
+            # Verifier claims/renewals update verify_jobs independently of the
+            # task snapshot. Recheck under the same write lock as recovery.
+            if self._has_live_verification_locked(connection, task.id):
+                return None
+            return self._transition_locked(
+                connection, task.id, task.status, to_status,
+                event_type="STALE_ACTIVE_RECOVERED", reason=reason,
+                extra_fields={"claimed_by": None, "claim_token": None, "lease_expires_at": None,
+                              "uncertain_or_waiting_since": iso_now() if to_status == WAITING_SESSION else None})
+
     def transition_task(self, task_id: str, to_status: str, *, event_type: str, reason: str | None = None,
                         extra_fields: dict[str, Any] | None = None) -> QueueTask:
         """The ONLY way any task's status ever changes -- validates
