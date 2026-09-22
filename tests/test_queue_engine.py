@@ -219,6 +219,27 @@ def test_a_blocked_task_stops_only_its_own_lane(store, ops):
     assert store.lane_status("lane-b")["paused"] is False
 
 
+@pytest.mark.parametrize("other_state,started,expected", [
+    ("IDLE", False, "COORDINATOR_READY"),
+    ("RUNNING", False, "COORDINATOR_NEEDS_HUMAN"),
+    ("IDLE", True, "COORDINATOR_NEEDS_HUMAN"),
+])
+def test_paused_unstarted_idle_lane_does_not_own_repo(store, ops, other_state, started, expected):
+    old = _make_task(store, session="old-shell")
+    store.claim_next_task("old-shell", claimed_by="test")
+    store.record_coordinator_decision(old, status="NEEDS_HUMAN", reason="preflight failed")
+    if started:
+        with store._connection() as connection:
+            connection.execute("UPDATE queue_tasks SET started_at = ?, attempt_count = 1 WHERE id = ?",
+                               ("2026-09-22T00:00:00+00:00", old))
+    ops.set_status("old-shell", {"state": other_state, "node_id": "local", "cwd": "/repo/a"})
+    _make_task(store)
+    engine = QueueEngine(store, ops, coordinator=_always_ready_gate())
+    engine.tick("lane-a")
+    assert engine.tick("lane-a").action == expected
+    assert store.get_task(old).status == PAUSED
+
+
 # ---------------------------------------------------------------------------
 # Send failure -> BLOCKED.
 # ---------------------------------------------------------------------------

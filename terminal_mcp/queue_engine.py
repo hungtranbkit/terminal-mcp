@@ -542,12 +542,16 @@ class QueueEngine:
             reader_alive=status_response.get("reader_alive"),
             recovery_state=status_response.get("recovery_state"),
         )
-        other_active = tuple(
-            OtherLaneSnapshot(session=lane["session"],
-                             node_id=(lane["current_task"] or {}).get("node_id"),
-                             cwd=None)  # populated below only for lanes actually queried
+        other_tasks = {
+            lane["session"]: lane["current_task"]
             for lane in self.store.list_all_lanes()
             if lane["session"] != session and lane["current_task"] is not None
+        }
+        other_active = tuple(
+            OtherLaneSnapshot(session=name,
+                             node_id=other_task.get("node_id"),
+                             cwd=None)  # populated below only for lanes actually queried
+            for name, other_task in other_tasks.items()
         )
         # Cheaply enrich other_active with a real observed cwd ONLY for
         # lanes that actually have something in flight right now.
@@ -568,6 +572,18 @@ class QueueEngine:
                 continue
             try:
                 other_status = self._status_bounded(other.session)
+                other_task = other_tasks[other.session]
+                # A preflight refusal occupies its own lane, but has never
+                # acquired the repo. Require live IDLE evidence as well:
+                # paused work that actually started must retain ownership.
+                if (other_task["status"] == "PAUSED"
+                        and other_task.get("paused_from_status") == QUEUED
+                        and not other_task.get("started_at")
+                        and not other_task.get("attempt_count")
+                        and not other_task.get("dispatch_idempotency_key")
+                        and other_status.get("state") == "IDLE"
+                        and not other_status.get("error")):
+                    continue
                 enriched.append(OtherLaneSnapshot(session=other.session, node_id=other_status.get("node_id"),
                                                   cwd=other_status.get("cwd")))
             except Exception:  # noqa: BLE001 -- best-effort enrichment only; never blocks this task's own review
