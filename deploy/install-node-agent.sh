@@ -197,9 +197,9 @@ KillMode=process
 # hit the ceiling.
 MemoryMax=3G
 TasksMax=2048
-ProtectSystem=full
-ProtectHome=read-only
-ReadWritePaths=%h/.local/state/terminal-mcp
+# IMPORTANT: do not use ProtectSystem/ProtectHome/ReadWritePaths here.
+# They create a user namespace under systemd --user; tmux children then see
+# root-owned SSH config as nobody and OpenSSH refuses to start.
 NoNewPrivileges=yes
 SystemCallFilter=@system-service
 

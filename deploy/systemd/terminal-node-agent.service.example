@@ -58,11 +58,11 @@ StartLimitBurst=8
 MemoryMax=3G
 TasksMax=2048
 CPUQuota=200%
-ProtectSystem=full
-ProtectHome=read-only
-# This node's own sqlite state (bindings/audit/killed-sessions dbs) --
-# adjust if this node's config.yaml points those elsewhere.
-ReadWritePaths=%h/.local/state/terminal-mcp
+# IMPORTANT: do not use ProtectSystem/ProtectHome/ReadWritePaths on the node agent.
+# Under systemd --user these directives create a mount/user namespace that only
+# maps the service UID. tmux children then see root-owned /etc/ssh files as
+# nobody, and OpenSSH aborts with Bad owner or permissions. Keep hardening
+# mechanisms below that do not create that namespace.
 NoNewPrivileges=yes
 SystemCallFilter=@system-service
 
