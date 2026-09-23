@@ -203,9 +203,9 @@ def test_wait_for_state_timeout_is_pending_and_resumable():
     assert result["last_observed_state"] == "RUNNING"
 
 
-def test_public_default_and_large_requested_timeout_use_twenty_second_slice():
+def test_public_default_and_large_requested_timeout_use_ten_second_slice():
     assert DEFAULT_WAIT_SECONDS == 20
-    assert SYNC_WAIT_BUDGET_SECONDS == 20
+    assert SYNC_WAIT_BUDGET_SECONDS == 10
     assert inspect.signature(CompactTerminalTools.wait_for_state).parameters["timeout"].default == 20
     compact, _terminal, controller = service()
     clock = FakeClock()
@@ -218,9 +218,9 @@ def test_public_default_and_large_requested_timeout_use_twenty_second_slice():
 
     assert result["status"] == "PENDING"
     assert result["requested_timeout_seconds"] == 900
-    assert result["waited_ms"] == 20_000
-    assert result["sync_wait_budget_ms"] == 20_000
-    assert clock.now == 20
+    assert result["waited_ms"] == 10_000
+    assert result["sync_wait_budget_ms"] == 10_000
+    assert clock.now == 10
     assert controller.bounded_status_timeouts
     assert max(controller.bounded_status_timeouts) <= SYNC_WAIT_BUDGET_SECONDS
     assert min(controller.bounded_status_timeouts) > 0
@@ -460,3 +460,100 @@ def test_send_task_rejects_contradictory_submit_confirmed_receipt():
     assert result["status"] == "FAILED"
     assert "enter_sent=False" in result["reason"]
     assert result["evidence"]["enter_sent"] is False
+
+
+def test_send_wait_shares_budget_with_submission_and_resume_never_resends():
+    compact, _, controller = service()
+    clock = FakeClock()
+    compact.monotonic, compact.sleep = clock.monotonic, clock.sleep
+    original = controller.terminal_send_text
+    controller.send_result = {'delivery_state': 'SUBMIT_CONFIRMED', 'enter_sent': True}
+    def slow_send(*args, **kwargs):
+        clock.sleep(8)
+        return original(*args, **kwargs)
+    controller.terminal_send_text = slow_send
+    controller.statuses['worker'] = {'state': 'RUNNING'}
+    result = compact.turn(action='send_wait', target='worker', text='sleep 60', timeout=10)
+    assert result['status'] == 'PENDING'
+    assert clock.now <= 10
+    controller.statuses['worker'] = {'state': 'IDLE'}
+    resumed = compact.resume_wait(result['wait']['resume_token'], timeout=1)
+    assert resumed['status'] == 'MATCHED'
+    assert len(controller.send_calls) == 1
+
+
+def test_slow_binding_status_returns_pending_without_cancelling_read():
+    import threading
+    import time
+    compact, terminal, _ = service()
+    release = threading.Event()
+    def blocked_status(binding):
+        release.wait(2)
+        return {'state': 'RUNNING'}
+    terminal.terminal_status_bound = blocked_status
+    try:
+        started = time.monotonic()
+        result = compact.wait_for_state('binding:primary', ['IDLE'], timeout=0.05)
+        assert time.monotonic() - started < 0.5
+        assert result['status'] == 'PENDING'
+        assert result['resume_token']
+    finally:
+        release.set()
+
+
+def test_matched_state_does_not_block_on_slow_final_tail():
+    import threading
+    import time
+    compact, _, controller = service()
+    controller.statuses['worker'] = {'state': 'IDLE'}
+    release = threading.Event()
+    def blocked_tail(*args):
+        release.wait(2)
+        return {'output': 'done'}
+    controller.terminal_tail = blocked_tail
+    try:
+        started = time.monotonic()
+        result = compact.wait_for_state('worker', ['IDLE'], timeout=0.05)
+        assert time.monotonic() - started < 0.5
+        assert result['status'] == 'MATCHED'
+        assert result['tail_unavailable'] is True
+    finally:
+        release.set()
+
+
+def test_slow_submission_exhausts_wait_budget_without_extra_probe():
+    compact, _, controller = service()
+    clock = FakeClock()
+    compact.monotonic, compact.sleep = clock.monotonic, clock.sleep
+    controller.send_result = {'delivery_state': 'SUBMIT_CONFIRMED'}
+    original = controller.terminal_send_text
+    def slow_send(*args, **kwargs):
+        clock.sleep(12)
+        return original(*args, **kwargs)
+    controller.terminal_send_text = slow_send
+    result = compact.turn(action='send_wait', target='worker', text='sleep 60', timeout=10)
+    assert result['status'] == 'PENDING'
+    assert result['wait']['resume_token']
+    assert controller.status_calls == 0
+    assert clock.now == 12
+
+
+def test_stalled_reads_are_single_flight_and_capacity_bounded():
+    import threading
+    compact, _, _ = service()
+    release = threading.Event()
+    calls = []
+    def read():
+        calls.append(1)
+        release.wait(5)
+        return {'state': 'IDLE'}
+    try:
+        for _ in range(3):
+            assert compact._bounded_read(('status', 'same'), read, 0.002)['error'] == 'STATUS_PROBE_TIMEOUT'
+        assert len(calls) == 1
+        for i in range(40):
+            compact._bounded_read(('status', i), read, 0.002)
+        assert len(compact._reads) == 32
+        assert len(calls) == 32
+    finally:
+        release.set()

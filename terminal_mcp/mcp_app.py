@@ -720,6 +720,14 @@ def build_mcp(service: TerminalService | None = None,
         task_id ONLY when the user explicitly asks to check on it. A wall of
         "Called tool" rows is the failure this surface exists to prevent.
 
+        For a plain shell command use send_wait with an idempotency_key.
+        Long-running shell commands return PENDING with a durable resume_token;
+        use action="resume" with that token to continue an explicitly requested
+        watch. Never resend the command because a wait returned PENDING.
+        Wait slices default to 10 seconds (configuration hard cap: 15 seconds).
+        MATCHED means the requested session state was observed, not that the
+        shell command succeeded; inspect its output/exit status separately.
+
         `action` is one of:
 
           start     THE DEFAULT for giving a session work: persist `text` as
@@ -733,7 +741,7 @@ def build_mcp(service: TerminalService | None = None,
           send      guarded, idempotent submission of `text`; pass
                     `long_task=true` to persist+dispatch through the durable
                     queue and return a task receipt in this one call
-          send_wait send, then wait in the same call
+          send_wait send once, then wait within the remaining call budget
           wait      durable bounded wait for `desired_states`
           resume    continue a wait that returned PENDING (`resume_token`)
           list_sessions | list  every session, with node and access info
@@ -812,7 +820,7 @@ def build_mcp(service: TerminalService | None = None,
     @server.tool()
     def terminal_wait_for_state(target: str, desired_states: list[str], timeout: float = 20,
                                 poll_interval: float = 1, tail_lines: int = 20) -> dict:
-        """PREFERRED wait: poll server-side for at most 20s; PENDING is durably resumable."""
+        """PREFERRED wait: bounded server-side slices, default 10s (cap 15s); PENDING is durably resumable."""
         _refresh_local_heartbeat()
         return compact_tools.wait_for_state(target, desired_states, timeout=timeout,
                                             poll_interval=poll_interval, tail_lines=tail_lines)

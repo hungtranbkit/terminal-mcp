@@ -5,6 +5,8 @@ import math
 import os
 import re
 import time
+import threading
+from concurrent.futures import Future, TimeoutError as FutureTimeout
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -17,7 +19,7 @@ MAX_TAIL_LINES = 20
 MAX_TAIL_CHARS_PER_TARGET = 1_000
 MAX_TOTAL_TAIL_CHARS = 16_000
 MAX_REASON_CHARS = 500
-SYNC_WAIT_BUDGET_SECONDS = min(30, max(1, int(os.environ.get("MCP_LONG_CALL_MAX_SEC", "20"))))
+SYNC_WAIT_BUDGET_SECONDS = min(15, max(1, int(os.environ.get("MCP_LONG_CALL_MAX_SEC", "10"))))
 DEFAULT_WAIT_SECONDS = 20
 MAX_SEND_WAIT_SECONDS = 20
 # Compatibility field retained for existing clients. New clients should use
@@ -413,6 +415,40 @@ class CompactTerminalTools:
         self.handlers: dict[str, Callable[..., Any]] = dict(handlers or {})
         self.monotonic = monotonic
         self.sleep = sleep
+        self._read_lock = threading.Lock()
+        self._reads: dict[tuple, Future] = {}
+
+    def _bounded_read(self, key: tuple, read: Callable, seconds: float) -> dict[str, Any]:
+        """Bound read-only I/O without cancelling or duplicating an in-flight probe.
+
+        A stalled node may ignore its transport timeout. Keep at most 32 daemon
+        readers and one per operation/target; never run a mutation here. A result
+        left over from an earlier timed-out call is discarded before a fresh
+        probe, since a stale IDLE observation must not complete new work.
+        """
+        if seconds <= 0:
+            return {"error": "STATUS_PROBE_TIMEOUT"}
+        with self._read_lock:
+            self._reads = {k: f for k, f in self._reads.items() if not f.done()}
+            future = self._reads.get(key)
+            if future is not None:
+                # Do not reuse an observation begun before this request.
+                return {"error": "STATUS_PROBE_TIMEOUT"}
+            if future is None:
+                if len(self._reads) >= 32:
+                    return {"error": "STATUS_PROBE_TIMEOUT"}
+                future = Future()
+                self._reads[key] = future
+                def run():
+                    try:
+                        future.set_result(read())
+                    except Exception as exc:
+                        future.set_exception(exc)
+                threading.Thread(target=run, daemon=True, name="terminal-bounded-read").start()
+        try:
+            return future.result(timeout=seconds)
+        except FutureTimeout:
+            return {"error": "STATUS_PROBE_TIMEOUT"}
 
     def _resolve(self, target: str) -> tuple[str, str] | tuple[None, dict[str, Any]]:
         if (not isinstance(target, str) or not target.strip()
@@ -639,12 +675,13 @@ class CompactTerminalTools:
                 "next_poll_after_ms": NEXT_POLL_MIN_MS,
                 "retry_after_ms": RECOMMENDED_RETRY_AFTER_MS,
                 "pending_reason": "SYNC_WAIT_BUDGET_EXHAUSTED",
-                "next_action": "Call terminal_resume_wait with resume_token",
+                "next_action": "Call terminal_turn action=resume with resume_token; do not resend the command",
+                "command_cancelled": False,
             })
         return result
 
     def _wait_slice(self, wait: dict[str, Any], *, timeout: float,
-                    poll_interval: float) -> dict[str, Any]:
+                    poll_interval: float, deadline: float | None = None) -> dict[str, Any]:
         # Terminal results are immutable and returned from SQLite without
         # consulting or redispatching the underlying target.
         if wait["status"] in {"MATCHED", "FAILED"}:
@@ -652,17 +689,20 @@ class CompactTerminalTools:
 
         slice_seconds = min(float(timeout), float(SYNC_WAIT_BUDGET_SECONDS))
         started = self.monotonic()
-        deadline = started + slice_seconds
+        deadline = min(started + slice_seconds, deadline) if deadline is not None else started + slice_seconds
         polls = 0
         final: dict[str, Any] = {}
         matched = False
         probe_timed_out = False
         while True:
             remaining = deadline - self.monotonic()
-            if remaining <= 0 and polls:
+            if remaining <= 0:
                 break
             polls += 1
-            final = self._status(wait["target"], timeout_seconds=max(0.001, remaining))
+            final = self._bounded_read(
+                ("status", wait["target"]),
+                lambda: self._status(wait["target"], timeout_seconds=max(0.001, remaining)),
+                remaining)
             if final.get("error") == "STATUS_PROBE_TIMEOUT":
                 probe_timed_out = True
                 final = {"state": wait.get("last_observed_state") or "UNKNOWN",
@@ -696,18 +736,24 @@ class CompactTerminalTools:
         rendered = ""
         clipped = False
         if status == "MATCHED":
-            tail = self._tail(wait["target"], wait["tail_lines"])
+            tail = self._bounded_read(
+                ("tail", wait["target"], wait["tail_lines"]),
+                lambda: self._tail(wait["target"], wait["tail_lines"]),
+                deadline - self.monotonic())
             rendered, clipped = _bounded(
                 redact_text(str(tail.get("output", ""))) if "error" not in tail else "",
                 MAX_TAIL_CHARS_PER_TARGET,
             )
-        return self._durable_result(
+        result = self._durable_result(
             saved, waited_ms=waited_ms, polls=polls, tail=rendered,
             tail_truncated=bool(clipped or tail.get("truncated", False)),
         )
+        result["tail_unavailable"] = bool(tail.get("error"))
+        return result
 
     def wait_for_state(self, target: str, desired_states: list[str], timeout: float = DEFAULT_WAIT_SECONDS,
-                       poll_interval: float = 1, tail_lines: int = 20) -> dict[str, Any]:
+                       poll_interval: float = 1, tail_lines: int = 20,
+                       _deadline: float | None = None) -> dict[str, Any]:
         if (not isinstance(target, str) or not target.strip() or len(target) > _MAX_TARGET_CHARS
                 or redact_text(target) != target):
             return {"status": "FAILED", "error": "INVALID_TARGET"}
@@ -736,7 +782,7 @@ class CompactTerminalTools:
         except Exception as exc:  # noqa: BLE001 -- persistence is mandatory here
             return {"status": "FAILED", "error": "CONTINUATION_PERSIST_FAILED",
                     "reason": type(exc).__name__}
-        return self._wait_slice(wait, timeout=timeout, poll_interval=poll_interval)
+        return self._wait_slice(wait, timeout=timeout, poll_interval=poll_interval, deadline=_deadline)
 
     def resume_wait(self, resume_token: str, timeout: float = DEFAULT_WAIT_SECONDS,
                     poll_interval: float = 1) -> dict[str, Any]:
@@ -919,6 +965,9 @@ class CompactTerminalTools:
         # positively confirmed. A blocked/failed send never creates a wait.
         if not text:
             return {"status": "FAILED", "error": "TEXT_REQUIRED"}
+        if error := self._validate_wait(timeout, poll_interval):
+            return error
+        deadline = self.monotonic() + min(float(timeout), SYNC_WAIT_BUDGET_SECONDS)
         sent = self.send_task(target, text, wait_for_accept=True,
                               timeout=min(float(timeout), MAX_SEND_WAIT_SECONDS),
                               idempotency_key=idempotency_key)
@@ -927,7 +976,7 @@ class CompactTerminalTools:
                     "action": normalized, "send": sent, "wait": None}
         waited = self.wait_for_state(target, states, timeout=timeout,
                                      poll_interval=poll_interval,
-                                     tail_lines=tail_lines)
+                                     tail_lines=tail_lines, _deadline=deadline)
         return {"status": waited.get("status", "FAILED"),
                 "action": normalized, "send": sent, "wait": waited}
 
