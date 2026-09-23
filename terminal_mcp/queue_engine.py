@@ -495,6 +495,21 @@ class QueueEngine:
                     if verify_completion_marker(marker, task_id=task.id, attempt=task.attempt_count,
                                                 nonce=task.verification_nonce, nonce_consumed=False):
                         self._inactive_active_observations.pop(task.id, None)
+                        # A real completion is here. Deferring to the evidence
+                        # path is right -- but this branch used to defer to it
+                        # without ever INVOKING it, so a VERIFYING task whose
+                        # marker the gate refuses was skipped by the very sweep
+                        # that exists to bound it, on this pass and every pass
+                        # after. The marker never expires, so the skip never
+                        # ended. Run that path here instead of naming it.
+                        #
+                        # The IDLE case is already handled above; this covers
+                        # the other quiet states (WAITING_INPUT/WAITING_
+                        # APPROVAL/PAGER), where nothing else was reached.
+                        if task.status == VERIFYING and state != "IDLE":
+                            settled = self._check_completion(task.session, task.id, VERIFYING)
+                            if settled.action in {COMPLETED, BLOCKED}:
+                                recovered.append(task.id)
                         continue
                     target = BLOCKED
                     reason = f"STALE_ACTIVE_TIMEOUT: session is {state}; no progress or completion for {timeout:g}s"
@@ -1038,8 +1053,21 @@ class QueueEngine:
             self.store.transition_task(
                 task_id, VERIFYING, event_type="VERIFYING",
                 reason="nonce-bound completion evidence observed during reconciliation")
-            completed = self.store.mark_completed_with_evidence(
-                task_id, evidence={"completion_marker": marker, "reconciled_from": DISPATCH_UNCERTAIN})
+            try:
+                completed = self.store.mark_completed_with_evidence(
+                    task_id, evidence={"completion_marker": marker, "reconciled_from": DISPATCH_UNCERTAIN})
+            except Exception as exc:
+                # Same settlement as the ordinary VERIFYING path: this route
+                # reaches the identical contract gate, so an escape here would
+                # leave the task in VERIFYING holding its lane while every
+                # later tick re-raised the same refusal.
+                #
+                # Re-read first: `task` was loaded before the two transitions
+                # THIS method just made, so it still says DISPATCH_UNCERTAIN.
+                # Settling needs the row as it now is -- the optimistic
+                # comparison inside recover_stale_active_task is there to
+                # catch a CONCURRENT writer, not our own edits.
+                return self._settle_refused_completion(self.store.get_task(task_id), exc)
             self._notify_completed(completed)
             if self.governor is not None:
                 self.governor.note_success(completed)
@@ -1171,22 +1199,7 @@ class QueueEngine:
             try:
                 completed = self.store.mark_completed_with_evidence(task_id, evidence={"completion_marker": marker})
             except Exception as exc:
-                # A deterministic contract refusal used to escape to the
-                # follower, which retried it forever while holding capacity.
-                # Preserve the gate and expose the blocker, never replay work
-                # or turn a verifier error into successful completion.
-                if isinstance(exc, RequirementsNotCoveredError):
-                    reason = f"VERIFICATION_REQUIREMENTS: {exc}"
-                else:
-                    _LOGGER.exception("completion verification failed for %s", task_id)
-                    reason = f"VERIFICATION_ERROR: {type(exc).__name__}"
-                changed = self.store.recover_stale_active_task(task, to_status=BLOCKED, reason=reason)
-                if changed is None:
-                    current = self.store.get_task(task_id)
-                    return TickResult(session, current.status, task_id=task_id, detail="concurrent verification update")
-                if watch:
-                    self.store.update_long_task_watch(task_id, state="BLOCKED", blocker=reason, reason=reason)
-                return TickResult(session, BLOCKED, task_id=task_id, detail=reason)
+                return self._settle_refused_completion(task, exc, watch=watch)
             if watch:
                 self.store.update_long_task_watch(task_id, state="DONE", first_checkpoint_at=watch.get("first_checkpoint_at") or iso_now(),
                                                   last_progress_at=iso_now(), reason="verified_completion")
@@ -1201,6 +1214,39 @@ class QueueEngine:
             return TickResult(session, "RUNNING", task_id=task_id, detail="false alarm, re-armed")
         return TickResult(session, "AWAITING_VERIFICATION", task_id=task_id,
                           detail="no verified completion marker yet")
+
+    def _settle_refused_completion(self, task: QueueTask, exc: Exception, *,
+                                   watch: Any = None) -> TickResult:
+        """A completion the store refused must SETTLE, never be retried.
+
+        Both routes to COMPLETED go through the same contract gate, and that
+        gate is deterministic: the identical evidence re-offered on the next
+        tick gets the identical answer. Letting the exception escape therefore
+        does not retry anything useful -- it leaves the task in VERIFYING,
+        which holds the session's lane, and every QUEUED sibling behind it
+        waits on a verdict that will never change. That is precisely how task
+        4b5ecb09... accumulated 549 identical refusals in 28 minutes while its
+        session's backlog sat undispatched.
+
+        So the refusal is recorded where a human will see it (BLOCKED, with
+        the gate's own reason) and the lane is released. The gate is NOT
+        softened here: work is never replayed, and an unexpected verifier
+        error is never allowed to read as success.
+        """
+        if isinstance(exc, RequirementsNotCoveredError):
+            reason = f"VERIFICATION_REQUIREMENTS: {exc}"
+        else:
+            _LOGGER.exception("completion verification failed for %s", task.id)
+            reason = f"VERIFICATION_ERROR: {type(exc).__name__}"
+        changed = self.store.recover_stale_active_task(task, to_status=BLOCKED, reason=reason)
+        if changed is None:
+            current = self.store.get_task(task.id)
+            return TickResult(task.session, current.status, task_id=task.id,
+                              detail="concurrent verification update")
+        if watch:
+            self.store.update_long_task_watch(task.id, state="BLOCKED", blocker=reason,
+                                              reason=reason)
+        return TickResult(task.session, BLOCKED, task_id=task.id, detail=reason)
 
     def _request_verification(self, task: QueueTask) -> Any:
         """Create this task's verify job if -- and only if -- its own

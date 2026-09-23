@@ -37,7 +37,8 @@ from .permissions import valid_session_name
 from .verify_queue import VerifyQueue
 from .queue_store import (
     PAUSE_ORIGIN_USER, PAUSED, QUEUED, TERMINAL_STATUSES, UNASSIGNED_LANE, VERIFYING,
-    HarnessRunOwnsTask, InvalidTransitionError, TaskAlreadyClaimedError, QueueStore,
+    HarnessRunOwnsTask, InvalidTransitionError, RequirementsNotCoveredError,
+    TaskAlreadyClaimedError, QueueStore,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -895,9 +896,20 @@ class QueueService:
                     "reason": f"task is {task.status}, not VERIFYING -- nothing to verify"}
         if not evidence:
             return {"error": "EVIDENCE_REQUIRED", "session": session, "task_id": task_id}
-        updated = self.store.mark_completed_with_evidence(
-            task_id, evidence=evidence,
-            event_type="RECONCILED" if undispatched else "VERIFIED")
+        try:
+            updated = self.store.mark_completed_with_evidence(
+                task_id, evidence=evidence,
+                event_type="RECONCILED" if undispatched else "VERIFIED")
+        except RequirementsNotCoveredError as exc:
+            # This tool is the operator's escape hatch for a task the engine
+            # could not finish, so a contract refusal here is an EXPECTED
+            # answer, not a crash. Returning the decision (with its checklist
+            # and the ids that block) is what lets a human see what to fix;
+            # raising through only produced an opaque tool error on the exact
+            # call someone makes when a task is already stuck.
+            return {"error": "REQUIREMENTS_NOT_COVERED", "session": session,
+                    "task_id": task_id, "reason": str(exc),
+                    "decision": exc.decision.to_dict()}
         if self.on_completed is not None:
             try:
                 self.on_completed(updated)

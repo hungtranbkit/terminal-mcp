@@ -217,3 +217,39 @@ def test_a_closed_task_is_no_longer_pending_anywhere(tmp_path):
     assert service.pending_counts().get("lane-a", 0) == 0
     statuses = {t["id"]: t["status"] for t in service.status("lane-a")["tasks"]}
     assert statuses[task_id] == "COMPLETED"
+
+
+def test_a_contract_refusal_comes_back_as_an_answer_not_a_crash(tmp_path):
+    """This tool is what an operator reaches for when a task is ALREADY stuck,
+    so a contract refusal here is an expected verdict, not an exception.
+
+    It used to raise straight through, which turned the one call someone makes
+    to diagnose a stranded task into an opaque tool error -- on the incident
+    task (4b5ecb09...) the operator was left editing the database by hand.
+    """
+    service = _service(tmp_path)
+    task_id = _undispatched_task(service)
+    service.store.set_requirement_contract(
+        task_id, requirements=[{"id": "R1", "text": "an unmet criterion"}])
+
+    result = service.verify("lane-a", task_id, {"live_verify": "PASS"})
+
+    assert result["error"] == "REQUIREMENTS_NOT_COVERED"
+    assert result["decision"]["missing_requirements"] == ["R1"]
+    assert [row["requirement_id"] for row in result["decision"]["checklist"]] == ["R1"]
+    assert service.store.get_task(task_id).status == "QUEUED", \
+        "a refused verification must leave the task where it was"
+
+
+def test_a_vacuous_amendment_no_longer_blocks_an_operator_reconciliation(tmp_path):
+    """The incident shape, through the operator's own path."""
+    service = _service(tmp_path)
+    task_id = _undispatched_task(service)
+    service.store.set_requirement_contract(task_id, requirements=[])
+    service.store.amend_requirement_contract(
+        task_id, prompt="a follow-up asking nothing new", requirements=[])
+
+    result = service.verify("lane-a", task_id, {"live_verify": "PASS"})
+
+    assert "error" not in result, result
+    assert result["task"]["status"] == "COMPLETED"

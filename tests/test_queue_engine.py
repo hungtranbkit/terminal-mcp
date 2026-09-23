@@ -9,6 +9,8 @@ SAFETY: every session name below is a disposable fixture -- never
 `window`/`window2`."""
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from terminal_mcp.coordinator import CoordinatorGate, RepoEvidence
@@ -180,7 +182,11 @@ def test_contract_refusal_is_bounded_and_releases_claim(store, ops):
     assert result.action == "BLOCKED"
     task = store.get_task(task_id)
     assert task.status == BLOCKED
-    assert "STALE_CONTRACT_VERSION" in task.last_error
+    # The blocker is named, not just labelled: an operator reading last_error
+    # can see which requirement to cover. A refusal that names nothing is the
+    # deadlock shape tested below.
+    assert "REQUIREMENTS_NOT_COVERED" in task.last_error
+    assert "coverage" in task.last_error
     assert task.claim_token is None
     assert len(ops.sent) == 1
     store.reevaluate_ai_owned_blocked(now="2099-01-01T00:00:00Z")
@@ -230,6 +236,126 @@ def test_verifier_exception_is_visible_and_does_not_hold_active_claim(store, ops
     assert engine.tick("lane-a").action == "BLOCKED"
     assert store.get_task(task_id).claim_token is None
     assert "VERIFICATION_ERROR" in store.get_task(task_id).last_error
+
+
+def test_a_vacuous_contract_amendment_does_not_strand_a_finished_worker(store, ops):
+    """The live deadlock: queue task 4b5ecb09..., facebook-property-claude.
+
+    The agent emitted its completion marker and went IDLE, but the task had
+    been amended with ZERO new requirements, so the gate refused on a bare
+    version-counter mismatch and named nothing. The task stayed VERIFYING for
+    28 minutes across 549 identical refusals and only moved when a human
+    edited the row.
+    """
+    engine, task_id = _finished_worker(store, ops)
+    store.set_requirement_contract(task_id, requirements=[])
+    amended = store.amend_requirement_contract(
+        task_id, prompt="a follow-up that asks for nothing new", requirements=[])
+    assert amended.contract_version == 2
+
+    assert engine.tick("lane-a").action == "COMPLETED"
+    assert store.get_task(task_id).status == COMPLETED
+    refusals = [e for e in store.list_events(session="lane-a")
+                if e["event_type"] == "COMPLETION_REFUSED_REQUIREMENTS"]
+    assert refusals == []
+
+
+def test_a_stranded_task_does_not_starve_its_lane(store, ops):
+    """Why the deadlock mattered: a lane carries one task at a time, so a task
+    pinned in VERIFYING holds every QUEUED sibling behind it. The evidence
+    session had six QUEUED tasks waiting on this one."""
+    engine, task_id = _finished_worker(store, ops)
+    store.set_requirement_contract(task_id, requirements=[])
+    store.amend_requirement_contract(task_id, prompt="nothing new", requirements=[])
+    next_id = store.append_tasks("lane-a", [{"prompt": "the next queued sibling"}])[0]
+
+    for _ in range(4):
+        engine.tick("lane-a")
+
+    assert store.get_task(task_id).status == COMPLETED
+    assert store.get_task(next_id).status == RUNNING, \
+        "the sibling must dispatch once the finished task stops holding the lane"
+
+
+def test_a_refusal_never_retries_forever_while_holding_the_lane(store, ops):
+    """Defence in depth: even a LEGITIMATE refusal must settle.
+
+    The gate is deterministic, so re-offering identical evidence gets an
+    identical answer -- retrying only burns ticks while the lane stays held.
+    A refusal therefore lands on BLOCKED, where a human can see it, on the
+    first tick and never repeats.
+    """
+    engine, task_id = _finished_worker(store, ops)
+    store.set_requirement_contract(
+        task_id, requirements=[{"id": "R1", "text": "a genuinely unmet criterion"}])
+
+    for _ in range(5):
+        engine.tick("lane-a")
+
+    assert store.get_task(task_id).status == BLOCKED
+    refusals = [e for e in store.list_events(session="lane-a")
+                if e["event_type"] == "COMPLETION_REFUSED_REQUIREMENTS"]
+    assert len(refusals) == 1, f"refusal retried {len(refusals)} times instead of settling"
+
+
+def test_uncertain_dispatch_reconciliation_also_settles_a_refusal(store, ops):
+    """The same gate is reached from the DISPATCH_UNCERTAIN path, which had no
+    handler at all -- the refusal escaped to the caller and left the task in
+    VERIFYING holding its lane, the very shape this fix removes."""
+    task_id = _make_task(store)
+
+    class UnknownOps(FakeOps):
+        def terminal_send_text(self, session, text, press_enter=False, dry_run=False, **kwargs):
+            self.sent.append({"session": session, "text": text})
+            return {"sent": True, "delivery_state": "DELIVERY_UNKNOWN"}
+
+    unknown_ops = UnknownOps()
+    engine = QueueEngine(store, unknown_ops, coordinator=_always_ready_gate())
+    for _ in range(3):
+        engine.tick("lane-a")
+    assert store.get_task(task_id).status == "DISPATCH_UNCERTAIN"
+
+    # The send DID land after all: the worker ran and emitted a real marker.
+    marker = unknown_ops.sent[0]["text"].rstrip().splitlines()[-1]
+    unknown_ops.set_capture("lane-a", {"output": "Implemented and tested.\n" + marker})
+    store.set_requirement_contract(
+        task_id, requirements=[{"id": "R1", "text": "a genuinely unmet criterion"}])
+
+    result = engine._recheck_uncertain("lane-a", task_id)
+
+    assert result.action == BLOCKED
+    assert store.get_task(task_id).status == BLOCKED
+    assert "R1" in store.get_task(task_id).last_error
+
+
+def test_the_stale_sweep_settles_a_quiet_non_idle_task_it_used_to_skip(store, ops):
+    """The sweep's last-resort timeout had a permanent blind spot.
+
+    Seeing a valid completion marker it deferred to "the existing evidence/
+    requirements verification path" -- by `continue`, without ever calling
+    that path. A marker does not expire, so on a VERIFYING task whose gate
+    refuses, that skip repeated on every pass forever, and the sweep that
+    exists to bound a stranded task was the thing guaranteeing it stayed
+    stranded. Only the IDLE case was covered elsewhere.
+    """
+    engine, task_id = _finished_worker(store, ops)
+    store.set_requirement_contract(
+        task_id, requirements=[{"id": "R1", "text": "a genuinely unmet criterion"}])
+    assert store.get_task(task_id).status == VERIFYING
+    # Quiet, but not IDLE -- the state the earlier branch does not look at.
+    ops.set_status("lane-a", {"state": "WAITING_INPUT", "node_id": "local", "cwd": "/repo/a"})
+
+    # First pass only records the inactivity observation; age it past the
+    # sweep's timeout so the next pass reaches the marker branch.
+    engine.reconcile_stale_active_tasks()
+    signature, _ = engine._inactive_active_observations[task_id]
+    engine._inactive_active_observations[task_id] = (signature, time.monotonic() - 100_000)
+
+    engine.reconcile_stale_active_tasks()
+
+    task = store.get_task(task_id)
+    assert task.status == BLOCKED, "the sweep skipped it again instead of settling it"
+    assert "R1" in task.last_error
 
 
 # ---------------------------------------------------------------------------

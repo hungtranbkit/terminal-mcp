@@ -115,7 +115,10 @@ def test_amendment_appends_and_blocks_completion_until_reconciled(store):
         store.mark_completed_with_evidence(task.id, evidence={"m": "x"})
 
     decision = excinfo.value.decision
-    assert decision.reason == rc.STALE_CONTRACT_VERSION
+    # See test_requirement_contract.test_amendment_added_after_the_task_ran:
+    # an un-claimed new requirement is named by the ordinary coverage
+    # comparison, which is the accurate reason for it.
+    assert decision.reason == rc.REQUIREMENTS_NOT_COVERED
     assert "R4" in decision.missing_requirements
 
 

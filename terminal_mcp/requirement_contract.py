@@ -371,6 +371,10 @@ def reconcile(contract: RequirementContract | None, matrix: EvidenceMatrix | Non
     invalid_waivers: list[str] = []
     unknown_status: list[str] = []
     checklist: list[dict[str, Any]] = []
+    # Requirements the matrix makes ANY claim about (anything but `missing`).
+    # Collected here, against the same normalisation the loop already applies,
+    # so the staleness rule below does not have to re-derive it from raw rows.
+    claimed: list[str] = []
 
     for requirement in requirements:
         entry = entries.get(requirement.id)
@@ -379,6 +383,8 @@ def reconcile(contract: RequirementContract | None, matrix: EvidenceMatrix | Non
             # An unrecognised status is not "probably fine".
             unknown_status.append(requirement.id)
             status = MISSING
+        if status != MISSING:
+            claimed.append(requirement.id)
         if status == WAIVED:
             # A waiver without an actor AND a reason is not a waiver.
             if not (entry and str(entry.waived_by or "").strip()
@@ -398,8 +404,8 @@ def reconcile(contract: RequirementContract | None, matrix: EvidenceMatrix | Non
             "waived_reason": entry.waived_reason if entry else None,
         })
 
-    known_ids = {r.id for r in requirements}
-    unknown_requirements = tuple(sorted(set(entries) - known_ids))
+    requirements_by_id = {r.id: r for r in requirements}
+    unknown_requirements = tuple(sorted(set(entries) - set(requirements_by_id)))
 
     findings: list[tuple[str, str]] = []
     for detector in detectors:
@@ -417,20 +423,52 @@ def reconcile(contract: RequirementContract | None, matrix: EvidenceMatrix | Non
         unknown_requirements=unknown_requirements,
         detector_findings=tuple(findings), checklist=tuple(checklist))
 
-    # Order matters: the staleness answer is the most useful one when both are
-    # true, because re-running the agent against an old contract is the exact
-    # failure being fixed.
-    if matrix.reconciled_contract_version != contract.contract_version:
-        added = tuple(r.id for r in requirements
-                      if r.added_in_version > matrix.reconciled_contract_version)
+    # Staleness is about UNTRUSTWORTHY EVIDENCE, not about a version counter.
+    #
+    # A bare `reconciled_contract_version != contract_version` comparison used
+    # to decide this, and it pinned a finished task in VERIFYING forever
+    # (queue task 4b5ecb09..., session facebook-property-claude: the agent
+    # emitted its completion marker, the gate answered STALE_CONTRACT_VERSION
+    # 549 times in 28 minutes naming ZERO requirements, and only a human
+    # writing the row by hand ever got it out). Two shapes hit it, and neither
+    # is a real failure:
+    #
+    #   * an amendment that adds no requirements ("v2: +0 requirement(s)") --
+    #     the counter moved, nothing was newly asked;
+    #   * any contract whose matrix was never written -- and nothing in this
+    #     package writes one outside tests, so `reconciled_contract_version`
+    #     is 0 on every real task.
+    #
+    # In both, the refusal named nothing (`blocking_ids() == ()`), so no
+    # worker, engine or operator action could ever clear it: an unsatisfiable
+    # gate on a lane-holding status is a deadlock, not a safety property.
+    #
+    # What the check is genuinely for is narrower: evidence that CLAIMS to
+    # cover a requirement which did not yet exist when that evidence was
+    # produced. That claim cannot be true, so it is refused by name. A
+    # requirement added later and NOT claimed needs no special case -- the
+    # ordinary comparison above already counted it as missing and will name it
+    # through REQUIREMENTS_NOT_COVERED, which is the accurate reason for it.
+    stale_claims = tuple(sorted(
+        rid for rid in claimed
+        if requirements_by_id[rid].added_in_version > matrix.reconciled_contract_version))
+    if stale_claims:
         return replace(
             base, reason=STALE_CONTRACT_VERSION,
             detail=(f"evidence was reconciled against contract v"
-                    f"{matrix.reconciled_contract_version} but the contract is now v"
-                    f"{contract.contract_version}"),
-            missing_requirements=tuple(sorted(set(missing) | set(added))))
+                    f"{matrix.reconciled_contract_version} but "
+                    f"{', '.join(stale_claims)} "
+                    f"{'was' if len(stale_claims) == 1 else 'were'} added later, "
+                    f"in contract v{contract.contract_version}"),
+            missing_requirements=tuple(sorted(set(missing) | set(stale_claims))))
     if unknown_status:
+        # Carried into missing_requirements so blocking_ids() names them. A
+        # status nobody can read is not coverage, and on an OPTIONAL
+        # requirement nothing else would have recorded the id -- leaving the
+        # same "refused, but nothing named" shape that stranded the task this
+        # module's staleness rule was rewritten for.
         return replace(base, reason=UNKNOWN_STATUS,
+                       missing_requirements=tuple(sorted(set(missing) | set(unknown_status))),
                        detail=f"unrecognised evidence status for: {', '.join(unknown_status)}")
     if invalid_waivers:
         return replace(base, reason=INVALID_WAIVER,

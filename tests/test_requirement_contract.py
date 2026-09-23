@@ -63,10 +63,18 @@ def test_amendment_added_after_the_task_ran():
     decision = rc.reconcile(amended, matrix)
 
     assert decision.verified_done is False
-    assert decision.reason == rc.STALE_CONTRACT_VERSION
+    # The refusal and the named id are the guarantee. The REASON is
+    # REQUIREMENTS_NOT_COVERED rather than STALE_CONTRACT_VERSION because the
+    # matrix makes no claim about R4 at all -- "you have not covered R4" is
+    # the accurate and actionable answer, and it is the same answer whether
+    # R4 arrived in v1 or in an amendment. STALE_CONTRACT_VERSION is now
+    # reserved for evidence that CLAIMS a requirement predating it (see
+    # test_evidence_claiming_a_requirement_added_after_it_is_stale).
+    assert decision.reason == rc.REQUIREMENTS_NOT_COVERED
     assert decision.contract_version == 2
     assert decision.reconciled_version == 1
     assert "R4" in decision.missing_requirements
+    assert "R4" in decision.blocking_ids()
 
 
 def test_amendment_reconciled_and_covered_passes():
@@ -313,3 +321,151 @@ def test_contract_round_trips_through_dict():
 def test_matrix_round_trips_through_dict():
     matrix = _matrix([("R1", rc.COVERED)], version=3)
     assert rc.EvidenceMatrix.from_dict(matrix.to_dict()).reconciled_contract_version == 3
+
+
+# -- the VERIFYING deadlock (queue task 4b5ecb09..., facebook-property-claude)
+
+
+def test_a_version_bump_that_adds_nothing_does_not_block_completion():
+    """The incident, at its source.
+
+    A finished task was pinned in VERIFYING for 28 minutes because its
+    contract had been amended with ZERO new requirements ("v2: +0
+    requirement(s)"): the version counter moved, so the gate answered
+    STALE_CONTRACT_VERSION, but it could name no requirement to fix. Nothing
+    the worker, the engine or an operator could do would ever clear it, and
+    the task held its session's lane the whole time.
+    """
+    contract = rc.amend_contract(
+        _contract_r1_r2_r3(), prompt="a follow-up instruction that asks nothing new",
+        requirements=[], created_at=LATER, actor="user")
+    matrix = _matrix([("R1", rc.COVERED), ("R2", rc.COVERED), ("R3", rc.COVERED)],
+                     version=1)
+
+    decision = rc.reconcile(contract, matrix)
+
+    assert contract.contract_version == 2, "the amendment really did bump the version"
+    assert decision.verified_done is True
+    assert decision.reason == rc.VERIFIED
+
+
+def test_a_contract_whose_matrix_was_never_written_does_not_block_completion():
+    """The shape EVERY real task has.
+
+    Nothing in the package writes an evidence matrix outside tests, so
+    `reconciled_contract_version` is 0 in production. Against a bare version
+    comparison that made the gate unsatisfiable for every contracted task
+    whose requirement list is empty -- which is what a contract built from an
+    unstructured prompt is.
+    """
+    contract = rc.create_contract(prompt="Do the thing", requirements=[],
+                                  created_at=NOW, actor="user")
+
+    decision = rc.reconcile(contract, None)
+
+    assert decision.verified_done is True
+    assert decision.reason == rc.VERIFIED
+
+
+def test_a_refusal_always_names_something_to_fix():
+    """The property that makes a refusal survivable.
+
+    A gate that refuses without naming a blocker cannot be satisfied, and on a
+    lane-holding status that is a deadlock rather than a safety property. Any
+    refusal must point at a requirement id.
+    """
+    contract = rc.amend_contract(
+        _contract_r1_r2_r3(), prompt="and export the audit trail",
+        requirements=[{"id": "R4", "text": "export the audit trail as CSV"}],
+        created_at=LATER, actor="user")
+
+    optional = rc.create_contract(
+        prompt="p", requirements=[{"id": "R1", "text": "optional", "required": False}],
+        created_at=NOW)
+
+    cases = [
+        (contract, None),
+        (contract, _matrix([], version=0)),
+        (contract, _matrix([("R1", rc.COVERED)], version=1)),
+        (contract, _matrix([("R1", rc.COVERED), ("R2", rc.COVERED),
+                            ("R3", rc.COVERED)], version=1)),
+        # Stale claim on a requirement added later.
+        (contract, _matrix([("R1", rc.COVERED), ("R2", rc.COVERED),
+                            ("R3", rc.COVERED), ("R4", rc.COVERED)], version=1)),
+        # A waiver missing its actor/reason.
+        (contract, _matrix([("R1", rc.WAIVED), ("R2", rc.COVERED),
+                            ("R3", rc.COVERED), ("R4", rc.COVERED)], version=2)),
+        # An unreadable status -- on an OPTIONAL requirement, so nothing else
+        # records the id.
+        (optional, rc.EvidenceMatrix(
+            entries=(rc.EvidenceEntry("R1", "probably-fine", evidence=("x",)),),
+            reconciled_contract_version=1)),
+    ]
+    for contract_under_test, matrix in cases:
+        decision = rc.reconcile(contract_under_test, matrix)
+        assert decision.verified_done is False
+        assert decision.blocking_ids(), \
+            f"refused with nothing to fix: {decision.reason}: {decision.detail}"
+
+
+def test_evidence_claiming_a_requirement_added_after_it_is_stale():
+    """What STALE_CONTRACT_VERSION is actually for, and it still holds.
+
+    Evidence reconciled at v1 cannot honestly claim R4, which only exists
+    from v2. That claim is refused BY NAME -- unlike the version-counter
+    check it replaces, this refusal is always actionable.
+    """
+    contract = rc.amend_contract(
+        _contract_r1_r2_r3(), prompt="and export the audit trail",
+        requirements=[{"id": "R4", "text": "export the audit trail as CSV"}],
+        created_at=LATER, actor="user")
+    matrix = _matrix([("R1", rc.COVERED), ("R2", rc.COVERED), ("R3", rc.COVERED),
+                      ("R4", rc.COVERED)], version=1)
+
+    decision = rc.reconcile(contract, matrix)
+
+    assert decision.verified_done is False
+    assert decision.reason == rc.STALE_CONTRACT_VERSION
+    assert decision.missing_requirements == ("R4",)
+    assert "R4" in decision.detail
+
+
+def test_a_stale_partial_claim_is_also_refused():
+    """`partial` and `waived` are claims too -- only `missing` is not."""
+    contract = rc.amend_contract(
+        _contract_r1_r2_r3(), prompt="and export the audit trail",
+        requirements=[{"id": "R4", "text": "export the audit trail as CSV"}],
+        created_at=LATER, actor="user")
+    matrix = rc.EvidenceMatrix(
+        entries=(rc.EvidenceEntry("R1", rc.COVERED, evidence=("commit abc",)),
+                 rc.EvidenceEntry("R2", rc.COVERED, evidence=("commit abc",)),
+                 rc.EvidenceEntry("R3", rc.COVERED, evidence=("commit abc",)),
+                 rc.EvidenceEntry("R4", rc.PARTIAL, evidence=("commit abc",))),
+        reconciled_contract_version=1)
+
+    decision = rc.reconcile(contract, matrix)
+
+    assert decision.verified_done is False
+    assert decision.reason == rc.STALE_CONTRACT_VERSION
+    assert "R4" in decision.missing_requirements
+
+
+def test_an_explicitly_missing_claim_on_a_new_requirement_is_not_stale():
+    """Saying "I did not do R4" is honest, not stale evidence.
+
+    It still blocks -- through the coverage comparison, which names R4 -- but
+    calling it stale would send a reader looking for a re-reconciliation that
+    would change nothing.
+    """
+    contract = rc.amend_contract(
+        _contract_r1_r2_r3(), prompt="and export the audit trail",
+        requirements=[{"id": "R4", "text": "export the audit trail as CSV"}],
+        created_at=LATER, actor="user")
+    matrix = _matrix([("R1", rc.COVERED), ("R2", rc.COVERED), ("R3", rc.COVERED),
+                      ("R4", rc.MISSING)], version=1)
+
+    decision = rc.reconcile(contract, matrix)
+
+    assert decision.verified_done is False
+    assert decision.reason == rc.REQUIREMENTS_NOT_COVERED
+    assert decision.missing_requirements == ("R4",)
