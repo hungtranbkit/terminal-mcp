@@ -1505,6 +1505,7 @@ DASHBOARD_HTML = """<!doctype html>
           <a href="/dashboard/nodes" id="nodesAdminLink" role="menuitem">🖥 Nodes</a>
           <a href="/dashboard/tasks" id="globalTasksLink" role="menuitem">🗂 Global Tasks</a>
           <a href="/dashboard/projects" id="projectsLink" role="menuitem">📁 Projects</a>
+          <a href="/dashboard/archify" id="archifyLink" role="menuitem">🧩 Architecture / Archify</a>
           <a href="/dashboard/agents" id="agentsLink" role="menuitem">🤖 Agents</a>
           <a href="/dashboard/backlog" id="backlogLink" role="menuitem">📋 Project Backlog</a>
           <a href="/dashboard/notes" id="notesLink" role="menuitem">💡 Ghi chú / Ý tưởng</a>
