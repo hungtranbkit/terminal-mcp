@@ -47,6 +47,17 @@ def test_missing_old_session_releases_slot_even_when_auto_dispatch_is_off(tmp_pa
     assert not [record for record in caplog.records if record.levelname == "ERROR"]
 
 
+def test_clean_stale_missing_session_releases_ownership(tmp_path):
+    store, ops, governor, engine, old_id = setup_case(tmp_path)
+    ops.set_status("old-lane", {"error": "SESSION_NOT_FOUND"})
+
+    assert engine.reconcile_stale_active_tasks() == [old_id]
+    task = store.get_task(old_id)
+    assert task.status == "WAITING_SESSION"
+    assert governor.status()["global_reserved"] == 0
+    assert not ops.sent
+
+
 def test_idle_old_verification_releases_slot_without_fabricating_completion(tmp_path, monkeypatch):
     store, ops, governor, engine, old_id = setup_case(tmp_path, "VERIFYING")
     ops.set_status("old-lane", {"state": "IDLE"})

@@ -97,6 +97,29 @@ def test_resolved_dirty_preflight_recovers_without_dispatch(store, ops, clean, u
     assert not ops.sent
 
 
+def test_dirty_worktree_checkpoint_recovers_automatically_once_clean(store, ops):
+    """A dirty preflight checkpoint survives, then reopens after the repo is clean."""
+    task_id = _make_task(store)
+    store.claim_next_task("lane-a", claimed_by="test")
+    reason = "uncommitted changes present in '/repo/a' (2 line(s))"
+    store.record_coordinator_decision(task_id, status="NEEDS_HUMAN", reason=reason)
+    engine = QueueEngine(store, ops, coordinator=CoordinatorGate(
+        evidence_collector=lambda cwd: RepoEvidence(branch="main", head="x", clean=False,
+                                                    status_lines=("?? artifact",))))
+
+    assert engine.reconcile_resolved_preflight_pauses() == []
+    paused = store.get_task(task_id)
+    assert paused.status == PAUSED
+    assert paused.coordinator_reason == reason
+    assert not ops.sent
+
+    engine.coordinator = CoordinatorGate(evidence_collector=lambda cwd: RepoEvidence(
+        branch="main", head="x", clean=True, status_lines=()))
+    assert engine.reconcile_resolved_preflight_pauses() == [task_id]
+    assert store.get_task(task_id).status == QUEUED
+    assert not ops.sent
+
+
 def test_ai_task_is_not_sent_to_plain_shell(store, ops):
     task_id = _make_task(store)
     ops.set_status("lane-a", {"state": "IDLE", "cwd": "/repo/a", "current_command": "bash"})

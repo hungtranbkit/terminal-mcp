@@ -37,6 +37,12 @@ def _task(store, *, isolated=True, max_attempts=3):
 
 def _walk(store, task_id, *statuses):
     for status in statuses:
+        if status == qs.RUNNING:
+            store.mark_running_with_evidence(
+                task_id,
+                evidence={"accepted": True, "signal": "explicit_running_signal"},
+            )
+            continue
         store.transition_task(task_id, status, event_type="TEST")
     return store.get_task(task_id)
 
