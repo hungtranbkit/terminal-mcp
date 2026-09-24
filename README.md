@@ -107,6 +107,37 @@ use -- toggling it here is immediately reflected in the main page's tab
 strip in the same browser, and vice versa, since both read/write the
 same key).
 
+### Shared Archify diagrams
+
+`/dashboard/archify` creates interactive, source-backed diagrams for an
+allowed repository. It supports Architecture, Workflow, Sequence, Dataflow,
+and Lifecycle views, an optional focus prompt, durable background jobs, recent
+history, an in-page sandboxed preview, and an **Open HTML** action. Source
+repositories are read-only; SQLite state and generated IR, metadata, and HTML
+live under `${XDG_STATE_HOME:-~/.local/state}/terminal-mcp/`.
+
+The official [`tt-a1i/archify`](https://github.com/tt-a1i/archify) runtime is
+one shared operator-managed dependency, never installed into selected
+projects. Node.js 18+ is required. One explicit provisioning approach is:
+
+```bash
+runtime_tmp="$(mktemp -d)"
+git clone --depth 1 https://github.com/tt-a1i/archify.git "$runtime_tmp/source"
+mkdir -p "${XDG_STATE_HOME:-$HOME/.local/state}/terminal-mcp/archify-runtime"
+cp -a "$runtime_tmp/source/archify/." \
+  "${XDG_STATE_HOME:-$HOME/.local/state}/terminal-mcp/archify-runtime/"
+node "${XDG_STATE_HOME:-$HOME/.local/state}/terminal-mcp/archify-runtime/bin/archify.mjs" doctor
+```
+
+Pin and record the upstream commit when provisioning production. Alternatively
+set `archify.runtime_dir` (or, when that setting is empty,
+`TERMINAL_MCP_ARCHIFY_HOME`) to a shared directory whose `bin/archify.mjs`
+exists. `archify.allowed_roots` defaults to the existing Repo Read roots and
+then session-lifecycle roots; it never falls back to `/`. Missing or broken
+dependencies are reported on the page and disable generation—Terminal MCP
+does not download them on request or create substitute output. See
+`config.example.yaml` for limits and `docs/CHATGPT_USAGE.md` for the flow.
+
 ### Password login
 
 The dashboard is also reachable through a second, independent path for
