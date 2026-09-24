@@ -53,6 +53,7 @@ class NodeClient(Protocol):
     def tail(self, session: str, lines: int | None = None, *, ansi: bool = False) -> dict[str, Any]: ...
     def capture(self, session: str, start_line: int | None = None) -> dict[str, Any]: ...
     def send_text(self, session: str, text: str, press_enter: bool = False, dry_run: bool = False, *,
+                  prompt_response: bool = False,
                   idempotency_key: str | None = None, origin: str | None = None, trace_id: str | None = None,
                   parent_turn_id: str | None = None, depth: int = 0) -> dict[str, Any]: ...
     def send_keys(self, session: str, keys: list[str], confirm_sensitive: bool = False) -> dict[str, Any]: ...
@@ -137,9 +138,12 @@ class LocalNodeClient:
         return self._terminal.terminal_capture(session, start_line)
 
     def send_text(self, session: str, text: str, press_enter: bool = False, dry_run: bool = False, *,
+                  prompt_response: bool = False,
                   idempotency_key: str | None = None, origin: str | None = None, trace_id: str | None = None,
                   parent_turn_id: str | None = None, depth: int = 0) -> dict[str, Any]:
-        return self._terminal.terminal_send_text(session, text, press_enter, dry_run, idempotency_key=idempotency_key,
+        return self._terminal.terminal_send_text(session, text, press_enter, dry_run,
+                                                  idempotency_key=idempotency_key,
+                                                  prompt_response=prompt_response,
                                                   origin=origin, trace_id=trace_id, parent_turn_id=parent_turn_id,
                                                   depth=depth)
 
@@ -489,10 +493,12 @@ class RemoteNodeClient:
                              params={"start_line": start_line})
 
     def send_text(self, session: str, text: str, press_enter: bool = False, dry_run: bool = False, *,
+                  prompt_response: bool = False,
                   idempotency_key: str | None = None, origin: str | None = None, trace_id: str | None = None,
                   parent_turn_id: str | None = None, depth: int = 0) -> dict[str, Any]:
         return self._request("POST", f"/v1/sessions/{urllib.parse.quote(session)}/send", body={
-            "text": text, "press_enter": press_enter, "dry_run": dry_run, "idempotency_key": idempotency_key,
+            "text": text, "press_enter": press_enter, "dry_run": dry_run,
+            "prompt_response": prompt_response, "idempotency_key": idempotency_key,
             "origin": origin, "trace_id": trace_id, "parent_turn_id": parent_turn_id, "depth": depth,
         })
 
@@ -727,4 +733,3 @@ class RemoteNodeClient:
         except NodeClientError as exc:
             return False, None, str(exc)
         return True, (time.monotonic() - started) * 1000.0, None
-

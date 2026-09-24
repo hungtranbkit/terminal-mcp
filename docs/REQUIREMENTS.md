@@ -2921,6 +2921,24 @@ scan/audit view over the SAME facts.)*
   pass" below.
 - **Trace:** `04f14d0`.
 
+### Restart-safe stale VERIFYING reconciliation
+
+- **Goal / user value:** an idle task cannot hold a queue lane forever merely
+  because the controller restarts before its inactivity timer expires.
+- **Status:** IMPLEMENTED; deployment and live reconciliation pending.
+- **Scope / flow:** the first stable inactive observation and its output/state
+  fingerprint are stored on `queue_tasks`. Progress resets the clock. A valid
+  completion marker still wins; a live verifier lease or active/uncertain
+  session is protected. An unchanged `VERIFYING + IDLE` task with no evidence
+  past `stale_active_timeout_seconds` becomes `CANCELLED`, atomically clears
+  claim/lease, and permits the next queued task to dispatch. Other quiet active
+  states retain the existing visible `BLOCKED` handling.
+- **Data/schema/migration:** migration v18 (`inactive_observed_at`,
+  `inactive_signature`).
+- **Acceptance/tests/evidence:** `tests/test_queue_engine.py` covers restart,
+  live progress, valid completion, live verifier protection, lane recovery and
+  single dispatch; `tests/test_stale_admission_recovery.py` covers admission.
+
 ### P0: persist-before-dispatch
 
 - **Goal / user value:** every ChatGPT/UI/API-originated prompt becomes
@@ -3275,6 +3293,23 @@ scan/audit view over the SAME facts.)*
   consider the same continued-polling treatment for
   `stuck_composer_evidence`'s own recovery-path evidence check if a
   similar transitional-frame gap is ever found there.
+
+### Explicit short response to a visible input prompt
+
+- **Goal / user value:** a caller can answer a basic question/menu already
+  visible in a Claude/Codex session without disabling the ordinary
+  `TARGET_AWAITING_APPROVAL` protection for new prompts.
+- **Status:** IMPLEMENTED; deployment pending.
+- **Scope / flow:** `terminal_send_text(..., prompt_response=true)` accepts one
+  non-empty line of at most 200 characters only when the adapter currently
+  reports `TARGET_WAITING` and `press_enter=true`. It refuses multiline input
+  and refuses response mode at a normal composer. Calls without the explicit
+  flag remain blocked exactly as before.
+- **API/tool/command:** additive `prompt_response` parameter on
+  `terminal_send_text`, routed identically through local and remote nodes.
+- **Acceptance/tests/evidence:** real disposable tmux fixtures in
+  `tests/test_send_reliability.py` cover allowed response, multiline refusal,
+  normal-composer refusal, and unchanged default blocking.
 
 ### TARGET_AWAITING_APPROVAL false positive on ordinary composer text
 

@@ -60,7 +60,7 @@ from typing import Any, Callable, Protocol
 from .coordinator import CoordinatorGate, OtherLaneSnapshot, SessionSnapshot, PLAIN_SHELL_COMMANDS
 from . import delivery_gate, retry_recovery
 from .queue_store import (
-    BLOCKED, COMPLETED, DISPATCH_UNCERTAIN, DISPATCHING, FAILED, PRECHECK, QUEUED, READY, RUNNING, VERIFYING,
+    BLOCKED, CANCELLED, COMPLETED, DISPATCH_UNCERTAIN, DISPATCHING, FAILED, PRECHECK, QUEUED, READY, RUNNING, VERIFYING,
     WAITING_SESSION, QueueStore, QueueTask, RequirementsNotCoveredError, iso_now,
 )
 from .status import COMPLETION_MARKER_RE, parse_completion_marker, verify_completion_marker
@@ -442,7 +442,8 @@ class QueueEngine:
 
         Missing sessions use task age. Reachable sessions require a full
         interval of unchanged inactivity, not merely a long task runtime.
-        This conservative observation clock resets after a controller restart.
+        The observation clock is persisted on the task, so restarting the
+        controller cannot restart the grace period forever.
         """
         timeout = self.governor.config.stale_active_timeout_seconds if self.governor else 900.0
         now = datetime.now(timezone.utc)
@@ -457,6 +458,7 @@ class QueueEngine:
             try:
                 if self.store.has_live_verification(task.id):
                     self._inactive_active_observations.pop(task.id, None)
+                    self.store.clear_inactive_observation(task.id)
                     continue
                 observation = self.ops.terminal_status(task.session)
                 error = observation.get("error")
@@ -471,26 +473,56 @@ class QueueEngine:
                         continue
                 if error in SESSION_UNREACHABLE_ERRORS:
                     self._inactive_active_observations.pop(task.id, None)
+                    self.store.clear_inactive_observation(task.id)
                     updated = datetime.fromisoformat(task.updated_at.replace("Z", "+00:00"))
                     if updated.tzinfo is None or (now - updated).total_seconds() < timeout:
                         continue
                     target = WAITING_SESSION
                     reason = f"STALE_ACTIVE_TIMEOUT: {error}; released admission after {timeout:g}s"
                 elif not error and state in {"IDLE", "WAITING_INPUT", "WAITING_APPROVAL", "PAGER"}:
-                    signature = (task.status, task.updated_at, task.attempt_count, task.claim_token,
-                                 state, hashlib.sha256(str(observation.get("last_output") or "").encode()).hexdigest())
-                    previous = self._inactive_active_observations.get(task.id)
-                    if previous is None or previous[0] != signature:
-                        self._inactive_active_observations[task.id] = (signature, observed_at)
-                        continue
-                    if observed_at - previous[1] < timeout:
-                        continue
-                    # A quiet terminal may contain a real completion. Leave it
-                    # to the existing evidence/requirements verification path.
                     capture = self.ops.terminal_tail(task.session, 200)
                     if capture.get("error"):
                         self._inactive_active_observations.pop(task.id, None)
+                        self.store.clear_inactive_observation(task.id)
                         continue
+                    progress_output = (str(capture.get("output") or "") + "\0" +
+                                       str(observation.get("last_output") or ""))
+                    output_hash = hashlib.sha256(progress_output.encode()).hexdigest()
+                    signature_text = f"{task.status}\0{task.attempt_count}\0{task.claim_token}\0{state}\0{output_hash}"
+                    first_observed_at = None
+                    if task.status == VERIFYING and not task.inactive_observed_at and task.lease_expires_at:
+                        try:
+                            lease_expiry = datetime.fromisoformat(task.lease_expires_at.replace("Z", "+00:00"))
+                        except ValueError:
+                            lease_expiry = now
+                        if lease_expiry < now:
+                            # Upgrade/restart bridge: an already-expired claim
+                            # has no in-process clock left to preserve.  Its
+                            # durable task timestamp is the conservative lower
+                            # bound, so an hours-old VERIFYING row can recover
+                            # on the first post-upgrade sweep instead of waiting
+                            # a brand-new timeout window.
+                            first_observed_at = task.updated_at
+                    durable = self.store.observe_inactive_task(
+                        task, signature=hashlib.sha256(signature_text.encode()).hexdigest(),
+                        observed_at=first_observed_at)
+                    if durable is None:
+                        self._inactive_active_observations.pop(task.id, None)
+                        continue
+                    task = durable
+                    signature = (task.status, task.attempt_count, task.claim_token, state, output_hash)
+                    previous = self._inactive_active_observations.get(task.id)
+                    if previous is None or previous[0] != signature:
+                        self._inactive_active_observations[task.id] = (signature, observed_at)
+                        previous = self._inactive_active_observations[task.id]
+                    durable_since = datetime.fromisoformat(task.inactive_observed_at.replace("Z", "+00:00")) \
+                        if task.inactive_observed_at else now
+                    durable_age = max(0.0, (now - durable_since).total_seconds())
+                    memory_age = max(0.0, observed_at - previous[1])
+                    if max(durable_age, memory_age) < timeout:
+                        continue
+                    # A quiet terminal may contain a real completion. Leave it
+                    # to the existing evidence/requirements verification path.
                     marker = parse_completion_marker(worker_output_after_prompt(str(capture.get("output") or "")))
                     if verify_completion_marker(marker, task_id=task.id, attempt=task.attempt_count,
                                                 nonce=task.verification_nonce, nonce_consumed=False):
@@ -511,12 +543,17 @@ class QueueEngine:
                             if settled.action in {COMPLETED, BLOCKED}:
                                 recovered.append(task.id)
                         continue
-                    target = BLOCKED
+                    # An IDLE verifier-less task with no completion evidence
+                    # has exhausted its bounded grace.  CANCELLED is terminal,
+                    # so the lane can advance; BLOCKED would keep occupying
+                    # the lane and reproduce the deadlock this sweep repairs.
+                    target = CANCELLED if task.status == VERIFYING and state == "IDLE" else BLOCKED
                     reason = f"STALE_ACTIVE_TIMEOUT: session is {state}; no progress or completion for {timeout:g}s"
                 else:
                     # Live work and uncertain observations break the inactivity
                     # interval; neither proves a task stopped making progress.
                     self._inactive_active_observations.pop(task.id, None)
+                    self.store.clear_inactive_observation(task.id)
                     continue
                 changed = self.store.recover_stale_active_task(task, to_status=target, reason=reason)
                 self._inactive_active_observations.pop(task.id, None)

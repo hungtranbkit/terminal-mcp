@@ -843,7 +843,8 @@ def build_mcp(service: TerminalService | None = None,
 
     @server.tool()
     def terminal_send_text(session: str, text: str, press_enter: bool = False,
-                           dry_run: bool = False, idempotency_key: str | None = None) -> dict:
+                           dry_run: bool = False, idempotency_key: str | None = None,
+                           prompt_response: bool = False) -> dict:
         """LOW-LEVEL/MANUAL send -- bypasses the durable task queue
         entirely (task: "persist-before-dispatch", item 10/12). For a
         normal ChatGPT/UI/API-originated task, use terminal_enqueue_task
@@ -863,9 +864,15 @@ def build_mcp(service: TerminalService | None = None,
         NOT proof the target processed Enter; treat SUBMIT_UNCONFIRMED as
         needing follow-up, never as success. Pass idempotency_key (e.g. a
         UUID you generate) to make a retried/duplicate call with the same
-        key return the original result instead of sending again."""
+        key return the original result instead of sending again.
+
+        Set prompt_response=true only to answer a currently visible input/menu
+        prompt with one short line. Ordinary sends remain blocked while such a
+        prompt is visible, and response mode refuses a normal composer."""
         _refresh_local_heartbeat()
-        result = controller.terminal_send_text(session, text, press_enter, dry_run, idempotency_key=idempotency_key)
+        result = controller.terminal_send_text(
+            session, text, press_enter, dry_run, idempotency_key=idempotency_key,
+            prompt_response=prompt_response)
         active_task = _active_queue_task_for(session)
         if active_task is not None and isinstance(result, dict):
             result["queue_conflict_warning"] = (

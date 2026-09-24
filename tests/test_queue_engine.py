@@ -14,8 +14,11 @@ import time
 import pytest
 
 from terminal_mcp.coordinator import CoordinatorGate, RepoEvidence
+from terminal_mcp.config import LLMGovernorConfig
 from terminal_mcp.queue_engine import QueueEngine, idempotency_key_for
-from terminal_mcp.queue_store import BLOCKED, COMPLETED, PAUSED, QUEUED, QueueStore, RUNNING, VERIFYING
+from terminal_mcp.queue_store import BLOCKED, CANCELLED, COMPLETED, PAUSED, QUEUED, QueueStore, RUNNING, VERIFYING
+from terminal_mcp.request_governor import RequestGovernor
+from terminal_mcp.verify_queue import VerifyQueue
 
 
 class FakeOps:
@@ -226,6 +229,82 @@ def test_restart_sweep_does_not_complete_wrong_nonce(store, ops):
     assert restarted.reconcile_stale_active_tasks() == []
     assert store.get_task(task_id).status == VERIFYING
     assert len(ops.sent) == 1
+
+
+def test_idle_verifying_timeout_survives_restart_and_releases_next_task(store, ops):
+    """Regression: production task 572d... held b6cec... behind it forever.
+
+    The first idle observation must be durable.  Recreating QueueEngine must
+    not restart the grace clock, and releasing the stale claim must let the
+    next queued sibling dispatch exactly once.
+    """
+    _, stale_id = _finished_worker(store, ops)
+    ops.set_capture("lane-a", {"output": "How do you want to proceed?\n1. Continue\n2. Stop"})
+    next_id = store.append_tasks("lane-a", [{"prompt": "the queued recovery task"}])[0]
+    config = LLMGovernorConfig(stale_active_timeout_seconds=0.01)
+    first = QueueEngine(store, ops, coordinator=_always_ready_gate(),
+                        governor=RequestGovernor(config, store))
+
+    assert first.reconcile_stale_active_tasks() == []
+    time.sleep(0.02)
+
+    reopened_store = QueueStore(store.path)
+    restarted = QueueEngine(reopened_store, ops, coordinator=_always_ready_gate(),
+                            governor=RequestGovernor(config, reopened_store))
+    assert restarted.reconcile_stale_active_tasks() == [stale_id]
+    stale = reopened_store.get_task(stale_id)
+    assert stale.status == CANCELLED
+    assert stale.claim_token is None
+    assert stale.lease_expires_at is None
+
+    for _ in range(6):
+        restarted.tick("lane-a")
+    assert reopened_store.get_task(next_id).status == VERIFYING
+    assert len(ops.sent) == 2, "restart recovery dispatched the queued sibling more than once"
+
+
+def test_live_progress_resets_durable_idle_grace_across_restart(store, ops):
+    """A session that becomes active must never inherit an old idle timeout."""
+    _, task_id = _finished_worker(store, ops)
+    ops.set_capture("lane-a", {"output": "Waiting without a completion marker"})
+    config = LLMGovernorConfig(stale_active_timeout_seconds=0.01)
+    engine = QueueEngine(store, ops, coordinator=_always_ready_gate(),
+                         governor=RequestGovernor(config, store))
+    assert engine.reconcile_stale_active_tasks() == []
+
+    ops.set_status("lane-a", {"state": "RUNNING", "node_id": "local", "cwd": "/repo/a"})
+    time.sleep(0.02)
+    restarted_store = QueueStore(store.path)
+    restarted = QueueEngine(restarted_store, ops, coordinator=_always_ready_gate(),
+                            governor=RequestGovernor(config, restarted_store))
+    assert restarted.reconcile_stale_active_tasks() == []
+    assert restarted_store.get_task(task_id).status == VERIFYING
+
+    ops.set_status("lane-a", {"state": "IDLE", "node_id": "local", "cwd": "/repo/a"})
+    assert restarted.reconcile_stale_active_tasks() == []
+    assert restarted_store.get_task(task_id).status == VERIFYING
+
+
+def test_live_verifier_claim_protects_idle_task_past_timeout_after_restart(store, ops):
+    """An independent verifier lease is completion activity, not staleness."""
+    _, task_id = _finished_worker(store, ops)
+    ops.set_capture("lane-a", {"output": "No in-session completion marker"})
+    verify = VerifyQueue(store)
+    verify.ensure_verify_job(store.get_task(task_id))
+    claimed = verify.claim_next(verifier="independent-verifier", capabilities=[], lease_seconds=60)
+    assert claimed is not None
+
+    config = LLMGovernorConfig(stale_active_timeout_seconds=0.01)
+    first = QueueEngine(store, ops, coordinator=_always_ready_gate(),
+                        governor=RequestGovernor(config, store))
+    assert first.reconcile_stale_active_tasks() == []
+    time.sleep(0.02)
+
+    reopened_store = QueueStore(store.path)
+    restarted = QueueEngine(reopened_store, ops, coordinator=_always_ready_gate(),
+                            governor=RequestGovernor(config, reopened_store))
+    assert restarted.reconcile_stale_active_tasks() == []
+    assert reopened_store.get_task(task_id).status == VERIFYING
 
 
 def test_verifier_exception_is_visible_and_does_not_hold_active_claim(store, ops, monkeypatch):

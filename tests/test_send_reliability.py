@@ -564,6 +564,37 @@ def test_claude_send_refused_when_target_shows_approval_prompt(tmux_session_fact
     assert result["sent"] is False
 
 
+@pytest.mark.parametrize("agent_type", ["claude", "codex"])
+def test_explicit_short_prompt_response_is_allowed_only_while_waiting(
+        tmux_session_factory, tmp_path, agent_type):
+    session = _waiting_prompt_session(
+        tmux_session_factory, f"test-explicit-prompt-response-{agent_type}", agent_type)
+    time.sleep(0.3)
+    service = _service(tmp_path)
+
+    result = service.terminal_send_text(
+        session, "2", press_enter=True, prompt_response=True,
+        idempotency_key="explicit-response-1")
+
+    assert result["sent"] is True
+    assert result["enter_sent"] is True
+    assert result["prompt_response"] is True
+    assert "APPROVED=2" in service.terminal_tail(session, 10)["output"]
+
+
+def test_prompt_response_mode_refuses_multiline_or_normal_composer(tmux_session_factory, tmp_path):
+    waiting = _waiting_prompt_session(tmux_session_factory, "test-bad-prompt-response", "claude")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    multiline = service.terminal_send_text(waiting, "1\n2", press_enter=True, prompt_response=True)
+    assert multiline["error"] == "INVALID_PROMPT_RESPONSE"
+
+    normal = _codex_session(tmux_session_factory, "test-response-at-normal-composer", "submits_and_shows_working")
+    time.sleep(0.3)
+    misplaced = service.terminal_send_text(normal, "1", press_enter=True, prompt_response=True)
+    assert misplaced["error"] == "PROMPT_RESPONSE_NOT_REQUIRED"
+
+
 def test_send_bound_also_refused_when_target_shows_approval_prompt(tmux_session_factory, tmp_path):
     from terminal_mcp.bindings import BindingStore
 

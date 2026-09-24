@@ -49,6 +49,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -432,6 +433,8 @@ class QueueTask:
     verification_nonce: str | None = None
     dispatch_idempotency_key: str | None = None
     uncertain_or_waiting_since: str | None = None
+    inactive_observed_at: str | None = None
+    inactive_signature: str | None = None
     original_owner: str | None = None
     migration_history: tuple[dict[str, Any], ...] = ()
     at_risk: bool = False
@@ -497,6 +500,8 @@ class QueueTask:
             verification_nonce=row["verification_nonce"],
             dispatch_idempotency_key=row["dispatch_idempotency_key"],
             uncertain_or_waiting_since=row["uncertain_or_waiting_since"],
+            inactive_observed_at=(row["inactive_observed_at"] if "inactive_observed_at" in row.keys() else None),
+            inactive_signature=(row["inactive_signature"] if "inactive_signature" in row.keys() else None),
             original_owner=row["original_owner"],
             migration_history=tuple(_parse_json_dict_list(row["migration_history"])),
             at_risk=bool(row["at_risk"]),
@@ -532,6 +537,8 @@ class QueueTask:
             "verification_nonce": self.verification_nonce,
             "dispatch_idempotency_key": self.dispatch_idempotency_key,
             "uncertain_or_waiting_since": self.uncertain_or_waiting_since,
+            "inactive_observed_at": self.inactive_observed_at,
+            "inactive_signature": self.inactive_signature,
             "original_owner": self.original_owner,
             "migration_history": list(self.migration_history),
             "at_risk": self.at_risk,
@@ -1091,6 +1098,21 @@ def _add_v17_analysis(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE queue_tasks ADD COLUMN analysis TEXT")
 
 
+def _add_v18_durable_inactive_observation(connection: sqlite3.Connection) -> None:
+    """Persist the grace clock used to release stale active reservations.
+
+    The old queue engine kept this observation only in process memory.  A
+    controller restart therefore restarted the timeout and could leave an
+    IDLE VERIFYING task holding its lane indefinitely.  These nullable fields
+    carry the first stable observation and its fingerprint across restarts.
+    """
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(queue_tasks)")}
+    if "inactive_observed_at" not in columns:
+        connection.execute("ALTER TABLE queue_tasks ADD COLUMN inactive_observed_at TEXT")
+    if "inactive_signature" not in columns:
+        connection.execute("ALTER TABLE queue_tasks ADD COLUMN inactive_signature TEXT")
+
+
 QUEUE_MIGRATIONS = [
     Migration(1, "initial Supervisor Queue v2 schema (queue_tasks/queue_lanes/queue_events)", _create_v1_schema),
     Migration(2, "Phase 2: Coordinator Agent columns (priority/depends_on/node_id/claim lease/"
@@ -1141,6 +1163,8 @@ QUEUE_MIGRATIONS = [
     Migration(17, "Analysis Gate: queue_tasks.analysis (nullable JSON Feature Contract) -- additive, "
                  "no backfill, legacy rows keep reading back as unclassified/ungated",
               _add_v17_analysis),
+    Migration(18, "durable inactive observation for restart-safe stale RUNNING/VERIFYING recovery",
+              _add_v18_durable_inactive_observation),
 ]
 
 
@@ -2432,13 +2456,46 @@ class QueueStore:
         with self._connection() as connection:
             return self._has_live_verification_locked(connection, task_id)
 
+    def observe_inactive_task(self, task: QueueTask, *, signature: str,
+                              observed_at: str | None = None) -> QueueTask | None:
+        """Durably start or continue one unchanged inactivity grace window.
+
+        The compare-and-set protects a task that completed, retried or changed
+        owner while the terminal probe was in flight.  A changed signature
+        starts a fresh window; an identical signature preserves the original
+        timestamp across process restarts.
+        """
+        observed_at = observed_at or datetime.now(timezone.utc).isoformat()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task.id,)).fetchone()
+            if (row is None or row["status"] != task.status or row["updated_at"] != task.updated_at
+                    or row["attempt_count"] != task.attempt_count or row["claim_token"] != task.claim_token):
+                return None
+            if self._has_live_verification_locked(connection, task.id):
+                return QueueTask.from_row(row)
+            if row["inactive_signature"] != signature or not row["inactive_observed_at"]:
+                connection.execute(
+                    "UPDATE queue_tasks SET inactive_observed_at = ?, inactive_signature = ? WHERE id = ?",
+                    (observed_at, signature, task.id))
+                row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task.id,)).fetchone()
+            return QueueTask.from_row(row)
+
+    def clear_inactive_observation(self, task_id: str) -> None:
+        """Clear a stale grace clock as soon as progress or uncertainty appears."""
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE queue_tasks SET inactive_observed_at = NULL, inactive_signature = NULL "
+                "WHERE id = ? AND (inactive_observed_at IS NOT NULL OR inactive_signature IS NOT NULL)",
+                (task_id,))
+
     def recover_stale_active_task(self, task: QueueTask, *, to_status: str, reason: str) -> QueueTask | None:
         """Release an observed inactive reservation without overwriting a newer task state.
 
         Session probes run outside the transaction. Compare the observed snapshot
         again while holding the write lock; a concurrent completion/cancel wins.
         """
-        if task.status not in (RUNNING, VERIFYING) or to_status not in (WAITING_SESSION, BLOCKED):
+        if task.status not in (RUNNING, VERIFYING) or to_status not in (WAITING_SESSION, BLOCKED, CANCELLED):
             raise ValueError("invalid stale active recovery")
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -2450,11 +2507,15 @@ class QueueStore:
             # task snapshot. Recheck under the same write lock as recovery.
             if self._has_live_verification_locked(connection, task.id):
                 return None
+            extra = {"claimed_by": None, "claim_token": None, "lease_expires_at": None,
+                     "uncertain_or_waiting_since": iso_now() if to_status == WAITING_SESSION else None,
+                     "inactive_observed_at": None, "inactive_signature": None}
+            if to_status == CANCELLED:
+                extra["last_error"] = reason
             return self._transition_locked(
                 connection, task.id, task.status, to_status,
                 event_type="STALE_ACTIVE_RECOVERED", reason=reason,
-                extra_fields={"claimed_by": None, "claim_token": None, "lease_expires_at": None,
-                              "uncertain_or_waiting_since": iso_now() if to_status == WAITING_SESSION else None})
+                extra_fields=extra)
 
     def transition_task(self, task_id: str, to_status: str, *, event_type: str, reason: str | None = None,
                         extra_fields: dict[str, Any] | None = None) -> QueueTask:
@@ -2480,7 +2541,8 @@ class QueueStore:
         if not is_valid_transition(from_status, to_status):
             raise InvalidTransitionError(f"{task_id}: {from_status} -> {to_status} is not a valid transition")
         now = iso_now()
-        fields = {"status": to_status, "updated_at": now}
+        fields = {"status": to_status, "updated_at": now,
+                  "inactive_observed_at": None, "inactive_signature": None}
         if to_status == RUNNING and from_status != VERIFYING:
             fields["started_at"] = now
         if to_status in (COMPLETED,):

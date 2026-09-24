@@ -1678,7 +1678,8 @@ class TerminalService:
         return result
 
     def _send_text_and_verify(self, session: str, text: str, press_enter: bool, *,
-                              idempotency_key: str | None = None) -> dict[str, Any]:
+                              idempotency_key: str | None = None,
+                              prompt_response: bool = False) -> dict[str, Any]:
         """P0-3/P0-4/P0 Part B wrapper around _send_text_and_verify_locked:
         claims an idempotency key (if given) before anything else,
         acquires the durable cross-process pane lease (lease.py -- the
@@ -1725,7 +1726,9 @@ class TerminalService:
             return result
         try:
             with self._pane_locks.get(lock_key):
-                result = self._send_text_and_verify_locked(session, text, press_enter, correlation_id=correlation_id)
+                result = self._send_text_and_verify_locked(
+                    session, text, press_enter, correlation_id=correlation_id,
+                    prompt_response=prompt_response)
         finally:
             self.leases.release(lock_key, correlation_id)
         result = self._enrich_receipt(result)
@@ -1734,7 +1737,7 @@ class TerminalService:
         return result
 
     def _send_text_and_verify_locked(self, session: str, text: str, press_enter: bool, *,
-                                     correlation_id: str) -> dict[str, Any]:
+                                     correlation_id: str, prompt_response: bool = False) -> dict[str, Any]:
         """Send `text` (and, if requested, Enter) through the tmux layer,
         then make a bounded, best-effort attempt to confirm Enter actually
         *submitted* rather than merely having been typed. This is the fix
@@ -1888,22 +1891,45 @@ class TerminalService:
         # ostensible cause in the bug report): this reads the pane's own
         # content directly, the same way every other status check in this
         # project already does, regardless of what has UI focus anywhere.
-        if press_enter:
+        pre_send_target_state = None
+        if press_enter or prompt_response:
             try:
                 pre_send_snapshot = self.tmux.capture_lines(session, SEND_VERIFY_LINES)
             except TmuxError:
                 pre_send_snapshot = None
-            if pre_send_snapshot is not None and adapter.identify_target_state(pre_send_snapshot) == TARGET_WAITING:
+            if pre_send_snapshot is not None:
+                pre_send_target_state = adapter.identify_target_state(pre_send_snapshot)
+        if prompt_response:
+            if (not press_enter or not text.strip() or len(text) > 200
+                    or "\n" in text or "\r" in text):
                 return {
-                    "sent": False, "enter_sent": False, "characters": len(text), "press_enter": press_enter,
-                    "correlation_id": correlation_id, "delivery_state": DELIVERY_BLOCKED,
-                    "submit_status": to_legacy_submit_status(DELIVERY_BLOCKED), "agent_type": adapter.name,
-                    "error": "TARGET_AWAITING_APPROVAL",
-                    "submit_reason": ("the target's current output looks like a menu/approval/confirmation "
-                                      "prompt, not its normal prompt composer -- sending would risk answering "
-                                      "that prompt instead of submitting a new message, so neither the text nor "
-                                      "Enter was sent; resolve the pending prompt first, then retry"),
+                    "sent": False, "enter_sent": False, "characters": len(text),
+                    "press_enter": press_enter, "correlation_id": correlation_id,
+                    "delivery_state": DELIVERY_BLOCKED,
+                    "submit_status": to_legacy_submit_status(DELIVERY_BLOCKED),
+                    "agent_type": adapter.name, "error": "INVALID_PROMPT_RESPONSE",
+                    "submit_reason": "an explicit prompt response must be one non-empty line of at most 200 characters",
                 }
+            if pre_send_target_state != TARGET_WAITING:
+                return {
+                    "sent": False, "enter_sent": False, "characters": len(text),
+                    "press_enter": press_enter, "correlation_id": correlation_id,
+                    "delivery_state": DELIVERY_BLOCKED,
+                    "submit_status": to_legacy_submit_status(DELIVERY_BLOCKED),
+                    "agent_type": adapter.name, "error": "PROMPT_RESPONSE_NOT_REQUIRED",
+                    "submit_reason": "the target is not currently showing a recognized input/menu prompt",
+                }
+        if press_enter and pre_send_target_state == TARGET_WAITING and not prompt_response:
+            return {
+                "sent": False, "enter_sent": False, "characters": len(text), "press_enter": press_enter,
+                "correlation_id": correlation_id, "delivery_state": DELIVERY_BLOCKED,
+                "submit_status": to_legacy_submit_status(DELIVERY_BLOCKED), "agent_type": adapter.name,
+                "error": "TARGET_AWAITING_APPROVAL",
+                "submit_reason": ("the target's current output looks like a menu/approval/confirmation "
+                                  "prompt, not its normal prompt composer -- sending would risk answering "
+                                  "that prompt instead of submitting a new message, so neither the text nor "
+                                  "Enter was sent; resolve the pending prompt first, then retry"),
+            }
 
         # Codex's composer can swallow Enter (and long multiline drafts can
         # temporarily be rendered as pager/composer chrome).  The verified
@@ -2759,6 +2785,7 @@ class TerminalService:
 
     def terminal_send_text(self, session: str, text: str, press_enter: bool = False,
                            dry_run: bool = False, idempotency_key: str | None = None, *,
+                           prompt_response: bool = False,
                            origin: str | None = None, trace_id: str | None = None,
                            parent_turn_id: str | None = None, depth: int = 0) -> dict[str, Any]:
         """idempotency_key (P0-4, optional): if provided, a repeat call
@@ -2797,11 +2824,16 @@ class TerminalService:
             return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter)
         if dry_run:
             response = {"session": session, "would_send": True, "dry_run": True,
-                        "characters": len(text), "press_enter": press_enter}
+                        "characters": len(text), "press_enter": press_enter,
+                        "prompt_response": prompt_response}
             return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter)
         try:
             response = {"session": session,
-                        **self._send_text_and_verify(session, text, press_enter, idempotency_key=idempotency_key)}
+                        **self._send_text_and_verify(session, text, press_enter,
+                                                     idempotency_key=idempotency_key,
+                                                     prompt_response=prompt_response)}
+            if prompt_response and "error" not in response:
+                response["prompt_response"] = True
         except TmuxError as exc:
             response = {"error": "SESSION_NOT_FOUND", "session": session, "reason": str(exc)}
         return self._audit_result(response, action=action, session=session, text=text, press_enter=press_enter,

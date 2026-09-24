@@ -705,7 +705,8 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
             body = {}
         result = await anyio.to_thread.run_sync(lambda: client.send_text(
             name, body.get("text", ""), bool(body.get("press_enter", False)), bool(body.get("dry_run", False)),
-            idempotency_key=body.get("idempotency_key"), origin=body.get("origin"),
+            idempotency_key=body.get("idempotency_key"),
+            prompt_response=bool(body.get("prompt_response", False)), origin=body.get("origin"),
             trace_id=body.get("trace_id"), parent_turn_id=body.get("parent_turn_id"),
             depth=int(body.get("depth") or 0),
         ))

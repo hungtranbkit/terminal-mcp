@@ -51,12 +51,12 @@ def test_idle_old_verification_releases_slot_without_fabricating_completion(tmp_
     store, ops, governor, engine, old_id = setup_case(tmp_path, "VERIFYING")
     ops.set_status("old-lane", {"state": "IDLE"})
     monkeypatch.setattr("terminal_mcp.queue_engine.time.monotonic", lambda: 0.0)
-    engine.reconcile_stale_active_tasks()
-    assert store.get_task(old_id).status == "VERIFYING"
-    monkeypatch.setattr("terminal_mcp.queue_engine.time.monotonic", lambda: 901.0)
-    engine.reconcile_stale_active_tasks()
+    # The task and its claim already predate the entire grace period.  A
+    # post-upgrade/restarted engine uses that durable lower bound and does not
+    # make an hours-old production incident wait through a new 15-minute clock.
+    assert engine.reconcile_stale_active_tasks() == [old_id]
     task = store.get_task(old_id)
-    assert task.status == "BLOCKED"
+    assert task.status == "CANCELLED"
     assert "STALE_ACTIVE_TIMEOUT" in task.last_error
     assert governor.status()["global_reserved"] == 0
     assert not ops.sent
