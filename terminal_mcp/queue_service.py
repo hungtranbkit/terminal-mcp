@@ -37,7 +37,7 @@ from .permissions import valid_session_name
 from .verify_queue import VerifyQueue
 from .queue_store import (
     PAUSE_ORIGIN_USER, PAUSED, QUEUED, TERMINAL_STATUSES, UNASSIGNED_LANE, VERIFYING,
-    HarnessRunOwnsTask, InvalidTransitionError, RequirementsNotCoveredError,
+    CompletionEvidenceError, HarnessRunOwnsTask, InvalidTransitionError, RequirementsNotCoveredError,
     TaskAlreadyClaimedError, QueueStore,
 )
 
@@ -910,6 +910,9 @@ class QueueService:
             return {"error": "REQUIREMENTS_NOT_COVERED", "session": session,
                     "task_id": task_id, "reason": str(exc),
                     "decision": exc.decision.to_dict()}
+        except CompletionEvidenceError as exc:
+            return {"error": "COMPLETION_EVIDENCE_REJECTED", "session": session,
+                    "task_id": task_id, "reason": str(exc)}
         if self.on_completed is not None:
             try:
                 self.on_completed(updated)

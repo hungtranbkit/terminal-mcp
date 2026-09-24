@@ -97,6 +97,28 @@ def test_happy_path_pending_claimed_running_pass(store, verify):
     assert store.get_task(task.id).verification_evidence["exit_code"] == 0
 
 
+def test_independent_verifier_cannot_bypass_required_git_evidence(store, verify):
+    task_id = store.append_tasks(SESSION, [{
+        "title": "git implementation", "prompt": "implement and commit",
+        "metadata": {"requires_git_evidence": True},
+    }])[0]
+    store.claim_next_task(SESSION, claimed_by="test")
+    store.record_coordinator_decision(
+        task_id, status="READY", reason="ready",
+        evidence={"cwd": "/repo", "node_id": "local", "branch": "main", "head": "base"})
+    store.transition_task(task_id, qs.DISPATCHING, event_type="DISPATCHED")
+    task = store.transition_task(task_id, qs.RUNNING, event_type="RUNNING")
+    job = verify.ensure_verify_job(task)
+    claimed = verify.claim_next(verifier="verifier-1", capabilities=[])
+
+    result = verify.complete(job.id, claimed.claim_token, evidence=GOOD_EVIDENCE)
+
+    assert result["ok"] is False
+    assert result["error"] == "EVIDENCE_REJECTED"
+    assert "GIT_EVIDENCE_REQUIRED" in result["reason"]
+    assert store.get_task(task_id).status == qs.VERIFYING
+
+
 def test_p0_5_adds_no_task_status_and_no_task_transition_edge(store, verify):
     """The central backward-compatibility claim, asserted structurally
     rather than trusted to review: every task status a verify outcome can

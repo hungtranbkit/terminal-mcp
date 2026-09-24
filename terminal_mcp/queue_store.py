@@ -235,7 +235,11 @@ before it can be reassigned."""
 TERMINAL_STATUSES = (COMPLETED, SKIPPED, CANCELLED)
 """Once here, a task never transitions again -- not even via a manual
 tool call. BLOCKED/FAILED are deliberately NOT terminal (terminal_queue_
-retry/skip/cancel all still apply to them -- see VALID_TRANSITIONS)."""
+retry/skip/cancel all still apply to them -- see VALID_TRANSITIONS).
+
+The only exception is `invalidate_false_completion`: a guarded audit repair
+from COMPLETED to CANCELLED for a Git-required legacy row objectively proven
+unchanged. It cannot retry or reopen work and is not a general transition."""
 
 # Every ALLOWED (from_status -> {to_status, ...}) edge. Anything not
 # listed here is refused by transition_task -- see its own docstring for
@@ -382,6 +386,10 @@ class RequirementsNotCoveredError(ValueError):
     def __init__(self, decision: "rc.GateDecision") -> None:
         super().__init__(f"{decision.reason}: {decision.detail}")
         self.decision = decision
+
+
+class CompletionEvidenceError(ValueError):
+    """A task-declared objective completion proof is missing or unchanged."""
 
 
 class TaskAlreadyClaimedError(ValueError):
@@ -2537,8 +2545,10 @@ class QueueStore:
         return updated
 
     def _transition_locked(self, connection: sqlite3.Connection, task_id: str, from_status: str, to_status: str, *,
-                           event_type: str, reason: str | None, extra_fields: dict[str, Any] | None = None) -> QueueTask:
-        if not is_valid_transition(from_status, to_status):
+                           event_type: str, reason: str | None, extra_fields: dict[str, Any] | None = None,
+                           allow_completion_invalidation: bool = False) -> QueueTask:
+        guarded_invalidation = allow_completion_invalidation and from_status == COMPLETED and to_status == CANCELLED
+        if not is_valid_transition(from_status, to_status) and not guarded_invalidation:
             raise InvalidTransitionError(f"{task_id}: {from_status} -> {to_status} is not a valid transition")
         now = iso_now()
         fields = {"status": to_status, "updated_at": now,
@@ -3392,6 +3402,17 @@ class QueueStore:
         if not evidence:
             raise ValueError("mark_completed_with_evidence requires non-empty evidence -- "
                             "use transition_task directly only for a test/legacy no-evidence path")
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        if task.metadata.get("requires_git_evidence"):
+            try:
+                self._validate_git_completion_evidence(task, evidence)
+            except CompletionEvidenceError as exc:
+                self.record_event(
+                    session=task.session, task_id=task_id,
+                    event_type="COMPLETION_REFUSED_EVIDENCE", reason=str(exc))
+                raise
         # Requirement Contract gate. Non-emptiness was never the question:
         # queue_engine passes {"completion_marker": marker}, a string the agent
         # emitted about itself, and it satisfied this check for free (RC2). The
@@ -3411,6 +3432,90 @@ class QueueStore:
         # engine having proved.
         return self.transition_task(task_id, COMPLETED, event_type=event_type,
                                     extra_fields={"verification_evidence": json.dumps(evidence)})
+
+    @staticmethod
+    def _validate_git_completion_evidence(task: QueueTask, evidence: dict[str, Any]) -> None:
+        """Require an objective repo delta from the coordinator's baseline."""
+        baseline = task.coordinator_decision.get("evidence") or {}
+        current = evidence.get("git_evidence")
+        if not isinstance(current, dict):
+            raise CompletionEvidenceError(
+                "GIT_EVIDENCE_REQUIRED: completion marker is only a candidate; "
+                "this task requires a current repository observation")
+        baseline_head = str(baseline.get("head") or "").strip()
+        current_head = str(current.get("head") or "").strip()
+        if not baseline_head or not current_head:
+            raise CompletionEvidenceError(
+                "GIT_EVIDENCE_UNAVAILABLE: baseline and current HEAD are required")
+        baseline_cwd = str(baseline.get("cwd") or "").strip()
+        current_cwd = str(current.get("cwd") or "").strip()
+        if baseline_cwd and current_cwd != baseline_cwd:
+            raise CompletionEvidenceError(
+                f"GIT_EVIDENCE_WRONG_REPO: current cwd {current_cwd!r} does not match "
+                f"baseline {baseline_cwd!r}")
+        baseline_node = str(baseline.get("node_id") or "").strip()
+        current_node = str(current.get("node_id") or "").strip()
+        if baseline_node and current_node != baseline_node:
+            raise CompletionEvidenceError(
+                f"GIT_EVIDENCE_WRONG_REPO: current node {current_node!r} does not match "
+                f"baseline {baseline_node!r}")
+        baseline_status = tuple(str(line) for line in (baseline.get("status_lines") or ()))
+        current_status = tuple(str(line) for line in (current.get("status_lines") or ()))
+        if current_head == baseline_head and current_status == baseline_status:
+            raise CompletionEvidenceError(
+                f"GIT_EVIDENCE_UNCHANGED: HEAD remains {current_head} and the working-tree "
+                "snapshot has no task-produced delta")
+
+    def invalidate_false_completion(self, task_id: str, *, reason: str,
+                                    git_evidence: dict[str, Any]) -> QueueTask:
+        """Audit-correct a legacy Git-required completion proven false.
+
+        This never retries or reopens the task. It is a narrow
+        COMPLETED -> CANCELLED correction for rows created before the Git
+        evidence gate existed. Only an unchanged baseline/current repository
+        observation proves the false completion; missing evidence or a real
+        delta is refused.
+        """
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        if task.status != COMPLETED or not task.metadata.get("requires_git_evidence"):
+            raise CompletionEvidenceError(
+                "FALSE_COMPLETION_INVALIDATION_REFUSED: task must be COMPLETED and "
+                "declare requires_git_evidence")
+        try:
+            self._validate_git_completion_evidence(task, {"git_evidence": git_evidence})
+        except CompletionEvidenceError as exc:
+            proof = str(exc)
+            if not proof.startswith("GIT_EVIDENCE_UNCHANGED:"):
+                raise
+        else:
+            raise CompletionEvidenceError(
+                "FALSE_COMPLETION_INVALIDATION_REFUSED: repository evidence contains "
+                "a change from the dispatch baseline")
+
+        audit_evidence = {
+            "invalidated_completion": {
+                "reason": reason, "proof": proof,
+                "git_evidence": git_evidence,
+                "previous_verification_evidence": task.verification_evidence,
+            }
+        }
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None or row["status"] != COMPLETED or row["updated_at"] != task.updated_at:
+                raise CompletionEvidenceError(
+                    "FALSE_COMPLETION_INVALIDATION_REFUSED: task changed during audit")
+            return self._transition_locked(
+                connection, task_id, COMPLETED, CANCELLED,
+                event_type="COMPLETION_INVALIDATED", reason=reason,
+                extra_fields={
+                    "claimed_by": None, "claim_token": None, "lease_expires_at": None,
+                    "completed_at": None, "last_error": f"{proof}; {reason}",
+                    "verification_evidence": json.dumps(audit_evidence),
+                },
+                allow_completion_invalidation=True)
 
     # -- Requirement Contract ------------------------------------------------
 

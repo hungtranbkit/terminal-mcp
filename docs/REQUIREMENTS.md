@@ -2940,8 +2940,37 @@ scan/audit view over the SAME facts.)*
   live progress, valid completion, live verifier protection, lane recovery and
   single dispatch; `tests/test_stale_admission_recovery.py` covers admission.
   The focused queue/send/node suite passed 331 tests. Production migration v18
-  is applied; stale instance `572d501d...` is terminal with no claim/lease,
-  and recovery `b6cecdb7...` is `COMPLETED` with exactly one dispatch event.
+  is applied; stale instance `572d501d...` is terminal with no claim/lease.
+  Recovery `b6cecdb7...` left the queue with exactly one dispatch event, but a
+  later Git audit proved its `COMPLETED` label false; the objective-evidence
+  correction immediately below owns that separate defect.
+
+### Objective Git evidence for implementation completion
+
+- **Goal / user value:** a nonce-bound completion marker is a candidate, not
+  proof that an implementation changed the repository. A task that explicitly
+  declares `metadata.requires_git_evidence=true` must not become `COMPLETED`
+  while its repository is unchanged from the coordinator baseline.
+- **Status:** IMPLEMENTED; production deployment and correction of the legacy
+  false-complete row are pending.
+- **Scope / flow:** READY records baseline cwd/node/branch/HEAD/status lines.
+  On completion, the engine observes the same repository on the session's real
+  node. Either HEAD or the status snapshot must differ; otherwise completion is
+  refused, the claim is released, and the task becomes visibly `BLOCKED`.
+  Collection failure is fail-closed. The evidence is stored with the marker.
+- **No bypass:** the QueueStore chokepoint, ordinary marker path,
+  uncertain-dispatch reconciliation, manual verification, and independent
+  verifier all enforce the same rule. Legacy tasks without the opt-in flag keep
+  their existing behavior.
+- **False-completion correction:** a guarded audit operation can change only a
+  `COMPLETED + requires_git_evidence` legacy row to `CANCELLED`, and only when
+  an objective current observation proves baseline HEAD/status are unchanged.
+  It records `COMPLETION_INVALIDATED`, clears claim/lease, and never retries or
+  dispatches the task.
+- **Acceptance/tests/evidence:** regressions cover unchanged HEAD, changed HEAD,
+  new worktree diff over a pre-existing dirty baseline, unavailable repo
+  evidence, direct store bypass, independent-verifier bypass, and guarded
+  invalidation without redispatch.
 
 ### P0: persist-before-dispatch
 

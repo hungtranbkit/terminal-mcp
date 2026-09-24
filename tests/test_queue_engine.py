@@ -178,6 +178,86 @@ def _finished_worker(store, ops):
     return engine, task_id
 
 
+def _git_evidence_worker(store, ops, current_repo):
+    task_id = store.append_tasks("lane-a", [{
+        "prompt": "implement the requested repository change and commit it",
+        "metadata": {"requires_git_evidence": True, "allow_dirty_repo": True},
+    }])[0]
+
+    def collect(cwd, node_id=None):
+        return RepoEvidence(
+            branch=current_repo["branch"], head=current_repo["head"],
+            clean=not current_repo["status_lines"],
+            status_lines=tuple(current_repo["status_lines"]),
+        )
+
+    engine = QueueEngine(store, ops, coordinator=CoordinatorGate(evidence_collector=collect))
+    for _ in range(4):
+        engine.tick("lane-a")
+    marker = ops.sent[0]["text"].rstrip().splitlines()[-1]
+    ops.set_capture("lane-a", {"output": "Reported complete.\n" + marker})
+    return engine, task_id
+
+
+def test_git_required_completion_refuses_unchanged_repo(store, ops):
+    """Regression: b6cecdb... completed at the baseline HEAD with no diff."""
+    current = {"branch": "main", "head": "8671e100", "status_lines": []}
+    engine, task_id = _git_evidence_worker(store, ops, current)
+
+    result = engine.tick("lane-a")
+
+    task = store.get_task(task_id)
+    assert result.action == BLOCKED
+    assert task.status == BLOCKED
+    assert task.verification_evidence == {}
+    assert task.claim_token is None
+    assert "GIT_EVIDENCE_UNCHANGED" in task.last_error
+
+
+def test_git_required_completion_records_changed_head(store, ops):
+    current = {"branch": "main", "head": "8671e100", "status_lines": []}
+    engine, task_id = _git_evidence_worker(store, ops, current)
+    current.update(branch="recovery/fix", head="9abc1234")
+
+    result = engine.tick("lane-a")
+
+    task = store.get_task(task_id)
+    assert result.action == COMPLETED
+    assert task.verification_evidence["git_evidence"] == {
+        "cwd": "/repo/a", "node_id": "local",
+        "baseline_branch": "main", "baseline_head": "8671e100",
+        "baseline_status_lines": [], "branch": "recovery/fix",
+        "head": "9abc1234", "status_lines": [],
+    }
+
+
+def test_git_required_completion_accepts_a_new_worktree_diff(store, ops):
+    current = {"branch": "main", "head": "8671e100", "status_lines": ["?? existing-artifact/"]}
+    engine, task_id = _git_evidence_worker(store, ops, current)
+    current["status_lines"].append(" M src/implemented.py")
+
+    assert engine.tick("lane-a").action == COMPLETED
+    evidence = store.get_task(task_id).verification_evidence["git_evidence"]
+    assert evidence["baseline_status_lines"] == ["?? existing-artifact/"]
+    assert evidence["status_lines"] == ["?? existing-artifact/", " M src/implemented.py"]
+
+
+def test_git_required_completion_fails_closed_when_repo_cannot_be_observed(store, ops):
+    current = {"branch": "main", "head": "8671e100", "status_lines": []}
+    engine, task_id = _git_evidence_worker(store, ops, current)
+
+    def unavailable(cwd, node_id=None):
+        raise RuntimeError("node endpoint unavailable")
+
+    engine.coordinator.evidence_collector = unavailable
+    result = engine.tick("lane-a")
+
+    task = store.get_task(task_id)
+    assert result.action == BLOCKED
+    assert task.status == BLOCKED
+    assert "GIT_EVIDENCE_UNAVAILABLE" in task.last_error
+
+
 def test_contract_refusal_is_bounded_and_releases_claim(store, ops):
     engine, task_id = _finished_worker(store, ops)
     store.set_requirement_contract(task_id, requirements=[{"id": "coverage", "text": "Independent test evidence"}])

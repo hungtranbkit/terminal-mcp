@@ -1096,7 +1096,8 @@ class CoordinatorGate:
             ready_evidence["repo_evidence"] = not_a_repository
         if repo is not None:
             ready_evidence.update({"branch": repo.branch, "head": repo.head, "has_upstream": repo.has_upstream,
-                                   "ahead": repo.ahead, "behind": repo.behind})
+                                   "ahead": repo.ahead, "behind": repo.behind,
+                                   "clean": repo.clean, "status_lines": list(repo.status_lines)})
         return CoordinatorDecision(READY, reason="all coordinator checks passed", evidence=ready_evidence)
 
     def _previous_task_in_lane(self, store: QueueStore, task: QueueTask) -> QueueTask | None:

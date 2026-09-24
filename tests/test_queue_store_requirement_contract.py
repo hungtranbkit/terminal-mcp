@@ -52,6 +52,77 @@ def test_a_task_with_no_contract_still_completes(store):
     assert done.status == qs.COMPLETED
 
 
+def test_git_required_task_cannot_bypass_evidence_gate_with_marker_only(store):
+    task_id = store.append_tasks("demo", [{
+        "prompt": "implement and commit the change",
+        "metadata": {"requires_git_evidence": True},
+    }])[0]
+    store.claim_next_task("demo", claimed_by="test")
+    store.record_coordinator_decision(
+        task_id, status="READY", reason="ready",
+        evidence={"cwd": "/repo", "node_id": "local", "branch": "main", "head": "base"})
+    store.transition_task(task_id, qs.DISPATCHING, event_type="DISPATCHED")
+    store.transition_task(task_id, qs.RUNNING, event_type="STARTED")
+    store.transition_task(task_id, qs.VERIFYING, event_type="VERIFYING")
+
+    with pytest.raises(qs.CompletionEvidenceError, match="GIT_EVIDENCE_REQUIRED"):
+        store.mark_completed_with_evidence(task_id, evidence={"completion_marker": "candidate"})
+
+    assert store.get_task(task_id).status == qs.VERIFYING
+
+
+def test_git_evidence_from_a_different_node_is_not_the_same_repository(store):
+    task_id = store.append_tasks("demo", [{
+        "prompt": "implement and commit", "metadata": {"requires_git_evidence": True},
+    }])[0]
+    store.claim_next_task("demo", claimed_by="test")
+    store.record_coordinator_decision(
+        task_id, status="READY", reason="ready",
+        evidence={"cwd": "/repo", "node_id": "node-a", "branch": "main", "head": "base"})
+    store.transition_task(task_id, qs.DISPATCHING, event_type="DISPATCHED")
+    store.transition_task(task_id, qs.RUNNING, event_type="STARTED")
+    store.transition_task(task_id, qs.VERIFYING, event_type="VERIFYING")
+
+    with pytest.raises(qs.CompletionEvidenceError, match="GIT_EVIDENCE_WRONG_REPO"):
+        store.mark_completed_with_evidence(task_id, evidence={
+            "completion_marker": "candidate",
+            "git_evidence": {"cwd": "/repo", "node_id": "node-b", "branch": "work",
+                             "head": "changed", "status_lines": []},
+        })
+
+
+def test_proven_false_git_completion_can_be_invalidated_without_redispatch(store):
+    task_id = store.append_tasks("demo", [{
+        "prompt": "implement and commit the change",
+        "metadata": {"requires_git_evidence": True},
+    }])[0]
+    store.claim_next_task("demo", claimed_by="test")
+    store.record_coordinator_decision(
+        task_id, status="READY", reason="ready",
+        evidence={"cwd": "/repo", "node_id": "local", "branch": "main",
+                  "head": "base", "status_lines": []})
+    store.transition_task(task_id, qs.DISPATCHING, event_type="DISPATCHED")
+    store.transition_task(task_id, qs.RUNNING, event_type="STARTED")
+    store.transition_task(task_id, qs.VERIFYING, event_type="VERIFYING")
+    store.transition_task(task_id, qs.COMPLETED, event_type="LEGACY_FALSE_VERIFIED",
+                          extra_fields={"verification_evidence": '{"completion_marker":"candidate"}'})
+
+    invalidated = store.invalidate_false_completion(
+        task_id, reason="post-deploy audit found no implementation delta",
+        git_evidence={"cwd": "/repo", "node_id": "local", "branch": "main",
+                      "head": "base", "status_lines": []})
+
+    assert invalidated.status == qs.CANCELLED
+    assert invalidated.claim_token is None
+    assert invalidated.lease_expires_at is None
+    assert invalidated.completed_at is None
+    assert "GIT_EVIDENCE_UNCHANGED" in invalidated.last_error
+    event = store.list_events("demo", limit=1)[0]
+    assert event["event_type"] == "COMPLETION_INVALIDATED"
+    assert event["from_status"] == qs.COMPLETED
+    assert event["to_status"] == qs.CANCELLED
+
+
 def test_legacy_columns_default_to_empty(store):
     task = _task(store)
     assert task.requirement_contract == {}

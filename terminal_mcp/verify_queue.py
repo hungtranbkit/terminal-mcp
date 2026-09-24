@@ -100,6 +100,7 @@ from .capability_profile import (
 from .queue_store import (
     BLOCKED,
     COMPLETED,
+    CompletionEvidenceError,
     FAILED,
     QueueStore,
     QueueTask,
@@ -754,12 +755,22 @@ class VerifyQueue:
             if row is None or row["claim_token"] != claim_token or row["status"] not in LEASED_VERIFY_STATUSES:
                 return {"ok": False, "error": "NOT_LEASE_HOLDER", "job_id": job_id,
                         "reason": "claim_token is not the current holder, or the job is not claimed"}
-            task_row = connection.execute("SELECT status FROM queue_tasks WHERE id = ?",
+            task_row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?",
                                           (row["task_id"],)).fetchone()
             if task_row is None or task_row["status"] != VERIFYING:
                 return {"ok": False, "error": "TASK_NOT_VERIFYING", "job_id": job_id,
                         "task_id": row["task_id"],
                         "reason": f"task is {task_row['status'] if task_row else 'missing'}, not VERIFYING"}
+            task = QueueTask.from_row(task_row)
+            try:
+                if task.metadata.get("requires_git_evidence"):
+                    self.store._validate_git_completion_evidence(task, clean)
+            except CompletionEvidenceError as exc:
+                self.store._record_event_locked(
+                    connection, session=task.session, task_id=task.id,
+                    event_type="COMPLETION_REFUSED_EVIDENCE", reason=str(exc))
+                return {"ok": False, "error": "EVIDENCE_REJECTED", "job_id": job_id,
+                        "reason": str(exc)}
             self.store._transition_locked(
                 connection, row["task_id"], VERIFYING, COMPLETED, event_type="VERIFIED",
                 reason=f"verified by {row['verifier']}",

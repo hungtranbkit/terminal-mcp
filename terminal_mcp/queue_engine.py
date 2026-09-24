@@ -61,7 +61,7 @@ from .coordinator import CoordinatorGate, OtherLaneSnapshot, SessionSnapshot, PL
 from . import delivery_gate, retry_recovery
 from .queue_store import (
     BLOCKED, CANCELLED, COMPLETED, DISPATCH_UNCERTAIN, DISPATCHING, FAILED, PRECHECK, QUEUED, READY, RUNNING, VERIFYING,
-    WAITING_SESSION, QueueStore, QueueTask, RequirementsNotCoveredError, iso_now,
+    WAITING_SESSION, CompletionEvidenceError, QueueStore, QueueTask, RequirementsNotCoveredError, iso_now,
 )
 from .status import COMPLETION_MARKER_RE, parse_completion_marker, verify_completion_marker
 from .request_governor import RequestGovernor
@@ -1092,7 +1092,8 @@ class QueueEngine:
                 reason="nonce-bound completion evidence observed during reconciliation")
             try:
                 completed = self.store.mark_completed_with_evidence(
-                    task_id, evidence={"completion_marker": marker, "reconciled_from": DISPATCH_UNCERTAIN})
+                    task_id, evidence=self._completion_evidence(
+                        task, marker, status_response, reconciled_from=DISPATCH_UNCERTAIN))
             except Exception as exc:
                 # Same settlement as the ordinary VERIFYING path: this route
                 # reaches the identical contract gate, so an escape here would
@@ -1234,7 +1235,8 @@ class QueueEngine:
         )
         if verified:
             try:
-                completed = self.store.mark_completed_with_evidence(task_id, evidence={"completion_marker": marker})
+                completed = self.store.mark_completed_with_evidence(
+                    task_id, evidence=self._completion_evidence(task, marker, status_response))
             except Exception as exc:
                 return self._settle_refused_completion(task, exc, watch=watch)
             if watch:
@@ -1251,6 +1253,38 @@ class QueueEngine:
             return TickResult(session, "RUNNING", task_id=task_id, detail="false alarm, re-armed")
         return TickResult(session, "AWAITING_VERIFICATION", task_id=task_id,
                           detail="no verified completion marker yet")
+
+    def _completion_evidence(self, task: QueueTask, marker: dict[str, str],
+                             status_response: dict[str, Any], *,
+                             reconciled_from: str | None = None) -> dict[str, Any]:
+        """Build objective completion evidence for the store's hard gate."""
+        evidence: dict[str, Any] = {"completion_marker": marker}
+        if reconciled_from is not None:
+            evidence["reconciled_from"] = reconciled_from
+        if not task.metadata.get("requires_git_evidence"):
+            return evidence
+
+        baseline = task.coordinator_decision.get("evidence") or {}
+        cwd = str(status_response.get("cwd") or baseline.get("cwd") or "").strip()
+        node_id = status_response.get("node_id") or baseline.get("node_id")
+        if not cwd:
+            raise CompletionEvidenceError(
+                "GIT_EVIDENCE_UNAVAILABLE: session cwd is missing at completion")
+        try:
+            repo = self.coordinator._collect_repo_evidence(cwd, node_id)
+        except Exception as exc:
+            raise CompletionEvidenceError(
+                f"GIT_EVIDENCE_UNAVAILABLE: could not inspect {cwd!r} on node "
+                f"{node_id!r}: {exc}") from exc
+        evidence["git_evidence"] = {
+            "cwd": cwd, "node_id": node_id,
+            "baseline_branch": baseline.get("branch"),
+            "baseline_head": baseline.get("head"),
+            "baseline_status_lines": list(baseline.get("status_lines") or ()),
+            "branch": repo.branch, "head": repo.head,
+            "status_lines": list(repo.status_lines),
+        }
+        return evidence
 
     def _settle_refused_completion(self, task: QueueTask, exc: Exception, *,
                                    watch: Any = None) -> TickResult:
@@ -1272,6 +1306,8 @@ class QueueEngine:
         """
         if isinstance(exc, RequirementsNotCoveredError):
             reason = f"VERIFICATION_REQUIREMENTS: {exc}"
+        elif isinstance(exc, CompletionEvidenceError):
+            reason = f"VERIFICATION_EVIDENCE: {exc}"
         else:
             _LOGGER.exception("completion verification failed for %s", task.id)
             reason = f"VERIFICATION_ERROR: {type(exc).__name__}"

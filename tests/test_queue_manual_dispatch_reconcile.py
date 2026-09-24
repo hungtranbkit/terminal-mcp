@@ -196,6 +196,20 @@ def test_reconciling_still_demands_evidence(tmp_path):
     assert service.store.get_task(task_id).status == "QUEUED"
 
 
+def test_manual_verify_reports_git_evidence_refusal_without_crashing(tmp_path):
+    service = _service(tmp_path)
+    (task_id,) = service.store.set_tasks("lane-a", [{
+        "prompt": "implement and commit", "title": "t",
+        "metadata": {"requires_git_evidence": True},
+    }])
+
+    result = service.verify("lane-a", task_id, {"completion_marker": "candidate"})
+
+    assert result["error"] == "COMPLETION_EVIDENCE_REJECTED"
+    assert "GIT_EVIDENCE_REQUIRED" in result["reason"]
+    assert service.store.get_task(task_id).status == "QUEUED"
+
+
 def test_a_task_the_engine_is_working_is_never_closed_from_the_side(tmp_path):
     """Only a task with no attempt, no start and no claim qualifies -- closing
     an in-flight one would race the engine's own transition."""
