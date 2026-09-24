@@ -2951,8 +2951,8 @@ scan/audit view over the SAME facts.)*
   proof that an implementation changed the repository. A task that explicitly
   declares `metadata.requires_git_evidence=true` must not become `COMPLETED`
   while its repository is unchanged from the coordinator baseline.
-- **Status:** IMPLEMENTED; production deployment and correction of the legacy
-  false-complete row are pending.
+- **Status:** VERIFIED and deployed on the HP controller (2026-09-24,
+  `23f73ff`).
 - **Scope / flow:** READY records baseline cwd/node/branch/HEAD/status lines.
   On completion, the engine observes the same repository on the session's real
   node. Either HEAD or the status snapshot must differ; otherwise completion is
@@ -2970,7 +2970,11 @@ scan/audit view over the SAME facts.)*
 - **Acceptance/tests/evidence:** regressions cover unchanged HEAD, changed HEAD,
   new worktree diff over a pre-existing dirty baseline, unavailable repo
   evidence, direct store bypass, independent-verifier bypass, and guarded
-  invalidation without redispatch.
+  invalidation without redispatch. The focused completion/queue/migration suite
+  passed 266 tests both locally and on the deployed HP venv. Production task
+  `b6cecdb7...` is `CANCELLED`, has no claim/lease/completed timestamp, retains
+  exactly one historical dispatch, and records `COMPLETION_INVALIDATED` with
+  unchanged HEAD `8671e100...`. The NovaRetail lane remains operator-paused.
 
 ### P0: persist-before-dispatch
 
