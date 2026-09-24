@@ -33,7 +33,7 @@ class ArchifyProjectPolicy:
     """Resolve and enumerate projects without widening configured roots."""
 
     def __init__(self, allowed_roots: Iterable[str | Path], *, max_projects: int = 200,
-                 max_discovery_depth: int = 2) -> None:
+                 max_discovery_depth: int = 2, max_entries: int = 2000) -> None:
         roots: list[Path] = []
         for value in allowed_roots:
             root = Path(value).expanduser()
@@ -47,6 +47,7 @@ class ArchifyProjectPolicy:
         self.allowed_roots = tuple(dict.fromkeys(roots))
         self.max_projects = max(1, int(max_projects))
         self.max_discovery_depth = max(0, int(max_discovery_depth))
+        self.max_entries = max(1, int(max_entries))
 
     @staticmethod
     def _is_project(path: Path) -> bool:
@@ -77,14 +78,28 @@ class ArchifyProjectPolicy:
     def discover_projects(self) -> list[ProjectInfo]:
         found: dict[str, ProjectInfo] = {}
         queue: list[tuple[Path, int]] = [(root, 0) for root in self.allowed_roots]
-        while queue and len(found) < self.max_projects:
+        entries_seen = 0
+        while queue and len(found) < self.max_projects and entries_seen < self.max_entries:
             current, depth = queue.pop(0)
+            try:
+                resolved_current = current.resolve(strict=True)
+            except (OSError, RuntimeError):
+                continue
+            if not self._inside_root(resolved_current):
+                continue
+            current = resolved_current
             if self._is_project(current):
                 found[str(current)] = ProjectInfo(name=current.name, path=str(current))
             if depth >= self.max_discovery_depth:
                 continue
             try:
-                children = sorted(current.iterdir(), key=lambda item: item.name.lower())
+                children: list[Path] = []
+                for child in current.iterdir():
+                    entries_seen += 1
+                    children.append(child)
+                    if entries_seen >= self.max_entries:
+                        break
+                children.sort(key=lambda item: item.name.lower())
             except OSError:
                 continue
             for child in children:

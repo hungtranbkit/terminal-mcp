@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -37,15 +39,21 @@ class ArchifyRuntime:
         node_bin: str | None = None,
         timeout: float = 120.0,
         max_output_bytes: int = 64 * 1024,
-        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+        popen_factory: Callable[..., Any] = subprocess.Popen,
     ) -> None:
-        configured = os.environ.get("TERMINAL_MCP_ARCHIFY_HOME") or str(runtime_dir)
-        self.runtime_dir = Path(configured).expanduser().resolve()
+        # The caller resolves precedence once: an explicit config value wins,
+        # while default_archify_runtime_dir() applies the environment override
+        # when config is empty. Keeping that decision out of this low-level
+        # adapter prevents a process environment variable from silently
+        # replacing an explicit operator configuration.
+        self.runtime_dir = Path(runtime_dir).expanduser().resolve()
         self.cli_path = self.runtime_dir / "bin" / "archify.mjs"
         self.node_bin = node_bin or shutil.which("node")
         self.timeout = max(1.0, float(timeout))
         self.max_output_bytes = max(1024, int(max_output_bytes))
         self._runner = runner
+        self._popen_factory = popen_factory
 
     def _text(self, value: str | bytes | None) -> str:
         if isinstance(value, bytes):
@@ -57,9 +65,78 @@ class ArchifyRuntime:
         return encoded.decode("utf-8", errors="replace")
 
     def _run(self, argv: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
-        return self._runner(
-            list(argv), cwd=str(self.runtime_dir), text=True, capture_output=True,
-            timeout=timeout, check=False, shell=False,
+        if self._runner is not None:
+            return self._runner(
+                list(argv), cwd=str(self.runtime_dir), text=True, capture_output=True,
+                timeout=timeout, check=False, shell=False,
+            )
+        popen_kwargs = {
+            "cwd": str(self.runtime_dir), "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE, "shell": False,
+        }
+        if os.name == "posix":
+            popen_kwargs["start_new_session"] = True
+        process = self._popen_factory(list(argv), **popen_kwargs)
+        captured: dict[str, bytearray] = {"stdout": bytearray(), "stderr": bytearray()}
+        truncated = {"stdout": False, "stderr": False}
+        stop_capture = threading.Event()
+
+        def drain(name: str, stream: Any) -> None:
+            while True:
+                chunk = stream.read(64 * 1024)
+                if not chunk:
+                    break
+                if stop_capture.is_set():
+                    break
+                remaining = self.max_output_bytes - len(captured[name])
+                if remaining > 0:
+                    captured[name].extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    truncated[name] = True
+
+        threads = [
+            threading.Thread(target=drain, args=("stdout", process.stdout), daemon=True),
+            threading.Thread(target=drain, args=("stderr", process.stderr), daemon=True),
+        ]
+        for thread in threads:
+            thread.start()
+
+        def stop_process_group(sig: int) -> None:
+            if os.name == "posix" and getattr(process, "pid", None) is not None:
+                try:
+                    os.killpg(process.pid, sig)
+                    return
+                except ProcessLookupError:
+                    return
+                except OSError:
+                    pass
+            if sig == signal.SIGKILL:
+                process.kill()
+
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            stop_process_group(signal.SIGKILL)
+            process.wait()
+            raise
+        finally:
+            # The renderer is a one-shot child. Kill any descendant that kept
+            # an inherited pipe open after the leader exited, then bound the
+            # drain joins so timeout enforcement cannot be defeated by a
+            # detached/grandchild process.
+            if os.name == "posix":
+                stop_process_group(signal.SIGKILL)
+            for thread in threads:
+                thread.join(timeout=0.25)
+            stop_capture.set()
+
+        def captured_text(name: str) -> str:
+            value = bytes(captured[name]).decode("utf-8", errors="replace")
+            return value + (" [truncated]" if truncated[name] else "")
+
+        return subprocess.CompletedProcess(
+            list(argv), process.returncode,
+            stdout=captured_text("stdout"), stderr=captured_text("stderr"),
         )
 
     def status(self) -> dict[str, Any]:

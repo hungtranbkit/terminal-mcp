@@ -84,3 +84,17 @@ def test_discovery_is_bounded_and_does_not_follow_symlinked_directories(tmp_path
     assert len(projects) == 1
     assert projects[0].path.startswith(str(allowed.resolve()))
     assert projects[0].name != "outside"
+
+
+def test_discovery_stops_after_bounded_candidate_entries(tmp_path):
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    for index in range(6):
+        child = allowed / f"item-{index}"
+        child.mkdir()
+        (child / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+
+    policy = ArchifyProjectPolicy((allowed,), max_projects=20, max_discovery_depth=1,
+                                  max_entries=3)
+
+    assert len(policy.discover_projects()) <= 3

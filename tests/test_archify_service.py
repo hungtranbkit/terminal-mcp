@@ -159,6 +159,36 @@ def test_runtime_failure_is_persisted_with_bounded_detail(tmp_path, repo):
         service.close()
 
 
+def test_worker_revalidates_project_if_path_becomes_symlink_before_execution(tmp_path, repo):
+    gate = threading.Event()
+    runtime = FakeRuntime(gate=gate)
+    service = make_service(tmp_path, repo, runtime=runtime, workers=1)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "pyproject.toml").write_text("[project]\nname='outside'\n", encoding="utf-8")
+    (outside / "a.py").write_text("import b\n", encoding="utf-8")
+    (outside / "b.py").write_text("VALUE=1\n", encoding="utf-8")
+    service.start()
+    try:
+        first = service.create_job(str(repo), "architecture", "")
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and runtime.calls != 1:
+            time.sleep(0.01)
+        assert runtime.calls == 1
+        second = service.create_job(str(repo), "architecture", "")
+        parked = repo.with_name("terminal-mcp-parked")
+        repo.rename(parked)
+        repo.symlink_to(outside, target_is_directory=True)
+        gate.set()
+
+        failed = wait_job(service, second["id"], status="failed")
+        assert failed["error_code"] == "PROJECT_NOT_ALLOWED"
+        assert runtime.calls == 1
+    finally:
+        gate.set()
+        service.close()
+
+
 @pytest.mark.parametrize("diagram_type", ["bogus", "ARCHITECTURE", ""])
 def test_invalid_diagram_type_is_rejected_before_persistence(tmp_path, repo, diagram_type):
     service = make_service(tmp_path, repo)

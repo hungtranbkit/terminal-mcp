@@ -51,6 +51,27 @@ def test_inspector_skips_secrets_vendor_and_outside_symlinks(repo, tmp_path):
     assert inspection.modules == ("app",)
 
 
+def test_candidate_replaced_by_outside_symlink_before_open_is_not_read(repo, tmp_path, monkeypatch):
+    victim = repo / "victim.py"
+    victim.write_text("VALUE = 'inside'\n", encoding="utf-8")
+    outside = tmp_path / "outside.py"
+    outside.write_text("SECRET = 'outside'\n", encoding="utf-8")
+    original = SourceInspector._read_file_at
+
+    def replace_then_open(directory_fd, name, limit):
+        if name == "victim.py" and victim.exists() and not victim.is_symlink():
+            victim.unlink()
+            victim.symlink_to(outside)
+        return original(directory_fd, name, limit)
+
+    monkeypatch.setattr(SourceInspector, "_read_file_at", staticmethod(replace_then_open))
+
+    inspection = SourceInspector().inspect(repo)
+
+    assert "victim.py" not in inspection.files
+    assert "outside" not in json.dumps(inspection.as_dict())
+
+
 def test_source_limits_report_truncation_without_reading_past_cap(repo):
     for index in range(4):
         (repo / f"module_{index}.py").write_text(f"VALUE = {index}\n", encoding="utf-8")
@@ -59,6 +80,17 @@ def test_source_limits_report_truncation_without_reading_past_cap(repo):
 
     assert inspection.truncated is True
     assert len(inspection.files) == 2
+
+
+def test_candidate_walk_and_file_reads_are_bounded(repo):
+    for index in range(10):
+        (repo / f"module_{index}.py").write_text("x" * 100, encoding="utf-8")
+
+    inspection = SourceInspector(max_files=20, max_bytes=150, max_candidates=3).inspect(repo)
+
+    assert inspection.truncated is True
+    assert inspection.bytes_read <= 150
+    assert len(inspection.files) <= 1
 
 
 def test_relative_python_import_is_resolved_to_real_sibling_module(repo):
@@ -120,16 +152,39 @@ def test_lifecycle_uses_only_explicit_state_enum_and_transition_map(repo):
 
 
 @pytest.mark.parametrize("diagram_type", ["workflow", "sequence", "dataflow"])
-def test_other_types_are_built_only_when_a_verified_edge_exists(repo, diagram_type):
+def test_imports_alone_are_not_relabelled_as_other_semantics(repo, diagram_type):
     (repo / "source.py").write_text("import sink\n", encoding="utf-8")
     (repo / "sink.py").write_text("VALUE = 1\n", encoding="utf-8")
 
-    ir = ArchifyAuthor().build(diagram_type, SourceInspector().inspect(repo), "")
+    with pytest.raises(ArchifyEvidenceError, match="INSUFFICIENT_EVIDENCE"):
+        ArchifyAuthor().build(diagram_type, SourceInspector().inspect(repo), "")
 
-    assert ir["diagram_type"] == diagram_type
-    assert "source" in json.dumps(ir)
-    assert "sink" in json.dumps(ir)
-    if diagram_type == "workflow":
-        assert "mainPath" not in ir
-    if diagram_type == "sequence":
-        assert min(message["y"] for message in ir["messages"]) >= 160
+
+def test_workflow_requires_an_explicit_entry_point_and_reachable_source_edge(repo):
+    (repo / "entry.py").write_text(
+        "import worker\nif __name__ == '__main__':\n    worker.run()\n", encoding="utf-8")
+    (repo / "worker.py").write_text("def run(): pass\n", encoding="utf-8")
+
+    ir = ArchifyAuthor().build("workflow", SourceInspector().inspect(repo), "")
+
+    assert {node["label"] for node in ir["nodes"]} == {"entry", "worker"}
+
+
+def test_sequence_requires_a_verified_imported_call(repo):
+    (repo / "caller.py").write_text("import callee\ncallee.handle()\n", encoding="utf-8")
+    (repo / "callee.py").write_text("def handle(): pass\n", encoding="utf-8")
+
+    ir = ArchifyAuthor().build("sequence", SourceInspector().inspect(repo), "")
+
+    assert ir["messages"] == [{"from": "caller", "to": "callee", "y": 160,
+                               "label": "calls"}]
+
+
+def test_dataflow_requires_an_explicit_module_flow_map(repo):
+    (repo / "source.py").write_text(
+        "DATA_FLOWS = {'source': ('sink',)}\n", encoding="utf-8")
+    (repo / "sink.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    ir = ArchifyAuthor().build("dataflow", SourceInspector().inspect(repo), "")
+
+    assert ir["flows"] == [{"from": "source", "to": "sink", "label": "data"}]

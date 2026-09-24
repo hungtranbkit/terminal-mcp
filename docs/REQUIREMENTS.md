@@ -87,6 +87,7 @@ file count from `ls tests/*.py`), not recalled from memory.
 | Dashboard: Supervisor/Coordinator panel | VERIFIED |
 | Dashboard: Integration lane view (in Supervisor panel) | VERIFIED |
 | Dashboard: AI Usage panel (read-only, local AI Usage Monitor) | VERIFIED |
+| Dashboard: shared Archify diagrams (source-backed, durable HTML history) | VERIFIED — real upstream runtime + Chromium acceptance, 2026-09-24 |
 | Notes / Ideas store (kho ghi chú: MCP `note_*` + `/dashboard/notes`) | VERIFIED |
 | Notes surface application-layer auth (webauth session or verified CF Access) | VERIFIED |
 | Dashboard: Requirements/Feature Matrix link | VERIFIED |
@@ -309,6 +310,28 @@ sessions bringing up dell-5530/m910/macbook — see `docs/multi-node.md`).
   one row per configured project, its own Waiting/Reviewing/Merging/
   Test/Regression/Rework/Blocked label (mapped from
   `integration_store.py`'s real status constants in exactly one place).
+- **Shared Archify diagrams:** `/dashboard/archify` discovers only projects
+  beneath `archify.allowed_roots` (falling back to the existing Repo Read,
+  then session-lifecycle roots, including Repo Read's home-directory default),
+  offers architecture/workflow/sequence/
+  dataflow/lifecycle generation and an optional focus prompt, and persists
+  jobs plus IR/metadata/standalone HTML under the shared Terminal MCP state
+  directory. Generation is asynchronous and restart-aware: orphaned running
+  jobs become an explicit `interrupted` failure, queued jobs resume, and
+  completed history remains readable even if Archify later becomes unhealthy.
+  Source inspection is bounded and evidence-only; prompt text can rank facts
+  but cannot add modules or edges. One operator-managed `tt-a1i/archify`
+  runtime is invoked with argument arrays, no shell, bounded output, and an
+  explicit timeout. Missing Node.js/runtime or failed `doctor` is exposed as
+  unavailable; no placeholder output is generated. Route handlers reuse the
+  dashboard read/mutation guards, HTML lookup accepts only stored job IDs, and
+  preview responses use `Content-Security-Policy: sandbox allow-scripts`.
+  **Live evidence, 2026-09-24:** Chromium selected the real `terminal-mcp`
+  checkout, generated an architecture job through the UI with upstream
+  Archify commit `9e35d2b0b39b155553ba9fcfe0b4f2a5198dd993`, rendered and opened an
+  800,929-byte HTML artifact in-page and in a new tab, retained two completed
+  history rows across refresh and process restart, then loaded the existing
+  `/dashboard` navigation without a blank/error state.
 - **Requirements/Feature Matrix link:** **VERIFIED, 2026-09-07** —
   `GET /dashboard/requirements` (plain-text, read fresh off disk every
   request, `_read_guard` only), linked from the header `⋯` menu ("📄
@@ -892,7 +915,7 @@ summarizes it, never duplicates it verbatim (avoids drift).
   sections: `permissions`, `input_policy`, `supervisor`, `queue`,
   `dashboard`, `session_lifecycle`, `session_knowledge`, `session_access`,
   `ask_chatgpt`, `maintenance`, `fleet_sync`, `work`, `repo_read`,
-  `submit`, `submit_watchdog`, `integration_loop`, `ai_usage`,
+  `archify`, `submit`, `submit_watchdog`, `integration_loop`, `ai_usage`,
   `auto_recovery`, plus per-node/discovery/remote-connect sections under
   `nodes`. (The count that used to head this line had drifted and is
   dropped rather than re-pinned; `AppConfig`'s own fields are the list.)

@@ -12,7 +12,11 @@ import anyio
 import uvicorn
 
 from .ai_usage_service import AiUsageService
-from .config import load_config
+from .archify_policy import ArchifyProjectPolicy
+from .archify_runtime import ArchifyRuntime, default_archify_runtime_dir
+from .archify_service import ArchifyService
+from .archify_store import ArchifyStore
+from .config import AppConfig, load_config
 from . import endpoint_policy
 from .connection_store import ConnectionStore
 from .enrollment import EnrollmentStore
@@ -82,6 +86,51 @@ def _http_port() -> int:
 
 HTTP_PORT = _http_port()
 HTTP_PATH = "/mcp"
+
+
+def _terminal_mcp_state_dir() -> Path:
+    state_home = os.environ.get("XDG_STATE_HOME")
+    base = Path(state_home).expanduser() if state_home else Path.home() / ".local" / "state"
+    return (base / "terminal-mcp").resolve()
+
+
+def build_archify_service(config: AppConfig) -> ArchifyService:
+    """Build the process-wide Archify service with shared persistent state.
+
+    Archify-specific roots take precedence; an empty setting inherits the
+    existing Repo Read boundary and then the session lifecycle boundary. If
+    both are empty, it matches Repo Read's existing home-directory fallback;
+    it never widens to filesystem root.
+    """
+    state_dir = _terminal_mcp_state_dir()
+    roots = (
+        config.archify.allowed_roots
+        or config.repo_read.allowed_roots
+        or config.session_lifecycle.allowed_cwd_roots
+        or (str(Path.home()),)
+    )
+    runtime_dir = (
+        Path(config.archify.runtime_dir).expanduser()
+        if config.archify.runtime_dir
+        else default_archify_runtime_dir()
+    )
+    policy = ArchifyProjectPolicy(
+        roots,
+        max_projects=config.archify.max_projects,
+        max_discovery_depth=config.archify.max_discovery_depth,
+    )
+    runtime = ArchifyRuntime(
+        runtime_dir,
+        timeout=config.archify.timeout_seconds,
+        max_output_bytes=config.archify.max_output_bytes,
+    )
+    return ArchifyService(
+        config.archify,
+        policy,
+        runtime,
+        ArchifyStore(state_dir / "archify.db"),
+        artifact_root=state_dir / "archify_artifacts",
+    )
 
 
 def local_node_identity() -> tuple[str, str]:
@@ -519,6 +568,12 @@ def main() -> None:
     # and the SAME attachment directory, never two drifting copies (each
     # surface's own fallback default would otherwise build a private one).
     notes = NotesService.from_config(config) if config.notes.enabled else None
+    # Archify is one shared process-lifetime capability. Its database,
+    # artifacts, runtime adapter, executor, and recovery pass are constructed
+    # once here and handed to the dashboard routes as a single unit. Selected
+    # repositories remain read-only; all generated state lives under the
+    # Terminal MCP state directory.
+    archify = build_archify_service(config)
     # P0.2: the bus is CONSTRUCTED (so publish/claim tools exist) but no
     # consumer loop is started here -- autonomous coordination stays off.
     events = EventBus()
@@ -561,7 +616,9 @@ def main() -> None:
                        queue=queue, integration=integration, pm=pm, planner=planner, ai_usage=ai_usage,
                        recovery=recovery, backlog=backlog, fleet=fleet, onboarding=onboarding,
                        credentials=credentials, heartbeat_replay=heartbeat_replay, notes=notes, webauth=webauth,
-                       run_journal=run_journal, harness=queue.harness)
+                       run_journal=run_journal, harness=queue.harness, archify=archify)
+    archify.start()
+    atexit.register(archify.close)
     register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2, controller,
                                queue=queue, run_journal=run_journal)
     register_health(server, terminal, supervisor)

@@ -250,7 +250,32 @@ use the queue flow (§4) and the git-isolation worktree flow (§4d).
 Also not available: searching git *history* (these search a work tree),
 and fetching/cloning a private remote this host cannot already read.
 
-## 2c. Bounded waits and durable resume
+## 2c. Creating a source-backed diagram (dashboard)
+
+Open `/dashboard/archify`. The project picker contains only recognized
+repositories beneath the server's configured allowlist. Choose Architecture,
+Workflow, Sequence, Dataflow, or Lifecycle; optionally add a short focus
+prompt; then choose **Generate diagram**. The prompt filters or ranks facts
+found in source—it is not authority to invent a component.
+
+Generation is a durable background job. Keep the page open to watch it, or
+return/refresh later: recent completed and failed jobs are loaded from shared
+Terminal MCP state. Select a completed row to preview its self-contained HTML
+in the sandboxed iframe; **Open HTML** opens that same stored artifact. The
+target repository is never modified.
+
+If the page reports `runtime_missing`, `node_missing`, `node_too_old`, or
+`doctor_failed`, stop and tell the operator the displayed dependency state.
+Do not claim that a diagram was generated and do not substitute a hand-written
+HTML file. Archify installation is an operator action documented in the
+README, not something a dashboard request performs.
+
+The backing endpoints are `/dashboard/api/archify/status`, `/projects`, and
+`/jobs`; individual job status and HTML are below `/jobs/{job_id}`. These are
+dashboard APIs governed by the existing dashboard authentication and CSRF
+rules, not MCP tools exposed to an agent client.
+
+## 2d. Bounded waits and durable resume
 
 `terminal_wait_for_state(target, desired_states, timeout=20)` never uses the
 caller's `timeout` as one long-held MCP request. The server persists a wait run

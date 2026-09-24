@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import io
+import os
 import subprocess
+import time
 
 import pytest
 
@@ -99,3 +102,45 @@ def test_timeout_becomes_stable_generation_timeout(tmp_path):
     with pytest.raises(ArchifyRuntimeError, match="GENERATION_TIMEOUT"):
         ArchifyRuntime(root, node_bin="node", runner=runner, timeout=1).render(
             "sequence", source, tmp_path / "out.html")
+
+
+def test_default_runner_drains_and_bounds_subprocess_output(tmp_path):
+    root = _runtime_dir(tmp_path)
+    seen = {}
+
+    class Process:
+        returncode = 0
+        stdout = io.BytesIO(b"x" * 10_000)
+        stderr = io.BytesIO(b"y" * 10_000)
+
+        def wait(self, timeout):
+            seen["timeout"] = timeout
+
+        def kill(self):
+            seen["killed"] = True
+
+    def popen(argv, **kwargs):
+        seen.update(kwargs)
+        return Process()
+
+    result = ArchifyRuntime(
+        root, node_bin="node", max_output_bytes=1024, popen_factory=popen,
+    )._run(["node", "fixture"], timeout=3)
+
+    assert seen["stdout"] is subprocess.PIPE
+    assert seen["stderr"] is subprocess.PIPE
+    assert seen["shell"] is False
+    assert len(result.stdout.encode()) <= 1040
+    assert len(result.stderr.encode()) <= 1040
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group timeout behavior is POSIX-specific")
+def test_descendant_inheriting_output_pipe_cannot_extend_timeout(tmp_path):
+    root = _runtime_dir(tmp_path)
+    started = time.monotonic()
+
+    ArchifyRuntime(root, node_bin="node")._run(
+        ["/bin/sh", "-c", "sleep 2 &"], timeout=0.2,
+    )
+
+    assert time.monotonic() - started < 1.0

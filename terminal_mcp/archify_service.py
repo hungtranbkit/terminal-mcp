@@ -146,24 +146,28 @@ class ArchifyService:
         job = self.store.get(job_id)
         job_root = (self.artifact_root / job_id).resolve()
         try:
+            try:
+                selected = self.policy.resolve_project(job["project_path"])
+            except ArchifyPolicyError as exc:
+                raise ArchifyServiceError(exc.code, exc.message) from exc
             if not job_root.is_relative_to(self.artifact_root):
                 raise ArchifyServiceError("ARTIFACT_MISSING", "Job artifact path escaped its root.")
             job_root.mkdir(parents=True, exist_ok=False, mode=0o700)
             inspection = SourceInspector(
                 max_files=self.config.max_files, max_bytes=self.config.max_source_bytes,
-            ).inspect(job["project_path"])
+            ).inspect(selected.path)
             ir = ArchifyAuthor().build(job["diagram_type"], inspection, job["prompt"])
             ir_path = job_root / "diagram.json"
             metadata_path = job_root / "metadata.json"
             output_part = job_root / "diagram.part.html"
             output_path = job_root / "diagram.html"
             self._atomic_json(ir_path, ir)
-            metadata = {"job_id": job_id, "project": job["project_path"],
+            metadata = {"job_id": job_id, "project": selected.path,
                         "diagram_type": job["diagram_type"], "prompt": job["prompt"],
                         "inspection": inspection.as_dict()}
             self._atomic_json(metadata_path, metadata)
             self.runtime.render(job["diagram_type"], ir_path, output_part,
-                                repo_root=job["project_path"])
+                                repo_root=selected.path)
             if not output_part.is_file() or not output_part.resolve().is_relative_to(job_root):
                 raise ArchifyServiceError("ARTIFACT_MISSING", "Renderer output is missing or invalid.")
             os.replace(output_part, output_path)

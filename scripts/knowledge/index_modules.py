@@ -109,6 +109,8 @@ GROUPS: dict[str, list[str]] = {
                  "logging_setup.py", "schema.py", "maintenance.py"],
     "mcp_surface": ["mcp_app.py"],
     "repo_read": ["repo_read.py", "repo_service.py", "repo_tools.py"],
+    "archify": ["archify_dashboard.py", "archify_policy.py", "archify_runtime.py",
+                "archify_service.py", "archify_source.py", "archify_store.py"],
     "observer": ["observer_app.py", "observer_auth.py"],
     "bridge": ["bridge.py"],
     "ai_usage": ["ai_usage_client.py", "ai_usage_index.py", "ai_usage_local.py",
