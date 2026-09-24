@@ -969,6 +969,24 @@ class RepoReadConfig:
 
 
 @dataclass(frozen=True)
+class ArchifyConfig:
+    """Shared source-backed diagram generation limits and runtime location."""
+
+    enabled: bool = True
+    runtime_dir: str = ""
+    allowed_roots: tuple[str, ...] = ()
+    max_projects: int = 200
+    max_discovery_depth: int = 2
+    max_files: int = 500
+    max_source_bytes: int = 4 * 1024 * 1024
+    max_prompt_chars: int = 4000
+    timeout_seconds: float = 120.0
+    max_output_bytes: int = 64 * 1024
+    history_limit: int = 100
+    workers: int = 1
+
+
+@dataclass(frozen=True)
 class UiWorkflowConfig:
     """The central UI workflow policy (ui_workflow.py, TMCP-UI-WORKFLOW-001).
 
@@ -1343,6 +1361,7 @@ class AppConfig:
     maintenance: MaintenanceConfig = MaintenanceConfig()
     fleet_sync: FleetSyncConfig = FleetSyncConfig()
     repo_read: RepoReadConfig = RepoReadConfig()
+    archify: ArchifyConfig = ArchifyConfig()
     browser: BrowserGatewayConfig = BrowserGatewayConfig()
     ui_workflow: UiWorkflowConfig = UiWorkflowConfig()
     worktree_janitor: WorktreeJanitorConfig = WorktreeJanitorConfig()
@@ -1814,6 +1833,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         maintenance=_load_maintenance_config(raw.get("maintenance", {})),
         fleet_sync=_load_fleet_sync_config(raw.get("fleet_sync", {})),
         repo_read=_load_repo_read_config(raw.get("repo_read", {})),
+        archify=_load_archify_config(raw.get("archify", {})),
         browser=_load_browser_gateway_config(raw.get("browser", {})),
         ui_workflow=_load_ui_workflow_config(raw.get("ui_workflow", {})),
         worktree_janitor=_load_worktree_janitor_config(raw.get("worktree_janitor", {})),
@@ -2468,6 +2488,48 @@ def _load_repo_read_config(raw: object) -> RepoReadConfig:
         max_log_entries=bounded("max_log_entries", RepoReadConfig.max_log_entries, 1, 5_000),
         max_diff_bytes=bounded("max_diff_bytes", RepoReadConfig.max_diff_bytes, 1_024, 16_000_000),
         timeout_seconds=float(timeout), extra_secret_globs=tuple(globs))
+
+
+def _load_archify_config(raw: object) -> ArchifyConfig:
+    if not isinstance(raw, dict):
+        raw = {}
+    enabled = raw.get("enabled", ArchifyConfig.enabled)
+    if not isinstance(enabled, bool):
+        raise ValueError("archify.enabled must be a boolean")
+    runtime_dir = raw.get("runtime_dir", "")
+    if not isinstance(runtime_dir, str):
+        raise ValueError("archify.runtime_dir must be a string")
+    if runtime_dir and not Path(runtime_dir).expanduser().is_absolute():
+        raise ValueError("archify.runtime_dir must be an absolute path")
+    roots = raw.get("allowed_roots", [])
+    if not isinstance(roots, list) or not all(isinstance(root, str) and root for root in roots):
+        raise ValueError("archify.allowed_roots must be a list of strings")
+    for root in roots:
+        expanded = Path(root).expanduser()
+        if not expanded.is_absolute() or expanded.resolve() == Path(expanded.anchor):
+            raise ValueError("archify.allowed_roots entries must be absolute and may not be filesystem root")
+
+    def integer(key: str, default: int, low: int, high: int) -> int:
+        value = raw.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+            raise ValueError(f"archify.{key} must be an integer between {low} and {high}")
+        return value
+
+    timeout = raw.get("timeout_seconds", ArchifyConfig.timeout_seconds)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 1 <= float(timeout) <= 600:
+        raise ValueError("archify.timeout_seconds must be a number between 1 and 600")
+    return ArchifyConfig(
+        enabled=enabled, runtime_dir=runtime_dir, allowed_roots=tuple(roots),
+        max_projects=integer("max_projects", ArchifyConfig.max_projects, 1, 2000),
+        max_discovery_depth=integer("max_discovery_depth", ArchifyConfig.max_discovery_depth, 0, 8),
+        max_files=integer("max_files", ArchifyConfig.max_files, 1, 5000),
+        max_source_bytes=integer("max_source_bytes", ArchifyConfig.max_source_bytes, 1024, 64 * 1024 * 1024),
+        max_prompt_chars=integer("max_prompt_chars", ArchifyConfig.max_prompt_chars, 0, 20000),
+        timeout_seconds=float(timeout),
+        max_output_bytes=integer("max_output_bytes", ArchifyConfig.max_output_bytes, 1024, 1024 * 1024),
+        history_limit=integer("history_limit", ArchifyConfig.history_limit, 1, 1000),
+        workers=integer("workers", ArchifyConfig.workers, 1, 4),
+    )
 
 
 def _load_ui_workflow_config(raw: object) -> UiWorkflowConfig:

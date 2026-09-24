@@ -275,6 +275,24 @@ repo_read:
     # - "*.backup.sql"
     # - "deploy/production-*.yaml"
 
+# Shared Archify diagram capability. The official tt-a1i/archify runtime is
+# installed once in Terminal MCP state (or pointed to here), never in a target
+# project. Generation stays unavailable with a clear status until it exists.
+archify:
+  enabled: true
+  runtime_dir: ""
+  # Empty reuses repo_read's effective allowed roots.
+  allowed_roots: []
+  max_projects: 200
+  max_discovery_depth: 2
+  max_files: 500
+  max_source_bytes: 4194304
+  max_prompt_chars: 4000
+  timeout_seconds: 120
+  max_output_bytes: 65536
+  history_limit: 100
+  workers: 1
+
 # -- Notes / Ideas ("Ghi chú / Ý tưởng") -------------------------------------
 # The cross-project note store ChatGPT writes into when the user says "lưu
 # lại" (MCP tools note_create/note_search/...), browsable at /dashboard/notes.
