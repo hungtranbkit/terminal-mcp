@@ -2925,7 +2925,8 @@ scan/audit view over the SAME facts.)*
 
 - **Goal / user value:** an idle task cannot hold a queue lane forever merely
   because the controller restarts before its inactivity timer expires.
-- **Status:** IMPLEMENTED; deployment and live reconciliation pending.
+- **Status:** VERIFIED and deployed on the HP controller (2026-09-24,
+  `2c49184`).
 - **Scope / flow:** the first stable inactive observation and its output/state
   fingerprint are stored on `queue_tasks`. Progress resets the clock. A valid
   completion marker still wins; a live verifier lease or active/uncertain
@@ -2938,6 +2939,9 @@ scan/audit view over the SAME facts.)*
 - **Acceptance/tests/evidence:** `tests/test_queue_engine.py` covers restart,
   live progress, valid completion, live verifier protection, lane recovery and
   single dispatch; `tests/test_stale_admission_recovery.py` covers admission.
+  The focused queue/send/node suite passed 331 tests. Production migration v18
+  is applied; stale instance `572d501d...` is terminal with no claim/lease,
+  and recovery `b6cecdb7...` is `COMPLETED` with exactly one dispatch event.
 
 ### P0: persist-before-dispatch
 
@@ -3299,7 +3303,8 @@ scan/audit view over the SAME facts.)*
 - **Goal / user value:** a caller can answer a basic question/menu already
   visible in a Claude/Codex session without disabling the ordinary
   `TARGET_AWAITING_APPROVAL` protection for new prompts.
-- **Status:** IMPLEMENTED; deployment pending.
+- **Status:** VERIFIED and deployed on the HP controller and Dell node agent
+  (2026-09-24, `2c49184`).
 - **Scope / flow:** `terminal_send_text(..., prompt_response=true)` accepts one
   non-empty line of at most 200 characters only when the adapter currently
   reports `TARGET_WAITING` and `press_enter=true`. It refuses multiline input
