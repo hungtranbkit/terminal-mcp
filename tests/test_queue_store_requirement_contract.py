@@ -62,7 +62,7 @@ def test_git_required_task_cannot_bypass_evidence_gate_with_marker_only(store):
         task_id, status="READY", reason="ready",
         evidence={"cwd": "/repo", "node_id": "local", "branch": "main", "head": "base"})
     store.transition_task(task_id, qs.DISPATCHING, event_type="DISPATCHED")
-    store.transition_task(task_id, qs.RUNNING, event_type="STARTED")
+    store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     store.transition_task(task_id, qs.VERIFYING, event_type="VERIFYING")
 
     with pytest.raises(qs.CompletionEvidenceError, match="GIT_EVIDENCE_REQUIRED"):
@@ -80,7 +80,7 @@ def test_git_evidence_from_a_different_node_is_not_the_same_repository(store):
         task_id, status="READY", reason="ready",
         evidence={"cwd": "/repo", "node_id": "node-a", "branch": "main", "head": "base"})
     store.transition_task(task_id, qs.DISPATCHING, event_type="DISPATCHED")
-    store.transition_task(task_id, qs.RUNNING, event_type="STARTED")
+    store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     store.transition_task(task_id, qs.VERIFYING, event_type="VERIFYING")
 
     with pytest.raises(qs.CompletionEvidenceError, match="GIT_EVIDENCE_WRONG_REPO"):
@@ -102,7 +102,7 @@ def test_proven_false_git_completion_can_be_invalidated_without_redispatch(store
         evidence={"cwd": "/repo", "node_id": "local", "branch": "main",
                   "head": "base", "status_lines": []})
     store.transition_task(task_id, qs.DISPATCHING, event_type="DISPATCHED")
-    store.transition_task(task_id, qs.RUNNING, event_type="STARTED")
+    store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     store.transition_task(task_id, qs.VERIFYING, event_type="VERIFYING")
     store.transition_task(task_id, qs.COMPLETED, event_type="LEGACY_FALSE_VERIFIED",
                           extra_fields={"verification_evidence": '{"completion_marker":"candidate"}'})

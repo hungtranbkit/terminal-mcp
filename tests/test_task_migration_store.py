@@ -83,7 +83,7 @@ def test_reassign_refuses_a_task_that_is_currently_in_flight(store, status):
     if status not in (PRECHECK, READY):
         store.transition_task(task_id, DISPATCHING, event_type="TEST")
     if status not in (PRECHECK, READY, DISPATCHING):
-        store.transition_task(task_id, RUNNING, event_type="TEST")
+        store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     if status == "VERIFYING":
         store.transition_task(task_id, "VERIFYING", event_type="TEST")
     with pytest.raises(TaskAlreadyClaimedError):
@@ -187,7 +187,7 @@ def test_reassign_survives_a_simulated_restart(tmp_path):
 def test_mark_at_risk_never_changes_task_status(store):
     task_id = _make_task(store)
     store.transition_task(task_id, DISPATCHING, event_type="TEST")
-    store.transition_task(task_id, RUNNING, event_type="TEST")
+    store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     updated = store.mark_at_risk(task_id)
     assert updated.at_risk is True
     assert updated.status == RUNNING  # untouched

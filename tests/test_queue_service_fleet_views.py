@@ -106,7 +106,7 @@ def test_pending_counts_excludes_running_and_verifying(queue):
         queue.store.transition_task(tid, "PRECHECK", event_type="TEST")
         queue.store.transition_task(tid, "READY", event_type="TEST")
         queue.store.transition_task(tid, "DISPATCHING", event_type="TEST")
-        queue.store.transition_task(tid, "RUNNING", event_type="TEST")
+        queue.store.mark_running_with_evidence(tid, evidence={"accepted": True, "signal": "explicit_running_signal"})
     queue.store.transition_task(verifying_id, "VERIFYING", event_type="TEST")
     # running_id: RUNNING (not pending); verifying_id: VERIFYING (not
     # pending); queued_id: still QUEUED (pending) -- only 1 counts.
@@ -120,7 +120,7 @@ def test_pending_counts_excludes_terminal_statuses(queue):
         queue.store.transition_task(tid, "PRECHECK", event_type="TEST")
         queue.store.transition_task(tid, "READY", event_type="TEST")
         queue.store.transition_task(tid, "DISPATCHING", event_type="TEST")
-        queue.store.transition_task(tid, "RUNNING", event_type="TEST")
+        queue.store.mark_running_with_evidence(tid, evidence={"accepted": True, "signal": "explicit_running_signal"})
     queue.store.transition_task(completed_id, "VERIFYING", event_type="TEST")
     queue.store.transition_task(completed_id, "COMPLETED", event_type="TEST")
     queue.store.transition_task(failed_id, "FAILED", event_type="TEST", reason="boom")
@@ -227,7 +227,7 @@ def test_assign_task_rejects_invalid_session_name(queue):
 def test_assign_task_refuses_a_running_task(queue):
     (task_id,) = queue.store.append_tasks("lane-a", [{"prompt": "p"}])
     queue.store.transition_task(task_id, "DISPATCHING", event_type="TEST")
-    queue.store.transition_task(task_id, "RUNNING", event_type="TEST")
+    queue.store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     result = queue.assign_task(task_id, "lane-b")
     assert result == {"error": "TASK_NOT_MOVABLE", "task_id": task_id, "status": "RUNNING"}
 
@@ -243,13 +243,13 @@ def test_board_groups_tasks_into_the_real_lifecycle_columns(queue):
     queued = queue.create_task("q", "p", session="lane-a")["task_id"]
     running = queue.create_task("r", "p", session="lane-a")["task_id"]
     queue.store.transition_task(running, "DISPATCHING", event_type="TEST")
-    queue.store.transition_task(running, "RUNNING", event_type="TEST")
+    queue.store.mark_running_with_evidence(running, evidence={"accepted": True, "signal": "explicit_running_signal"})
     blocked = queue.create_task("b", "p", session="lane-b")["task_id"]
     queue.store.transition_task(blocked, "PRECHECK", event_type="TEST")
     queue.store.transition_task(blocked, "BLOCKED", event_type="TEST", reason="x")
     done = queue.create_task("d", "p", session="lane-b")["task_id"]
     queue.store.transition_task(done, "DISPATCHING", event_type="TEST")
-    queue.store.transition_task(done, "RUNNING", event_type="TEST")
+    queue.store.mark_running_with_evidence(done, evidence={"accepted": True, "signal": "explicit_running_signal"})
     queue.store.transition_task(done, "VERIFYING", event_type="TEST")
     queue.store.mark_completed_with_evidence(done, evidence={"marker_found": True})
 
@@ -361,7 +361,7 @@ def test_list_active_incidents_excludes_terminal_and_non_incidents(queue):
     active = queue.create_incident_task("Active incident", "p", session="lane-b")["task_id"]
     done = queue.create_incident_task("Resolved incident", "p", session="lane-c")["task_id"]
     queue.store.transition_task(done, "DISPATCHING", event_type="TEST")
-    queue.store.transition_task(done, "RUNNING", event_type="TEST")
+    queue.store.mark_running_with_evidence(done, evidence={"accepted": True, "signal": "explicit_running_signal"})
     queue.store.transition_task(done, "VERIFYING", event_type="TEST")
     queue.store.mark_completed_with_evidence(done, evidence={"resolved": True})
 

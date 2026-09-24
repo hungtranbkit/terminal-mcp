@@ -92,7 +92,7 @@ def test_first_preview_is_a_real_transition_and_says_which_one(wired, telemetry)
     queue, _ = wired
     task_id = _queued_task(queue)
     _dispatch(queue, task_id)
-    queue.store.transition_task(task_id, "RUNNING", event_type="STARTED")
+    queue.store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     queue.store.transition_task(task_id, "VERIFYING", event_type="VERIFY_REQUESTED")
 
     row = telemetry.for_task(task_id)
@@ -108,11 +108,11 @@ def test_only_the_first_preview_counts(wired, telemetry):
     queue, _ = wired
     task_id = _queued_task(queue)
     _dispatch(queue, task_id)
-    queue.store.transition_task(task_id, "RUNNING", event_type="STARTED")
+    queue.store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     queue.store.transition_task(task_id, "VERIFYING", event_type="VERIFY_REQUESTED")
     first = telemetry.for_task(task_id)["first_preview_at"]
     # A false alarm sends it back to RUNNING and then to VERIFYING again.
-    queue.store.transition_task(task_id, "RUNNING", event_type="RUNNING")
+    queue.store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     queue.store.transition_task(task_id, "VERIFYING", event_type="VERIFY_REQUESTED")
     assert telemetry.for_task(task_id)["first_preview_at"] == first
 
@@ -121,7 +121,7 @@ def test_completion_closes_the_row_and_records_a_first_pass_success(wired, telem
     queue, _ = wired
     task_id = _queued_task(queue)
     _dispatch(queue, task_id)
-    queue.store.transition_task(task_id, "RUNNING", event_type="STARTED")
+    queue.store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     queue.store.transition_task(task_id, "VERIFYING", event_type="VERIFY_REQUESTED")
     queue.store.transition_task(task_id, "COMPLETED", event_type="COMPLETED")
 
@@ -142,7 +142,7 @@ def test_a_retry_is_the_same_row_and_is_not_a_first_pass_success(wired, telemetr
                                 reason="send failed")
     queue.store.transition_task(task_id, "QUEUED", event_type="RETRY")
     _dispatch(queue, task_id)
-    queue.store.transition_task(task_id, "RUNNING", event_type="STARTED")
+    queue.store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     queue.store.transition_task(task_id, "VERIFYING", event_type="VERIFY_REQUESTED")
     queue.store.transition_task(task_id, "COMPLETED", event_type="COMPLETED")
 
@@ -438,7 +438,7 @@ def test_work_service_enables_telemetry_on_its_own_queue(tmp_path, telemetry):
     work_id = created["work"]["work_id"]
     task_id = created["tasks"][0]["queue_task_id"]
     _dispatch(queue, task_id)
-    queue.store.transition_task(task_id, "RUNNING", event_type="STARTED")
+    queue.store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     queue.store.transition_task(task_id, "VERIFYING", event_type="VERIFY_REQUESTED")
     queue.store.transition_task(task_id, "COMPLETED", event_type="COMPLETED")
 

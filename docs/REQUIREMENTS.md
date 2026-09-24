@@ -3006,8 +3006,12 @@ scan/audit view over the SAME facts.)*
 - **Status:** VERIFIED.
 - **Scope / flow:** `enqueue()` persists first, dispatch only follows
   once the Coordinator says READY and the session is idle/eligible;
-  `DELIVERY_UNKNOWN` moves to `DISPATCH_UNCERTAIN`, reconciled via
-  idempotency key + observed activity before any retry.
+  `RUNNING` requires persisted acceptance/execution evidence; `VERIFYING`
+  requires prior execution evidence. `DELIVERY_UNKNOWN` remains
+  `DISPATCH_UNCERTAIN` and is inspected without blind resend, including
+  after restart. Claim/lease and injected text are not execution evidence.
+- **Dashboard truth:** `DISPATCH_UNCERTAIN` is rendered as
+  “Đang xác nhận agent nhận task”, never as Running.
 - **UI route/screen:** none at this phase.
 - **API/tool/command:** `terminal_enqueue_task`, `terminal_task_status`,
   `terminal_queue_metrics`.

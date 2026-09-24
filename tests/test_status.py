@@ -238,8 +238,22 @@ def test_ambiguous_agent_pane_stays_unknown():
     # general-purpose guess.
     ambiguous = "\n".join(("  reading files...", "", "❯", RULE))
     assert detect_agent_ui_state(ambiguous)[0] is None
-    state, _input_required, _reason = classify_status(info("claude", activity=0), ambiguous, now=999)
+
+
+def test_codex_idle_composer_is_idle_even_when_process_is_recent():
+    pane = """gpt-5.6 · ~/workspace/project
+› Ask Codex to do anything"""
+    state, input_required, reason = classify_status(info("codex", activity=99), pane, now=100)
+    assert state == "IDLE"
+    assert input_required is False
+    assert "composer" in reason.casefold()
+
+
+def test_codex_process_and_recent_activity_alone_are_not_running_evidence():
+    state, input_required, _reason = classify_status(
+        info("codex", activity=99), "task contract text without Codex UI chrome", now=100)
     assert state == "UNKNOWN"
+    assert input_required is False
 
 
 def test_done_marker_far_above_the_footer_region_is_not_idle():

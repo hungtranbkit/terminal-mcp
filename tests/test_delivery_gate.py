@@ -25,7 +25,7 @@ from terminal_mcp.adapters import (DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_SU
 from terminal_mcp.config import PromptDeliveryConfig
 from terminal_mcp.queue_engine import QueueEngine
 from terminal_mcp.queue_store import (BLOCKED, DISPATCH_UNCERTAIN, QUEUED, READY, RUNNING,
-                                      QueueStore)
+                                      WAITING_SESSION, InvalidTransitionError, QueueStore)
 
 
 # -- gate 1: activation, as a positive allowlist -------------------------
@@ -265,20 +265,18 @@ def test_delivery_unknown_still_becomes_dispatch_uncertain():
     assert store.get_task(task_id).status == DISPATCH_UNCERTAIN
 
 
-def test_advisory_mode_changes_no_outcome_when_acceptance_is_missing():
-    """Backward compatibility: a confirmed submit with NO acceptance
-    evidence still reaches RUNNING in advisory mode -- exactly as today --
-    while the verdict is recorded for the operator to see."""
+def test_advisory_mode_still_enforces_lifecycle_acceptance_gate():
+    """Policy may be advisory, but task lifecycle truth is never advisory."""
     store = _store()
     task_id = _ready_task(store)
     ops = _Ops({"delivery_state": DELIVERY_SUBMIT_CONFIRMED, "press_enter": True},
                status={"state": "IDLE", "last_output": "unchanged"})
     _engine(store, ops, mode="advisory")._dispatch("agent-gate", task_id)
     task = store.get_task(task_id)
-    assert task.status == RUNNING
+    assert task.status == DISPATCH_UNCERTAIN
     verdict = task.metadata["delivery_verdict"]
     assert verdict["kind"] == delivery_gate.NOT_ACCEPTED
-    assert verdict["may_advance"] is False  # recorded honestly even though we advanced
+    assert verdict["may_advance"] is False
 
 
 def test_enforce_mode_holds_a_confirmed_submit_with_no_acceptance_evidence():
@@ -294,6 +292,17 @@ def test_enforce_mode_holds_a_confirmed_submit_with_no_acceptance_evidence():
     assert task.status != RUNNING
     assert task.metadata["delivery_verdict"]["acceptance"] in (
         delivery_gate.ACCEPTANCE_NOT_OBSERVED, delivery_gate.ACCEPTANCE_UNOBSERVABLE)
+
+
+def test_codex_idle_composer_overrides_stale_running_status():
+    store = _store()
+    task_id = _ready_task(store)
+    ops = _Ops({"delivery_state": DELIVERY_SUBMIT_CONFIRMED, "press_enter": True},
+               status={"state": "RUNNING", "current_command": "codex",
+                       "last_output": "› Ask Codex to do anything"})
+    result = _engine(store, ops)._dispatch("agent-gate", task_id)
+    assert result.action == "DISPATCH_UNCERTAIN"
+    assert store.get_task(task_id).status == DISPATCH_UNCERTAIN
 
 
 def test_enforce_mode_reaches_running_with_real_acceptance_evidence():
@@ -320,10 +329,8 @@ def test_exactly_one_enter_per_dispatch_no_duplicate_submit():
     assert ops.sends[0]["press_enter"] is True
 
 
-def test_retry_reuses_the_same_submission_id_so_the_send_is_idempotent():
-    """Scenario 4: an uncertain dispatch returned to QUEUED must re-attempt
-    under the SAME idempotency key, so core.py's idempotent_sends layer
-    returns the original result instead of sending twice."""
+def test_uncertain_dispatch_cannot_be_requeued_by_timeout():
+    """Elapsed time cannot authorize a retry of a possibly accepted prompt."""
     store = _store()
     task_id = _ready_task(store)
     ops = _Ops({"delivery_state": DELIVERY_UNKNOWN, "press_enter": True})
@@ -333,11 +340,8 @@ def test_retry_reuses_the_same_submission_id_so_the_send_is_idempotent():
     assert store.get_task(task_id).status == DISPATCH_UNCERTAIN
     assert store.get_task(task_id).dispatch_idempotency_key == first_key
 
-    store.transition_task(task_id, QUEUED, event_type="REQUEUED", reason="grace elapsed")
-    store.transition_task(task_id, "PRECHECK", event_type="CLAIMED")
-    store.transition_task(task_id, READY, event_type="READY")
-    engine._dispatch("agent-gate", task_id)
-    assert ops.sends[1]["idempotency_key"] == first_key, "a retry must not mint a new submission id"
+    with pytest.raises(InvalidTransitionError):
+        store.transition_task(task_id, QUEUED, event_type="REQUEUED", reason="grace elapsed")
 
 
 def test_the_verdict_is_recorded_on_every_dispatch_including_refusals():
@@ -369,8 +373,9 @@ def test_an_unobservable_status_call_cannot_crash_dispatch():
     store = _store()
     task_id = _ready_task(store)
     ops = _Boom({"delivery_state": DELIVERY_SUBMIT_CONFIRMED, "press_enter": True})
-    _engine(store, ops, mode="enforce")._dispatch("agent-gate", task_id)
-    assert store.get_task(task_id).status == DISPATCH_UNCERTAIN
+    result = _engine(store, ops, mode="enforce")._dispatch("agent-gate", task_id)
+    assert result.action == "WAITING_SESSION"
+    assert store.get_task(task_id).status == WAITING_SESSION
 
 
 def test_send_errors_still_block_exactly_as_before():

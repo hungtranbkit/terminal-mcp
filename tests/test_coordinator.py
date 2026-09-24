@@ -225,7 +225,7 @@ def test_previous_task_with_no_verification_evidence_needs_rework(store):
     ids = store.set_tasks("lane-a", [{"prompt": "first task here please"}, {"prompt": "second task here please"}])
     # First task marked COMPLETED the "legacy" way -- no evidence attached.
     store.transition_task(ids[0], DISPATCHING, event_type="TEST")
-    store.transition_task(ids[0], RUNNING, event_type="TEST")
+    store.mark_running_with_evidence(ids[0], evidence={"accepted": True, "signal": "explicit_running_signal"})
     store.transition_task(ids[0], VERIFYING, event_type="TEST")
     store.transition_task(ids[0], "COMPLETED", event_type="TEST")
 
@@ -240,7 +240,7 @@ def test_previous_task_with_no_verification_evidence_needs_rework(store):
 def test_previous_task_with_verification_evidence_passes(store):
     ids = store.set_tasks("lane-a", [{"prompt": "first task here please"}, {"prompt": "second task here please"}])
     store.transition_task(ids[0], DISPATCHING, event_type="TEST")
-    store.transition_task(ids[0], RUNNING, event_type="TEST")
+    store.mark_running_with_evidence(ids[0], evidence={"accepted": True, "signal": "explicit_running_signal"})
     store.transition_task(ids[0], VERIFYING, event_type="TEST")
     store.mark_completed_with_evidence(ids[0], evidence={"marker": "abc"})
 

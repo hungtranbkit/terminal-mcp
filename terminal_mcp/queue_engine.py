@@ -63,7 +63,8 @@ from .queue_store import (
     BLOCKED, CANCELLED, COMPLETED, DISPATCH_UNCERTAIN, DISPATCHING, FAILED, PRECHECK, QUEUED, READY, RUNNING, VERIFYING,
     WAITING_SESSION, CompletionEvidenceError, QueueStore, QueueTask, RequirementsNotCoveredError, iso_now,
 )
-from .status import COMPLETION_MARKER_RE, parse_completion_marker, verify_completion_marker
+from .status import (COMPLETION_MARKER_RE, detect_agent_ui_state, parse_completion_marker,
+                     verify_completion_marker)
 from .request_governor import RequestGovernor
 from .runbook_registry import RunbookRef, RunbookRegistry, lookup_key_for_task
 
@@ -888,7 +889,11 @@ class QueueEngine:
     def _dispatch(self, session: str, task_id: str) -> TickResult:
         task = self.store.get_task(task_id)
         if task.metadata.get("execution_mode") != "shell":
-            observed = self._status_bounded(session)
+            try:
+                observed = self._status_bounded(session)
+            except Exception as exc:  # noqa: BLE001 -- fail closed before any bytes are sent
+                self.store.mark_waiting_session(task_id, reason=f"pre-dispatch status unavailable: {exc}")
+                return TickResult(session, "WAITING_SESSION", task_id=task_id, detail=str(exc))
             if str(observed.get("current_command") or "").casefold() in PLAIN_SHELL_COMMANDS:
                 return self._review(session, task_id)
         nonce = self.store.ensure_verification_nonce(task_id)
@@ -916,6 +921,23 @@ class QueueEngine:
             task, nonce=nonce,
             continuation_text=(retry_plan.continuation_text if retry_plan is not None else None),
             skills_preamble=self._skills_preamble(task), runbook=self._retrieve_runbook(task))
+        try:
+            baseline_status = self.ops.terminal_status(session) or {}
+        except Exception:  # noqa: BLE001 -- dispatch remains bounded; uncertainty is recorded
+            baseline_status = {}
+        try:
+            baseline_capture = self.ops.terminal_tail(session, 40) or {}
+        except Exception:  # noqa: BLE001 -- unavailable baseline cannot become acceptance evidence
+            baseline_capture = {}
+        baseline_output = str(baseline_capture.get("output") or baseline_status.get("last_output") or "")
+        baseline_lines = baseline_output.splitlines() if baseline_output else None
+        self.store.record_dispatch_observation(task_id, {
+            "dispatch_idempotency_key": idempotency_key,
+            "node_id": baseline_status.get("node_id"),
+            "state": baseline_status.get("state"),
+            "output_sha256": hashlib.sha256(baseline_output.encode()).hexdigest() if baseline_output else None,
+            "observed_at": iso_now(),
+        })
         self.store.transition_task(task_id, DISPATCHING, event_type="DISPATCHED",
                                    extra_fields={"dispatch_idempotency_key": idempotency_key})
 
@@ -925,8 +947,15 @@ class QueueEngine:
         # PROMPT DELIVERY / ACCEPTANCE GATE. The verdict is ALWAYS computed
         # and recorded; whether it can change a transition is gated on
         # prompt_delivery.mode (advisory by default -- see below).
-        verdict = self._delivery_verdict(session, response, dispatch_text)
+        verdict = self._delivery_verdict(session, response, dispatch_text, before_lines=baseline_lines)
         self.store.record_delivery_verdict(task_id, verdict.to_dict())
+        self.store.record_dispatch_observation(task_id, {
+            "submission_id": response.get("submission_id") or response.get("correlation_id"),
+            "dispatch_idempotency_key": idempotency_key,
+            "node_id": response.get("node_id") or baseline_status.get("node_id"),
+            "signal": verdict.acceptance,
+            "observed_at": iso_now(),
+        })
         if response.get("error"):
             # About to lose this attempt: write what we can still see first.
             self._snapshot_recovery_state(task, session, why="blocked: send failed")
@@ -947,28 +976,26 @@ class QueueEngine:
                 task_id, BLOCKED, event_type="BLOCKED",
                 reason=f"delivery refused: {verdict.activation} ({verdict.detail or delivery_state})")
             return TickResult(session, "BLOCKED", task_id=task_id, detail=verdict.activation)
-        # Gate 2, acceptance. ONLY enforced in enforce mode: holding a task
-        # that the old code would have marked RUNNING is a real behaviour
-        # change, so it needs the operator's explicit opt-in.
-        if verdict.kind == delivery_gate.NOT_ACCEPTED and self.delivery_policy.enforcing:
-            self.store.mark_dispatch_uncertain(
-                task_id, reason=f"submit confirmed but acceptance not observed: {verdict.acceptance}")
-            return TickResult(session, "DISPATCH_UNCERTAIN", task_id=task_id,
-                              detail=verdict.acceptance)
-        if verdict.kind == delivery_gate.UNCERTAIN or delivery_state == "DELIVERY_UNKNOWN":
+        # A task lifecycle is never advisory: only DeliveryVerdict.may_advance
+        # can move this row into RUNNING. Text injection and Enter transmission
+        # are not acceptance evidence. Unproven/not-accepted receipts stay in
+        # the durable uncertainty state for pane reconciliation.
+        if not verdict.may_advance:
             # P0 item 2: never resend blindly, and never silently look
             # like an ordinary QUEUED task either -- DISPATCH_UNCERTAIN,
             # KEEPING the same dispatch_idempotency_key (the outcome is
             # genuinely unknown -- if the send actually went through,
-            # core.py's own idempotent_sends store will return that
-            # original result the next time this exact key is reused,
-            # rather than sending twice). _recheck_uncertain resolves
-            # this on a later tick: real evidence of activity -> RUNNING,
-            # else a grace period -> QUEUED for a fresh attempt.
+            # core.py's idempotent_sends store retains its original result.
+            # _recheck_uncertain only inspects; elapsed time never authorizes
+            # a resend and bounded inconclusive observations require a human.
             self._snapshot_recovery_state(task, session, why="dispatch uncertain")
-            self.store.mark_dispatch_uncertain(task_id, reason="delivery_state=DELIVERY_UNKNOWN")
-            return TickResult(session, "DISPATCH_UNCERTAIN", task_id=task_id)
-        self.store.transition_task(task_id, RUNNING, event_type="STARTED")
+            reason = (f"delivery_state={delivery_state}; activation={verdict.activation}; "
+                      f"acceptance={verdict.acceptance}")
+            self.store.mark_dispatch_uncertain(task_id, reason=reason)
+            return TickResult(session, "DISPATCH_UNCERTAIN", task_id=task_id, detail=verdict.acceptance)
+        execution_evidence = self._execution_evidence_from_verdict(
+            response, verdict, session=session, node_id=response.get("node_id"))
+        self.store.mark_running_with_evidence(task_id, evidence=execution_evidence)
         self._ensure_long_task_watch(task, session, response, idempotency_key)
         detail = idempotency_key
         if retry_plan is not None:
@@ -1029,7 +1056,8 @@ class QueueEngine:
                 watch_lease_expires_at=(datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat(),
             )
 
-    def _delivery_verdict(self, session: str, response: dict, sent_text: str):
+    def _delivery_verdict(self, session: str, response: dict, sent_text: str, *,
+                          before_lines: list[str] | None = None):
         """Compute the delivery verdict for one send.
 
         The post-submit observation is ONE extra read (status + tail), not a
@@ -1039,43 +1067,76 @@ class QueueEngine:
         UNOBSERVABLE, which is never a pass."""
         after_lines = None
         target_state = None
-        if self.delivery_policy.require_acceptance:
-            try:
-                status = self.ops.terminal_status(session)
-                if not status.get("error"):
-                    target_state = status.get("target_state") or _target_state_from_status(status)
-                    tail = status.get("last_output")
-                    if isinstance(tail, str):
-                        after_lines = tail.splitlines()
-            except Exception:  # noqa: BLE001 -- an unobservable target must not crash dispatch
-                after_lines = None
+        status: dict[str, Any] = {}
+        try:
+            status = self.ops.terminal_status(session) or {}
+            capture = self.ops.terminal_tail(session, 40) or {}
+            tail = capture.get("output") or status.get("last_output")
+            if isinstance(tail, str):
+                after_lines = tail.splitlines()
+            if not status.get("error"):
+                target_state = status.get("target_state") or _target_state_from_status(status)
+            if after_lines:
+                from .adapters import select_adapter
+                command = str(response.get("agent_type") or status.get("current_command") or "")
+                adapter_state = select_adapter(command).identify_target_state(after_lines)
+                # Strong current UI evidence outranks a stale/misclassified
+                # status field (Codex's process exists while its composer is idle).
+                if adapter_state in ("composer", "waiting") or (
+                        adapter_state == "running" and target_state is None):
+                    target_state = adapter_state
+        except Exception:  # noqa: BLE001 -- an unobservable target must not crash dispatch
+            after_lines = None
+        from .adapters import select_adapter
+        command = str(response.get("agent_type") or status.get("current_command") or "")
         return delivery_gate.evaluate(
-            response, before_lines=response.get("pre_submit_lines"), after_lines=after_lines,
+            response, before_lines=before_lines, after_lines=after_lines,
             target_state=target_state, sent_text=sent_text,
-            require_acceptance=self.delivery_policy.require_acceptance)
+            adapter=select_adapter(command),
+            require_acceptance=True)
+
+    @staticmethod
+    def _execution_evidence_from_verdict(response: dict[str, Any], verdict: Any, *,
+                                         session: str, node_id: str | None) -> dict[str, Any]:
+        ack_state = str(response.get("ack_state") or "").upper()
+        if response.get("execution_started") is True:
+            signal = "process_started"
+        elif ack_state in {"ACCEPTED", "RUNNING", "EXECUTION_STARTED"}:
+            signal = "agent_acceptance"
+        elif verdict.acceptance == delivery_gate.ACCEPTANCE_TARGET_WORKING:
+            signal = "explicit_running_signal"
+        else:
+            signal = "post_submit_output"
+        return {
+            "accepted": True, "signal": signal,
+            "submission_id": response.get("submission_id") or response.get("correlation_id"),
+            "dispatch_idempotency_key": response.get("dispatch_idempotency_key"),
+            "session": session, "node": node_id,
+            "activation": verdict.activation, "acceptance": verdict.acceptance,
+            "evidence": list(verdict.evidence), "accepted_at": iso_now(),
+        }
 
     # -- P0 persist-before-dispatch: uncertain/waiting reconciliation -------
 
     def _recheck_uncertain(self, session: str, task_id: str) -> TickResult:
-        """A DISPATCH_UNCERTAIN task, revisited on a later tick (item 2):
-        if the session now shows real activity (RUNNING, or simply no
-        longer showing an error), the send almost certainly landed --
-        promote straight to RUNNING rather than waiting out the full
-        grace period pointlessly. Otherwise leave it for reconcile_
-        uncertain_and_waiting's own grace-period timeout to eventually
-        return it to QUEUED (already run once at the top of this same
-        tick, before this method is ever reached -- so by construction
-        this branch only sees a task still genuinely within its grace
-        window)."""
+        """Inspect uncertain delivery without resending or guessing acceptance."""
         task = self.store.get_task(task_id)
-        status_response = self.ops.terminal_status(session)
+        observation = (task.metadata or {}).get("dispatch_observation", {})
+        if observation.get("requires_human"):
+            return TickResult(session, "DISPATCH_UNCERTAIN", task_id=task_id,
+                              detail="bounded inspection exhausted; human resolution required")
+        status_response = self.ops.terminal_status(session) or {}
         # DELIVERY_UNKNOWN means only that acceptance was not observable in
         # the submit window. The worker may already have completed before a
         # later tick. Reconcile the same nonce-bound evidence used by the
         # ordinary VERIFYING path before considering any grace-period retry;
         # this completes without resending and cannot accept the marker that
         # was embedded in our own dispatched instruction.
-        capture = self.ops.terminal_tail(session, 200)
+        # Match the pre-dispatch window length exactly. Comparing a 200-line
+        # post-dispatch tail with the 40-line baseline makes the hashes differ
+        # even when the pane did not change, which would turn observation
+        # shape into false execution evidence.
+        capture = self.ops.terminal_tail(session, 40)
         output = worker_output_after_prompt(str(capture.get("output") or ""))
         marker = parse_completion_marker(output)
         if verify_completion_marker(
@@ -1084,9 +1145,12 @@ class QueueEngine:
         ):
             # Preserve the existing state machine/audit path: uncertain
             # delivery is first confirmed as started, then verified complete.
-            self.store.transition_task(
-                task_id, RUNNING, event_type="STARTED",
-                reason="verified completion proves uncertain dispatch was accepted")
+            self.store.mark_running_with_evidence(task_id, evidence={
+                "accepted": True, "signal": "completion_marker",
+                "submission_id": observation.get("submission_id"),
+                "session": session, "node": status_response.get("node_id"),
+                "accepted_at": iso_now(), "evidence": ["valid_task_nonce_completion_marker"],
+            }, reason="verified completion proves uncertain dispatch was accepted")
             self.store.transition_task(
                 task_id, VERIFYING, event_type="VERIFYING",
                 reason="nonce-bound completion evidence observed during reconciliation")
@@ -1111,11 +1175,46 @@ class QueueEngine:
                 self.governor.note_success(completed)
             return TickResult(session, "COMPLETED", task_id=task_id,
                               detail="verified completion after uncertain dispatch")
-        if not status_response.get("error") and status_response.get("state") == "RUNNING":
-            self.store.transition_task(task_id, RUNNING, event_type="STARTED",
-                                       reason="confirmed real activity after DISPATCH_UNCERTAIN")
-            return TickResult(session, "RUNNING", task_id=task_id, detail="confirmed after uncertain dispatch")
-        return TickResult(session, "NO_OP", task_id=task_id, detail="still DISPATCH_UNCERTAIN, within grace period")
+        ui_state, ui_reason = detect_agent_ui_state(str(capture.get("output") or ""))
+        from .adapters import TARGET_COMPOSER, select_adapter
+        pane_lines = str(capture.get("output") or status_response.get("last_output") or "").splitlines()
+        command = str(status_response.get("current_command") or "")
+        target_state = select_adapter(command).identify_target_state(pane_lines)
+        if target_state == TARGET_COMPOSER:
+            ui_state = "IDLE"
+        baseline_hash = observation.get("output_sha256")
+        current_output = str(capture.get("output") or "")
+        current_hash = hashlib.sha256(current_output.encode()).hexdigest() if current_output else None
+        output_changed = bool(baseline_hash and current_hash and current_hash != baseline_hash and output.strip())
+        accepted = False
+        signal = None
+        if status_response.get("execution_started") is True:
+            accepted, signal = True, "process_started"
+        elif status_response.get("ack_state") in {"ACCEPTED", "RUNNING", "EXECUTION_STARTED"}:
+            accepted, signal = True, "agent_acceptance"
+        elif ui_state == "RUNNING":
+            accepted, signal = True, "explicit_running_signal"
+        elif status_response.get("state") == "RUNNING" and ui_state != "IDLE":
+            accepted, signal = True, "explicit_running_signal"
+        elif output_changed and output.strip():
+            accepted, signal = True, "post_submit_output"
+        if accepted:
+            self.store.mark_running_with_evidence(task_id, evidence={
+                "accepted": True, "signal": signal,
+                "submission_id": observation.get("submission_id"),
+                "dispatch_idempotency_key": observation.get("dispatch_idempotency_key"),
+                "session": session, "node": status_response.get("node_id"),
+                "accepted_at": iso_now(), "evidence": [ui_reason if ui_state == "RUNNING" else signal],
+            }, reason="execution evidence observed while reconciling uncertain dispatch")
+            return TickResult(session, "RUNNING", task_id=task_id, detail=f"accepted: {signal}")
+        outcome = "NOT_ACCEPTED" if ui_state == "IDLE" else "STILL_UNCERTAIN"
+        recovery = self.store.record_uncertain_reconciliation(
+            task_id, outcome=outcome, submission_id=observation.get("submission_id"))
+        detail = ("agent remains idle; prompt not accepted, retry requires explicit safe resolution"
+                  if outcome == "NOT_ACCEPTED" else "delivery uncertain; inspected without resend")
+        if recovery.get("requires_human"):
+            detail = "bounded inspection exhausted; human resolution required"
+        return TickResult(session, "DISPATCH_UNCERTAIN", task_id=task_id, detail=detail)
 
     def _recheck_waiting_session(self, session: str, task_id: str) -> TickResult:
         """A WAITING_SESSION task, revisited on a later tick (item 9): if
@@ -1156,6 +1255,10 @@ class QueueEngine:
             self.governor.note_output(task, str(status_response.get("last_output") or ""))
 
         state = status_response.get("state")
+        metadata = task.metadata or {}
+        if not self.store._valid_execution_evidence(metadata):
+            return TickResult(session, "DISPATCH_UNCERTAIN", task_id=task_id,
+                              detail="execution evidence missing; refusing RUNNING/VERIFYING")
         watch = self.store.long_task_watch(task_id)
         if watch:
             output = str(status_response.get("last_output") or "")
@@ -1175,6 +1278,9 @@ class QueueEngine:
         if current_status == RUNNING:
             if state == "RUNNING":
                 return TickResult(session, "RUNNING", task_id=task_id)
+            if state not in {"IDLE", "WAITING_INPUT", "WAITING_APPROVAL", "PAGER"}:
+                return TickResult(session, "RUNNING", task_id=task_id,
+                                  detail=f"execution observed; state={state} is not completion evidence")
             if watch and watch.get("state") == "WATCHING" and not watch.get("first_checkpoint_at"):
                 # A long task that fell back to an idle prompt before its
                 # first checkpoint gets one bounded continuation.  This is

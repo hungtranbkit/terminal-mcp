@@ -9326,6 +9326,7 @@ WORK_HTML = r"""<!doctype html>
     // The task lifecycle, in the order it really happens. Drawn as steps so
     // an operator sees WHERE a task is instead of decoding one word.
     const FLOW = ['QUEUED', 'PRECHECK', 'READY', 'DISPATCHING', 'RUNNING', 'VERIFYING', 'COMPLETED'];
+    const STATUS_LABEL = {DISPATCH_UNCERTAIN: 'Đang xác nhận agent nhận task'};
     const BAD = {BLOCKED: 1, FAILED: 1, CANCELLED: 1, REVISION_REQUIRED: 1,
                  DISPATCH_UNCERTAIN: 1, WAITING_SESSION: 1, PAUSED: 1};
 
@@ -9380,7 +9381,7 @@ WORK_HTML = r"""<!doctype html>
       }
       // A status outside the happy path is shown as its own terminal step
       // rather than silently leaving every step dim.
-      if (BAD[status]) strip.appendChild(el('span', {className: 'step bad', text: status}));
+      if (BAD[status]) strip.appendChild(el('span', {className: 'step bad', text: STATUS_LABEL[status] || status}));
       return strip;
     }
 

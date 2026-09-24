@@ -16,7 +16,7 @@ def stores(tmp_path):
 def _complete_task(store, session="lane-a", metadata=None):
     (task_id,) = store.set_tasks(session, [{"prompt": "do the feature work", "metadata": metadata or {}}])
     store.transition_task(task_id, DISPATCHING, event_type="TEST")
-    store.transition_task(task_id, RUNNING, event_type="TEST")
+    store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     store.transition_task(task_id, VERIFYING, event_type="TEST")
     return store.mark_completed_with_evidence(task_id, evidence={"marker": "ok"})
 

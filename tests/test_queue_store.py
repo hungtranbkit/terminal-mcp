@@ -48,7 +48,11 @@ def test_every_documented_valid_transition_is_accepted(store, from_status, to_st
     # Walk QUEUED to from_status first via whatever path is shortest/valid,
     # then apply the transition under test.
     _drive_to_status(store, task_id, from_status)
-    updated = store.transition_task(task_id, to_status, event_type="TEST")
+    if to_status == RUNNING:
+        updated = store.mark_running_with_evidence(
+            task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
+    else:
+        updated = store.transition_task(task_id, to_status, event_type="TEST")
     assert updated.status == to_status
 
 
@@ -58,7 +62,7 @@ def _drive_to_status(store, task_id, status):
     store.transition_task(task_id, DISPATCHING, event_type="TEST")
     if status == DISPATCHING:
         return
-    store.transition_task(task_id, RUNNING, event_type="TEST")
+    store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     if status == RUNNING:
         return
     if status == VERIFYING:
@@ -129,7 +133,7 @@ def test_reconciliation_edge_exists_but_only_for_an_untouched_task(from_status, 
 def test_transition_task_raises_on_invalid_transition_and_never_mutates(store):
     task_id = _make_one_task(store)
     with pytest.raises(InvalidTransitionError):
-        store.transition_task(task_id, RUNNING, event_type="TEST")  # QUEUED -> RUNNING skips DISPATCHING
+        store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})  # QUEUED -> RUNNING skips DISPATCHING
     # Refused transition must not have partially applied.
     assert store.get_task(task_id).status == QUEUED
 
@@ -206,7 +210,7 @@ def test_migration_5_heals_a_real_already_migrated_db_missing_the_column(tmp_pat
 def test_set_tasks_replaces_pending_but_never_touches_in_flight(store):
     old_ids = store.set_tasks("lane-a", [{"prompt": "old-1"}, {"prompt": "old-2"}])
     store.transition_task(old_ids[0], DISPATCHING, event_type="TEST")
-    store.transition_task(old_ids[0], RUNNING, event_type="TEST")
+    store.mark_running_with_evidence(old_ids[0], evidence={"accepted": True, "signal": "explicit_running_signal"})
 
     new_ids = store.set_tasks("lane-a", [{"prompt": "new-1"}])
 
@@ -242,7 +246,7 @@ def test_next_dispatchable_task_returns_none_when_a_task_is_already_in_flight(st
     assert store.next_dispatchable_task("lane-a").id == ids[0]
     store.transition_task(ids[0], DISPATCHING, event_type="TEST")
     assert store.next_dispatchable_task("lane-a") is None  # b must wait
-    store.transition_task(ids[0], RUNNING, event_type="TEST")
+    store.mark_running_with_evidence(ids[0], evidence={"accepted": True, "signal": "explicit_running_signal"})
     assert store.next_dispatchable_task("lane-a") is None
     store.transition_task(ids[0], VERIFYING, event_type="TEST")
     store.transition_task(ids[0], COMPLETED, event_type="TEST")
@@ -272,7 +276,7 @@ def test_two_sessions_are_completely_independent_lanes(store):
 def test_pause_lane_moves_an_in_flight_task_to_paused_and_remembers_its_status(store):
     task_id = _make_one_task(store)
     store.transition_task(task_id, DISPATCHING, event_type="TEST")
-    store.transition_task(task_id, RUNNING, event_type="TEST")
+    store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     store.pause_lane("lane-a", reason="manual intervention detected")
     task = store.get_task(task_id)
     assert task.status == PAUSED
@@ -282,7 +286,7 @@ def test_pause_lane_moves_an_in_flight_task_to_paused_and_remembers_its_status(s
 def test_resume_lane_restores_a_paused_task_to_its_prior_status(store):
     task_id = _make_one_task(store)
     store.transition_task(task_id, DISPATCHING, event_type="TEST")
-    store.transition_task(task_id, RUNNING, event_type="TEST")
+    store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     store.pause_lane("lane-a", reason="test")
     store.resume_lane("lane-a")
     task = store.get_task(task_id)
@@ -304,7 +308,7 @@ def test_pause_with_no_in_flight_task_just_blocks_future_dispatch(store):
 def test_blocked_task_is_never_auto_retried_or_auto_skipped(store):
     ids = store.set_tasks("lane-a", [{"prompt": "a"}, {"prompt": "b"}])
     store.transition_task(ids[0], DISPATCHING, event_type="TEST")
-    store.transition_task(ids[0], RUNNING, event_type="TEST")
+    store.mark_running_with_evidence(ids[0], evidence={"accepted": True, "signal": "explicit_running_signal"})
     store.transition_task(ids[0], BLOCKED, event_type="TEST", reason="simulated failure")
     # b must NOT become dispatchable just because a failed.
     assert store.next_dispatchable_task("lane-a") is None
@@ -314,7 +318,7 @@ def test_blocked_task_is_never_auto_retried_or_auto_skipped(store):
 def test_retry_task_moves_blocked_back_to_queued_without_resetting_attempt_count(store):
     task_id = _make_one_task(store)
     store.transition_task(task_id, DISPATCHING, event_type="TEST")  # attempt_count -> 1
-    store.transition_task(task_id, RUNNING, event_type="TEST")
+    store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     store.transition_task(task_id, BLOCKED, event_type="TEST", reason="fail")
     store.retry_task(task_id)
     task = store.get_task(task_id)
@@ -325,14 +329,14 @@ def test_retry_task_moves_blocked_back_to_queued_without_resetting_attempt_count
 def test_skip_and_cancel_from_blocked(store):
     id_a = _make_one_task(store, session="lane-a", prompt="a")
     store.transition_task(id_a, DISPATCHING, event_type="TEST")
-    store.transition_task(id_a, RUNNING, event_type="TEST")
+    store.mark_running_with_evidence(id_a, evidence={"accepted": True, "signal": "explicit_running_signal"})
     store.transition_task(id_a, BLOCKED, event_type="TEST", reason="fail")
     store.skip_task(id_a)
     assert store.get_task(id_a).status == SKIPPED
 
     id_b = _make_one_task(store, session="lane-a", prompt="b")
     store.transition_task(id_b, DISPATCHING, event_type="TEST")
-    store.transition_task(id_b, RUNNING, event_type="TEST")
+    store.mark_running_with_evidence(id_b, evidence={"accepted": True, "signal": "explicit_running_signal"})
     store.transition_task(id_b, BLOCKED, event_type="TEST", reason="fail")
     store.cancel_task(id_b)
     assert store.get_task(id_b).status == CANCELLED
@@ -363,7 +367,7 @@ def test_clear_tasks_only_pending_never_touches_in_flight(store):
 def test_clear_tasks_not_only_pending_also_clears_blocked_but_never_in_flight(store):
     ids = store.set_tasks("lane-a", [{"prompt": "a"}, {"prompt": "b"}])
     store.transition_task(ids[0], DISPATCHING, event_type="TEST")
-    store.transition_task(ids[0], RUNNING, event_type="TEST")
+    store.mark_running_with_evidence(ids[0], evidence={"accepted": True, "signal": "explicit_running_signal"})
     store.transition_task(ids[0], BLOCKED, event_type="TEST", reason="fail")
     cleared = store.clear_tasks("lane-a", only_pending=False)
     assert store.get_task(ids[0]).status == CANCELLED
@@ -426,7 +430,7 @@ def test_move_task_to_session_same_session_is_a_noop_not_an_error(store):
 def test_move_task_to_session_refuses_running_task(store):
     task_id = _make_one_task(store, session="lane-a")
     store.transition_task(task_id, DISPATCHING, event_type="DISPATCH_ATTEMPTED")
-    store.transition_task(task_id, RUNNING, event_type="DISPATCH_CONFIRMED")
+    store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     result = store.move_task_to_session(task_id, "lane-b")
     assert result == {"error": "TASK_NOT_MOVABLE", "task_id": task_id, "status": RUNNING}
     # Refused -- task must still be exactly where it was, unchanged.

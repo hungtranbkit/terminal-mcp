@@ -35,7 +35,7 @@ def rig(tmp_path):
 def running_task(queue: QueueService, *, session: str = "vq-lane") -> str:
     (task_id,) = queue.store.set_tasks(session, [{"title": "impl", "prompt": "do the work"}])
     queue.store.transition_task(task_id, qs.DISPATCHING, event_type="DISPATCHING")
-    queue.store.transition_task(task_id, qs.RUNNING, event_type="RUNNING")
+    queue.store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     return task_id
 
 

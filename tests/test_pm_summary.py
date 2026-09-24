@@ -105,7 +105,7 @@ def test_detect_stale_backlog_tasks_never_flags_running_or_done(queue):
         connection.execute("UPDATE queue_tasks SET created_at = '2020-01-01T00:00:00+00:00' WHERE id = ?",
                            (task_id,))
     queue.store.transition_task(task_id, "DISPATCHING", event_type="TEST")
-    queue.store.transition_task(task_id, "RUNNING", event_type="TEST")
+    queue.store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     result = detect_stale_backlog_tasks(queue, stale_after_hours=24.0)
     assert result["count"] == 0  # RUNNING, not backlog/queued
 
@@ -131,7 +131,7 @@ def test_detect_duplicate_tasks_never_counts_done_tasks(queue):
     a = queue.create_task("t1", "same prompt", session="lane-a")["task_id"]
     queue.create_task("t2", "same prompt", session="lane-b")
     queue.store.transition_task(a, "DISPATCHING", event_type="TEST")
-    queue.store.transition_task(a, "RUNNING", event_type="TEST")
+    queue.store.mark_running_with_evidence(a, evidence={"accepted": True, "signal": "explicit_running_signal"})
     queue.store.transition_task(a, "VERIFYING", event_type="TEST")
     queue.store.mark_completed_with_evidence(a, evidence={"ok": True})
     result = detect_duplicate_tasks(queue)

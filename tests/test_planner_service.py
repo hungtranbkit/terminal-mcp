@@ -147,7 +147,7 @@ def test_children_progress_counts_real_child_statuses(planner):
     result = planner.propose_split(parent["task_id"], _children(2, session="lane-a"), mode=MODE_AUTO)
     child_a, child_b = result["child_task_ids"]
     planner.queue.store.transition_task(child_a, "DISPATCHING", event_type="TEST")
-    planner.queue.store.transition_task(child_a, "RUNNING", event_type="TEST")
+    planner.queue.store.mark_running_with_evidence(child_a, evidence={"accepted": True, "signal": "explicit_running_signal"})
     planner.queue.store.transition_task(child_a, "VERIFYING", event_type="TEST")
     planner.queue.store.mark_completed_with_evidence(child_a, evidence={"ok": True})
 
@@ -168,7 +168,7 @@ def test_complete_parent_if_children_done_completes_once_all_children_done(plann
     result = planner.propose_split(parent["task_id"], _children(1, session="lane-a"), mode=MODE_AUTO)
     (child_id,) = result["child_task_ids"]
     planner.queue.store.transition_task(child_id, "DISPATCHING", event_type="TEST")
-    planner.queue.store.transition_task(child_id, "RUNNING", event_type="TEST")
+    planner.queue.store.mark_running_with_evidence(child_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     planner.queue.store.transition_task(child_id, "VERIFYING", event_type="TEST")
     planner.queue.store.mark_completed_with_evidence(child_id, evidence={"ok": True})
 
@@ -195,7 +195,7 @@ def test_a_cancelled_child_still_allows_parent_completion(planner):
     result = planner.propose_split(parent["task_id"], _children(2, session="lane-a"), mode=MODE_AUTO)
     done_child, cancelled_child = result["child_task_ids"]
     planner.queue.store.transition_task(done_child, "DISPATCHING", event_type="TEST")
-    planner.queue.store.transition_task(done_child, "RUNNING", event_type="TEST")
+    planner.queue.store.mark_running_with_evidence(done_child, evidence={"accepted": True, "signal": "explicit_running_signal"})
     planner.queue.store.transition_task(done_child, "VERIFYING", event_type="TEST")
     planner.queue.store.mark_completed_with_evidence(done_child, evidence={"ok": True})
     planner.queue.store.transition_task(cancelled_child, "CANCELLED", event_type="TEST")

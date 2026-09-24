@@ -148,7 +148,7 @@ async def test_a_completed_queue_task_with_integration_required_publishes_a_real
     queue.store.transition_task(task_id, "PRECHECK", event_type="TEST")
     queue.store.transition_task(task_id, "READY", event_type="TEST")
     queue.store.transition_task(task_id, "DISPATCHING", event_type="TEST")
-    queue.store.transition_task(task_id, "RUNNING", event_type="TEST")
+    queue.store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     queue.store.transition_task(task_id, "VERIFYING", event_type="TEST")
 
     verify_result = await _call(mcp_server, "terminal_queue_verify", session="lane-a", task_id=task_id,

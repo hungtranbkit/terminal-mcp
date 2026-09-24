@@ -72,7 +72,7 @@ def _running_task(store: QueueStore, *, metadata=None, title="impl"):
     ids = store.set_tasks(SESSION, [{"title": title, "prompt": "work",
                                      "project_id": PROJECT, "metadata": metadata or {}}])
     store.transition_task(ids[0], qs.DISPATCHING, event_type="DISPATCHING")
-    return store.transition_task(ids[0], qs.RUNNING, event_type="RUNNING")
+    return store.mark_running_with_evidence(ids[0], evidence={"accepted": True, "signal": "explicit_running_signal"})
 
 
 def _pass_verification(queue: QueueService, task):

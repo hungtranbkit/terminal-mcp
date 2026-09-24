@@ -94,11 +94,10 @@ either way). Distinct from a bare re-QUEUED task specifically so a
 dashboard/ChatGPT/operator can SEE "this one's outcome is genuinely
 unknown right now" rather than it silently looking like an ordinary
 still-waiting task -- the whole point of this status existing at all.
-Never resolved by guessing: reconcile_uncertain_and_waiting either
-confirms real activity (-> RUNNING) or, after a grace period with none,
-falls back to QUEUED for a safe re-attempt (same sticky dispatch_
-idempotency_key, so a send that actually DID land is still deduped by
-core.py's own idempotent_sends store rather than repeated)."""
+Never resolved by guessing or by timeout: the follower inspects durable
+submission identity and pane evidence; after bounded inconclusive checks,
+the task remains here and is marked requires_human. A possible prior
+acceptance is never blindly resent."""
 RUNNING = "RUNNING"
 VERIFYING = "VERIFYING"
 COMPLETED = "COMPLETED"    # == spec's "VERIFIED_DONE"
@@ -284,7 +283,6 @@ VALID_TRANSITIONS: dict[str, frozenset[str]] = {
     }),
     DISPATCH_UNCERTAIN: frozenset({
         RUNNING,   # later evidence confirms it really was delivered
-        QUEUED,    # grace period elapsed with no confirming evidence -- safe re-attempt (same sticky key)
         CANCELLED, PAUSED,
     }),
     RUNNING: frozenset({VERIFYING, WAITING_SESSION, BLOCKED, FAILED, CANCELLED, PAUSED}),
@@ -574,6 +572,24 @@ def _parse_json_object(raw: str | None) -> dict[str, Any]:
     except (TypeError, ValueError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+_INTERNAL_TASK_METADATA_KEYS = frozenset({
+    "execution_evidence", "dispatch_observation", "dispatch_reconciliation",
+})
+
+
+def _external_task_metadata(raw: Any) -> dict[str, Any]:
+    """Drop queue-owned evidence keys supplied by task creators.
+
+    Execution evidence is written only by the dispatch lifecycle. Accepting
+    the same keys from enqueue metadata would let a caller pre-seed a fake
+    acceptance and defeat the state-transition guard.
+    """
+    metadata = dict(raw) if isinstance(raw, dict) else {}
+    for key in _INTERNAL_TASK_METADATA_KEYS:
+        metadata.pop(key, None)
+    return metadata
 
 
 def _parse_json_list(raw: str | None) -> list[str]:
@@ -1733,7 +1749,8 @@ class QueueStore:
                     "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (task_id, session, next_position + offset, task.get("title") or "", task["prompt"], QUEUED, now,
                      int(task.get("max_attempts") or 3), json.dumps(task.get("completion_policy") or {}),
-                     json.dumps(task.get("metadata") or {}), now, int(task.get("priority") or 0),
+                     json.dumps(_external_task_metadata(task.get("metadata") or {})),
+                     now, int(task.get("priority") or 0),
                      json.dumps(list(task.get("depends_on") or [])), session,
                      task.get("project_id"), task.get("request_key") or None,
                      json.dumps(task["analysis"]) if task.get("analysis") else None),
@@ -2550,6 +2567,15 @@ class QueueStore:
         guarded_invalidation = allow_completion_invalidation and from_status == COMPLETED and to_status == CANCELLED
         if not is_valid_transition(from_status, to_status) and not guarded_invalidation:
             raise InvalidTransitionError(f"{task_id}: {from_status} -> {to_status} is not a valid transition")
+        if to_status in (RUNNING, VERIFYING):
+            if extra_fields and "metadata" in extra_fields:
+                metadata = _parse_json_object(extra_fields["metadata"])
+            else:
+                current = connection.execute("SELECT metadata FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+                metadata = _parse_json_object(current["metadata"] if current else None)
+            if not self._valid_execution_evidence(metadata):
+                raise InvalidTransitionError(
+                    f"{task_id}: {from_status} -> {to_status} requires recorded execution evidence")
         now = iso_now()
         fields = {"status": to_status, "updated_at": now,
                   "inactive_observed_at": None, "inactive_signature": None}
@@ -2790,6 +2816,76 @@ class QueueStore:
         except Exception:  # noqa: BLE001 -- diagnostics must never break dispatch
             _LOGGER.warning("could not record delivery verdict for %s", task_id, exc_info=True)
 
+    @staticmethod
+    def _valid_execution_evidence(metadata: dict[str, Any]) -> bool:
+        evidence = metadata.get("execution_evidence")
+        return (isinstance(evidence, dict) and evidence.get("accepted") is True
+                and evidence.get("signal") in {
+                    "agent_acceptance", "post_submit_output", "process_started",
+                    "explicit_running_signal", "completion_marker",
+                })
+
+    def record_dispatch_observation(self, task_id: str, observation: dict[str, Any]) -> None:
+        """Persist bounded, non-content dispatch identity and baseline data."""
+        allowed = {key: observation[key] for key in (
+            "submission_id", "dispatch_idempotency_key", "node_id", "state",
+            "output_sha256", "observed_at", "signal", "reconciliation_attempts",
+            "requires_human",
+        ) if key in observation}
+        with self._connection() as connection:
+            row = connection.execute("SELECT metadata FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            metadata = _parse_json_object(row["metadata"])
+            current = metadata.get("dispatch_observation")
+            current = dict(current) if isinstance(current, dict) else {}
+            current.update(allowed)
+            metadata["dispatch_observation"] = current
+            connection.execute("UPDATE queue_tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+                               (json.dumps(metadata), iso_now(), task_id))
+
+    def record_uncertain_reconciliation(self, task_id: str, *, outcome: str,
+                                        submission_id: str | None = None,
+                                        max_attempts: int = 5) -> dict[str, Any]:
+        """Count bounded inspections without ever converting uncertainty to retry."""
+        with self._connection() as connection:
+            row = connection.execute("SELECT metadata FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            metadata = _parse_json_object(row["metadata"])
+            observation = metadata.get("dispatch_observation")
+            observation = dict(observation) if isinstance(observation, dict) else {}
+            attempts = int(observation.get("reconciliation_attempts") or 0) + 1
+            observation.update({"reconciliation_attempts": attempts,
+                                "last_reconciliation": outcome,
+                                "last_reconciled_at": iso_now(),
+                                "requires_human": attempts >= max_attempts})
+            if submission_id:
+                observation["submission_id"] = submission_id
+            metadata["dispatch_observation"] = observation
+            connection.execute("UPDATE queue_tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+                               (json.dumps(metadata), iso_now(), task_id))
+        return observation
+
+    def mark_running_with_evidence(self, task_id: str, *, evidence: dict[str, Any],
+                                   reason: str | None = None) -> QueueTask:
+        """Atomically store execution proof and advance into RUNNING."""
+        if evidence.get("accepted") is not True or evidence.get("signal") not in {
+                "agent_acceptance", "post_submit_output", "process_started",
+                "explicit_running_signal", "completion_marker"}:
+            raise InvalidTransitionError(f"{task_id}: valid execution evidence is required")
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            metadata = _parse_json_object(row["metadata"])
+            metadata["execution_evidence"] = {**evidence, "accepted_at": evidence.get("accepted_at") or iso_now()}
+            return self._transition_locked(
+                connection, task_id, row["status"], RUNNING,
+                event_type="STARTED", reason=reason,
+                extra_fields={"metadata": json.dumps(metadata)},
+            )
+
     def record_coordinator_decision(self, task_id: str, *, status: str, reason: str,
                                     blockers: list[str] | None = None, required_actions: list[str] | None = None,
                                     evidence: dict[str, Any] | None = None) -> QueueTask:
@@ -3022,16 +3118,10 @@ class QueueStore:
         itself is still safely in progress (a healthy engine keeps
         renewing/finishing well within the lease). PRECHECK is always
         safe to reconcile straight back to QUEUED (nothing was ever sent
-        to any session in that state). DISPATCHING is reconciled to
-        QUEUED too -- this deliberately does NOT re-check delivery
-        evidence here; that is queue_engine.py's own job on its next
-        claim of the task (it re-derives an idempotency_key from
-        (task_id, attempt_count) before ever calling terminal_send_text
-        again, so even if the original send DID go through, the durable
-        idempotency store -- core.py's terminal_send_text idempotency_
-        key -- returns the original result instead of sending twice;
-        see queue_engine.py's own module docstring). Returns the ids
-        actually reconciled."""
+        to any session in that state). DISPATCHING crosses the submit
+        boundary and therefore becomes DISPATCH_UNCERTAIN; the follower
+        inspects it without a blind resend. Returns ids actually
+        reconciled."""
         now = now or iso_now()
         with self._connection() as connection:
             clause = "session = ? AND " if session else ""
@@ -3043,11 +3133,16 @@ class QueueStore:
             ).fetchall()
             reconciled = []
             for row in rows:
-                self._transition_locked(connection, row["id"], row["status"], QUEUED,
+                target = DISPATCH_UNCERTAIN if row["status"] == DISPATCHING else QUEUED
+                extra = {"claimed_by": None, "claim_token": None, "lease_expires_at": None}
+                if target == DISPATCH_UNCERTAIN:
+                    extra["uncertain_or_waiting_since"] = now
+                self._transition_locked(connection, row["id"], row["status"], target,
                                         event_type="RECOVERED_AFTER_RESTART",
-                                        reason="stale lease reconciled after restart",
-                                        extra_fields={"claimed_by": None, "claim_token": None,
-                                                     "lease_expires_at": None})
+                                        reason=("stale dispatch requires evidence-based reconciliation"
+                                                if target == DISPATCH_UNCERTAIN else
+                                                "stale precheck reconciled after restart"),
+                                        extra_fields=extra)
                 reconciled.append(row["id"])
         return reconciled
 
@@ -3273,16 +3368,13 @@ class QueueStore:
 
     def reconcile_uncertain_and_waiting(self, session: str | None = None, *, grace_seconds: float = 60.0,
                                         now: str | None = None) -> list[str]:
-        """Restart-safe AND ordinary-operation reconciliation (item 2/9):
-        a DISPATCH_UNCERTAIN or WAITING_SESSION task older than
-        grace_seconds (by its own uncertain_or_waiting_since clock, which
-        survives a restart same as lease_expires_at does) falls back to
-        QUEUED for a fresh attempt -- WAITING_SESSION always via this
-        path (its only outgoing edge); DISPATCH_UNCERTAIN only reaches
-        here if queue_engine.py's own more specific re-check (did the
-        session show real activity since?) didn't already resolve it to
-        RUNNING first. Never drops a task -- the worst case is an extra,
-        safely-deduped retry attempt, never silence."""
+        """Restart-safe recovery for tasks whose SESSION was unavailable.
+
+        A delivery-uncertain task is deliberately excluded: elapsed time is
+        not proof that the target did not accept the prompt. QueueEngine
+        performs bounded pane/composer reconciliation and leaves unresolved
+        work in DISPATCH_UNCERTAIN for human resolution, never blind retry.
+        """
         now_epoch = now or iso_now()
         # calendar.timegm (NOT time.mktime, which wrongly assumes its
         # struct_time input is LOCAL time) -- these timestamps are
@@ -3297,9 +3389,9 @@ class QueueStore:
             clause = "session = ? AND " if session else ""
             params: tuple[Any, ...] = (session,) if session else ()
             rows = connection.execute(
-                f"SELECT id, status FROM queue_tasks WHERE {clause}status IN (?, ?) "
+                f"SELECT id, status FROM queue_tasks WHERE {clause}status = ? "
                 f"AND uncertain_or_waiting_since IS NOT NULL AND uncertain_or_waiting_since < ?",
-                (*params, DISPATCH_UNCERTAIN, WAITING_SESSION, cutoff),
+                (*params, WAITING_SESSION, cutoff),
             ).fetchall()
             reconciled = []
             for row in rows:

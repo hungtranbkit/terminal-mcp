@@ -86,7 +86,7 @@ def test_feeder_rechecks_dependencies_fail_closed(tmp_path):
     store.transition_task(task.id, "PRECHECK", event_type="TEST")
     store.transition_task(task.id, "READY", event_type="TEST")
     store.transition_task(task.id, "DISPATCHING", event_type="TEST")
-    store.transition_task(task.id, "RUNNING", event_type="TEST")
+    store.mark_running_with_evidence(task.id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     store.transition_task(task.id, "VERIFYING", event_type="TEST")
     store.mark_completed_with_evidence(task.id, evidence={"test": True})
 
@@ -110,7 +110,7 @@ def test_terminal_dedup_does_not_reenqueue_stale_registry_task(tmp_path):
     store.transition_task(row.id, "PRECHECK", event_type="TEST")
     store.transition_task(row.id, "READY", event_type="TEST")
     store.transition_task(row.id, "DISPATCHING", event_type="TEST")
-    store.transition_task(row.id, "RUNNING", event_type="TEST")
+    store.mark_running_with_evidence(row.id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     store.transition_task(row.id, "VERIFYING", event_type="TEST")
     store.mark_completed_with_evidence(row.id, evidence={"test": True})
 

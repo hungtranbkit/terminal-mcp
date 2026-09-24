@@ -59,7 +59,7 @@ def test_compute_load_reports_current_task_runtime(store, ops):
     store.transition_task(task_id, "PRECHECK", event_type="TEST")
     store.transition_task(task_id, "READY", event_type="TEST")
     store.transition_task(task_id, "DISPATCHING", event_type="TEST")
-    store.transition_task(task_id, "RUNNING", event_type="TEST")
+    store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     ops.set_status("lane-a", {"state": "RUNNING"})
     planner = TaskMigrationPlanner(store, ops)
     load = planner.compute_load("lane-a")

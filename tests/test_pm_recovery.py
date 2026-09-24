@@ -138,7 +138,7 @@ def test_running_work_is_never_moved_on_a_timer(store):
                           event_type="TEST")
     task_id = store.lane_status("worker")["tasks"][0]["id"]
     store.transition_task(task_id, "DISPATCHING", event_type="TEST")
-    store.transition_task(task_id, "RUNNING", event_type="TEST")
+    store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
 
     fleet = _Fleet(nodes=[_Node(id="live")], sessions=[{"name": "worker", "node_id": "live"}])
     recovery = ProjectPMRecovery(store, router=_Router(session="x"), controller=fleet,
@@ -275,7 +275,11 @@ def test_a_task_queued_behind_live_work_is_not_called_stalled(store):
     store.bind_task_to_session(first, "worker", node_id="live", routing_state=BOUND,
                                evidence={"reason": "test"})
     for status in ("PRECHECK", "READY", "DISPATCHING", "RUNNING"):
-        store.transition_task(first, status, event_type="TEST")
+        if status == "RUNNING":
+            store.mark_running_with_evidence(
+                first, evidence={"accepted": True, "signal": "explicit_running_signal"})
+        else:
+            store.transition_task(first, status, event_type="TEST")
     _bound_task(store, session="worker", node_id="live")
 
     fleet = _Fleet(nodes=[_Node(id="live")], sessions=[{"name": "worker", "node_id": "live"}])

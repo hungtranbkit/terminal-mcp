@@ -167,7 +167,7 @@ async def test_queue_tasks_follow_the_rename_including_a_running_one(rig):
         queue.store.transition_task(running["task_id"], "PRECHECK", event_type="TEST")
         queue.store.transition_task(running["task_id"], "READY", event_type="TEST")
         queue.store.transition_task(running["task_id"], "DISPATCHING", event_type="TEST")
-        queue.store.transition_task(running["task_id"], "RUNNING", event_type="TEST")
+        queue.store.mark_running_with_evidence(running["task_id"], evidence={"accepted": True, "signal": "explicit_running_signal"})
 
         result = await _call(server, "terminal_rename_session", name=old, new_name=new)
         assert "error" not in result, result

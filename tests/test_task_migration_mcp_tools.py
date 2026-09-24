@@ -151,7 +151,7 @@ async def test_reassign_refuses_a_running_task(rig):
     queue.store.transition_task(task_id, "PRECHECK", event_type="TEST")
     queue.store.transition_task(task_id, "READY", event_type="TEST")
     queue.store.transition_task(task_id, "DISPATCHING", event_type="TEST")
-    queue.store.transition_task(task_id, "RUNNING", event_type="TEST")
+    queue.store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
 
     reassign_result = await _call(server, "terminal_task_reassign", task_id=task_id, to_session="migrate-b",
                                   reason="test", actor="chatgpt")

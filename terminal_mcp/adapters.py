@@ -484,8 +484,12 @@ class CodexAdapter(AgentAdapter):
     buffers_embedded_newlines = True
     submit_policy = CODEX_SUBMIT_POLICY
 
+    _IDLE_COMPOSER = re.compile(r"^\s*[›>]\s*Ask Codex to do anything\s*$", re.IGNORECASE)
+
     def identify_target_state(self, lines: list[str]) -> str:
         tail = _tail(lines, 6)
+        if any(self._IDLE_COMPOSER.search(line) for line in tail.splitlines()):
+            return TARGET_COMPOSER
         if _match_any(_WAITING_PATTERNS, tail):
             return TARGET_WAITING
         if _match_any(_WORKING_PATTERNS, tail):

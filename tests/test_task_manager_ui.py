@@ -73,7 +73,7 @@ def test_one_running_and_many_waiting_group_correctly(rig):
     queue.store.transition_task(running_id, "PRECHECK", event_type="TEST")
     queue.store.transition_task(running_id, "READY", event_type="TEST")
     queue.store.transition_task(running_id, "DISPATCHING", event_type="TEST")
-    queue.store.transition_task(running_id, "RUNNING", event_type="TEST")
+    queue.store.mark_running_with_evidence(running_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
 
     board = queue.session_task_board(name)
     assert board["summary"]["running"] == 1
@@ -129,7 +129,7 @@ def test_recent_completed_and_failed_are_capped_and_sorted(rig):
         queue.store.transition_task(task_id, "PRECHECK", event_type="TEST")
         queue.store.transition_task(task_id, "READY", event_type="TEST")
         queue.store.transition_task(task_id, "DISPATCHING", event_type="TEST")
-        queue.store.transition_task(task_id, "RUNNING", event_type="TEST")
+        queue.store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
         queue.store.transition_task(task_id, "VERIFYING", event_type="TEST")
         queue.store.mark_completed_with_evidence(task_id, evidence={"output_tail": "done"})
     board = queue.session_task_board(name, recent_limit=2)
@@ -491,7 +491,7 @@ def test_dashboard_tasks_board_route_shows_child_progress_for_split_parent(tmp_p
     split = planner.propose_split(parent["task_id"], children, mode="AUTO")
     done_child = split["child_task_ids"][0]
     queue.store.transition_task(done_child, "DISPATCHING", event_type="TEST")
-    queue.store.transition_task(done_child, "RUNNING", event_type="TEST")
+    queue.store.mark_running_with_evidence(done_child, evidence={"accepted": True, "signal": "explicit_running_signal"})
     queue.store.transition_task(done_child, "VERIFYING", event_type="TEST")
     queue.store.mark_completed_with_evidence(done_child, evidence={"ok": True})
 

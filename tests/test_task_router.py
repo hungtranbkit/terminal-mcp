@@ -541,7 +541,11 @@ def test_a_completed_task_releases_its_session_for_the_next_one(store, queue):
     router = _router(store, queue, controller)
     first = router.route_start("one")
     for status in ("RUNNING", "VERIFYING", COMPLETED):
-        store.transition_task(first["task_id"], status, event_type="TEST")
+        if status == "RUNNING":
+            store.mark_running_with_evidence(
+                first["task_id"], evidence={"accepted": True, "signal": "explicit_running_signal"})
+        else:
+            store.transition_task(first["task_id"], status, event_type="TEST")
 
     second = router.route_start("two")
 

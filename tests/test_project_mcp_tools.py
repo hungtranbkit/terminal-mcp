@@ -49,7 +49,7 @@ async def test_status_through_the_real_tool(rig):
     server, queue, _ = rig
     task_id = scoped_task(queue, session="lane-a")
     queue.store.transition_task(task_id, qs.DISPATCHING, event_type="D")
-    queue.store.transition_task(task_id, qs.RUNNING, event_type="R")
+    queue.store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
 
     status = await _call(server, "terminal_project_status", project_id=PROJECT)
     assert status["project_id"] == PROJECT

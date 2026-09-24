@@ -99,6 +99,10 @@ ACCEPTANCE_TARGET_AWAITING_HUMAN = "ACCEPTANCE_TARGET_AWAITING_HUMAN"
 ACCEPTANCE_NOT_CHECKED = "ACCEPTANCE_NOT_CHECKED"
 ACCEPTANCE_UNOBSERVABLE = "ACCEPTANCE_UNOBSERVABLE"
 
+
+def _flatten(value: str) -> str:
+    return "".join(str(value).split())
+
 # Target states that are positive acceptance on their own: the agent is
 # demonstrably doing something with the prompt.
 _WORKING_TARGET_STATES = (TARGET_RUNNING,)
@@ -194,7 +198,8 @@ def classify_activation(send_result: dict[str, Any]) -> tuple[str, str, str | No
 
 def classify_acceptance(*, before_lines: list[str] | None, after_lines: list[str] | None,
                         target_state: str | None = None, adapter: Any = None,
-                        sent_text: str | None = None) -> tuple[bool, str, tuple[str, ...]]:
+                        sent_text: str | None = None,
+                        acceptance_signal: str | None = None) -> tuple[bool, str, tuple[str, ...]]:
     """Gate 2. -> (accepted, reason_code, evidence_codes).
 
     Positive acceptance requires one of:
@@ -210,11 +215,21 @@ def classify_acceptance(*, before_lines: list[str] | None, after_lines: list[str
         unobservable is never a pass.
     """
     evidence: list[str] = []
+    if acceptance_signal:
+        return True, ACCEPTANCE_ADAPTER_ACK, (ACCEPTANCE_ADAPTER_ACK,)
     if after_lines is None:
         return False, ACCEPTANCE_UNOBSERVABLE, ()
 
     if target_state == TARGET_WAITING:
         return False, ACCEPTANCE_TARGET_AWAITING_HUMAN, ()
+    # The task still visible in the composer is a definitive NOT_ACCEPTED
+    # signal. Its appearance changes the pane, but that change is our own
+    # injected prompt, not agent activity.
+    if target_state == TARGET_COMPOSER:
+        return False, ACCEPTANCE_PROMPT_STILL_IN_COMPOSER, ()
+    if (sent_text and target_state not in _WORKING_TARGET_STATES
+            and _flatten(sent_text) in _flatten("\n".join(after_lines))):
+        return False, ACCEPTANCE_PROMPT_STILL_IN_COMPOSER, ()
     if target_state in _WORKING_TARGET_STATES:
         evidence.append(ACCEPTANCE_TARGET_WORKING)
 
@@ -234,8 +249,6 @@ def classify_acceptance(*, before_lines: list[str] | None, after_lines: list[str
 
     # Nothing positive. Distinguish the diagnostic case a human most needs
     # to see -- the prompt still sitting in the composer, unsubmitted.
-    if target_state == TARGET_COMPOSER:
-        return False, ACCEPTANCE_PROMPT_STILL_IN_COMPOSER, ()
     return False, ACCEPTANCE_NOT_OBSERVED, ()
 
 
@@ -266,9 +279,14 @@ def evaluate(send_result: dict[str, Any], *, before_lines: list[str] | None = No
                                detail="acceptance not required by policy",
                                delivery_state=delivery_state, submission_id=submission_id)
 
+    ack_state = str(send_result.get("ack_state") or "").upper()
+    acceptance_signal = None
+    if send_result.get("execution_started") is True or ack_state in {
+            "ACCEPTED", "RUNNING", "EXECUTION_STARTED"}:
+        acceptance_signal = "transport_acknowledged_agent_acceptance"
     accepted, acceptance, evidence = classify_acceptance(
         before_lines=before_lines, after_lines=after_lines, target_state=target_state,
-        adapter=adapter, sent_text=sent_text)
+        adapter=adapter, sent_text=sent_text, acceptance_signal=acceptance_signal)
     if accepted:
         return DeliveryVerdict(kind=DELIVERED, activation=activation, acceptance=acceptance,
                                evidence=(ACTIVATION_CONFIRMED, *evidence), detail=None,

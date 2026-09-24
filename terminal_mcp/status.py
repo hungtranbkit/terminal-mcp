@@ -209,7 +209,10 @@ def classify_status(session: SessionInfo, output: str, now: int | None = None) -
             return "RUNNING", False, f"{command} adapter reports a turn in flight"
         if target == adapters.TARGET_COMPOSER:
             return "IDLE", False, f"{command} is back at its composer; the turn has finished"
-    if command in ACTIVE_COMMANDS and age <= 60:
+    # An agent CLI is a persistent interactive process: its pane command and
+    # a recent redraw do not prove that a task is executing. Agent commands
+    # reach RUNNING only through their own UI/footer or adapter evidence above.
+    if command in ACTIVE_COMMANDS and (command != "codex") and age <= 60:
         return "RUNNING", False, f"current command is {command!r}; tmux activity age is {age}s"
     if command in {"bash", "zsh", "sh", "fish"} and age > 60:
         return "IDLE", False, f"shell pane has no tmux activity for {age}s"

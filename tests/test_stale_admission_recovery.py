@@ -16,7 +16,7 @@ def setup_case(tmp_path, state="RUNNING", age=3600):
     ops = FakeOps()
     old_id = store.append_tasks("old-lane", [{"prompt": "old work"}])[0]
     store.transition_task(old_id, "DISPATCHING", event_type="DISPATCHING")
-    store.transition_task(old_id, "RUNNING", event_type="RUNNING")
+    store.mark_running_with_evidence(old_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     if state == "VERIFYING":
         store.transition_task(old_id, state, event_type=state)
     stamp = (datetime.now(timezone.utc) - timedelta(seconds=age)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -90,7 +90,7 @@ def test_one_probe_exception_does_not_strand_other_old_tasks(tmp_path):
     store, ops, _, engine, old_id = setup_case(tmp_path)
     other = store.append_tasks("other-old", [{"prompt": "other task"}])[0]
     store.transition_task(other, "DISPATCHING", event_type="DISPATCHING")
-    store.transition_task(other, "RUNNING", event_type="RUNNING")
+    store.mark_running_with_evidence(other, evidence={"accepted": True, "signal": "explicit_running_signal"})
     with sqlite3.connect(store.path) as c:
         c.execute("UPDATE queue_tasks SET updated_at=? WHERE id=?", (store.get_task(old_id).updated_at, other))
     def probe(session):

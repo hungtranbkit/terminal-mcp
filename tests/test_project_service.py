@@ -85,7 +85,7 @@ def test_lanes_are_discovered_from_both_sources(queue, projects):
 def test_status_reports_workers_blockers_and_counts(queue, projects):
     running = scoped_task(queue, session="lane-a", title="running one")
     queue.store.transition_task(running, qs.DISPATCHING, event_type="D")
-    queue.store.transition_task(running, qs.RUNNING, event_type="R")
+    queue.store.mark_running_with_evidence(running, evidence={"accepted": True, "signal": "explicit_running_signal"})
     blocked = scoped_task(queue, session="lane-a", title="blocked one")
     queue.store.transition_task(blocked, qs.DISPATCHING, event_type="D")
     queue.store.transition_task(blocked, qs.BLOCKED, event_type="B", reason="needs a human")
@@ -126,7 +126,7 @@ def test_unwired_subsystems_report_null_not_zero(queue):
 def test_status_surfaces_pending_verification_with_its_block_reason(queue, projects):
     task_id = scoped_task(queue, session="lane-a")
     queue.store.transition_task(task_id, qs.DISPATCHING, event_type="D")
-    task = queue.store.transition_task(task_id, qs.RUNNING, event_type="R")
+    task = queue.store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     queue.verify_queue.ensure_verify_job(task, required_capabilities=["dotnet", "windows"])
 
     verification = projects.status(PROJECT)["verification"]
@@ -148,7 +148,7 @@ def test_routability_uses_this_services_registry_not_only_the_verify_queues(queu
                              registry=_FakeRegistry([_node("linux-a", capabilities=["python"])]))
     task_id = scoped_task(queue, session="lane-a")
     queue.store.transition_task(task_id, qs.DISPATCHING, event_type="D")
-    task = queue.store.transition_task(task_id, qs.RUNNING, event_type="R")
+    task = queue.store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     queue.verify_queue.ensure_verify_job(task, required_capabilities=["python"])
 
     routing = service.status(PROJECT)["verification"]["pending"][0]["routability"]
@@ -238,7 +238,7 @@ def test_pause_then_resume_restores_a_running_task(queue, projects):
     pause must inherit that rather than dropping tasks to QUEUED."""
     task_id = scoped_task(queue, session="lane-a")
     queue.store.transition_task(task_id, qs.DISPATCHING, event_type="D")
-    queue.store.transition_task(task_id, qs.RUNNING, event_type="R")
+    queue.store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
 
     projects.pause(PROJECT, reason="freeze")
     assert queue.store.get_task(task_id).status == qs.PAUSED

@@ -52,7 +52,7 @@ async def test_raw_send_while_a_queue_task_is_active_carries_a_warning_and_is_au
     queue.store.transition_task(task_id, "PRECHECK", event_type="TEST")
     queue.store.transition_task(task_id, "READY", event_type="TEST")
     queue.store.transition_task(task_id, DISPATCHING, event_type="TEST")
-    queue.store.transition_task(task_id, RUNNING, event_type="TEST")
+    queue.store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
 
     result = await _call(server, "terminal_send_text", session=session, text="y", press_enter=True)
     assert result["sent"] is True  # the send itself still proceeded, unblocked

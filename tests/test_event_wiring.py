@@ -50,7 +50,7 @@ def test_a_full_task_lifecycle_produces_the_expected_stream(store, bus, tmp_path
     verify = VerifyQueue(store, event_sink=build_verify_event_sink(bus))
     task_id = scoped_task(store)
     store.transition_task(task_id, qs.DISPATCHING, event_type="D")
-    task = store.transition_task(task_id, qs.RUNNING, event_type="R")
+    task = store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     job = verify.ensure_verify_job(task, required_capabilities=["python"])
     claimed = verify.claim_next(verifier="v1", capabilities=["python"])
     verify.complete(job.id, claimed.claim_token, evidence={"command": "pytest", "exit_code": 0})
@@ -65,7 +65,7 @@ def test_events_are_attributed_and_project_scoped(store, bus):
     verify = VerifyQueue(store, event_sink=build_verify_event_sink(bus))
     task_id = scoped_task(store)
     store.transition_task(task_id, qs.DISPATCHING, event_type="D")
-    task = store.transition_task(task_id, qs.RUNNING, event_type="R")
+    task = store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     verify.ensure_verify_job(task, required_capabilities=["python"])
 
     by_type = {e["type"]: e for e in bus.list_events()}
@@ -84,7 +84,7 @@ def test_dispatching_does_not_double_emit_a_start(store, bus):
     number a consumer counted."""
     task_id = scoped_task(store)
     store.transition_task(task_id, qs.DISPATCHING, event_type="D")
-    store.transition_task(task_id, qs.RUNNING, event_type="R")
+    store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     assert [e["type"] for e in bus.list_events()].count("TASK_STARTED") == 1
 
 
@@ -94,7 +94,7 @@ def test_worker_done_and_verify_pending_are_distinct_signals(store, bus):
     verify = VerifyQueue(store, event_sink=build_verify_event_sink(bus))
     task_id = scoped_task(store)
     store.transition_task(task_id, qs.DISPATCHING, event_type="D")
-    task = store.transition_task(task_id, qs.RUNNING, event_type="R")
+    task = store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     verify.ensure_verify_job(task, required_capabilities=["dotnet"])
     types = [e["type"] for e in bus.list_events()]
     assert types.count("VERIFY_PENDING") == 1
@@ -163,7 +163,7 @@ def test_verify_transaction_drains_its_own_task_events(store, bus):
     verify = VerifyQueue(store, event_sink=build_verify_event_sink(bus))
     task_id = scoped_task(store)
     store.transition_task(task_id, qs.DISPATCHING, event_type="D")
-    task = store.transition_task(task_id, qs.RUNNING, event_type="R")
+    task = store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
 
     verify.ensure_verify_job(task, required_capabilities=["python"])
     # Immediately after the verify transaction -- before any further queue

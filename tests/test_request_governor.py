@@ -13,7 +13,7 @@ from terminal_mcp.request_governor import RequestGovernor, retry_after_seconds
 def _finish(store: QueueStore, task_id: str) -> None:
     store.transition_task(task_id, READY, event_type="READY")
     store.transition_task(task_id, DISPATCHING, event_type="DISPATCHED")
-    store.transition_task(task_id, RUNNING, event_type="STARTED")
+    store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     store.transition_task(task_id, VERIFYING, event_type="VERIFYING")
     store.transition_task(task_id, COMPLETED, event_type="COMPLETED")
 

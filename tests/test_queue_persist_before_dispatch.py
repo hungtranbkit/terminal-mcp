@@ -83,7 +83,18 @@ def test_dispatch_uncertain_does_not_occupy_the_lane_forever_and_blocks_new_clai
     assert store.claim_next_task("lane-a", claimed_by="e") is None  # b must wait
 
 
-def test_reconcile_uncertain_and_waiting_falls_back_to_queued_after_grace_period(store):
+def test_store_refuses_running_from_uncertain_without_execution_evidence(store):
+    from terminal_mcp.queue_store import InvalidTransitionError
+
+    task_id = _make_task(store)
+    store.transition_task(task_id, "DISPATCHING", event_type="TEST")
+    store.mark_dispatch_uncertain(task_id, reason="DELIVERY_UNKNOWN")
+
+    with pytest.raises(InvalidTransitionError, match="execution evidence"):
+        store.transition_task(task_id, RUNNING, event_type="STARTED")
+
+
+def test_grace_timeout_never_requeues_uncertain_delivery(store):
     task_id = _make_task(store)
     store.transition_task(task_id, "DISPATCHING", event_type="TEST")
     store.mark_dispatch_uncertain(task_id, reason="test")
@@ -91,10 +102,9 @@ def test_reconcile_uncertain_and_waiting_falls_back_to_queued_after_grace_period
         connection.execute("UPDATE queue_tasks SET uncertain_or_waiting_since = '2000-01-01T00:00:00Z' "
                           "WHERE id = ?", (task_id,))
     reconciled = store.reconcile_uncertain_and_waiting("lane-a")
-    assert task_id in reconciled
+    assert task_id not in reconciled
     task = store.get_task(task_id)
-    assert task.status == QUEUED
-    assert task.uncertain_or_waiting_since is None
+    assert task.status == DISPATCH_UNCERTAIN
 
 
 def test_reconcile_uncertain_and_waiting_never_touches_a_task_still_within_grace(store):
@@ -228,7 +238,7 @@ class FakeOps:
         if idempotency_key and idempotency_key in self._sent_by_key:
             return self._sent_by_key[idempotency_key]
         self.sent.append({"session": session, "text": text, "idempotency_key": idempotency_key})
-        response = {"sent": True, "delivery_state": "SUBMIT_CONFIRMED"}
+        response = {"sent": True, "delivery_state": "SUBMIT_CONFIRMED", "ack_state": "ACCEPTED"}
         if idempotency_key:
             self._sent_by_key[idempotency_key] = response
         return response
@@ -287,6 +297,61 @@ def test_engine_dispatch_uncertain_recovers_to_running_on_confirmed_activity(sto
     assert store.get_task(task_id).status == RUNNING
 
 
+def test_engine_keeps_dispatch_uncertain_when_codex_process_is_idle(store):
+    task_id = _make_task(store)
+
+    class UnknownOps(FakeOps):
+        def terminal_send_text(self, session, text, press_enter=False, dry_run=False, **kwargs):
+            return {"sent": True, "delivery_state": "DELIVERY_UNKNOWN", "submission_id": "submit-1"}
+
+    ops = UnknownOps()
+    ops.set_status("lane-a", {"state": "IDLE", "node_id": "local", "cwd": "/repo/a"})
+    engine = QueueEngine(store, ops, coordinator=_always_ready_gate())
+    engine.tick("lane-a")
+    engine.tick("lane-a")
+    assert engine.tick("lane-a").action == "DISPATCH_UNCERTAIN"
+
+    ops.set_status("lane-a", {
+        "state": "RUNNING", "current_command": "codex", "node_id": "local", "cwd": "/repo/a",
+        "reason": "current command is 'codex'; activity age is 5s",
+        "last_output": "› Ask Codex to do anything",
+    })
+    result = engine.tick("lane-a")
+
+    assert result.action == "DISPATCH_UNCERTAIN"
+    assert store.get_task(task_id).status == DISPATCH_UNCERTAIN
+
+
+def test_uncertain_reconciliation_does_not_treat_tail_length_change_as_execution(store):
+    task_id = _make_task(store)
+
+    class SamePaneOps(FakeOps):
+        def __init__(self):
+            super().__init__()
+            self.pane = "\n".join([*(f"old scrollback {i}" for i in range(80)),
+                                    "› Ask Codex to do anything"])
+
+        def terminal_tail(self, session, lines=None):
+            rows = self.pane.splitlines()
+            return {"output": "\n".join(rows[-lines:]) if lines else self.pane}
+
+        def terminal_send_text(self, session, text, press_enter=False, dry_run=False, **kwargs):
+            return {"sent": True, "delivery_state": "DELIVERY_UNKNOWN"}
+
+    ops = SamePaneOps()
+    ops.set_status("lane-a", {"state": "IDLE", "current_command": "codex", "node_id": "local",
+                               "cwd": "/repo/a", "last_output": ops.pane})
+    engine = QueueEngine(store, ops, coordinator=_always_ready_gate())
+    engine.tick("lane-a")
+    engine.tick("lane-a")
+    assert engine.tick("lane-a").action == "DISPATCH_UNCERTAIN"
+
+    result = engine.tick("lane-a")
+
+    assert result.action == "DISPATCH_UNCERTAIN"
+    assert store.get_task(task_id).status == DISPATCH_UNCERTAIN
+
+
 def test_session_unreachable_errors_is_a_narrow_deliberate_set():
     assert "SESSION_NOT_FOUND" in SESSION_UNREACHABLE_ERRORS
     assert "NODE_UNREACHABLE" in SESSION_UNREACHABLE_ERRORS
@@ -300,7 +365,7 @@ def test_session_unreachable_errors_is_a_narrow_deliberate_set():
 # reconcile_stale_claims test.
 # ---------------------------------------------------------------------------
 
-def test_restart_recovers_a_dispatch_uncertain_task_after_grace_period(tmp_path):
+def test_restart_preserves_uncertain_delivery_without_blind_retry(tmp_path):
     db_path = tmp_path / "queue.db"
     store1 = QueueStore(db_path)
     task_id = (store1.set_tasks("lane-a", [{"prompt": "a"}]))[0]
@@ -312,12 +377,8 @@ def test_restart_recovers_a_dispatch_uncertain_task_after_grace_period(tmp_path)
 
     store2 = QueueStore(db_path)  # fresh instance, same file -- "process restarted"
     reconciled = store2.reconcile_uncertain_and_waiting()
-    assert task_id in reconciled
-    assert store2.get_task(task_id).status == QUEUED
-    # And it's cleanly re-claimable from here on -- no double-dispatch,
-    # no drop.
-    reclaimed = store2.claim_next_task("lane-a", claimed_by="engine-after-restart")
-    assert reclaimed.id == task_id
+    assert task_id not in reconciled
+    assert store2.get_task(task_id).status == DISPATCH_UNCERTAIN
 
 
 def test_restart_recovers_a_waiting_session_task_after_grace_period(tmp_path):

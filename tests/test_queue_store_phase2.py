@@ -263,7 +263,7 @@ def test_reconcile_stale_claims_survives_a_simulated_restart(tmp_path):
 
 def _drive_to_verifying(store, task_id):
     store.transition_task(task_id, DISPATCHING, event_type="TEST")
-    store.transition_task(task_id, RUNNING, event_type="TEST")
+    store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     store.transition_task(task_id, VERIFYING, event_type="TEST")
 
 
@@ -298,7 +298,7 @@ def test_task_dependency_satisfied_once_dependency_completes(store):
     dep_id = _make_one_task(store, session="lane-a", prompt="dependency")
     (dependent_id,) = store.set_tasks("lane-b", [{"prompt": "depends on lane-a", "depends_on": [dep_id]}])
     store.transition_task(dep_id, DISPATCHING, event_type="TEST")
-    store.transition_task(dep_id, RUNNING, event_type="TEST")
+    store.mark_running_with_evidence(dep_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     store.transition_task(dep_id, VERIFYING, event_type="TEST")
     store.mark_completed_with_evidence(dep_id, evidence={"done": True})
 

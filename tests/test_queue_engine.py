@@ -54,7 +54,8 @@ class FakeOps:
         if idempotency_key and idempotency_key in self._sent_by_key:
             return self._sent_by_key[idempotency_key]  # real core.py behavior: return the ORIGINAL result
         self.sent.append({"session": session, "text": text, "idempotency_key": idempotency_key})
-        response = {"sent": True, "delivery_state": "SUBMIT_CONFIRMED", "node_id": "local"}
+        response = {"sent": True, "delivery_state": "SUBMIT_CONFIRMED", "node_id": "local",
+                    "ack_state": "ACCEPTED"}
         if idempotency_key:
             self._sent_by_key[idempotency_key] = response
         return response
@@ -132,6 +133,21 @@ def test_explicit_shell_task_is_still_allowed(store, ops):
     for _ in range(3):
         engine.tick("lane-a")
     assert store.get_task(task_id).status == RUNNING
+
+
+def test_submit_confirmed_without_acceptance_does_not_start_task(store, ops):
+    ops.terminal_send_text = lambda *args, **kwargs: {
+        "sent": True, "delivery_state": "SUBMIT_CONFIRMED", "node_id": "local"}
+    task_id = _make_task(store)
+    ops.set_status("lane-a", {"state": "IDLE", "node_id": "local", "cwd": "/repo/a"})
+    engine = QueueEngine(store, ops, coordinator=_always_ready_gate())
+
+    engine.tick("lane-a")  # claim
+    engine.tick("lane-a")  # coordinator review
+    result = engine.tick("lane-a")  # submit confirmed, but target stayed idle
+
+    assert result.action == "DISPATCH_UNCERTAIN"
+    assert store.get_task(task_id).status == "DISPATCH_UNCERTAIN"
 
 
 def test_agent_exit_between_review_and_dispatch_never_receives_prompt(store, ops):
@@ -730,7 +746,7 @@ def test_delivery_unknown_reconciles_to_queued_not_a_resend(store, ops):
     # A later tick with the session still not showing real activity --
     # stays DISPATCH_UNCERTAIN (within its grace period), never resent.
     still_uncertain = engine.tick("lane-a")
-    assert still_uncertain.action == "NO_OP"
+    assert still_uncertain.action == "DISPATCH_UNCERTAIN"
     assert store.get_task(task_id).status == "DISPATCH_UNCERTAIN"
     assert len(unknown_ops.sent) == 1
 
@@ -739,8 +755,8 @@ def test_delivery_unknown_reconciles_to_queued_not_a_resend(store, ops):
         connection.execute("UPDATE queue_tasks SET uncertain_or_waiting_since = '2000-01-01T00:00:00Z' "
                           "WHERE id = ?", (task_id,))
     reconciled = store.reconcile_uncertain_and_waiting("lane-a")
-    assert task_id in reconciled
-    assert store.get_task(task_id).status == QUEUED
+    assert task_id not in reconciled
+    assert store.get_task(task_id).status == "DISPATCH_UNCERTAIN"
 
 
 def test_delivery_unknown_completes_from_verified_worker_marker_without_resend(store, ops):
@@ -814,15 +830,12 @@ def test_reconciled_stale_dispatch_reuses_the_same_idempotency_key_and_never_dou
                           "WHERE id = ?", (task_id,))
     reconciled = store.reconcile_stale_claims("lane-a")
     assert task_id in reconciled
-    assert store.get_task(task_id).status == QUEUED
+    assert store.get_task(task_id).status == "DISPATCH_UNCERTAIN"
     assert store.get_task(task_id).dispatch_idempotency_key == first_key  # STICKY -- not cleared
 
-    # A brand new engine instance (simulating a fresh process) re-claims
-    # and re-dispatches.
+    # A new engine inspects this unresolved submission; it does not resend.
     engine2 = QueueEngine(store, ops, coordinator=_always_ready_gate())
-    engine2.tick("lane-a")  # CLAIMED
-    engine2.tick("lane-a")  # COORDINATOR_READY
-    engine2.tick("lane-a")  # DISPATCHED again
+    assert engine2.tick("lane-a").action == "DISPATCH_UNCERTAIN"
 
     # FakeOps.terminal_send_text itself mimics core.py's real dedup
     # behavior (a repeat call with the same idempotency_key returns the
@@ -837,7 +850,7 @@ def test_reconciled_stale_dispatch_reuses_the_same_idempotency_key_and_never_dou
     # and-reclaim cycle, which is the precondition those guarantees rely
     # on).
     assert len(ops.sent) == 1
-    assert store.get_task(task_id).status == RUNNING
+    assert store.get_task(task_id).status == "DISPATCH_UNCERTAIN"
     final_task = store.get_task(task_id)
     assert final_task.dispatch_idempotency_key == first_key
 

@@ -55,7 +55,7 @@ def make_running_task(store: QueueStore, *, session: str = SESSION, title: str =
                                           "completion_policy": completion_policy or {}}])
     task_id = task_ids[0]
     store.transition_task(task_id, qs.DISPATCHING, event_type="DISPATCHING")
-    return store.transition_task(task_id, qs.RUNNING, event_type="RUNNING")
+    return store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
 
 
 def node(node_id: str, *, capabilities=(), platform="linux", backend="tmux",
@@ -107,7 +107,7 @@ def test_independent_verifier_cannot_bypass_required_git_evidence(store, verify)
         task_id, status="READY", reason="ready",
         evidence={"cwd": "/repo", "node_id": "local", "branch": "main", "head": "base"})
     store.transition_task(task_id, qs.DISPATCHING, event_type="DISPATCHED")
-    task = store.transition_task(task_id, qs.RUNNING, event_type="RUNNING")
+    task = store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     job = verify.ensure_verify_job(task)
     claimed = verify.claim_next(verifier="verifier-1", capabilities=[])
 
@@ -281,7 +281,7 @@ def test_implementer_cannot_verify_its_own_work_when_independence_is_required(st
     claimed_task = store.claim_next_task(SESSION, claimed_by="worker-A")
     store.transition_task(claimed_task.id, qs.READY, event_type="READY")
     store.transition_task(claimed_task.id, qs.DISPATCHING, event_type="DISPATCHING")
-    task = store.transition_task(claimed_task.id, qs.RUNNING, event_type="RUNNING")
+    task = store.mark_running_with_evidence(claimed_task.id, evidence={"accepted": True, "signal": "explicit_running_signal"})
 
     job = verify.ensure_verify_job(task, require_independent=True)
     assert job.implementer == "worker-A"
@@ -294,7 +294,7 @@ def test_independence_can_be_waived_explicitly(store, verify):
     claimed_task = store.claim_next_task(SESSION, claimed_by="solo")
     store.transition_task(claimed_task.id, qs.READY, event_type="READY")
     store.transition_task(claimed_task.id, qs.DISPATCHING, event_type="DISPATCHING")
-    task = store.transition_task(claimed_task.id, qs.RUNNING, event_type="RUNNING")
+    task = store.mark_running_with_evidence(claimed_task.id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     verify.ensure_verify_job(task, require_independent=False)
     assert verify.claim_next(verifier="solo", capabilities=[]) is not None
 
@@ -403,7 +403,7 @@ def test_a_genuine_retry_gets_its_own_job(store, verify):
                 failure_summary={"headline": "not right yet"})
     store.retry_task(task.id)
     store.transition_task(task.id, qs.DISPATCHING, event_type="DISPATCHING")
-    retried = store.transition_task(task.id, qs.RUNNING, event_type="RUNNING")
+    retried = store.mark_running_with_evidence(task.id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     assert retried.attempt_count == 2
 
     job2 = verify.ensure_verify_job(retried)
@@ -460,7 +460,7 @@ def test_routability_reports_the_lone_implementer_case(store):
     claimed_task = store.claim_next_task(SESSION, claimed_by="only")
     store.transition_task(claimed_task.id, qs.READY, event_type="READY")
     store.transition_task(claimed_task.id, qs.DISPATCHING, event_type="DISPATCHING")
-    task = store.transition_task(claimed_task.id, qs.RUNNING, event_type="RUNNING")
+    task = store.mark_running_with_evidence(claimed_task.id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     job = verify.ensure_verify_job(task, required_capabilities=["python"])
     routing = verify.routability(job)
     assert routing["routable"] is False and "implementer" in routing["reason"]
@@ -506,7 +506,7 @@ def test_trace_links_backlog_task_implementer_branch_verifier_and_evidence(store
     store.set_task_project(claimed_task.id, "git:github.com/acme/widget")
     store.transition_task(claimed_task.id, qs.READY, event_type="READY")
     store.transition_task(claimed_task.id, qs.DISPATCHING, event_type="DISPATCHING")
-    task = store.transition_task(claimed_task.id, qs.RUNNING, event_type="RUNNING")
+    task = store.mark_running_with_evidence(claimed_task.id, evidence={"accepted": True, "signal": "explicit_running_signal"})
 
     job = verify.ensure_verify_job(task, backlog_id="BL-42", branch="feat/x",
                                    commit_sha="deadbeef", required_capabilities=["python"])
