@@ -99,6 +99,7 @@ DASHBOARD_NAV = NavSurface(
         # so the primary bar still fits on a 1366px screen without wrapping.
         NavItem("backlog", "Backlog", "/dashboard/backlog", secondary=True),
         NavItem("notes", "Notes", "/dashboard/notes", secondary=True),
+        NavItem("archify", "Archify", "/dashboard/archify", secondary=True),
         NavItem("fleet", "Fleet", "/dashboard/fleet", secondary=True),
         NavItem("ai-usage", "AI Usage", "/dashboard/ai-usage", secondary=True),
         NavItem("audit", "Audit", "/dashboard/audit", secondary=True),

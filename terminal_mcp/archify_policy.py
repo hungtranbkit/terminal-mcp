@@ -59,6 +59,9 @@ class ArchifyProjectPolicy:
         raw = Path(value).expanduser()
         if not raw.is_absolute():
             raise ArchifyPolicyError("PROJECT_NOT_ALLOWED", "project path must be absolute")
+        candidate = raw.resolve(strict=False)
+        if not self._inside_root(candidate):
+            raise ArchifyPolicyError("PROJECT_NOT_ALLOWED", "project is outside allowed roots")
         try:
             resolved = raw.resolve(strict=True)
         except (OSError, RuntimeError):

@@ -1402,6 +1402,15 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
               if hasattr(route, "methods")}
     assert routes == {
         "/dashboard": {"GET", "HEAD"},
+        # Shared Archify capability: one guarded page, four reads, one create
+        # mutation and one ID-addressed HTML artifact read. No caller path is
+        # accepted by the artifact route.
+        "/dashboard/archify": {"GET", "HEAD"},
+        "/dashboard/api/archify/status": {"GET", "HEAD"},
+        "/dashboard/api/archify/projects": {"GET", "HEAD"},
+        "/dashboard/api/archify/jobs": {"POST"},
+        "/dashboard/api/archify/jobs/{job_id}": {"GET", "HEAD"},
+        "/dashboard/api/archify/jobs/{job_id}/html": {"GET", "HEAD"},
         # AI Usage report: a read-only VIEW over local CLI artefacts
         # (ai_usage_index.py). No provider API, no mutation surface.
         "/dashboard/ai-usage": {"GET", "HEAD"},

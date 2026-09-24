@@ -20,6 +20,15 @@ class ArchifyRuntimeError(RuntimeError):
         self.detail = detail
 
 
+def default_archify_runtime_dir() -> Path:
+    override = os.environ.get("TERMINAL_MCP_ARCHIFY_HOME")
+    if override:
+        return Path(override).expanduser()
+    state_home = os.environ.get("XDG_STATE_HOME")
+    base = Path(state_home).expanduser() if state_home else Path.home() / ".local" / "state"
+    return base / "terminal-mcp" / "archify-runtime"
+
+
 class ArchifyRuntime:
     def __init__(
         self,

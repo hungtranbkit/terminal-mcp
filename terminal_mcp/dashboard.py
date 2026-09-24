@@ -82,6 +82,7 @@ from .ephemeral_state import ephemeral_db_path, ephemeral_state_dir
 from .replay_guard import (HEADER_NONCE, HEADER_TIMESTAMP, HeartbeatReplayGuard, LEGACY_ACCEPTED)
 from .novaretail_dispatch_dashboard import register as register_novaretail_dispatch_dashboard
 from .dispatch_settings_dashboard import register as register_dispatch_settings_dashboard
+from .archify_dashboard import register_archify_dashboard
 
 _log = logging.getLogger(__name__)
 
@@ -13320,6 +13321,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                        heartbeat_replay: "HeartbeatReplayGuard | None" = None,
                        rotation: "TokenRotationService | None" = None,
                        notes: NotesService | None = None,
+                       archify: Any = None,
                        agents: Any = None,
                        projects: Any = None,
                        harness: "HarnessService | None" = None,
@@ -13661,6 +13663,44 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             _nav_page(DASHBOARD_HTML, "home"),
             headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
         )
+
+    if archify is None:
+        # Keep the nav destination real for embedders/tests that call
+        # register_dashboard directly. Production server_http passes a
+        # persistent service; this fallback follows the existing private
+        # ephemeral-store convention used by queue/notes/planner above.
+        from .archify_policy import ArchifyProjectPolicy
+        from .archify_runtime import ArchifyRuntime, default_archify_runtime_dir
+        from .archify_service import ArchifyService
+        from .archify_store import ArchifyStore
+
+        archify_root = ephemeral_state_dir("archify")
+        configured_roots = (
+            terminal.config.archify.allowed_roots
+            or terminal.config.repo_read.allowed_roots
+            or terminal.config.session_lifecycle.allowed_cwd_roots
+            or (str(Path.home()),)
+        )
+        runtime_dir = terminal.config.archify.runtime_dir or str(default_archify_runtime_dir())
+        archify = ArchifyService(
+            terminal.config.archify,
+            ArchifyProjectPolicy(
+                configured_roots,
+                max_projects=terminal.config.archify.max_projects,
+                max_discovery_depth=terminal.config.archify.max_discovery_depth,
+            ),
+            ArchifyRuntime(
+                runtime_dir, timeout=terminal.config.archify.timeout_seconds,
+                max_output_bytes=terminal.config.archify.max_output_bytes,
+            ),
+            ArchifyStore(archify_root / "archify.db"),
+            artifact_root=archify_root / "artifacts",
+        )
+        archify.start()
+    register_archify_dashboard(
+        server, archify, read_guard=_read_guard, mutation_guard=_mutation_guard,
+        nav_page=lambda page: _nav_page(page, "archify"),
+    )
 
     @server.custom_route("/dashboard/sessions", methods=["GET"], include_in_schema=False)
     async def dashboard_sessions_admin(request: Request) -> HTMLResponse | JSONResponse:
