@@ -30,15 +30,11 @@ def test_verified_submit_sends_enter_only_until_ack(tmp_path: Path, backend: str
                              session="codex-disposable", agent_type="codex", prompt=prompt)
     injected: list[str] = []
     enters: list[int] = []
-    polls = {"n": 0}
-
     def capture() -> list[str]:
-        polls["n"] += 1
-        return (["composer: " + prompt + f" [tick {polls['n']}]" ]
-                if polls["n"] <= accepted_after else ["Working"])
+        return ["composer: " + prompt]
 
     def evidence(lines, current):
-        if lines == ["Working"]:
+        if current.enter_count >= accepted_after:
             return ACK_RUNNING, "working_indicator"
         return "COMPOSER", "draft_still_present"
 
@@ -69,7 +65,7 @@ def test_vietnamese_ime_first_enter_commits_composition_then_one_recovery_enter(
         # First Enter is consumed by the IME; the exact draft remains.
         if polls["n"] == 1:
             return ["> " + prompt]
-        if polls["n"] == 2:
+        if polls["n"] <= 4:
             return ["> " + prompt + " [composition committed]"]
         return ["esc to interrupt"]
 
@@ -83,6 +79,128 @@ def test_vietnamese_ime_first_enter_commits_composition_then_one_recovery_enter(
     assert result["recovery_enter_sent"] is True
     assert result["first_enter_effect"] == "composition_commit_or_submit"
     assert result["composer_after"] == "cleared_or_executing"
+
+
+def test_persisted_long_wrapped_draft_recovers_once_after_restart(tmp_path: Path):
+    """The durable prompt can prove a wrapped visible prefix after the
+    first Enter; recovery does not need the entire long draft on screen."""
+    from terminal_mcp.core import _codex_draft_in_composer
+
+    path = tmp_path / "wrapped-recovery.db"
+    prompt = "A" * 5_000
+    store = SubmissionStore(path)
+    record, _ = store.create(idempotency_key="wrapped-recovery", session="codex",
+                             agent_type="codex", prompt=prompt)
+    entered: list[int] = []
+
+    def evidence(lines, current):
+        if current.enter_count >= 2:
+            return ACK_RUNNING, "execution_started_after_recovery"
+        if _codex_draft_in_composer(lines, current.prompt):
+            return "COMPOSER", "draft_still_in_composer"
+        return "INCOMPLETE", "composer_prefix_not_visible"
+
+    first = VerifiedSubmitWatchdog(store, WatchdogConfig(
+        poll_interval_seconds=.01, timeout_seconds=.1, max_enter_attempts=2,
+    )).run(record.submission_id, capture=lambda: ["> " + prompt],
+          inject=lambda _text: None, send_enter=lambda: entered.append(1),
+          evidence=evidence, max_new_enters=1)
+    assert first["enter_count"] == 1
+
+    # The full composer buffer has scrolled beyond the bounded live capture.
+    # Its leading 80 chars remain, wrapped over physical pane rows; the exact
+    # associated draft stays durable in SubmissionStore across this restart.
+    wrapped = ["> " + prompt[:37], "   " + prompt[37:80]]
+    reopened = SubmissionStore(path)
+    second = VerifiedSubmitWatchdog(reopened, WatchdogConfig(
+        poll_interval_seconds=.01, timeout_seconds=.1, max_enter_attempts=2,
+    )).run(record.submission_id, capture=lambda: wrapped,
+          inject=lambda _text: pytest.fail("recovery must never re-inject prompt text"),
+          send_enter=lambda: entered.append(1), evidence=evidence, max_new_enters=1)
+    assert entered == [1, 1], second
+    assert second["ack_state"] == ACK_RUNNING
+    assert second["execution_started"] is True
+
+
+def test_recovery_waits_for_a_stable_composer_frame(tmp_path: Path):
+    store = SubmissionStore(tmp_path / "stable-recovery.db")
+    record, _ = store.create(idempotency_key="stable-recovery", session="codex",
+                             agent_type="codex", prompt="stable draft")
+    entered: list[int] = []
+    captures = iter([
+        ["> stable draft"],  # pre-Enter composer
+        ["> stable draft [redraw 1]"],  # first Enter was consumed; pane is not settled
+        ["> stable draft [redraw 2]"],
+        ["> stable draft [redraw 2]"],
+        ["> stable draft [redraw 2]"],
+        ["esc to interrupt"],  # recovery Enter was accepted
+    ])
+
+    result = VerifiedSubmitWatchdog(store, WatchdogConfig(
+        poll_interval_seconds=.01, timeout_seconds=.2, max_enter_attempts=2,
+    )).run(record.submission_id, capture=lambda: next(captures),
+        inject=lambda _text: None, send_enter=lambda: entered.append(1),
+        evidence=lambda lines, current: (
+            (ACK_RUNNING, "execution_after_recovery")
+            if current.enter_count >= 2 and lines == ["esc to interrupt"]
+              else ("COMPOSER", "draft_still_in_composer")),
+    )
+    assert entered == [1, 1]
+    assert result["ack_state"] == ACK_RUNNING
+
+
+@pytest.mark.parametrize("state,reason", [
+    ("PAGER", "approval_or_pager_visible"),
+    ("WAITING_APPROVAL", "approval prompt"),
+    ("INPUT_REQUIRED", "input_required"),
+])
+def test_recovery_after_first_enter_never_answers_a_pager_or_prompt(
+    tmp_path: Path, state: str, reason: str,
+):
+    store = SubmissionStore(tmp_path / f"blocked-{state}.db")
+    record, _ = store.create(idempotency_key=state, session="codex",
+                             agent_type="codex", prompt="submitted once")
+    store.update(record.submission_id, ack_state="SUBMITTING", enter_count=1,
+                 evidence="same_submission_draft_before_enter")
+    entered: list[int] = []
+    result = VerifiedSubmitWatchdog(store, WatchdogConfig(
+        poll_interval_seconds=.01, timeout_seconds=.1,
+    )).run(record.submission_id, capture=lambda: ["menu"], inject=None,
+          send_enter=lambda: entered.append(1),
+          evidence=lambda _lines, _current: (state, reason), max_new_enters=1)
+    assert result["ack_state"] == ACK_BLOCKED_APPROVAL
+    assert result["enter_count"] == 1
+    assert entered == []
+
+
+def test_sweeper_does_not_enter_when_codex_may_already_be_running(tmp_path: Path):
+    from types import SimpleNamespace
+    from terminal_mcp.core import TerminalService
+
+    store = SubmissionStore(tmp_path / "running-recovery.db")
+    record, _ = store.create(idempotency_key="running-recovery", session="codex",
+                             agent_type="codex", prompt="same task draft")
+    store.update(record.submission_id, ack_state="SUBMITTING", enter_count=1,
+                 evidence="same_submission_draft_before_enter")
+    sent: list[list[str]] = []
+    service = object.__new__(TerminalService)
+    service.submissions = store
+    service.submit_watchdog = VerifiedSubmitWatchdog(store, WatchdogConfig(
+        poll_interval_seconds=.01, timeout_seconds=.1,
+    ))
+    service.tmux = SimpleNamespace(
+        get_session=lambda _session: SimpleNamespace(pane_current_command="codex"),
+        capture_lines=lambda _session, _lines: [
+            "> same task draft", "esc to interrupt", "tab to queue message",
+        ],
+        send_keys=lambda _session, keys: sent.append(keys),
+    )
+
+    service.recover_submission(store.get(record.submission_id))
+    recovered = store.get(record.submission_id)
+    assert recovered is not None and recovered.ack_state == ACK_RUNNING
+    assert recovered.execution_started is True
+    assert sent == []
 
 
 def test_stuck_submit_never_spams_more_than_two_enters(tmp_path: Path):

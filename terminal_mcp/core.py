@@ -279,15 +279,33 @@ def _codex_draft_in_composer(snapshot: list[str], text: str) -> bool:
     if (not queue_prompt and any(re.search(r"esc to interrupt", line, re.IGNORECASE)
                                  for line in snapshot[last_marker + 1:])):
         return False
-    for line in snapshot[last_marker:last_marker + 1]:
+    # Ink wraps a long Codex draft onto physical pane rows without repeating
+    # the composer glyph. The complete prompt is already durable in the
+    # SubmissionStore, so match its bounded leading prefix across those rows
+    # instead of requiring the full buffer to fit on one captured line.
+    composer_rows: list[str] = []
+    for offset, line in enumerate(snapshot[last_marker:last_marker + 10]):
         stripped = line.strip()
-        body = re.sub(r"^[>›]\s*", "", stripped)
-        if normalized_prefix and normalized_prefix in " ".join(body.split()):
-            return True
-        match = re.search(r"\[Pasted Content\s+(\d+)\s+chars\]", body, re.IGNORECASE)
-        if match and int(match.group(1)) >= len(text):
-            return True
-    return False
+        if offset == 0:
+            stripped = re.sub(r"^[>›]\s*", "", stripped)
+        elif (not stripped or re.match(r"^[>›]\s*", stripped)
+              or re.search(r"SUBMITTED\[|esc to interrupt|tab to queue message", stripped, re.IGNORECASE)):
+            if not stripped:
+                continue
+            break
+        composer_rows.append(stripped)
+    body = " ".join(" ".join(row.split()) for row in composer_rows)
+    if normalized_prefix and normalized_prefix in body:
+        return True
+    # A pane can hard-wrap in the middle of a word, where inserting a
+    # separator would make the logical prefix differ. Compare a bounded
+    # whitespace-free form as well; the first 80 non-whitespace characters
+    # remain tied to the exact prompt stored on this submission row.
+    compact_prefix = "".join(text.split())[:80]
+    if compact_prefix and compact_prefix in "".join(body.split()):
+        return True
+    match = re.search(r"\[Pasted Content\s+(\d+)\s+chars\]", body, re.IGNORECASE)
+    return bool(match and int(match.group(1)) >= len(text))
 
 
 def _codex_composer_marker_present(snapshot: list[str]) -> bool:
@@ -526,6 +544,12 @@ class TerminalService:
         def evidence(lines: list[str], current: Submission) -> tuple[str, str]:
             if adapter.identify_target_state(lines) == "waiting":
                 return "PAGER", "approval_or_pager_visible"
+            # The sweeper is allowed to activate only a still-idle composer.
+            # Once Codex exposes its running indicator after the first Enter,
+            # the task may already have started even if a queued composer is
+            # also visible. Stop recovery before inspecting that draft.
+            if current.enter_count > 0 and adapter.identify_target_state(lines) == "running":
+                return ACK_RUNNING, "execution_evidence_after_first_enter"
             if _codex_draft_in_composer(lines, record.prompt):
                 return "COMPOSER", "draft_still_in_composer"
             if (current.enter_count > 0 and _codex_draft_in_composer(baseline, record.prompt)
