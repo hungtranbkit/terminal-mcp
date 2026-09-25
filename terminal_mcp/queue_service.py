@@ -50,6 +50,56 @@ the cycle walk run against the real graph without inventing a row -- any
 path that returns to it is a cycle the new edges would close."""
 
 
+def _structured_outcome(task: Any) -> dict[str, Any]:
+    """Compact terminal result from persisted evidence, without pane logs."""
+    status = str(getattr(task, "status", "UNKNOWN") or "UNKNOWN").upper()
+    metadata = getattr(task, "metadata", {}) or {}
+    evidence = getattr(task, "verification_evidence", {}) or {}
+    decision = getattr(task, "coordinator_decision", {}) or {}
+    git = evidence.get("git_evidence") if isinstance(evidence, dict) else {}
+    if not isinstance(git, dict):
+        git = {}
+    if status == "COMPLETED":
+        outcome_status = "COMPLETE"
+    elif status == "DISPATCH_UNCERTAIN":
+        outcome_status = "DELIVERY_UNKNOWN"
+    elif status in {"NEEDS_HUMAN", "NEEDS_DECISION", "PAUSED"}:
+        outcome_status = "NEEDS_DECISION"
+    elif status in {"BLOCKED", "WAITING_SESSION"}:
+        outcome_status = "BLOCKED"
+    elif status in {"FAILED", "CANCELLED"}:
+        outcome_status = "FAILED"
+    else:
+        outcome_status = status
+    blocker = (getattr(task, "last_error", None) or getattr(task, "coordinator_reason", None)
+               or decision.get("reason"))
+    if not blocker and status == "DISPATCH_UNCERTAIN":
+        blocker = "Delivery acceptance is unproven; do not resend until this task is reconciled."
+    changed = metadata.get("changed_files") or evidence.get("changed_files") or []
+    if not changed and isinstance(git.get("status_lines"), list):
+        changed = git["status_lines"]
+    raw_tests = metadata.get("tests") or evidence.get("tests") or []
+    tests = ([str(item)[:200] for item in raw_tests[:20]]
+             if isinstance(raw_tests, (list, tuple)) else [])
+    marker = evidence.get("completion_marker") if isinstance(evidence, dict) else None
+    verification = {"completion_marker_verified": bool(marker)}
+    if git:
+        verification["git_evidence"] = {
+            key: git[key] for key in ("branch", "head") if git.get(key) is not None
+        }
+    summary = metadata.get("summary") or getattr(task, "title", "") or status.lower().replace("_", " ")
+    root_cause = metadata.get("root_cause") or decision.get("reason") or ""
+    return {
+        "status": outcome_status, "summary": str(summary)[:300],
+        "root_cause": str(root_cause)[:300],
+        "changed_files": list(changed)[:100] if isinstance(changed, (list, tuple)) else [],
+        "tests": tests, "verification": verification,
+        "commit": git.get("head") or metadata.get("commit"),
+        "blocker": str(blocker)[:500] if blocker else None,
+        "requires_user_action": outcome_status in {"BLOCKED", "NEEDS_DECISION", "DELIVERY_UNKNOWN"},
+    }
+
+
 class QueueService:
     def __init__(self, store: QueueStore | None = None, *,
                 on_completed: Callable[[Any], None] | None = None, planner: Any = None) -> None:
@@ -119,8 +169,7 @@ class QueueService:
         attempt recorded, no start timestamp and no claim. That combination is
         what makes it safe to close the task from the side -- there is no
         in-flight engine transition to race, and no half-finished attempt whose
-        outcome we would be overwriting with someone's say-so.
-        """
+        outcome we would be overwriting with someone's say-so."""
         return (
             getattr(task, "status", None) in (QUEUED, PAUSED)
             and not getattr(task, "attempt_count", 0)
@@ -529,7 +578,8 @@ class QueueService:
         task = self.store.get_task(task_id)
         if task is None:
             return {"error": "TASK_NOT_FOUND", "task_id": task_id}
-        result = {"task": task.to_dict(), "queue_position": self.store.queue_position(task_id)}
+        result = {"task": task.to_dict(), "queue_position": self.store.queue_position(task_id),
+                  "outcome": _structured_outcome(task)}
         if task.status == "QUEUED":
             lane = self.store.lane_status(task.session)
             active = lane.get("current_task") or {}

@@ -43,7 +43,11 @@ def finished_task(store: QueueStore, *, session="lane-a", title="t") -> str:
     (task_id,) = store.set_tasks(session, [{"title": title, "prompt": "p"}],
                                  replace_pending=False)
     for target, event in ((qs.DISPATCHING, "D"), (qs.RUNNING, "R"), (qs.VERIFYING, "V")):
-        store.transition_task(task_id, target, event_type=event)
+        if target == qs.RUNNING:
+            store.mark_running_with_evidence(
+                task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
+        else:
+            store.transition_task(task_id, target, event_type=event)
     store.mark_completed_with_evidence(task_id, evidence={"exit_code": 0})
     return task_id
 

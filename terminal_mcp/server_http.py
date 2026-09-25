@@ -612,6 +612,15 @@ def main() -> None:
     server = build_mcp(terminal, supervisor, supervisor_v2, controller, queue=queue, integration=integration, pm=pm,
                        planner=planner, ai_usage=ai_usage, recovery=recovery, backlog=backlog, notes=notes,
                        events=events, fleet=fleet, run_journal=run_journal)
+    # Reattach task-specific followers after a process restart. The queue
+    # rows remain authoritative; only explicitly opted-in fast-agent tasks
+    # are followed, and the same engine still enforces acceptance/evidence.
+    follower = getattr(queue, "started_task_follower", None)
+    if follower is not None:
+        try:
+            follower.restore_active_tasks(queue.store)
+        except Exception:  # noqa: BLE001 -- durable task rows remain available for manual recovery
+            _log.exception("fast-agent follower recovery failed")
     register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store,
                        queue=queue, integration=integration, pm=pm, planner=planner, ai_usage=ai_usage,
                        recovery=recovery, backlog=backlog, fleet=fleet, onboarding=onboarding,

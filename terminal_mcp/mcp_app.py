@@ -441,6 +441,7 @@ def build_mcp(service: TerminalService | None = None,
         queue.task_status,
         poll_interval_seconds=terminal.config.queue.poll_interval_seconds,
     )
+    queue.started_task_follower = _started_task_follower
     queue.engine = queue.engine or queue_engine
     integration.engine = integration.engine or IntegrationEngine(integration.store, queue.store)
     # Event-driven WAIT/wake background loop (integration_loop.py) --

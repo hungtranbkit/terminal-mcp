@@ -528,9 +528,6 @@ class CompactTerminalTools:
                 "session": status.get("session"),
                 "state": status.get("state", "UNKNOWN"),
                 "input_required": bool(status.get("input_required", False)),
-                "reason": reason,
-                "tail": rendered,
-                "tail_truncated": bool(clipped or tail.get("truncated", False)),
             }
             # TMCP-SESSION-HEALTH-001: pass the canonical status payload's
             # own `resource` block straight through, in BOTH compact and
@@ -542,13 +539,40 @@ class CompactTerminalTools:
             if isinstance(status.get("resource"), dict):
                 row["resource"] = status["resource"]
             if not compact:
+                row["reason"] = reason
+                row["tail"] = rendered
+                row["tail_truncated"] = bool(clipped or tail.get("truncated", False))
                 row["exists"] = status.get("exists")
                 row["cwd"] = status.get("cwd")
+            else:
+                # Compact inspect v2 is a decision surface. Keep the fields
+                # that help route or act. Preserve established keys so older
+                # clients can keep using the same row shape.
+                row["reason"] = reason or ""
+                row["tail"] = rendered
+                row["tail_truncated"] = bool(clipped or tail.get("truncated", False))
+                for key, value in (
+                    ("node", status.get("node_id")),
+                    ("cwd", status.get("cwd")),
+                    ("last_activity_s", status.get("last_activity_s")),
+                ):
+                    if value is not None and value != "":
+                        row[key] = value
+                resource = status.get("resource")
+                git = resource.get("git") if isinstance(resource, dict) else None
+                if isinstance(git, dict):
+                    if git.get("branch") not in (None, ""):
+                        row["branch"] = git["branch"]
+                    if git.get("dirty") is not None:
+                        row["dirty"] = git["dirty"]
+                if status.get("state") == "UNKNOWN" and reason:
+                    row["reason"] = reason
             if "error" in tail:
                 row["tail_error"] = tail["error"]
             rows.append(row)
-            response_truncated |= row["tail_truncated"] or reason_clipped
+            response_truncated |= bool(row.get("tail_truncated")) or reason_clipped
         return {
+            "version": 2 if compact else 1,
             "targets": rows,
             "count": len(rows),
             "response_truncated": response_truncated,
@@ -1012,8 +1036,9 @@ class CompactTerminalTools:
         if enqueue is None:
             return {"status": "FAILED", "error": "ACTION_UNAVAILABLE", "action": "start",
                     "detail": "start is not wired on this server"}
+        durable_metadata = {**(metadata or {}), "fast_agent_mode": True}
         accepted = enqueue(target, text, title=title, priority=priority,
-                           metadata=metadata, request_key=request_key)
+                           metadata=durable_metadata, request_key=request_key)
         if not isinstance(accepted, dict) or accepted.get("error") or not accepted.get("task_id"):
             return {"status": "FAILED", "action": "start", "result": accepted}
         task_id = accepted["task_id"]

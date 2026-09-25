@@ -76,7 +76,11 @@ def _task(queue_store, *, prompt="build the commute card", title="Commute card")
 
 def _to_running(queue_store, task_id):
     for target in (qs.PRECHECK, qs.READY, qs.DISPATCHING, qs.RUNNING):
-        queue_store.transition_task(task_id, target, event_type="TEST")
+        if target == qs.RUNNING:
+            queue_store.mark_running_with_evidence(
+                task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
+        else:
+            queue_store.transition_task(task_id, target, event_type="TEST")
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +226,11 @@ def test_a_projection_the_queue_refuses_is_recorded_not_forced(queue_store, repo
     back to RUNNING by a harness stage. The divergence is logged instead."""
     task_id = _task(queue_store)
     for target in (qs.PRECHECK, qs.BLOCKED):
-        queue_store.transition_task(task_id, target, event_type="TEST")
+        if target == qs.RUNNING:
+            queue_store.mark_running_with_evidence(
+                task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
+        else:
+            queue_store.transition_task(task_id, target, event_type="TEST")
     service = _service(queue_store, repo)
 
     service.start(task_id=task_id, acceptance=["a"], checks=["npm test"],

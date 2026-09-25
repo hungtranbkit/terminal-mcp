@@ -186,7 +186,11 @@ def test_capacity_frees_up_when_the_holding_task_settles(registry, queue):
     assert second["session"] is None
 
     for status in ("RUNNING", "VERIFYING", "COMPLETED"):
-        queue.store.transition_task(first["task_id"], status, event_type="TEST")
+        if status == "RUNNING":
+            queue.store.mark_running_with_evidence(
+                first["task_id"], evidence={"accepted": True, "signal": "explicit_running_signal"})
+        else:
+            queue.store.transition_task(first["task_id"], status, event_type="TEST")
     report = router.rescue_once()
 
     assert report["routed"] == 1

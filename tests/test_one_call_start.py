@@ -185,6 +185,33 @@ def test_server_side_follower_carries_the_task_with_zero_further_client_calls():
     assert lane.client_calls == calls_after_start == 1
 
 
+def test_restart_recovery_reattaches_only_explicit_fast_agent_tasks():
+    lane = FakeLane()
+    lane.enqueue_task("fast-lane", "continue durable work")
+    lane.tasks["task-1"]["metadata"] = {"fast_agent_mode": True}
+    lane.enqueue_task("ordinary-lane", "ordinary queued work")
+    lane.tasks["task-2"]["session"] = "ordinary-lane"
+    lane.tasks["task-2"]["metadata"] = {}
+
+    class DurableStore:
+        def list_all_lanes(self):
+            return [
+                {"session": "fast-lane", "current_task": dict(lane.tasks["task-1"])},
+                {"session": "ordinary-lane", "current_task": dict(lane.tasks["task-2"])},
+            ]
+
+    follower = StartedTaskFollower(lane.tick, lane.task_status,
+                                   poll_interval_seconds=0.01, ttl_seconds=5)
+    result = follower.restore_active_tasks(DurableStore())
+
+    assert result["restored"] == ["task-1"]
+    deadline = time.monotonic() + 5
+    while lane.tasks["task-1"]["status"] != "COMPLETED" and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert lane.tasks["task-1"]["status"] == "COMPLETED"
+    assert lane.tasks["task-2"]["status"] == "QUEUED"
+
+
 def test_follower_stops_at_a_settled_task_and_never_claims_the_next_one():
     """It is a follow-through for ONE task, not a second auto-dispatcher --
     the OFF-by-default lane gates queue_loop.py owns stay meaningful."""

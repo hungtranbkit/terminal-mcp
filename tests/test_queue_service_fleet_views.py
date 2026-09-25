@@ -80,6 +80,49 @@ def test_recent_events_respects_limit(queue):
     assert len(result["events"]) == 3
 
 
+def test_task_status_returns_compact_structured_completion_without_logs(queue):
+    (task_id,) = queue.store.append_tasks("fast-agent-lane", [{
+        "prompt": "implement feature", "title": "Feature", "metadata": {
+            "summary": "Feature delivered", "root_cause": "missing handler",
+            "changed_files": ["terminal_mcp/example.py"], "tests": ["pytest -q"],
+        },
+    }])
+    queue.store.transition_task(task_id, "PRECHECK", event_type="TEST")
+    queue.store.transition_task(task_id, "READY", event_type="TEST")
+    queue.store.transition_task(task_id, "DISPATCHING", event_type="TEST")
+    queue.store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
+    queue.store.transition_task(task_id, "VERIFYING", event_type="TEST")
+    queue.store.mark_completed_with_evidence(task_id, evidence={
+        "completion_marker": {"verified": True},
+        "git_evidence": {"head": "abc123", "status_lines": ["M terminal_mcp/example.py"]},
+    })
+
+    result = queue.task_status(task_id)
+
+    assert result["outcome"] == {
+        "status": "COMPLETE", "summary": "Feature delivered", "root_cause": "missing handler",
+        "changed_files": ["terminal_mcp/example.py"], "tests": ["pytest -q"],
+        "verification": {"completion_marker_verified": True,
+                         "git_evidence": {"head": "abc123"}},
+        "commit": "abc123", "blocker": None,
+        "requires_user_action": False,
+    }
+    assert "logs" not in result["outcome"]
+
+
+def test_uncertain_delivery_outcome_requires_decision_and_never_suggests_resend(queue):
+    (task_id,) = queue.store.append_tasks("fast-agent-lane", [{"prompt": "implement"}])
+    queue.store.transition_task(task_id, "DISPATCHING", event_type="TEST")
+    queue.store.mark_dispatch_uncertain(task_id, reason="acceptance not observed")
+
+    outcome = queue.task_status(task_id)["outcome"]
+
+    assert outcome["status"] == "DELIVERY_UNKNOWN"
+    assert outcome["requires_user_action"] is True
+    assert outcome["blocker"]
+    assert "retry" not in str(outcome).casefold()
+
+
 # ---------------------------------------------------------------------------
 # Dashboard Task button pending-count badge (2026-09-07 checkpoint) --
 # QueueService.count_pending/pending_counts is the ONE canonical

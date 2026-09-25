@@ -357,6 +357,33 @@ def test_turn_inspect_wraps_batch_in_one_logical_result():
     assert result["result"]["targets"][0]["tail"] == "READY"
 
 
+def test_compact_inspect_v2_projects_useful_fields_and_keeps_legacy_row_keys():
+    compact, _terminal, controller = service()
+    controller.statuses["worker"] = {
+        "session": "worker", "state": "IDLE", "input_required": False,
+        "reason": "", "exists": True, "cwd": "/repo", "node_id": "node-a",
+        "last_activity_s": 12, "resource": {"git": {"branch": "main", "dirty": False}},
+        "recovery_state": None, "last_output": "",
+    }
+    controller.tails["worker"] = ""
+
+    result = compact.turn(action="inspect", target="worker")
+
+    assert result["result"]["version"] == 2
+    row = result["result"]["targets"][0]
+    assert row["session"] == "worker"
+    assert row["state"] == "IDLE"
+    assert row["node"] == "node-a"
+    assert row["cwd"] == "/repo"
+    assert row["branch"] == "main"
+    assert row["dirty"] is False
+    assert row["last_activity_s"] == 12
+    assert row["reason"] == ""
+    assert row["resource"]["git"]["branch"] == "main"
+    assert row["tail"] == ""
+    assert row["tail_truncated"] is False
+
+
 def test_turn_send_wait_sends_once_then_creates_one_durable_wait():
     compact, _terminal, controller = service()
     clock = FakeClock()

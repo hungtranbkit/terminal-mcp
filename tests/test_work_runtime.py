@@ -198,7 +198,11 @@ def _complete(queue, session, task_id):
     # RUNNING -> COMPLETED outright, which is the "a worker cannot declare
     # itself done" rule already enforced one level down.
     for step in ("PRECHECK", "READY", "DISPATCHING", "RUNNING", "VERIFYING", "COMPLETED"):
-        queue.store.transition_task(task_id, step, event_type="test", reason="test")
+        if step == "RUNNING":
+            queue.store.mark_running_with_evidence(
+                task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
+        else:
+            queue.store.transition_task(task_id, step, event_type="test", reason="test")
 
 
 def test_progress_is_computed_from_weights_not_parsed_from_a_model(work):

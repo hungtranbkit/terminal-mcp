@@ -171,6 +171,11 @@ def detect_agent_ui_state(output: str) -> tuple[str | None, str]:
 def detect_waiting_input(output: str) -> tuple[bool, str]:
     lines = [line.strip() for line in output.splitlines() if line.strip()]
     recent = lines[-12:]
+    # Common full-screen pagers are interactive even when their prompt has no
+    # question mark. Restrict these exact affordances to the bottom line so
+    # examples in command output do not turn into false input requests.
+    if recent and re.fullmatch(r"(?:--More--|\(END\))", recent[-1], re.IGNORECASE):
+        return True, f"pager prompt {recent[-1]!r} is waiting for input"
     # A prompt must be very near the current pane bottom to avoid matching old logs.
     for offset, line in enumerate(reversed(recent[-4:])):
         for pattern in WAIT_PATTERNS:

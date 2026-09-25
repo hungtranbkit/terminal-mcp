@@ -232,6 +232,23 @@ def test_live_codex_tool_approval_menu_is_waiting_input():
     assert input_required is True
 
 
+def test_pager_prompt_is_waiting_input_not_an_ambiguous_agent_state():
+    pane = "\n".join(("long command output", "line 2", "line 3", "--More--"))
+    state, input_required, reason = classify_status(info("less", activity=0), pane, now=100)
+    assert state == "WAITING_INPUT"
+    assert input_required is True
+    assert "pager" in reason.casefold()
+
+
+def test_codex_idle_composer_beats_stale_question_and_pager_text():
+    pane = "\n".join(("Earlier output: press q to quit", "gpt-5.6 · ~/workspace/project",
+                        "› Ask Codex to do anything"))
+    state, input_required, reason = classify_status(info("codex", activity=99), pane, now=100)
+    assert state == "IDLE"
+    assert input_required is False
+    assert "composer" in reason.casefold()
+
+
 def test_ambiguous_agent_pane_stays_unknown():
     # No busy footer, no finished-turn marker, no prompt: the honest answer is
     # still UNKNOWN. This is what keeps the two markers above from becoming a

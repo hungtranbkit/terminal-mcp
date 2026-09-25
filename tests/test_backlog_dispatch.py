@@ -84,7 +84,11 @@ def test_done_accepted_when_the_linked_queue_task_is_verified(svc, queue, repo):
     # makes "linked queue task is COMPLETED" trustworthy as evidence.
     qid = out["queue_task_id"]
     for state in (DISPATCHING, RUNNING, VERIFYING, COMPLETED):
-        queue.store.transition_task(qid, state, event_type="TEST_WALK")
+        if state == RUNNING:
+            queue.store.mark_running_with_evidence(
+                qid, evidence={"accepted": True, "signal": "explicit_running_signal"})
+        else:
+            queue.store.transition_task(qid, state, event_type="TEST_WALK")
     done = svc.complete(str(repo), task_id=tid)
     assert done["item"]["status"] == "DONE" and done["verified_by"] == "queue_task"
 

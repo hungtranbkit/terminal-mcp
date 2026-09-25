@@ -24,7 +24,11 @@ def _task(store, prompt="Build the Excel mismatch report"):
 
 def _to_verifying(store, task_id):
     for target in (qs.PRECHECK, qs.READY, qs.DISPATCHING, qs.RUNNING, qs.VERIFYING):
-        store.transition_task(task_id, target, event_type="TEST")
+        if target == qs.RUNNING:
+            store.mark_running_with_evidence(
+                task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
+        else:
+            store.transition_task(task_id, target, event_type="TEST")
 
 
 def _r1_r2_r3(store, task_id):

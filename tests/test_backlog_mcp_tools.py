@@ -111,7 +111,11 @@ async def test_full_chatgpt_workflow(rig):
     assert refused["error"] == "EVIDENCE_REQUIRED"
 
     for state in (DISPATCHING, RUNNING, VERIFYING, COMPLETED):
-        queue.store.transition_task(qid, state, event_type="TEST_WALK")
+        if state == RUNNING:
+            queue.store.mark_running_with_evidence(
+                qid, evidence={"accepted": True, "signal": "explicit_running_signal"})
+        else:
+            queue.store.transition_task(qid, state, event_type="TEST_WALK")
     done = await _call(server, "terminal_backlog_complete", path=path, task_id=top["id"])
     assert done["item"]["status"] == "DONE" and done["verified_by"] == "queue_task"
 

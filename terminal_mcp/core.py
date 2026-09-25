@@ -1449,6 +1449,7 @@ class TerminalService:
                 "state": state,
                 "input_required": input_required,
                 "reason": reason,
+                "last_activity_s": max(0, int(time.time()) - int(info.activity_epoch)),
                 "last_output": _redacted_capture([last_output]),
                 "untrusted_output": True, "untrusted_fields": ["last_output"], "content_source": "session",
                 # Supervisor Queue v2 Phase 2 (Coordinator Agent): the

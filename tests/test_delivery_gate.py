@@ -111,6 +111,20 @@ def test_submit_confirmed_but_prompt_still_visible_in_composer_is_not_accepted()
     assert verdict.safe_to_retry is False  # a resend would duplicate a confirmed submit
 
 
+def test_shell_echo_of_submitted_text_is_not_mistaken_for_an_agent_composer():
+    from terminal_mcp.adapters import select_adapter
+
+    before = ["$"]
+    after = ["$", "running command", "the exact submitted task"]
+    verdict = delivery_gate.evaluate(
+        {"delivery_state": DELIVERY_SUBMIT_CONFIRMED, "press_enter": True},
+        before_lines=before, after_lines=after, target_state=None,
+        adapter=select_adapter("bash"), sent_text="the exact submitted task")
+
+    assert verdict.kind == delivery_gate.DELIVERED
+    assert verdict.may_advance is True
+
+
 # -- scenario 2: DELIVERY_UNKNOWN ---------------------------------------
 
 def test_delivery_unknown_is_uncertain_and_not_retry_safe():

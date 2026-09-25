@@ -100,9 +100,6 @@ ACCEPTANCE_NOT_CHECKED = "ACCEPTANCE_NOT_CHECKED"
 ACCEPTANCE_UNOBSERVABLE = "ACCEPTANCE_UNOBSERVABLE"
 
 
-def _flatten(value: str) -> str:
-    return "".join(str(value).split())
-
 # Target states that are positive acceptance on their own: the agent is
 # demonstrably doing something with the prompt.
 _WORKING_TARGET_STATES = (TARGET_RUNNING,)
@@ -226,9 +223,6 @@ def classify_acceptance(*, before_lines: list[str] | None, after_lines: list[str
     # signal. Its appearance changes the pane, but that change is our own
     # injected prompt, not agent activity.
     if target_state == TARGET_COMPOSER:
-        return False, ACCEPTANCE_PROMPT_STILL_IN_COMPOSER, ()
-    if (sent_text and target_state not in _WORKING_TARGET_STATES
-            and _flatten(sent_text) in _flatten("\n".join(after_lines))):
         return False, ACCEPTANCE_PROMPT_STILL_IN_COMPOSER, ()
     if target_state in _WORKING_TARGET_STATES:
         evidence.append(ACCEPTANCE_TARGET_WORKING)

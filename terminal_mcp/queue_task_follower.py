@@ -145,6 +145,31 @@ class StartedTaskFollower:
         return {"following": True, "reason": "FOLLOWING", "task_id": task_id,
                 "ttl_seconds": self.ttl_seconds}
 
+    def restore_active_tasks(self, store: Any) -> dict[str, Any]:
+        """Reattach the bounded follower to opted-in durable tasks after restart.
+
+        Only tasks explicitly created through Fast Agent Mode (or long_task)
+        are resumed here; this does not turn ordinary queue rows into new
+        autonomous dispatches or claim another task from their lane.
+        """
+        restored: list[str] = []
+        for lane in store.list_all_lanes():
+            task = lane.get("current_task") if isinstance(lane, dict) else None
+            if not isinstance(task, dict):
+                continue
+            metadata = task.get("metadata") or {}
+            if not (metadata.get("fast_agent_mode") or metadata.get("long_task")):
+                continue
+            if task.get("status") not in {
+                    "QUEUED", "PRECHECK", "READY", "DISPATCHING", "DISPATCH_UNCERTAIN",
+                    "RUNNING", "VERIFYING", "WAITING_SESSION"}:
+                continue
+            result = self.follow(str(lane.get("session") or task.get("session") or ""),
+                                 str(task.get("id") or ""))
+            if result.get("following"):
+                restored.append(str(task["id"]))
+        return {"restored": restored, "count": len(restored)}
+
     def _body(self, session: str, task_id: str) -> None:
         try:
             self.run_until_settled(session, task_id)

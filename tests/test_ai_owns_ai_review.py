@@ -158,7 +158,8 @@ def test_reclaiming_a_stale_verifier_lease_never_completes_the_task(tmp_path):
     store.claim_next_task(SESSION, claimed_by="test", lease_seconds=60)
     store.record_coordinator_decision(task_id, status="READY", reason="ok")
     store.transition_task(task_id, "DISPATCHING", event_type="DISPATCHING", reason=None)
-    store.transition_task(task_id, "RUNNING", event_type="STARTED", reason=None)
+    store.mark_running_with_evidence(
+        task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
     store.transition_task(task_id, "VERIFYING", event_type="VERIFYING", reason=None)
 
     from terminal_mcp.verify_queue import VerifyQueue
