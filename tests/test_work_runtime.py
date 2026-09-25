@@ -733,6 +733,54 @@ def test_an_echoed_prompt_is_never_accepted_as_a_completion():
     assert completed(prompt + "\nwork\n" + marker_line + "\nmore\n") is True
 
 
+def test_unclosed_wrapped_worker_marker_survives_prompt_stripping_and_nonce_gates():
+    """A pane contains our closed template and the worker's final marker,
+    wrapped by the terminal and missing its final fence."""
+    from terminal_mcp.queue_engine import build_dispatch_text, worker_output_after_prompt
+    from terminal_mcp.status import COMPLETION_MARKER_RE, parse_completion_marker, verify_completion_marker
+
+    class _Task:
+        id = "task-abc"
+        prompt = "do the thing"
+        attempt_count = 0
+
+    prompt = build_dispatch_text(_Task(), nonce="NONCE")
+    prompt_marker = COMPLETION_MARKER_RE.search(prompt).group(0)
+    worker_marker = (
+        "###TERMINAL_MCP_COMPLETION protocol=terminal-mcp-completion/v1 task_id=task-abc\n"
+        "attempt=1 nonce=NONCE status=completion_candidate\n"
+        "summary_sha256=deadbeef"
+    )
+    pane = prompt + "\nworking...\n" + worker_marker + "\n2:05 PM\n› "
+    worker_output = worker_output_after_prompt(pane)
+    assert prompt_marker not in worker_output
+    marker = parse_completion_marker(worker_output)
+    assert marker is not None
+    assert verify_completion_marker(marker, task_id="task-abc", attempt=1,
+                                    nonce="NONCE", nonce_consumed=False)
+    assert not verify_completion_marker(marker, task_id="other-task", attempt=1,
+                                        nonce="NONCE", nonce_consumed=False)
+    assert not verify_completion_marker(marker, task_id="task-abc", attempt=2,
+                                        nonce="NONCE", nonce_consumed=False)
+    assert not verify_completion_marker(marker, task_id="task-abc", attempt=1,
+                                        nonce="OTHER", nonce_consumed=False)
+    assert not verify_completion_marker(marker, task_id="task-abc", attempt=1,
+                                        nonce="NONCE", nonce_consumed=True)
+
+
+def test_unclosed_prompt_only_marker_is_not_worker_evidence():
+    from terminal_mcp.queue_engine import build_dispatch_text, worker_output_after_prompt
+    from terminal_mcp.status import parse_completion_marker
+
+    class _Task:
+        id = "task-abc"
+        prompt = "do the thing"
+        attempt_count = 0
+
+    prompt = build_dispatch_text(_Task(), nonce="NONCE")
+    assert parse_completion_marker(worker_output_after_prompt(prompt)) is None
+
+
 def test_a_scrolled_away_instruction_does_not_hide_a_real_completion():
     """The tail is bounded. If our prompt has scrolled out, everything left
     is the worker's -- including the marker it printed."""

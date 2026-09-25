@@ -388,6 +388,13 @@ def _match_recent(patterns: tuple[re.Pattern[str], ...], output: str, window: in
 COMPLETION_MARKER_RE = re.compile(
     r"###TERMINAL_MCP_COMPLETION\s+protocol=terminal-mcp-completion/v1\s+([^#]*?)###"
 )
+_UNCLOSED_COMPLETION_MARKER_RE = re.compile(
+    # Codex can omit the closing fence and append UI text (timestamp and
+    # composer prompt) after the marker. Bound this form at the final required
+    # field so later pane content cannot become marker fields.
+    r"###TERMINAL_MCP_COMPLETION\s+protocol=terminal-mcp-completion/v1\s+"
+    r"([^#]*?\bsummary_sha256=[^\s#]+)(?=\s|$)"
+)
 _MARKER_FIELD_RE = re.compile(r"(\w+)=(\S+)")
 COMPLETION_MARKER_REQUIRED_FIELDS = ("task_id", "status", "summary_sha256")
 
@@ -397,10 +404,12 @@ def parse_completion_marker(output: str) -> dict[str, str] | None:
     if any. Returns its fields as a dict, or None if no marker is present
     or the marker found is missing a required field (never guessed/
     partially trusted -- an ambiguous marker is the same as no marker)."""
-    matches = COMPLETION_MARKER_RE.findall(output)
+    matches = [(match.start(), match.group(1)) for match in COMPLETION_MARKER_RE.finditer(output)]
+    matches.extend((match.start(), match.group(1))
+                   for match in _UNCLOSED_COMPLETION_MARKER_RE.finditer(output))
     if not matches:
         return None
-    fields = dict(_MARKER_FIELD_RE.findall(matches[-1]))
+    fields = dict(_MARKER_FIELD_RE.findall(max(matches, key=lambda item: item[0])[1]))
     if not all(name in fields for name in COMPLETION_MARKER_REQUIRED_FIELDS):
         return None
     if fields.get("status") != "completion_candidate":
