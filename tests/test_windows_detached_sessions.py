@@ -576,16 +576,21 @@ def _cleanup(state_root):
     for name, entry in wsh.discover(root).items():
         paths = SessionPaths(root, name)
         meta = wsh.read_meta(paths)
-        if meta is None or entry.get("host_state") != HOST_ALIVE:
-            continue  # not confirmed ours: never signal it
-        if meta.host_pid == os.getpid():
-            continue  # belt and braces: never signal the test runner
-        wsh.terminate_host(paths, meta)
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline and wsh.pid_alive(meta.host_pid):
-            time.sleep(0.05)
-        if (meta.child_pid and meta.child_pid != os.getpid()
-                and wsh.pid_alive(meta.child_pid)):
+        if meta is None:
+            continue
+        if entry.get("host_state") == HOST_ALIVE and meta.host_pid != os.getpid():
+            wsh.terminate_host(paths, meta)
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and wsh.pid_alive(meta.host_pid):
+                time.sleep(0.05)
+        # Dọn CON dù host còn sống hay không. Trước đây phần này nằm sau một `continue` chung
+        # cho cả mục, nên khi host chết TRƯỚC — đúng trường hợp một test hỏng giữa đường —
+        # đứa con không bao giờ được dọn. Đo thật 25/09/2026 trên máy này: 8 tiến trình
+        # `python` mồ côi, stdio trỏ `/dev/pts/NN (deleted)`, mỗi cái quay 98% CPU, tổng 16,2
+        # giờ lõi bị đốt trong một ngày. Chốt an toàn không mất đi mà chuyển vào
+        # `child_reapable`: nó đòi xác nhận ĐÚNG tiến trình đó qua `child_start_token`, nên
+        # một PID đã đổi chủ sẽ không bị ra tay.
+        if wsh.child_reapable(meta):
             try:
                 os.kill(int(meta.child_pid), signal.SIGKILL)
             except (OSError, ProcessLookupError):
@@ -810,3 +815,143 @@ def test_a_clock_skew_at_creation_cannot_change_the_identity_across_adoption(
         "session_id moved across adoption -- pinned bindings fail closed"
     assert after.pane_id == before.pane_id
     restarted.kill_session("pinned-skewed")
+
+
+# == the leak that burned 16 CPU-hours in one day =========================
+
+def _mot_pid_da_chet() -> int:
+    """Mot PID chac chan khong con song, de dung lam host_pid da chet."""
+    doomed = subprocess.Popen([sys.executable, "-c", ""])
+    doomed.wait()
+    return doomed.pid
+
+
+def _con_dang_song():
+    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+
+
+def test_teardown_don_con_du_host_da_chet_truoc(state_root):
+    """Chỗ rò rỉ thật, đo được trên máy này 25/09/2026.
+
+    `_cleanup` từng bỏ qua CẢ mục khi host không còn ALIVE, và phần dọn CON nằm sau cái
+    `continue` đó — nên một test hỏng giữa đường, làm host chết trước, để lại đứa con chạy
+    mãi. Hậu quả không phải lý thuyết: 8 tiến trình `python` mồ côi, stdio trỏ
+    `/dev/pts/NN (deleted)`, mỗi cái quay 98% CPU, tổng 16,2 giờ lõi bị đốt trong một ngày,
+    load máy lên 16 trên 12 lõi. Không có mã lỗi nào cả — chỉ là máy chậm dần."""
+    con = _con_dang_song()
+    try:
+        p = SessionPaths(state_root, "host-chet-truoc")
+        wsh.write_meta_atomic(p, wsh.SessionMeta(
+            name="host-chet-truoc", host_pid=_mot_pid_da_chet(), host_generation="cu",
+            child_pid=con.pid, child_start_token=wsh.process_start_token(con.pid),
+            cwd=str(REPO_ROOT), argv=[sys.executable], created_at=time.time() - 30))
+        assert wsh.discover(state_root)["host-chet-truoc"]["host_state"] != HOST_ALIVE
+
+        _cleanup(state_root)
+
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and con.poll() is None:
+            time.sleep(0.05)
+        assert con.poll() is not None, "đứa con phải bị dọn dù host đã chết trước"
+    finally:
+        if con.poll() is None:
+            con.kill()
+            con.wait()
+
+
+def test_khong_ra_tay_voi_pid_da_doi_chu(state_root):
+    """Chốt an toàn không được mất khi nới chỗ trên. PID có thể bị dùng lại, và một bản
+    `_cleanup` cũ hơn từng SIGKILL đúng chính test runner vì chỉ tin vào "PID còn sống".
+    Nay phải khớp cả `child_start_token`."""
+    con = _con_dang_song()
+    try:
+        p = SessionPaths(state_root, "pid-doi-chu")
+        wsh.write_meta_atomic(p, wsh.SessionMeta(
+            name="pid-doi-chu", host_pid=_mot_pid_da_chet(), host_generation="cu",
+            child_pid=con.pid, child_start_token="9999999999",   # token KHÔNG khớp
+            cwd=str(REPO_ROOT), argv=[sys.executable], created_at=time.time() - 30))
+
+        assert wsh.child_reapable(wsh.read_meta(p)) is False
+        _cleanup(state_root)
+        time.sleep(1.0)
+        assert con.poll() is None, "PID đã đổi chủ thì tuyệt đối không được SIGKILL"
+    finally:
+        con.kill()
+        con.wait()
+
+
+def test_ban_ghi_cu_khong_co_token_thi_khong_ra_tay(state_root):
+    """Bản ghi viết trước khi có `child_start_token` thì không xác nhận được là của ai —
+    để lại một tiến trình mồ côi còn đỡ hơn giết oan một tiến trình vô can."""
+    con = _con_dang_song()
+    try:
+        p = SessionPaths(state_root, "ban-ghi-cu")
+        wsh.write_meta_atomic(p, wsh.SessionMeta(
+            name="ban-ghi-cu", host_pid=_mot_pid_da_chet(), host_generation="cu",
+            child_pid=con.pid, cwd=str(REPO_ROOT), argv=[sys.executable],
+            created_at=time.time() - 30))          # không có token
+        assert wsh.read_meta(p).child_start_token == ""
+        assert wsh.child_reapable(wsh.read_meta(p)) is False
+    finally:
+        con.kill()
+        con.wait()
+
+
+def test_token_khoi_dong_phan_biet_duoc_hai_tien_trinh_khac_nhau(state_root):
+    """`process_start_token` phải khác nhau giữa hai tiến trình khác nhau, và trả '' cho
+    PID không tồn tại — gọi phải coi '' là 'không xác nhận được', không phải 'khớp'."""
+    a, b = _con_dang_song(), _con_dang_song()
+    try:
+        ta, tb = wsh.process_start_token(a.pid), wsh.process_start_token(b.pid)
+        assert ta and tb
+        assert wsh.process_start_token(a.pid) == ta, "cùng tiến trình thì ổn định"
+        assert (ta, a.pid) != (tb, b.pid)
+        assert wsh.process_start_token(None) == ""
+        assert wsh.process_start_token(-1) == ""
+    finally:
+        for c in (a, b):
+            c.kill(); c.wait()
+
+
+def test_host_bi_SIGTERM_thi_con_chet_theo(state_root, child_script, spawn_env):
+    """Mắt thứ ba, và là mắt làm rò rỉ NGAY CẢ KHI cả file test xanh.
+
+    `terminate_host` gửi SIGTERM cho host. Host không có handler thì chết ngay, nên khối
+    `finally` của nó — nơi DUY NHẤT gọi `process.terminate()` để giết con — không bao giờ
+    chạy. Con được sinh với `start_new_session=True` nên nó là session leader riêng và không
+    nhận tín hiệu nào khi host chết: nó sống mãi trên một pty đã chết, quay 98% CPU.
+
+    Trên Windows `taskkill /T` dọn cả cây nên lỗ này không tồn tại — đây là cái giá của một
+    module viết cho Windows trước mà chạy thật trên Linux. Đo thật 25/09/2026: bản sửa phần
+    teardown của bộ test vẫn để lại 2 tiến trình mỗi lượt chạy, đúng vì mắt này."""
+    _make_session(state_root, "sigterm", child_script)
+    p = SessionPaths(state_root, "sigterm")
+    _wait(lambda: wsh.read_meta(p) is not None, what="metadata")
+    meta = wsh.read_meta(p)
+    assert meta.child_pid and wsh.pid_alive(meta.child_pid)
+    assert meta.child_start_token, "phải ghi được token để dọn con an toàn"
+
+    os.kill(meta.host_pid, signal.SIGTERM)
+
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline and (wsh.pid_alive(meta.host_pid)
+                                           or wsh.pid_alive(meta.child_pid)):
+        time.sleep(0.05)
+    assert not wsh.pid_alive(meta.host_pid), "host phải dừng khi nhận SIGTERM"
+    assert not wsh.pid_alive(meta.child_pid), \
+        "con PHẢI chết theo host — nếu không, mỗi lần tắt là thêm một tiến trình quay CPU mãi"
+
+
+def test_don_nhom_con_khong_ra_tay_khi_pid_da_doi_chu(state_root):
+    """`reap_child_group` là dây đai cho trường hợp host bị SIGKILL. Nó vẫn phải đi qua
+    `child_reapable`, nên một PID đã đổi chủ thì tuyệt đối không bị giết."""
+    con = _con_dang_song()
+    try:
+        meta = wsh.SessionMeta(
+            name="dai-an-toan", host_pid=_mot_pid_da_chet(), host_generation="cu",
+            child_pid=con.pid, child_start_token="123",   # token KHÔNG khớp
+            cwd=str(REPO_ROOT), argv=[sys.executable], created_at=time.time())
+        assert wsh.reap_child_group(meta) is False
+        assert con.poll() is None
+    finally:
+        con.kill(); con.wait()
