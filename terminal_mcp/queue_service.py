@@ -580,6 +580,9 @@ class QueueService:
             return {"error": "TASK_NOT_FOUND", "task_id": task_id}
         result = {"task": task.to_dict(), "queue_position": self.store.queue_position(task_id),
                   "outcome": _structured_outcome(task)}
+        checkpoint = (task.metadata or {}).get("fast_agent_checkpoint")
+        if isinstance(checkpoint, dict):
+            result["checkpoint"] = checkpoint
         if task.status == "QUEUED":
             lane = self.store.lane_status(task.session)
             active = lane.get("current_task") or {}

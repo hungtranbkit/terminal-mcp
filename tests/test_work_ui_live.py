@@ -107,7 +107,11 @@ def test_a_long_wait_is_marked_stale_with_a_reason(live):
         pytest.skip(f"work lane refused: {created['error']}")
     task_id = created["tasks"][0]["queue_task_id"]
     for state in ("PRECHECK", "READY", "DISPATCHING", "RUNNING", "VERIFYING"):
-        queue.store.transition_task(task_id, state, event_type=state)
+        if state == "RUNNING":
+            queue.store.mark_running_with_evidence(
+                task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
+        else:
+            queue.store.transition_task(task_id, state, event_type=state)
     # Backdate the VERIFYING transition to look like yesterday's stall.
     with queue.store._connection() as connection:
         connection.execute(

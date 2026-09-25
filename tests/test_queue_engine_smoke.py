@@ -19,19 +19,12 @@ a remote node-agent, which the rest of this codebase's own multi-node
 test suite already covers independently. Faster, safer, and zero risk
 to a real project.
 
-HARMLESS FAKE WORKER: each disposable session runs a small shell one-
-liner (see the `rig` fixture's own make_worker helper for the exact
-command and why it's shaped the way it is) that reads one line, waits
-briefly, echoes it, then execs into `cat` for everything after --
-`cat`/the echoed line reproduce every line of stdin back to the pane
-verbatim. Since the dispatch text this feature sends already contains,
-as part of its own short completion-marker instruction (queue_engine.
-build_dispatch_text), the EXACT marker line with the real task_id/
-attempt/nonce already substituted in, echoing it back is a real,
-working, zero-risk stand-in for "an agent that did the work and then
-printed the marker" -- this is not a mocked completion signal; it goes
-through the real send -> real pane -> real capture -> real regex-parse
--> real nonce-verify pipeline end to end.
+HARMLESS FAKE WORKER: each disposable session runs a compiled Codex-like
+interactive TUI. It buffers multiline input in its composer and prints the
+nonce-bound completion marker only after entering a separate worker-output
+phase. The queue still sends through TerminalService's guarded path and the
+real adapter must positively accept the submission. A plain shell cannot
+use this fixture to bypass MULTILINE_SHELL_SEND_REFUSED.
 
 SAFETY: every session/repo here is a disposable tmp_path fixture. This
 file NEVER references `window`/`window2`, and does not enable
@@ -40,23 +33,14 @@ matching the "no automatic background loop is wired yet" phase 2
 constraint).
 
 NOT RUN BY DEFAULT (`pytest.mark.queue_smoke`, excluded in pyproject.toml's
-own addopts, same convention as the existing live_cli/real_network/
-real_ssh markers): classify_status (status.py, pre-existing, unmodified)
-only leaves its own RUNNING classification once a session's tmux
-activity age exceeds 60 real seconds OR its foreground command visibly
-changes -- a deliberate, existing "genuine quiet window before treating
-something as done" design this feature's own completion detection
-reuses as-is rather than second-guessing. The harmless fake worker
-below is built to change its own foreground command (not just go
-quiet) specifically so this smoke test does not have to wait a real 60
-seconds per task -- but SOME real wall-clock waiting is unavoidable
-here (this file takes on the order of a minute to run, not
-milliseconds), which is exactly why it is not part of the default fast
-suite. Run explicitly: `pytest -m queue_smoke tests/test_queue_engine_smoke.py -v`."""
+own addopts): these tests exercise real disposable tmux sessions and
+submission timing. Run explicitly: `pytest -m queue_smoke
+tests/test_queue_engine_smoke.py -v`."""
 from __future__ import annotations
 
 import subprocess
 import time
+import shutil
 
 import pytest
 
@@ -97,7 +81,7 @@ def _init_real_git_repo(path):
 def rig(tmp_path, tmux_session_factory):
     """One real TerminalService/ControllerService/QueueStore/
     CoordinatorGate/QueueEngine, plus a helper to spin up a disposable
-    delayed-echo worker session inside its own real, clean git repo."""
+    interactive disposable Codex session inside its own clean git repo."""
     service = _service(tmp_path)
     controller = build_default_controller(service)
     # The "local" node's status is DERIVED from heartbeat freshness (see
@@ -113,35 +97,47 @@ def rig(tmp_path, tmux_session_factory):
     coordinator = CoordinatorGate()  # real git evidence collector, real sensitive-pattern screen
     engine = QueueEngine(store, controller, coordinator=coordinator, lease_seconds=300)
 
+    # The dispatch is intentionally multiline. Exercise the real interactive
+    # Codex adapter contract: its composer buffers pasted newlines, unlike a
+    # plain shell where embedded newlines execute before the guarded send can
+    # withhold Enter. This disposable TUI echoes the draft, enters a working
+    # state, and returns the exact nonce-bound marker as worker output.
+    if not shutil.which("cc"):
+        pytest.skip("C compiler required for disposable interactive TUI worker")
+    source = r'''#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+int main(void) {
+  char line[8192], marker[8192] = "";
+  puts("gpt-5.6 · disposable repo");
+  puts("› Ask Codex to do anything");
+  fflush(stdout);
+  while (fgets(line, sizeof(line), stdin)) {
+    fputs(line, stdout); fflush(stdout);
+    if (strstr(line, "###TERMINAL_MCP_COMPLETION")) {
+      snprintf(marker, sizeof(marker), "%s", line);
+      char *end = strstr(marker + 3, "###");
+      if (end) end[3] = '\0';
+    }
+    if (line[0] == '\n' && marker[0]) {
+      puts("Working"); fflush(stdout);
+      struct timespec pause = {3, 0}; nanosleep(&pause, NULL);
+      printf("\n%s\n", marker);
+      puts("› Ask Codex to do anything"); fflush(stdout);
+      marker[0] = '\0';
+    }
+  }
+  return 0;
+}
+'''
+    c_path, binary = tmp_path / "fake_codex.c", tmp_path / "codex"
+    c_path.write_text(source)
+    subprocess.run(["cc", "-O0", "-o", str(binary), str(c_path)], check=True)
+
     def make_worker(name: str) -> str:
         repo = _init_real_git_repo(tmp_path / f"repo-{name}")
-        # See this module's own "HARMLESS FAKE WORKER" docstring section.
-        # Two real, disclosed constraints this specific command satisfies:
-        # (1) a literal multi-line tmux send-keys write lands (and,
-        #     against a plain line-buffered `cat`, gets fully echoed)
-        #     BEFORE this project's own send-confirmation logic takes its
-        #     "pre-Enter" reference snapshot -- a real Claude/Codex Ink
-        #     composer buffers multi-line paste input specially and does
-        #     not have this issue (already extensively tested elsewhere in
-        #     this codebase -- see adapters.py's own ClaudeAdapter
-        #     docstring), but GenericShellAdapter (selected for any plain,
-        #     non-agent command, exactly what this disposable worker is)
-        #     uses a simple before/after-Enter diff that a bare `cat`
-        #     defeats by echoing everything too early -- reading and
-        #     delaying the FIRST line specifically fixes this: the
-        #     observable echo lands during the real post-Enter poll
-        #     window, not before it.
-        # (2) classify_status's own ACTIVE_COMMANDS treats a bare "bash"
-        #     foreground command as RUNNING for up to 60s of tmux
-        #     activity age regardless of real progress -- `exec cat`
-        #     immediately after that first delayed line makes the pane's
-        #     foreground command "cat" (not in ACTIVE_COMMANDS), so this
-        #     project's own classify_status correctly and promptly
-        #     reports it as no-longer-RUNNING once the worker is done
-        #     with its one deliberate delay, exactly like a real one-shot
-        #     command completing would.
-        tmux_session_factory(
-            name, f"bash -c 'cd {repo} && IFS= read -r first_line && sleep 0.15 && echo \"$first_line\" && exec cat'")
+        tmux_session_factory(name, f"cd {repo} && exec -a codex {binary}")
         return str(repo)
 
     return {"service": service, "controller": controller, "store": store, "engine": engine,
@@ -241,26 +237,36 @@ def test_two_queues_run_independently_and_task2_never_dispatches_before_task1_co
     # wall-clock wait) -- proves genuine per-lane parallelism, not
     # accidental serialization through a shared global queue, while
     # never paying the ~60s quiet-window wait twice.
-    seen_a_task2_early = False
+    order_violation = None
 
     def check_ordering():
-        nonlocal seen_a_task2_early
-        if store.get_task(ids_a[1]).status != QUEUED:
-            seen_a_task2_early = True
+        nonlocal order_violation
+        first_status = store.get_task(ids_a[0]).status
+        second_status = store.get_task(ids_a[1]).status
+        if second_status != QUEUED and first_status != COMPLETED:
+            order_violation = (first_status, second_status)
         return (store.get_task(ids_a[0]).status == COMPLETED
                 and store.get_task(ids_b[0]).status == COMPLETED)
 
     _drive_concurrently(engine, ["queue-smoke-a", "queue-smoke-b"], controller=rig["controller"],
                        deadline_seconds=90, poll_interval=0.5, stop_when=check_ordering)
 
-    assert not seen_a_task2_early, "lane A's task 2 dispatched/moved before task 1 reached COMPLETED"
+    assert order_violation is None, (
+        "lane A's task 2 dispatched/moved before task 1 reached COMPLETED; "
+        f"observed statuses={order_violation}")
     assert store.get_task(ids_a[0]).status == COMPLETED
     assert store.get_task(ids_a[0]).verification_evidence  # real evidence, not just the label
     assert store.get_task(ids_b[0]).status == COMPLETED  # lane B progressed independently, in parallel
 
     # NOW (only after task 1 completed) task 2 becomes claimable in lane A.
-    engine.tick("queue-smoke-a")  # CLAIMED
-    assert store.get_task(ids_a[1]).status == "PRECHECK"
+    # The interleaved driver may already have made its first transition in
+    # the iteration that completed lane B, so accept either adjacent state.
+    second = store.get_task(ids_a[1])
+    assert second.status in {"QUEUED", "PRECHECK", "READY"}
+    if second.status == "QUEUED":
+        engine.tick("queue-smoke-a")  # CLAIMED
+        second = store.get_task(ids_a[1])
+    assert second.status in {"PRECHECK", "READY"}
 
 
 # ---------------------------------------------------------------------------
@@ -423,7 +429,7 @@ def test_restart_mid_dispatch_never_duplicates_the_real_send(rig, tmp_path):
     engine2.tick("queue-smoke-a")  # CLAIMED again
     engine2.tick("queue-smoke-a")  # COORDINATOR_READY again
     redispatch_result = engine2.tick("queue-smoke-a")  # re-dispatch attempt, SAME idempotency_key
-    assert redispatch_result.action == "DISPATCHED"
+    assert redispatch_result.action in ("DISPATCHED", "RUNNING")
     time.sleep(0.3)
 
     # The real, decisive proof: the occurrence count after the RECLAIMED

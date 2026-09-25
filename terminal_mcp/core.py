@@ -1064,7 +1064,8 @@ class TerminalService:
         if current is None or not grant.pinned_session_id:
             return self._stale_pin_fallback(session)
         pinned = SessionIdentity(name=session, session_id=grant.pinned_session_id,
-                                 pane_id=grant.pinned_pane_id or "", created_epoch=grant.pinned_created_epoch or 0)
+                                 pane_id=grant.pinned_pane_id or "", created_epoch=grant.pinned_created_epoch or 0,
+                                 pane_pid=grant.pinned_pane_pid or 0)
         if not pinned.matches(current):
             return self._stale_pin_fallback(session)
         return True, None
@@ -1113,7 +1114,8 @@ class TerminalService:
             return True
         pinned = SessionIdentity(name=session, session_id=grant.pinned_session_id,
                                  pane_id=grant.pinned_pane_id or "",
-                                 created_epoch=grant.pinned_created_epoch or 0)
+                                 created_epoch=grant.pinned_created_epoch or 0,
+                                 pane_pid=grant.pinned_pane_pid or 0)
         return not pinned.matches(current)
 
     def _input_authorized(self, session: str) -> tuple[bool, str | None]:
@@ -3206,6 +3208,7 @@ class TerminalService:
             input_enabled=input_enabled, replace=replace,
             pinned_session_id=info.session_id, pinned_pane_id=info.pane_id,
             pinned_created_epoch=info.created_epoch,
+            pinned_pane_pid=info.pane_pid,
         )
         if not changed:
             return {"error": "BINDING_EXISTS", "binding": binding, "session": stored.session}
@@ -3301,7 +3304,8 @@ class TerminalService:
             }
         pinned = SessionIdentity(name=stored.session, session_id=stored.pinned_session_id,
                                  pane_id=stored.pinned_pane_id or "",
-                                 created_epoch=stored.pinned_created_epoch or 0)
+                                 created_epoch=stored.pinned_created_epoch or 0,
+                                 pane_pid=stored.pinned_pane_pid or 0)
         if current is None or not pinned.matches(current):
             return {
                 "error": "IDENTITY_MISMATCH", "binding": binding, "session": stored.session,
@@ -3921,7 +3925,10 @@ class TerminalService:
             return {"error": "SESSION_NOT_FOUND", "session": session}
         grant = self.grants.set_input(session, True, granted_by=granted_by,
                                       pinned_session_id=info.session_id, pinned_pane_id=info.pane_id,
-                                      pinned_created_epoch=info.created_epoch)
+                                      pinned_created_epoch=info.created_epoch,
+                                      pinned_pane_pid=info.pane_pid)
+        # Pin the process incarnation as well: tmux server restart can
+        # recycle $0/%0 and session_created within one second.
         if grant is None:  # read was revoked concurrently between the check above and here
             return {"error": "READ_GRANT_REQUIRED", "session": session}
         self.session_registry.touch_grant(self.REGISTRY_LOCAL_NODE_ID, session,

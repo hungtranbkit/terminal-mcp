@@ -107,7 +107,10 @@ class WorkRuntimeStore:
 
     def attempts(self, work_session_id: str) -> list[dict[str, Any]]:
         with self.store._connection() as c:
-            rows = c.execute("SELECT * FROM work_attempts WHERE work_session_id=? ORDER BY created_at,id", (work_session_id,)).fetchall()
+            # rowid is the insertion sequence. Timestamps have finite
+            # resolution and can tie for fast provider handoffs; UUID order
+            # is deterministic but does not preserve attempt chronology.
+            rows = c.execute("SELECT * FROM work_attempts WHERE work_session_id=? ORDER BY created_at,rowid", (work_session_id,)).fetchall()
         return [dict(r) for r in rows]
 
     def add_verified_experience(self, project_id: str, *, kind: str, title: str, content: str,

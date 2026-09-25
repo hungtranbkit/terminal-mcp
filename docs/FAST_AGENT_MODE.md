@@ -22,6 +22,12 @@ summary, root cause, changed files, tests, verification, commit, blocker, and
 `requires_user_action`. Full terminal output remains available through the
 existing task/session diagnostics.
 
+The queue task stores a bounded `checkpoint` with the goal, findings, files
+read/changed, tests, failures, next action, and repository identity. A worker or
+caller can update it with `terminal_turn` action `task_checkpoint`, passing
+`task_id` and `args: {"checkpoint": {...}}`. Partial updates retain fields
+from the prior checkpoint. It stores summaries and paths, not pane logs.
+
 `action="send"` with `long_task=true` also uses the existing persistent queue.
 Short one-shot shell commands still use `send` or `send_wait`.
 
@@ -65,3 +71,13 @@ The `tests/test_one_call_start.py` suite exercises the one-call submission,
 bounded start sequence, follower progression, restart reattachment, terminal
 stop states, and the no-polling receipt. The queue store remains the source of
 truth across process restart; only marked tasks resume on this follower path.
+When the target session is on the local node, start also caches a compact
+RepoContext (branch, commit, dirty state, likely package manager/runtime,
+known test/lint/build commands, and confidently detected service port) against
+the task. Remote paths are not inspected on the central host. Project metadata
+and git changes invalidate the in-process cache conservatively. Capability,
+health, draining, repository locality, and queue-load routing continue through
+the existing TaskRouter; pinned `start` targets remain hard affinity.
+
+See [the round-trip benchmark](FAST_AGENT_MODE_BENCHMARK.md) for the call-count
+comparison and disposable E2E evidence.

@@ -125,7 +125,11 @@ def test_a_shadow_run_shows_its_stage_while_the_task_status_stays_put(rig):
     client, queue, harness = rig
     task_id = _task(queue)
     for target in (qs.PRECHECK, qs.READY, qs.DISPATCHING, qs.RUNNING):
-        queue.store.transition_task(task_id, target, event_type="TEST")
+        if target == qs.RUNNING:
+            queue.store.mark_running_with_evidence(
+                task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
+        else:
+            queue.store.transition_task(task_id, target, event_type="TEST")
     harness.start(task_id=task_id, acceptance=["a"], checks=["npm test"],
                   write_authority=policy.SHADOW, steps=24)
 
@@ -297,7 +301,11 @@ def test_the_page_shows_the_task_status_and_the_run_stage_separately(rig):
     client, queue, harness = rig
     task_id = _task(queue)
     for target in (qs.PRECHECK, qs.READY, qs.DISPATCHING, qs.RUNNING):
-        queue.store.transition_task(task_id, target, event_type="TEST")
+        if target == qs.RUNNING:
+            queue.store.mark_running_with_evidence(
+                task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
+        else:
+            queue.store.transition_task(task_id, target, event_type="TEST")
     harness.start(task_id=task_id, acceptance=["a"], checks=["npm test"],
                   write_authority=policy.SHADOW, steps=24)
 

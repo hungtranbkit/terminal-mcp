@@ -215,6 +215,7 @@ TURN_HANDLER_ACTIONS: dict[str, str] = {
     "project_recover": "project_recover",
     "task_status": "task_status",
     "task_batch_status": "task_batch_status",
+    "task_checkpoint": "task_checkpoint",
     # TMCP-HARNESS-001. The harness is reachable ONLY from here. There is
     # deliberately no standalone harness_* tool: a second surface would be a
     # second place for "may this write the task status" to be decided, and
@@ -413,6 +414,8 @@ class CompactTerminalTools:
         # here, and the wrapper-layer side effects those tools already carry
         # (heartbeat refresh, supervisor-watch cleanup on delete) still run.
         self.handlers: dict[str, Callable[..., Any]] = dict(handlers or {})
+        from .context_pack import RepoContextCache
+        self._repo_context_cache = RepoContextCache()
         self.monotonic = monotonic
         self.sleep = sleep
         self._read_lock = threading.Lock()
@@ -1037,11 +1040,27 @@ class CompactTerminalTools:
             return {"status": "FAILED", "error": "ACTION_UNAVAILABLE", "action": "start",
                     "detail": "start is not wired on this server"}
         durable_metadata = {**(metadata or {}), "fast_agent_mode": True}
+        repo_context = self._repo_context_for_target(target)
+        if repo_context is not None:
+            durable_metadata.setdefault("repo_context", repo_context)
         accepted = enqueue(target, text, title=title, priority=priority,
                            metadata=durable_metadata, request_key=request_key)
         if not isinstance(accepted, dict) or accepted.get("error") or not accepted.get("task_id"):
             return {"status": "FAILED", "action": "start", "result": accepted}
         task_id = accepted["task_id"]
+
+        checkpoint_handler = self.handlers.get("task_checkpoint")
+        if checkpoint_handler is not None:
+            try:
+                checkpoint_handler(task_id, {
+                    "task_id": task_id, "goal": text, "findings": [], "files_read": [],
+                    "changed_files": [], "tests": [], "failures": [],
+                    "next_action": "inspect the repository and reproduce the requested behavior",
+                    "repo": ({key: repo_context[key] for key in ("path", "branch", "commit")
+                              if repo_context.get(key) is not None} if repo_context else {}),
+                })
+            except Exception:  # noqa: BLE001 -- task enqueue remains durable if advisory checkpoint fails
+                pass
 
         ticks, task_state, blocked_reason = self._drive_start(target, task_id)
         follow = self._follow(target, task_id, task_state)
@@ -1055,8 +1074,27 @@ class CompactTerminalTools:
             "request_key": accepted.get("request_key"),
             "dispatch_ticks": ticks,
             "server_side_progress": follow,
+            "repo_context_cached": repo_context is not None,
             **self._start_next_step(task_state, blocked_reason),
         }
+
+    def _repo_context_for_target(self, target: str) -> dict[str, Any] | None:
+        """Inspect only a repository on this process's own node."""
+        local_node = getattr(self.controller, "local_node_id", None)
+        status_reader = getattr(self.controller, "terminal_status", None)
+        if not local_node or status_reader is None:
+            return None
+        try:
+            status = status_reader(target)
+            if (not isinstance(status, dict) or status.get("error")
+                    or status.get("node_id") != local_node or not status.get("cwd")):
+                return None
+            from pathlib import Path
+            if not Path(status["cwd"]).is_dir():
+                return None
+            return self._repo_context_cache.get(status["cwd"])
+        except Exception:  # noqa: BLE001 -- advisory context must not block durable enqueue
+            return None
 
     @staticmethod
     def _start_next_step(task_state: str, blocked_reason: str | None) -> dict[str, Any]:
@@ -1231,6 +1269,18 @@ class CompactTerminalTools:
         if action in {"enqueue_task", "route_start"} and (
                 not isinstance(text, str) or not text.strip()):
             return {"status": "FAILED", "error": "TEXT_REQUIRED", "action": action}
+        if action == "task_checkpoint":
+            if not isinstance(task_id, str) or not task_id.strip():
+                return {"status": "FAILED", "error": "TASK_ID_REQUIRED", "action": action}
+            if not isinstance(args, dict) or set(args) != {"checkpoint"}:
+                return {"status": "FAILED", "error": "INVALID_ARGS", "action": action,
+                        "allowed": ["checkpoint"]}
+            try:
+                result = handler(task_id.strip(), args["checkpoint"])
+            except (KeyError, ValueError) as exc:
+                return {"status": "FAILED", "error": "INVALID_CHECKPOINT",
+                        "action": action, "detail": str(exc)[:300]}
+            return {"status": "OK", "action": action, "result": result}
         if action in AGENT_ARGS:
             # Shaped from `args` plus the two conventional positionals this
             # surface already uses everywhere else: `target` is the agent or

@@ -419,7 +419,13 @@ def test_a_confirmed_old_orphan_owned_by_a_finished_task_is_really_removed(tmp_p
         "metadata": {"git_isolation": {"worktree_path": str(path), "repo_path": str(repo)},
                      wc.METADATA_KEY: {"state": wc.CLEANUP_PENDING}}}])
     for status in ("PRECHECK", "READY", "DISPATCHING", "RUNNING", "VERIFYING", "COMPLETED"):
-        store.transition_task(task_id, status, event_type="TEST")
+        if status == "RUNNING":
+            store.mark_running_with_evidence(
+                task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
+        elif status == "COMPLETED":
+            store.mark_completed_with_evidence(task_id, evidence={"exit_code": 0})
+        else:
+            store.transition_task(task_id, status, event_type="TEST")
 
     report = _sweep(tmp_path, repo, store=store).run_once(**_probes())
     assert report["removed_count"] == 1, report

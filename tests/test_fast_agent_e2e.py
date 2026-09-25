@@ -105,6 +105,7 @@ int main(void) {
         "enqueue_task": enqueue, "task_status": queue.task_status,
         "dispatch_tick": lambda lane: engine.tick(lane).to_dict(),
         "follow_task": follower.follow,
+        "task_checkpoint": queue.store.record_fast_agent_checkpoint,
     })
     receipt = tools.turn(action="start", target=session, title="Disposable E2E",
                          text="Create fast-agent-e2e.txt with the proof string.",
@@ -120,7 +121,9 @@ int main(void) {
 
     task = queue.store.get_task(task_id)
     assert task.status == "COMPLETED", task.last_error
+    assert task.metadata["repo_context"]["path"] == str(repo)
     assert (repo / "fast-agent-e2e.txt").read_text() == "created by the disposable worker\n"
     outcome = queue.task_status(task_id)["outcome"]
     assert outcome["status"] == "COMPLETE"
+    assert queue.task_status(task_id)["checkpoint"]["next_action"].startswith("inspect")
     assert task.attempt_count == 1

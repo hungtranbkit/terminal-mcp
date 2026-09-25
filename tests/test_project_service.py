@@ -305,7 +305,11 @@ def test_report_counts_transitions_not_a_snapshot(queue, projects):
     that happened; a snapshot of current status would have lost it."""
     task_id = scoped_task(queue, session="lane-a")
     for target, event in ((qs.DISPATCHING, "D"), (qs.RUNNING, "R"), (qs.VERIFYING, "V")):
-        queue.store.transition_task(task_id, target, event_type=event)
+        if target == qs.RUNNING:
+            queue.store.mark_running_with_evidence(
+                task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
+        else:
+            queue.store.transition_task(task_id, target, event_type=event)
     queue.store.mark_completed_with_evidence(task_id, evidence={"exit_code": 0})
 
     report = projects.report(PROJECT, window_hours=1)

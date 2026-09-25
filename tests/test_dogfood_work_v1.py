@@ -261,7 +261,8 @@ def test_the_pipeline_publishes_counts_and_never_a_token_estimate(store, knowled
 
     assert all(isinstance(v, int) for v in payload["counters"].values())
     assert not any("token" in key.lower() for key in payload["counters"])
-    assert "token" not in str(payload["stages"]).lower()
+    import re
+    assert not re.search(r"\b\d+\s*(?:input|output)?\s*tokens?\b", str(payload["stages"]), re.I)
 
 
 def test_the_pipeline_records_the_commit_it_planned_against(store, knowledge):

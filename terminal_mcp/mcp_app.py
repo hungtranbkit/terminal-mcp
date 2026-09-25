@@ -106,6 +106,7 @@ def _fleet_session_names(controller: "ControllerService") -> list[str]:
 
 def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_session,
                      enqueue_task, route_start, task_status, task_batch_status,
+                     task_checkpoint,
                      agent_start, list_agents, get_agent, create_agent, update_agent,
                      list_skills, register_skill, bind_agent_skill, cleanup_candidates,
                      project_plan, project_bootstrap, project_list, project_get,
@@ -159,6 +160,7 @@ def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_sessio
         "project_recover": project_recover,
         "task_status": task_status,
         "task_batch_status": task_batch_status,
+        "task_checkpoint": task_checkpoint,
         # May be None on a build with no browser gateway wired. The router
         # already answers ACTION_UNAVAILABLE for a missing handler, which
         # is the honest result -- far better than a browser action that
@@ -6272,6 +6274,7 @@ def build_mcp(service: TerminalService | None = None,
         project_recover=terminal_project_recover,
         task_status=terminal_task_status,
         task_batch_status=terminal_task_batch_status,
+        task_checkpoint=queue.store.record_fast_agent_checkpoint,
         browser_status=browser_handlers.get("browser_status"),
         browser_verify=browser_handlers.get("browser_verify"),
         browser_screenshot=browser_handlers.get("browser_screenshot"),

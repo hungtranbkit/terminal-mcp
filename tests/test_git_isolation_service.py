@@ -111,7 +111,7 @@ def test_coordinator_gate_refuses_a_session_not_on_its_own_worktree(tmp_path, re
     gate = CoordinatorGate()
     # Session is really still on the shared repo_path (main), NOT the
     # isolated worktree -- a real, live cwd mismatch.
-    snapshot = SessionSnapshot(node_id="local", cwd=str(repo), current_command="bash", state="IDLE",
+    snapshot = SessionSnapshot(node_id="local", cwd=str(repo), current_command="codex", state="IDLE",
                                input_required=False, reader_alive=True)
     decision = gate.review(task, store=isolation.queue.store, session=snapshot)
     assert decision.status == "NEEDS_HUMAN"
@@ -125,7 +125,7 @@ def test_coordinator_gate_accepts_a_session_correctly_on_its_own_worktree(tmp_pa
     worktree_path = task.metadata["expected_cwd"]
 
     gate = CoordinatorGate()
-    snapshot = SessionSnapshot(node_id="local", cwd=worktree_path, current_command="bash", state="IDLE",
+    snapshot = SessionSnapshot(node_id="local", cwd=worktree_path, current_command="codex", state="IDLE",
                                input_required=False, reader_alive=True)
     decision = gate.review(task, store=isolation.queue.store, session=snapshot)
     assert decision.status == "READY"

@@ -24,7 +24,13 @@ project_knowledge and bug_spec have already scrubbed.
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
+import subprocess
+import time
+import tomllib
+from threading import RLock
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
@@ -684,3 +690,121 @@ def _resolve_modules(knowledge: Any, asked: Sequence[str]) -> tuple[list[str], l
         return list(asked), []
     return ([name for name in asked if name in recorded],
             [name for name in asked if name not in recorded])
+
+
+# Fast Agent Mode repository metadata cache. Kept beside other reusable
+# context builders so the canonical package index remains complete.
+_METADATA_FILES = (
+    "package.json", "pnpm-lock.yaml", "yarn.lock", "package-lock.json", "bun.lockb",
+    "bun.lock", "pyproject.toml", "uv.lock", "poetry.lock", "Pipfile", "Pipfile.lock",
+    "Cargo.toml", "Cargo.lock", "go.mod", "Makefile", "vite.config.ts",
+    "vite.config.js", "next.config.js", "next.config.ts", "next.config.mjs",
+    "playwright.config.ts", "pytest.ini", "setup.cfg", "tox.ini",
+)
+_PORT_RE = re.compile(r"(?:port\s*[:=]\s*|PORT\s*[:=]\s*|listen\s*\(\s*)(\d{2,5})", re.I)
+
+
+def _git(root: Path, *args: str) -> str | None:
+    try:
+        result = subprocess.run(["git", "-C", str(root), *args], capture_output=True,
+                                text=True, timeout=2, check=False)
+        return result.stdout.strip() if result.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+class RepoContextCache:
+    """In-process cache invalidated by repository and project metadata changes."""
+
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._entries: dict[str, dict[str, Any]] = {}
+
+    def get(self, path: str | os.PathLike[str]) -> dict[str, Any]:
+        requested = Path(path).expanduser().resolve()
+        root_text = _git(requested, "rev-parse", "--show-toplevel")
+        root = Path(root_text).resolve() if root_text else requested
+        manifest_data: dict[str, bytes] = {}
+        for name in _METADATA_FILES:
+            file = root / name
+            try:
+                if file.is_file() and file.stat().st_size <= 1_000_000:
+                    manifest_data[name] = file.read_bytes()
+            except OSError:
+                continue
+        branch = _git(root, "branch", "--show-current")
+        commit = _git(root, "rev-parse", "HEAD")
+        status = _git(root, "status", "--porcelain")
+        digest = hashlib.sha256()
+        digest.update((branch or "").encode())
+        digest.update((commit or "").encode())
+        digest.update((status or "").encode())
+        for name, content in sorted(manifest_data.items()):
+            digest.update(name.encode() + b"\0" + content)
+        fingerprint = digest.hexdigest()
+        key = str(root)
+        with self._lock:
+            cached = self._entries.get(key)
+            if cached and cached["fingerprint"] == fingerprint:
+                return dict(cached)
+        context = self._derive(root, manifest_data)
+        context.update({"path": key, "branch": branch, "commit": commit,
+                        "dirty": None if status is None else bool(status),
+                        "fingerprint": fingerprint,
+                        "invalidated_at": int(time.time())})
+        with self._lock:
+            self._entries[key] = context
+        return dict(context)
+
+    @staticmethod
+    def _derive(root: Path, files: dict[str, bytes]) -> dict[str, Any]:
+        names = set(files)
+        package_manager = next((manager for name, manager in (
+            ("pnpm-lock.yaml", "pnpm"), ("yarn.lock", "yarn"),
+            ("package-lock.json", "npm"), ("bun.lock", "bun"), ("bun.lockb", "bun"),
+            ("uv.lock", "uv"), ("poetry.lock", "poetry"), ("Pipfile.lock", "pipenv"),
+            ("Cargo.lock", "cargo"),
+        ) if name in names), None)
+        package: dict[str, Any] = {}
+        try:
+            package = json.loads(files["package.json"]) if "package.json" in files else {}
+        except (ValueError, UnicodeDecodeError):
+            pass
+        pyproject: dict[str, Any] = {}
+        try:
+            pyproject = tomllib.loads(files["pyproject.toml"].decode()) if "pyproject.toml" in files else {}
+        except (ValueError, UnicodeDecodeError):
+            pass
+        deps = {**(package.get("dependencies") or {}), **(package.get("devDependencies") or {})}
+        framework = next((name for name in ("next", "react", "vue", "svelte", "express") if name in deps), None)
+        if not framework and ("Cargo.toml" in names):
+            framework = "rust"
+        if not framework and ("go.mod" in names):
+            framework = "go"
+        if not framework and "pyproject.toml" in names:
+            framework = "python"
+        if not package_manager:
+            package_manager = "npm" if "package.json" in names else (
+                "uv" if "pyproject.toml" in names else None)
+        scripts = package.get("scripts") if isinstance(package.get("scripts"), dict) else {}
+        commands = {key: str(scripts[key])[:200] for key in ("test", "lint", "build")
+                    if isinstance(scripts.get(key), str)}
+        if "pyproject.toml" in names and not commands.get("test"):
+            commands["test"] = "pytest -q"
+        if "Cargo.toml" in names and not commands.get("test"):
+            commands["test"] = "cargo test"
+        port = None
+        for name in ("vite.config.ts", "vite.config.js", "next.config.js", "next.config.ts",
+                     "next.config.mjs", "playwright.config.ts", "Makefile"):
+            content = files.get(name)
+            if not content:
+                continue
+            match = _PORT_RE.search(content.decode("utf-8", "ignore"))
+            if match and 1 <= int(match.group(1)) <= 65535:
+                port = int(match.group(1)); break
+        runtime = ("node" if "package.json" in names else
+                   "python" if "pyproject.toml" in names else
+                   "rust" if "Cargo.toml" in names else
+                   "go" if "go.mod" in names else None)
+        return {"package_manager": package_manager, "framework": framework,
+                "runtime": runtime, "commands": commands, "service_port": port}

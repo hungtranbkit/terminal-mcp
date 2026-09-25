@@ -86,6 +86,7 @@ import signal
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -223,7 +224,10 @@ def write_meta_atomic(paths: SessionPaths, meta: SessionMeta) -> None:
     # would let two writers interleave their bytes into it before either
     # rename -- producing an atomically-installed but internally corrupt record,
     # which is worse than a partial write because it looks committed.
-    tmp = paths.dir / f".{META_NAME}.{os.getpid()}.{threading.get_ident()}.tmp"
+    # Thread identifiers can be reused as soon as a short lived writer
+    # exits. A per-write random suffix keeps simultaneous publications
+    # independent even when the OS recycles a thread ID.
+    tmp = paths.dir / f".{META_NAME}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     payload = json.dumps(meta.to_dict(), indent=2, sort_keys=True)
     with open(tmp, "w", encoding="utf-8") as handle:
         handle.write(payload)

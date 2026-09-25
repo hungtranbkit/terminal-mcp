@@ -98,6 +98,10 @@ class SessionIdentity:
         # keep its session_id while its active pane is killed/replaced);
         # created_epoch is a third, redundant corroboration in case a
         # tmux build/version ever leaves session_id or pane_id blank.
+        # tmux session/pane IDs can restart from $0/%0 when the server exits
+        # after its last session is killed. `session_created` has only
+        # second resolution, so rapid recreation can repeat those three
+        # values. The pane process ID distinguishes that new incarnation.
         return (self.session_id == other.session_id and self.pane_id == other.pane_id
-                and self.created_epoch == other.created_epoch)
-
+                and self.created_epoch == other.created_epoch
+                and (not self.pane_pid or not other.pane_pid or self.pane_pid == other.pane_pid))

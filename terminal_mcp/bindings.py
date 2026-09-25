@@ -51,6 +51,7 @@ class Binding:
     pinned_session_id: str | None = None
     pinned_pane_id: str | None = None
     pinned_created_epoch: int | None = None
+    pinned_pane_pid: int | None = None
 
 
 class BindingStore:
@@ -107,6 +108,7 @@ class BindingStore:
                 ("pinned_session_id", "TEXT"),
                 ("pinned_pane_id", "TEXT"),
                 ("pinned_created_epoch", "INTEGER"),
+                ("pinned_pane_pid", "INTEGER"),
             ):
                 if column not in existing_columns:
                     connection.execute(f"ALTER TABLE bindings ADD COLUMN {column} {declaration}")
@@ -126,6 +128,7 @@ class BindingStore:
             created_at=row["created_at"], updated_at=row["updated_at"],
             pinned_session_id=row["pinned_session_id"], pinned_pane_id=row["pinned_pane_id"],
             pinned_created_epoch=row["pinned_created_epoch"],
+            pinned_pane_pid=row["pinned_pane_pid"],
         )
 
     def get(self, name: str) -> Binding | None:
@@ -141,7 +144,8 @@ class BindingStore:
     def put(self, name: str, session: str, *, read_enabled: bool = True,
             input_enabled: bool = False, replace: bool = False,
             pinned_session_id: str | None = None, pinned_pane_id: str | None = None,
-            pinned_created_epoch: int | None = None) -> tuple[Binding | None, bool]:
+            pinned_created_epoch: int | None = None,
+            pinned_pane_pid: int | None = None) -> tuple[Binding | None, bool]:
         now = datetime.now(timezone.utc).isoformat()
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -152,17 +156,17 @@ class BindingStore:
                 connection.execute(
                     """INSERT INTO bindings
                     (name, session, read_enabled, input_enabled, created_at, updated_at,
-                     pinned_session_id, pinned_pane_id, pinned_created_epoch)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     pinned_session_id, pinned_pane_id, pinned_created_epoch, pinned_pane_pid)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (name, session, int(read_enabled), int(input_enabled), now, now,
-                     pinned_session_id, pinned_pane_id, pinned_created_epoch),
+                     pinned_session_id, pinned_pane_id, pinned_created_epoch, pinned_pane_pid),
                 )
             else:
                 connection.execute(
                     """UPDATE bindings SET session = ?, read_enabled = ?, input_enabled = ?, updated_at = ?,
-                       pinned_session_id = ?, pinned_pane_id = ?, pinned_created_epoch = ? WHERE name = ?""",
+                       pinned_session_id = ?, pinned_pane_id = ?, pinned_created_epoch = ?, pinned_pane_pid = ? WHERE name = ?""",
                     (session, int(read_enabled), int(input_enabled), now,
-                     pinned_session_id, pinned_pane_id, pinned_created_epoch, name),
+                     pinned_session_id, pinned_pane_id, pinned_created_epoch, pinned_pane_pid, name),
                 )
             row = connection.execute("SELECT * FROM bindings WHERE name = ?", (name,)).fetchone()
         return self._from_row(row), True

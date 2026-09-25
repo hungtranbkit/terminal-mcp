@@ -41,7 +41,8 @@ class FakeOps:
 
     def terminal_send_text(self, session, text, press_enter=False, dry_run=False, **kwargs):
         self.sent.append({"session": session, "text": text, "idempotency_key": kwargs.get("idempotency_key")})
-        return {"sent": True, "delivery_state": "SUBMIT_CONFIRMED", "node_id": "local"}
+        return {"sent": True, "delivery_state": "SUBMIT_CONFIRMED", "ack_state": "ACCEPTED",
+                "node_id": "local"}
 
 
 @pytest.fixture

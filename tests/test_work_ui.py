@@ -86,7 +86,11 @@ def test_a_worker_running_a_task_reports_busy_and_what_it_is_doing(wired):
                              tasks=[{"title": "the task", "prompt": "p"}])
     task_id = created["tasks"][0]["queue_task_id"]
     for step in ("PRECHECK", "READY", "DISPATCHING", "RUNNING"):
-        queue.store.transition_task(task_id, step, event_type="t")
+        if step == "RUNNING":
+            queue.store.mark_running_with_evidence(
+                task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
+        else:
+            queue.store.transition_task(task_id, step, event_type="t")
     worker = {w["session"]: w for w in
               service.workers(sessions=SESSIONS, nodes=NODES)["workers"]}["mesflow-work"]
     assert worker["state"] == "BUSY"
@@ -107,7 +111,11 @@ def test_the_list_carries_what_an_operator_scans_for(wired):
     work_id = created["work"]["work_id"]
     running = created["tasks"][0]["queue_task_id"]
     for step in ("PRECHECK", "READY", "DISPATCHING", "RUNNING"):
-        queue.store.transition_task(running, step, event_type="t")
+        if step == "RUNNING":
+            queue.store.mark_running_with_evidence(
+                running, evidence={"accepted": True, "signal": "explicit_running_signal"})
+        else:
+            queue.store.transition_task(running, step, event_type="t")
     blocked = created["tasks"][1]["queue_task_id"]
     queue.store.transition_task(blocked, "PRECHECK", event_type="t")
     queue.store.transition_task(blocked, "BLOCKED", event_type="t")

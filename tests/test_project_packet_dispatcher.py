@@ -27,7 +27,11 @@ def _feeder(tmp_path, tasks, *, lane="linux-codex-work", owner=None, second=None
 def _done(store, task_id):
     row = store.get_task(task_id)
     for state in ("PRECHECK", "READY", "DISPATCHING", "RUNNING", "VERIFYING"):
-        store.transition_task(row.id, state, event_type="TEST")
+        if state == "RUNNING":
+            store.mark_running_with_evidence(
+                row.id, evidence={"accepted": True, "signal": "explicit_running_signal"})
+        else:
+            store.transition_task(row.id, state, event_type="TEST")
     store.mark_completed_with_evidence(row.id, evidence={"test": True})
 
 

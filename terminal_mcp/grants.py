@@ -66,6 +66,7 @@ class SessionGrant:
     pinned_session_id: str | None
     pinned_pane_id: str | None
     pinned_created_epoch: int | None
+    pinned_pane_pid: int | None
     granted_by: str | None
     created_at: str
     updated_at: str
@@ -80,6 +81,7 @@ def _from_row(row: sqlite3.Row | None) -> SessionGrant | None:
         input_enabled=bool(row["input_enabled"]),
         pinned_session_id=row["pinned_session_id"], pinned_pane_id=row["pinned_pane_id"],
         pinned_created_epoch=row["pinned_created_epoch"], granted_by=row["granted_by"],
+        pinned_pane_pid=row["pinned_pane_pid"],
         created_at=row["created_at"], updated_at=row["updated_at"],
         revision=int(row["revision"]) if "revision" in row.keys() and row["revision"] is not None else 1,
     )
@@ -100,6 +102,7 @@ class SessionGrantStore:
                     pinned_session_id TEXT,
                     pinned_pane_id TEXT,
                     pinned_created_epoch INTEGER,
+                    pinned_pane_pid INTEGER,
                     granted_by TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -107,6 +110,9 @@ class SessionGrantStore:
                 """
             )
             apply_migrations(connection, GRANT_MIGRATIONS)
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(session_grants)")}
+            if "pinned_pane_pid" not in columns:
+                connection.execute("ALTER TABLE session_grants ADD COLUMN pinned_pane_pid INTEGER")
         try:
             self.path.chmod(0o600)
         except OSError:
@@ -156,7 +162,7 @@ class SessionGrantStore:
                 # reactivate.
                 connection.execute(
                     """UPDATE session_grants SET input_enabled = 0, pinned_session_id = NULL,
-                       pinned_pane_id = NULL, pinned_created_epoch = NULL, updated_at = ?,
+                       pinned_pane_id = NULL, pinned_created_epoch = NULL, pinned_pane_pid = NULL, updated_at = ?,
                        revision = revision + 1
                        WHERE session = ?""",
                     (now, session),
@@ -197,7 +203,8 @@ class SessionGrantStore:
 
     def set_input(self, session: str, enabled: bool, *, granted_by: str | None,
                   pinned_session_id: str | None = None, pinned_pane_id: str | None = None,
-                  pinned_created_epoch: int | None = None) -> SessionGrant | None:
+                  pinned_created_epoch: int | None = None,
+                  pinned_pane_pid: int | None = None) -> SessionGrant | None:
         """Returns None (does nothing) if read isn't already granted --
         callers (core.py) are expected to check that and return their own
         explicit error rather than silently no-op through this."""
@@ -208,13 +215,14 @@ class SessionGrantStore:
         with self._connection() as connection:
             connection.execute(
                 """UPDATE session_grants SET input_enabled = ?, pinned_session_id = ?,
-                   pinned_pane_id = ?, pinned_created_epoch = ?, granted_by = ?, updated_at = ?,
+                   pinned_pane_id = ?, pinned_created_epoch = ?, pinned_pane_pid = ?, granted_by = ?, updated_at = ?,
                    revision = revision + 1
                    WHERE session = ?""",
                 (int(enabled),
                  pinned_session_id if enabled else None,
                  pinned_pane_id if enabled else None,
                  pinned_created_epoch if enabled else None,
+                 pinned_pane_pid if enabled else None,
                  granted_by, now, session),
             )
         return self.get(session)

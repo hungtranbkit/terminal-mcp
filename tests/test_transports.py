@@ -118,7 +118,8 @@ async def test_stdio_real_handshake_and_tools(tmp_path):
         # Worktrees may intentionally share the primary checkout's venv (the
         # production self-host unit does). Use this pytest process's venv
         # rather than assuming every worktree owns a .venv directory.
-        command=str(__import__("pathlib").Path(sys.executable).with_name("terminal-mcp")),
+        command=sys.executable,
+        args=["-m", "terminal_mcp.server"],
         cwd=str(root),
         env={"TERMINAL_MCP_CONFIG": _config_with_open_access(tmp_path),
              "TERMINAL_MCP_BINDINGS_DB": str(tmp_path / "bindings.db"),

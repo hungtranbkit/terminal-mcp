@@ -62,6 +62,7 @@ from . import worktree_cleanup as wj
 from .schema import Migration, apply_migrations
 from .harness_schema import HARNESS_MIGRATIONS
 from . import harness_state
+from .redaction import redact_text
 
 # -- Task status state machine ------------------------------------------
 #
@@ -2843,6 +2844,49 @@ class QueueStore:
             metadata["dispatch_observation"] = current
             connection.execute("UPDATE queue_tasks SET metadata = ?, updated_at = ? WHERE id = ?",
                                (json.dumps(metadata), iso_now(), task_id))
+
+    def record_fast_agent_checkpoint(self, task_id: str, checkpoint: dict[str, Any]) -> dict[str, Any]:
+        """Persist a bounded Fast Agent progress delta on the existing task row."""
+        if not isinstance(checkpoint, dict):
+            raise ValueError("checkpoint must be an object")
+        allowed = {"goal", "findings", "files_read", "changed_files", "tests", "failures",
+                   "next_action", "repo", "task_id"}
+        if set(checkpoint) - allowed:
+            raise ValueError(f"unsupported checkpoint fields: {sorted(set(checkpoint) - allowed)}")
+        bounded: dict[str, Any] = {}
+        for key in ("goal", "next_action"):
+            value = checkpoint.get(key)
+            if value is not None:
+                bounded[key] = redact_text(str(value))[:1200]
+        for key in ("findings", "files_read", "changed_files", "tests", "failures"):
+            if key not in checkpoint:
+                continue
+            value = checkpoint[key]
+            if not isinstance(value, (list, tuple)):
+                raise ValueError(f"{key} must be a list")
+            bounded[key] = [redact_text(str(item))[:300] for item in value[:50]]
+        repo = checkpoint.get("repo", {})
+        if repo:
+            if not isinstance(repo, dict):
+                raise ValueError("repo must be an object")
+            bounded["repo"] = {key: redact_text(str(repo[key]))[:500] for key in
+                                ("path", "branch", "commit") if repo.get(key) is not None}
+        with self._connection() as connection:
+            row = connection.execute("SELECT session, metadata FROM queue_tasks WHERE id = ?",
+                                     (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            previous = _parse_json_object(row["metadata"])
+            old = previous.get("fast_agent_checkpoint")
+            old = old if isinstance(old, dict) else {}
+            bounded = {**old, **bounded, "task_id": task_id,
+                       "version": int(old.get("version", 0)) + 1, "updated_at": iso_now()}
+            previous["fast_agent_checkpoint"] = bounded
+            connection.execute("UPDATE queue_tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+                               (json.dumps(previous), iso_now(), task_id))
+            self._record_event_locked(connection, session=row["session"], task_id=task_id,
+                                      event_type="FAST_AGENT_CHECKPOINT", reason="progress delta saved")
+        return bounded
 
     def record_uncertain_reconciliation(self, task_id: str, *, outcome: str,
                                         submission_id: str | None = None,

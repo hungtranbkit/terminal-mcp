@@ -147,6 +147,8 @@ def pilot_toolchain(declared_toolchain):
 
 @real_repo_only
 def test_exactly_one_urbanflow_task_needs_a_human_asset():
+    if (REAL_REPO / "docs/design/reference/00-ui-board.png").exists():
+        pytest.skip("approved VIS-001 asset is already present; missing-asset expectation no longer applies")
     definitions = load_definitions(REAL_REPO / "TASKS.json")
     blocked = {task_id: human_input_required(definition, REAL_REPO)
                for task_id, definition in definitions.items()}
