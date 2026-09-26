@@ -3409,6 +3409,12 @@ class QueueStore:
             ).fetchall()
             for row in rows:
                 task = dict(row)
+                metadata = _parse_json_object(task.get("metadata"))
+                delivery_verdict = metadata.get("delivery_verdict")
+                if isinstance(delivery_verdict, dict) and str(delivery_verdict.get("kind") or "").upper() == "REFUSED":
+                    continue  # a transport/delivery refusal needs explicit retry or reroute, never blind AI replay
+                if str(task.get("last_error") or "").startswith("send failed:"):
+                    continue  # legacy hard-send failures may predate delivery_verdict metadata
                 if str(task.get("last_error") or "").startswith("VERIFICATION_"):
                     # This worker already finished. Missing verification
                     # evidence must be reconciled, not replayed as new work.

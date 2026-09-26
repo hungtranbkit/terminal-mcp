@@ -405,3 +405,11 @@ def test_the_loop_runs_the_ai_sweeps_without_dispatching(tmp_path):
     assert QueueLoop(Engine(store)).run_one_cycle() == []
     assert store.get_task(task).status == "QUEUED", "the AI sweep re-evaluated it"
     assert store.lane_status(SESSION)["auto_dispatch_enabled"] is False
+
+
+def test_delivery_refusal_is_not_ai_auto_requeued(tmp_path):
+    store = _store(tmp_path)
+    task = _blocked_task(store, REASON_CONTENTION)
+    store.record_delivery_verdict(task, {"kind": "REFUSED", "activation": "ACTIVATION_REFUSED", "detail": "delivery blocked", "delivery_state": "BLOCKED"})
+    assert store.reevaluate_ai_owned_blocked(now="2099-01-01T00:00:00Z") == []
+    assert store.get_task(task).status == "BLOCKED"

@@ -115,6 +115,9 @@ def plan_dispatch(*, current_command: str | None, execution_mode: str | None, ag
     command = normalize_command(current_command or "")
     shell_task = execution_mode == "shell"
     if not command:
+        if shell_task:
+            return DispatchPlan(WRAPPED, text=build_shell_line(
+                script, task_id=task_id, attempt=attempt, nonce=nonce, summary_sha256=summary_sha256))
         return DispatchPlan(AGENT, text=agent_text)
     if select_adapter(command).buffers_embedded_newlines:
         if shell_task:

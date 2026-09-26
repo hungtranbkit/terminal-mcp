@@ -1193,3 +1193,16 @@ def test_a_controller_without_registry_get_still_dispatches(store, ops):
     ops.set_status("lane-a", {"state": "IDLE", "exists": True, "node_id": "local", "cwd": "/repo/a"})
     assert PROMPT in _dispatch_once(store, ops)
     assert store.get_recovery_state(task_id)["session"] == "lane-a"
+
+
+def test_shell_task_without_reported_current_command_is_wrapped_atomically(store, ops):
+    task_id = store.append_tasks("lane-a", [{"prompt": """printf a
+printf b""", "metadata": {"execution_mode": "shell"}}])[0]
+    ops.set_status("lane-a", {"state": "IDLE", "cwd": "/repo/a"})
+    engine = QueueEngine(store, ops, coordinator=_always_ready_gate())
+    for _ in range(3):
+        engine.tick("lane-a")
+    assert store.get_task(task_id).status == RUNNING
+    assert len(ops.sent) == 1
+    assert "base64 -d" in ops.sent[0]["text"]
+    assert "\n" not in ops.sent[0]["text"]
