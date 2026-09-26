@@ -200,8 +200,18 @@ def test_persisted_refused_queued_row_recovers_to_blocked(store, ops):
 
 def test_completed_task_has_no_queue_position(store):
     task_id = _make_task(store)
+    claimed = store.claim_next_task("lane-a", claimed_by="test-worker")
+    assert claimed is not None and claimed.claim_token
+    store.record_coordinator_decision(task_id, status="READY", reason="test ready")
+    store.transition_task(task_id, "DISPATCHING", event_type="DISPATCHED")
+    store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "post_submit_output"})
+    store.transition_task(task_id, VERIFYING, event_type="VERIFYING")
     store.transition_task(task_id, COMPLETED, event_type="LEGACY_COMPLETION")
+    task = store.get_task(task_id)
     assert store.queue_position(task_id) is None
+    assert task.claimed_by is None
+    assert task.claim_token is None
+    assert task.lease_expires_at is None
 
 
 def test_verified_marker_self_heals_stale_queued_task_once(store, ops):

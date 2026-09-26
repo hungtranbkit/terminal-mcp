@@ -2587,6 +2587,8 @@ class QueueStore:
             fields["started_at"] = now
         if to_status in (COMPLETED,):
             fields["completed_at"] = now
+        if to_status in TERMINAL_STATUSES:
+            fields.update({"claimed_by": None, "claim_token": None, "lease_expires_at": None})
         if to_status == DISPATCHING:
             fields["attempt_count"] = connection.execute(
                 "SELECT attempt_count FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()["attempt_count"] + 1
