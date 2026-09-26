@@ -6613,3 +6613,22 @@ still run the previous build**, so rows they report continue to show the old
 semantics when their agent is redeployed; on `dell-5530` that redeploy is
 gated on the ConPTY session-loss constraint documented in
 CONTROLLER_RUNBOOK.md.
+
+## Queue dispatch target and refusal lifecycle
+
+Before sending a READY task, the queue inspects the target command. An
+`execution_mode=shell` script on a POSIX shell is encoded into one atomic
+single-line wrapper and evaluated in that shell, preserving the script's
+bytes and returning a task/attempt/nonce-bound completion marker on success.
+The core `terminal_send_text` multiline plain-shell guard remains the final
+safety boundary for every caller and target race.
+
+Multiline agent work aimed at a plain shell, and shell work aimed at an
+unsupported target, is refused before bytes are sent and settled as BLOCKED
+with an actionable reason. Claims and leases are released. A delivery verdict
+of REFUSED is a durable outcome: it must never return to ordinary QUEUED
+retry. Unknown delivery remains in the existing evidence-based uncertainty
+lifecycle; retries are allowed only after a transport change can make the
+payload deliverable. A valid task/attempt/nonce-bound completion marker found
+for stale QUEUED or DISPATCHING work is verified and settled as COMPLETED once;
+completed tasks never have a queue position.

@@ -252,6 +252,8 @@ unchanged. It cannot retry or reopen work and is not a general transition."""
 VALID_TRANSITIONS: dict[str, frozenset[str]] = {
     QUEUED: frozenset({
         PRECHECK,     # Phase 2: engine claimed this task, coordinator review starting
+        BLOCKED,      # recovered durable delivery refusal; never requeue a refused send
+        COMPLETED,    # verified nonce-bound marker self-healed a stale queued row
         DISPATCHING,  # Phase 1 compat: direct dispatch, bypassing the coordinator gate
         SKIPPED, CANCELLED, PAUSED,
         # RECONCILIATION ONLY, and only for a task that was never dispatched.
@@ -272,7 +274,7 @@ VALID_TRANSITIONS: dict[str, frozenset[str]] = {
         PAUSED,       # coordinator: NEEDS_HUMAN -- pauses the whole lane
         CANCELLED,
     }),
-    READY: frozenset({DISPATCHING, WAITING_SESSION, CANCELLED, PAUSED}),
+    READY: frozenset({DISPATCHING, WAITING_SESSION, BLOCKED, CANCELLED, PAUSED}),
     DISPATCHING: frozenset({
         RUNNING,  # submit confirmed (delivery_state == SUBMIT_CONFIRMED)
         DISPATCH_UNCERTAIN,  # delivery_state == DELIVERY_UNKNOWN -- outcome genuinely unknown
@@ -280,6 +282,7 @@ VALID_TRANSITIONS: dict[str, frozenset[str]] = {
         WAITING_SESSION,  # the session/node itself vanished mid-send
         BLOCKED,  # a hard send failure needing human attention
         FAILED,   # a hard send failure the engine can auto-classify as retryable
+        COMPLETED,  # verified nonce-bound marker self-healed a stale dispatch row
         CANCELLED, PAUSED,
     }),
     DISPATCH_UNCERTAIN: frozenset({
@@ -2816,6 +2819,32 @@ class QueueStore:
                                    (json.dumps(metadata), task_id))
         except Exception:  # noqa: BLE001 -- diagnostics must never break dispatch
             _LOGGER.warning("could not record delivery verdict for %s", task_id, exc_info=True)
+
+    def reconcile_persisted_refusals(self, session: str | None = None) -> list[str]:
+        """Settle legacy rows whose durable verdict says refusal but status
+        was left QUEUED/READY/DISPATCHING by an interrupted older engine."""
+        changed: list[str] = []
+        with self._connection() as connection:
+            clause = " AND session = ?" if session else ""
+            params = (session,) if session else ()
+            rows = connection.execute(
+                "SELECT id, status, metadata FROM queue_tasks WHERE status IN (?, ?, ?)" + clause,
+                (QUEUED, READY, DISPATCHING, *params),
+            ).fetchall()
+            for row in rows:
+                metadata = _parse_json_object(row["metadata"])
+                verdict = metadata.get("delivery_verdict")
+                if not isinstance(verdict, dict) or verdict.get("kind") != "REFUSED":
+                    continue
+                reason = (f"persisted delivery refusal: {verdict.get('activation') or 'REFUSED'}; "
+                          f"{verdict.get('detail') or 'operator must resolve the target before retry'}")
+                self._transition_locked(
+                    connection, row["id"], row["status"], BLOCKED,
+                    event_type="PERSISTED_DELIVERY_REFUSAL_RECOVERED", reason=reason,
+                    extra_fields={"claimed_by": None, "claim_token": None, "lease_expires_at": None},
+                )
+                changed.append(row["id"])
+        return changed
 
     @staticmethod
     def _valid_execution_evidence(metadata: dict[str, Any]) -> bool:

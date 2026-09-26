@@ -158,6 +158,71 @@ def test_explicit_shell_task_is_still_allowed(store, ops):
     assert store.get_task(task_id).status == RUNNING
 
 
+def test_shell_task_on_plain_posix_shell_is_sent_as_one_atomic_line(store, ops):
+    task_id = store.append_tasks("lane-a", [{"prompt": "printf 'first\\nsecond'", "metadata": {"execution_mode": "shell"}}])[0]
+    ops.set_status("lane-a", {"state": "IDLE", "cwd": "/repo/a", "current_command": "bash"})
+    engine = QueueEngine(store, ops, coordinator=_always_ready_gate())
+    for _ in range(3):
+        engine.tick("lane-a")
+    assert store.get_task(task_id).status == RUNNING
+    assert len(ops.sent) == 1
+    assert "base64 -d" in ops.sent[0]["text"]
+    assert "printf 'first\\nsecond'" not in ops.sent[0]["text"]
+    assert "\n" not in ops.sent[0]["text"]
+
+
+def test_multiline_refused_delivery_is_blocked_and_not_requeued(store, ops):
+    task_id = store.append_tasks("lane-a", [{"prompt": "echo hello", "metadata": {"execution_mode": "shell"}}])[0]
+    ops.set_status("lane-a", {"state": "IDLE", "cwd": "/repo/a", "current_command": "bash"})
+    ops.terminal_send_text = lambda *args, **kwargs: {
+        "sent": False, "delivery_state": "DELIVERY_BLOCKED", "error": "MULTILINE_SHELL_SEND_REFUSED"}
+    engine = QueueEngine(store, ops, coordinator=_always_ready_gate())
+    engine.tick("lane-a")
+    engine.tick("lane-a")
+    result = engine.tick("lane-a")
+    assert result.action == "BLOCKED"
+    task = store.get_task(task_id)
+    assert task.status == BLOCKED
+    assert task.claim_token is None and task.lease_expires_at is None
+    assert engine.tick("lane-a").action != "QUEUED"
+
+
+def test_persisted_refused_queued_row_recovers_to_blocked(store, ops):
+    task_id = _make_task(store)
+    store.record_delivery_verdict(task_id, {"kind": "REFUSED", "activation": "REFUSED", "detail": "plain shell"})
+    engine = QueueEngine(store, ops, coordinator=_always_ready_gate())
+    result = engine.tick("lane-a")
+    task = store.get_task(task_id)
+    assert result.action == "NO_OP"
+    assert task.status == BLOCKED
+    assert task.claim_token is None and task.lease_expires_at is None
+
+
+def test_completed_task_has_no_queue_position(store):
+    task_id = _make_task(store)
+    store.transition_task(task_id, COMPLETED, event_type="LEGACY_COMPLETION")
+    assert store.queue_position(task_id) is None
+
+
+def test_verified_marker_self_heals_stale_queued_task_once(store, ops):
+    task_id = _make_task(store)
+    engine = QueueEngine(store, ops, coordinator=_always_ready_gate())
+    engine.tick("lane-a")
+    engine.tick("lane-a")
+    engine.tick("lane-a")
+    task = store.get_task(task_id)
+    marker = (f"###TERMINAL_MCP_COMPLETION protocol=terminal-mcp-completion/v1 task_id={task.id} "
+              f"attempt={task.attempt_count} nonce={task.verification_nonce} status=completion_candidate "
+              "summary_sha256=x###")
+    ops.set_capture("lane-a", {"output": marker})
+    with store._connection() as connection:
+        connection.execute("UPDATE queue_tasks SET status = 'QUEUED' WHERE id = ?", (task_id,))
+    assert engine.tick("lane-a").action == "COMPLETED"
+    assert store.get_task(task_id).status == COMPLETED
+    assert store.queue_position(task_id) is None
+    assert engine.tick("lane-a").action != "COMPLETED"
+
+
 def test_submit_confirmed_without_acceptance_does_not_start_task(store, ops):
     ops.terminal_send_text = lambda *args, **kwargs: {
         "sent": True, "delivery_state": "SUBMIT_CONFIRMED", "node_id": "local"}
@@ -180,7 +245,8 @@ def test_agent_exit_between_review_and_dispatch_never_receives_prompt(store, ops
     engine.tick("lane-a")
     ops.set_status("lane-a", {"state": "IDLE", "cwd": "/repo/a", "current_command": "bash"})
     engine.tick("lane-a")
-    assert store.get_task(task_id).status == PAUSED
+    assert store.get_task(task_id).status == BLOCKED
+    assert "MULTILINE_DISPATCH_UNSUPPORTED_TARGET" in store.get_task(task_id).last_error
     assert not ops.sent
 
 

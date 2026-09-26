@@ -67,6 +67,7 @@ from .status import (COMPLETION_MARKER_RE, detect_agent_ui_state, parse_completi
                      verify_completion_marker)
 from .request_governor import RequestGovernor
 from .runbook_registry import RunbookRef, RunbookRegistry, lookup_key_for_task
+from .shell_dispatch import AGENT as DISPATCH_AGENT, REFUSED as DISPATCH_REFUSED, WRAPPED as DISPATCH_WRAPPED, plan_dispatch
 
 DEFAULT_CLAIMED_BY = "queue-engine"
 DEFAULT_LEASE_SECONDS = 300.0
@@ -576,9 +577,40 @@ class QueueEngine:
         review, dispatch, or completion check) -- never more than one
         state transition per call, so a test (or an operator watching
         terminal_queue_events) can observe each step individually."""
+        self.store.reconcile_persisted_refusals(session)
         self.store.reconcile_stale_claims(session)
         self.store.reconcile_uncertain_and_waiting(session)
         lane = self.store.lane_status(session)
+        for row in lane.get("tasks", ()):
+            if row.get("status") not in (QUEUED, DISPATCHING):
+                continue
+            candidate = self.store.get_task(row["id"])
+            if not candidate or not candidate.verification_nonce or not candidate.attempt_count:
+                continue
+            try:
+                capture = self.ops.terminal_tail(session, 200) or {}
+            except Exception:  # noqa: BLE001 -- recovery is best effort
+                continue
+            marker = parse_completion_marker(worker_output_after_prompt(str(capture.get("output") or "")))
+            if not verify_completion_marker(marker, task_id=candidate.id,
+                                            attempt=candidate.attempt_count,
+                                            nonce=candidate.verification_nonce, nonce_consumed=False):
+                continue
+            try:
+                completed = self.store.mark_completed_with_evidence(
+                    candidate.id,
+                    evidence=self._completion_evidence(candidate, marker,
+                                                       self.ops.terminal_status(session) or {},
+                                                       reconciled_from=candidate.status),
+                    event_type="VERIFIED_RECOVERED",
+                )
+            except Exception:  # noqa: BLE001 -- contract refusal remains unsettled for review
+                continue
+            self._notify_completed(completed)
+            if self.governor is not None:
+                self.governor.note_success(completed)
+            return TickResult(session, "COMPLETED", task_id=candidate.id,
+                              detail="verified completion marker recovered from stale queue state")
         if lane["paused"]:
             return TickResult(session, "PAUSED", detail=lane.get("paused_reason") or "")
 
@@ -888,14 +920,11 @@ class QueueEngine:
 
     def _dispatch(self, session: str, task_id: str) -> TickResult:
         task = self.store.get_task(task_id)
-        if task.metadata.get("execution_mode") != "shell":
-            try:
-                observed = self._status_bounded(session)
-            except Exception as exc:  # noqa: BLE001 -- fail closed before any bytes are sent
-                self.store.mark_waiting_session(task_id, reason=f"pre-dispatch status unavailable: {exc}")
-                return TickResult(session, "WAITING_SESSION", task_id=task_id, detail=str(exc))
-            if str(observed.get("current_command") or "").casefold() in PLAIN_SHELL_COMMANDS:
-                return self._review(session, task_id)
+        try:
+            observed = self._status_bounded(session)
+        except Exception as exc:  # noqa: BLE001 -- fail closed before any bytes are sent
+            self.store.mark_waiting_session(task_id, reason=f"pre-dispatch status unavailable: {exc}")
+            return TickResult(session, "WAITING_SESSION", task_id=task_id, detail=str(exc))
         nonce = self.store.ensure_verification_nonce(task_id)
         # STICKY idempotency key (item 8/9, and the real Phase 2 fix
         # this closes -- see queue_store.py's own dispatch_idempotency_
@@ -921,6 +950,23 @@ class QueueEngine:
             task, nonce=nonce,
             continuation_text=(retry_plan.continuation_text if retry_plan is not None else None),
             skills_preamble=self._skills_preamble(task), runbook=self._retrieve_runbook(task))
+        plan = plan_dispatch(
+            current_command=str(observed.get("current_command") or ""),
+            execution_mode=task.metadata.get("execution_mode"), agent_text=dispatch_text,
+            script=task.prompt, task_id=task.id, attempt=task.attempt_count + 1,
+            nonce=nonce, summary_sha256=hashlib.sha256(task.id.encode()).hexdigest()[:16],
+        )
+        if plan.kind == DISPATCH_REFUSED:
+            reason = f"{plan.code}: {plan.reason}"
+            self.store.transition_task(
+                task_id, BLOCKED, event_type="BLOCKED", reason=reason,
+                extra_fields={"claimed_by": None, "claim_token": None, "lease_expires_at": None},
+            )
+            return TickResult(session, "BLOCKED", task_id=task_id, detail=reason)
+        if plan.kind == DISPATCH_WRAPPED:
+            dispatch_text = plan.text or ""
+        elif plan.kind == DISPATCH_AGENT:
+            dispatch_text = plan.text or dispatch_text
         try:
             baseline_status = self.ops.terminal_status(session) or {}
         except Exception:  # noqa: BLE001 -- dispatch remains bounded; uncertainty is recorded
@@ -960,7 +1006,9 @@ class QueueEngine:
             # About to lose this attempt: write what we can still see first.
             self._snapshot_recovery_state(task, session, why="blocked: send failed")
             self.store.transition_task(task_id, BLOCKED, event_type="BLOCKED",
-                                       reason=f"send failed: {response['error']}")
+                                       reason=f"send failed: {response['error']}",
+                                       extra_fields={"claimed_by": None, "claim_token": None,
+                                                     "lease_expires_at": None})
             return TickResult(session, "BLOCKED", task_id=task_id, detail=str(response["error"]))
         # Gate 1, POSITIVE allowlist. The original code asked "is this the
         # one literal string DELIVERY_UNKNOWN?" and fell through to RUNNING
@@ -974,7 +1022,8 @@ class QueueEngine:
         if verdict.kind == delivery_gate.REFUSED:
             self.store.transition_task(
                 task_id, BLOCKED, event_type="BLOCKED",
-                reason=f"delivery refused: {verdict.activation} ({verdict.detail or delivery_state})")
+                reason=f"delivery refused: {verdict.activation} ({verdict.detail or delivery_state})",
+                extra_fields={"claimed_by": None, "claim_token": None, "lease_expires_at": None})
             return TickResult(session, "BLOCKED", task_id=task_id, detail=verdict.activation)
         # A task lifecycle is never advisory: only DeliveryVerdict.may_advance
         # can move this row into RUNNING. Text injection and Enter transmission

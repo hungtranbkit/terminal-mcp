@@ -40,6 +40,15 @@ def test_delivery_state_confirmed_on_plain_shell(tmux_session_factory, tmp_path)
     assert result["enter_sent"] is True
 
 
+def test_terminal_send_text_still_refuses_multiline_plain_shell_before_bytes(tmux_session_factory, tmp_path):
+    session = tmux_session_factory("test-delivery-multiline-guard", "bash")
+    time.sleep(0.2)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "echo first\necho second", press_enter=True)
+    assert result["error"] == "MULTILINE_SHELL_SEND_REFUSED"
+    assert result["enter_sent"] is False
+
+
 def test_every_correlation_id_is_unique_per_attempt(tmux_session_factory, tmp_path):
     session = tmux_session_factory("test-delivery-corr-unique", "bash")
     time.sleep(0.2)
