@@ -451,7 +451,7 @@ class QueueEngine:
         now = datetime.now(timezone.utc)
         observed_at = time.monotonic()
         recovered = []
-        tasks = self.store.tasks_with_statuses((RUNNING, VERIFYING))
+        tasks = self.store.tasks_with_statuses((RUNNING, VERIFYING, DISPATCH_UNCERTAIN))
         active_ids = {task.id for task in tasks}
         self._inactive_active_observations = {
             key: value for key, value in self._inactive_active_observations.items() if key in active_ids
@@ -479,8 +479,12 @@ class QueueEngine:
                     updated = datetime.fromisoformat(task.updated_at.replace("Z", "+00:00"))
                     if updated.tzinfo is None or (now - updated).total_seconds() < timeout:
                         continue
-                    target = WAITING_SESSION
-                    reason = f"STALE_ACTIVE_TIMEOUT: {error}; released admission after {timeout:g}s"
+                    if task.status == DISPATCH_UNCERTAIN:
+                        target = CANCELLED
+                        reason = f"STALE_ACTIVE_TIMEOUT: {error}; cancelled uncertain dispatch after {timeout:g}s"
+                    else:
+                        target = WAITING_SESSION
+                        reason = f"STALE_ACTIVE_TIMEOUT: {error}; released admission after {timeout:g}s"
                 elif not error and state in {"IDLE", "WAITING_INPUT", "WAITING_APPROVAL", "PAGER"}:
                     capture = self.ops.terminal_tail(task.session, 200)
                     if capture.get("error"):
@@ -549,7 +553,9 @@ class QueueEngine:
                     # has exhausted its bounded grace.  CANCELLED is terminal,
                     # so the lane can advance; BLOCKED would keep occupying
                     # the lane and reproduce the deadlock this sweep repairs.
-                    target = CANCELLED if task.status == VERIFYING and state == "IDLE" else BLOCKED
+                    if task.status == DISPATCH_UNCERTAIN and state != "IDLE":
+                        continue
+                    target = CANCELLED if task.status in {VERIFYING, DISPATCH_UNCERTAIN} and state == "IDLE" else BLOCKED
                     reason = f"STALE_ACTIVE_TIMEOUT: session is {state}; no progress or completion for {timeout:g}s"
                 else:
                     # Live work and uncertain observations break the inactivity

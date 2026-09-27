@@ -2524,7 +2524,7 @@ class QueueStore:
         Session probes run outside the transaction. Compare the observed snapshot
         again while holding the write lock; a concurrent completion/cancel wins.
         """
-        if task.status not in (RUNNING, VERIFYING) or to_status not in (WAITING_SESSION, BLOCKED, CANCELLED):
+        if task.status not in (RUNNING, VERIFYING, DISPATCH_UNCERTAIN) or to_status not in (WAITING_SESSION, BLOCKED, CANCELLED):
             raise ValueError("invalid stale active recovery")
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")

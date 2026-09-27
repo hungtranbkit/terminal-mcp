@@ -16,9 +16,12 @@ def setup_case(tmp_path, state="RUNNING", age=3600):
     ops = FakeOps()
     old_id = store.append_tasks("old-lane", [{"prompt": "old work"}])[0]
     store.transition_task(old_id, "DISPATCHING", event_type="DISPATCHING")
-    store.mark_running_with_evidence(old_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
-    if state == "VERIFYING":
+    if state == "DISPATCH_UNCERTAIN":
         store.transition_task(old_id, state, event_type=state)
+    else:
+        store.mark_running_with_evidence(old_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
+        if state == "VERIFYING":
+            store.transition_task(old_id, state, event_type=state)
     stamp = (datetime.now(timezone.utc) - timedelta(seconds=age)).strftime("%Y-%m-%dT%H:%M:%SZ")
     with sqlite3.connect(store.path) as c:
         c.execute("UPDATE queue_tasks SET updated_at=?,lease_expires_at=? WHERE id=?", (stamp, stamp, old_id))
@@ -231,3 +234,26 @@ def test_expired_verifier_lease_does_not_strand_missing_session(tmp_path):
     ops.set_status("old-lane", {"error": "SESSION_NOT_FOUND"})
     engine.reconcile_stale_active_tasks()
     assert store.get_task(task_id).status == "WAITING_SESSION"
+
+
+def test_dispatch_uncertain_missing_session_is_cancelled_and_releases_slot(tmp_path):
+    store, ops, governor, engine, old_id = setup_case(tmp_path, "DISPATCH_UNCERTAIN")
+    ops.set_status("old-lane", {"error": "SESSION_NOT_FOUND"})
+    assert engine.reconcile_stale_active_tasks() == [old_id]
+    task = store.get_task(old_id)
+    assert task.status == "CANCELLED"
+    assert "STALE_ACTIVE_TIMEOUT" in task.last_error
+    assert governor.status()["global_reserved"] == 0
+
+
+def test_dispatch_uncertain_idle_is_cancelled_after_grace(tmp_path, monkeypatch):
+    store, ops, governor, engine, old_id = setup_case(tmp_path, "DISPATCH_UNCERTAIN")
+    ops.set_status("old-lane", {"state": "IDLE"})
+    monkeypatch.setattr("terminal_mcp.queue_engine.time.monotonic", lambda: 0.0)
+    assert engine.reconcile_stale_active_tasks() == []
+    monkeypatch.setattr("terminal_mcp.queue_engine.time.monotonic", lambda: 901.0)
+    assert engine.reconcile_stale_active_tasks() == [old_id]
+    task = store.get_task(old_id)
+    assert task.status == "CANCELLED"
+    assert "STALE_ACTIVE_TIMEOUT" in task.last_error
+    assert governor.status()["global_reserved"] == 0

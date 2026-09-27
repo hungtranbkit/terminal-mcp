@@ -6628,7 +6628,12 @@ unsupported target, is refused before bytes are sent and settled as BLOCKED
 with an actionable reason. Claims and leases are released. A delivery verdict
 of REFUSED is a durable outcome: it must never return to ordinary QUEUED
 retry. Unknown delivery remains in the existing evidence-based uncertainty
-lifecycle; retries are allowed only after a transport change can make the
-payload deliverable. A valid task/attempt/nonce-bound completion marker found
+lifecycle and must not occupy a lane forever.  participates
+in stale-active reconciliation: after the configured grace period, an
+unreachable session or a reachable session that remains IDLE with no progress
+or completion evidence is settled as CANCELLED so admission is released without
+resending the uncertain payload. Interactive states such as WAITING_INPUT remain
+operator-visible rather than being silently retried. Retries are allowed only
+after a transport change can make the payload deliverable. A valid task/attempt/nonce-bound completion marker found
 for stale QUEUED or DISPATCHING work is verified and settled as COMPLETED once;
 completed tasks never have a queue position.
