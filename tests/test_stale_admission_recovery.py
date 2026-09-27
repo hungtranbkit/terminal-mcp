@@ -25,6 +25,8 @@ def setup_case(tmp_path, state="RUNNING", age=3600):
     stamp = (datetime.now(timezone.utc) - timedelta(seconds=age)).strftime("%Y-%m-%dT%H:%M:%SZ")
     with sqlite3.connect(store.path) as c:
         c.execute("UPDATE queue_tasks SET updated_at=?,lease_expires_at=? WHERE id=?", (stamp, stamp, old_id))
+        if state == "DISPATCH_UNCERTAIN":
+            c.execute("UPDATE queue_tasks SET uncertain_or_waiting_since=? WHERE id=?", (stamp, old_id))
     governor = RequestGovernor(LLMGovernorConfig(global_max_concurrency=1), store)
     engine = QueueEngine(store, ops, coordinator=_always_ready_gate(), governor=governor)
     return store, ops, governor, engine, old_id
@@ -250,8 +252,6 @@ def test_dispatch_uncertain_idle_is_cancelled_after_grace(tmp_path, monkeypatch)
     store, ops, governor, engine, old_id = setup_case(tmp_path, "DISPATCH_UNCERTAIN")
     ops.set_status("old-lane", {"state": "IDLE"})
     monkeypatch.setattr("terminal_mcp.queue_engine.time.monotonic", lambda: 0.0)
-    assert engine.reconcile_stale_active_tasks() == []
-    monkeypatch.setattr("terminal_mcp.queue_engine.time.monotonic", lambda: 901.0)
     assert engine.reconcile_stale_active_tasks() == [old_id]
     task = store.get_task(old_id)
     assert task.status == "CANCELLED"

@@ -496,7 +496,13 @@ class QueueEngine:
                     output_hash = hashlib.sha256(progress_output.encode()).hexdigest()
                     signature_text = f"{task.status}\0{task.attempt_count}\0{task.claim_token}\0{state}\0{output_hash}"
                     first_observed_at = None
-                    if task.status == VERIFYING and not task.inactive_observed_at and task.lease_expires_at:
+                    if (task.status == DISPATCH_UNCERTAIN and not task.inactive_observed_at
+                            and task.uncertain_or_waiting_since):
+                        # Dispatch uncertainty already has a durable clock.  A
+                        # controller restart must not buy it another full stale
+                        # timeout before releasing an idle lane.
+                        first_observed_at = task.uncertain_or_waiting_since
+                    elif task.status == VERIFYING and not task.inactive_observed_at and task.lease_expires_at:
                         try:
                             lease_expiry = datetime.fromisoformat(task.lease_expires_at.replace("Z", "+00:00"))
                         except ValueError:

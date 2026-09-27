@@ -6632,7 +6632,7 @@ lifecycle and must not occupy a lane forever.  participates
 in stale-active reconciliation: after the configured grace period, an
 unreachable session or a reachable session that remains IDLE with no progress
 or completion evidence is settled as CANCELLED so admission is released without
-resending the uncertain payload. Interactive states such as WAITING_INPUT remain
+resending the uncertain payload. The persisted uncertainty timestamp survives controller restarts, so an already-stale task is reaped on the first post-restart sweep rather than receiving a fresh grace period. Interactive states such as WAITING_INPUT remain
 operator-visible rather than being silently retried. Retries are allowed only
 after a transport change can make the payload deliverable. A valid task/attempt/nonce-bound completion marker found
 for stale QUEUED or DISPATCHING work is verified and settled as COMPLETED once;
