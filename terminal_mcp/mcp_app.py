@@ -106,7 +106,7 @@ def _fleet_session_names(controller: "ControllerService") -> list[str]:
 
 
 def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_session,
-                     enqueue_task, route_start, task_status, task_batch_status,
+                     enqueue_task, queue_resume, queue_run_once, route_start, task_status, task_batch_status,
                      task_checkpoint,
                      agent_start, list_agents, get_agent, create_agent, update_agent,
                      list_skills, register_skill, bind_agent_skill, cleanup_candidates,
@@ -134,6 +134,8 @@ def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_sessio
         "create_session": create_session,
         "delete_session": delete_session,
         "enqueue_task": enqueue_task,
+        "queue_resume": queue_resume,
+        "queue_run_once": queue_run_once,
         "route_start": route_start,
         # Phase B. Every one of these is the SAME function its standalone tool
         # is registered from -- the one-tool surface must never be a weaker or
@@ -3453,8 +3455,12 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
 
     @server.tool()
     def terminal_queue_resume(session: str) -> dict:
-        """Resume a paused lane -- restores any PAUSED task to whatever
-        status it was paused from, and allows dispatch again."""
+        """Resume a paused legacy queue lane when server opt-in is enabled."""
+        if not queue_submission_enabled():
+            return queue_disabled_response(action="queue_resume")
+        allowed, reason = terminal._input_authorized(session)
+        if not allowed:
+            return {"error": reason or "INPUT_RESTRICTED", "session": session}
         return queue.resume(session)
 
     @server.tool()
@@ -4567,6 +4573,9 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         auto-dispatches into a paused lane."""
         if not queue_submission_enabled():
             return queue_disabled_response(action="queue_run_once")
+        allowed, reason = terminal._input_authorized(session)
+        if not allowed:
+            return {"error": reason or "INPUT_RESTRICTED", "session": session}
         return queue_engine.tick(session).to_dict()
 
     @server.tool()
@@ -6223,6 +6232,8 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         create_session=terminal_create_session,
         delete_session=terminal_delete_session,
         enqueue_task=terminal_enqueue_task,
+        queue_resume=terminal_queue_resume,
+        queue_run_once=terminal_queue_run_once,
         route_start=terminal_route_start,
         agent_start=terminal_agent_start,
         list_agents=terminal_list_agents,

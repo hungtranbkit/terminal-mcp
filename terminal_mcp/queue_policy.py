@@ -22,6 +22,8 @@ QUEUE_SUBMISSION_ACTIONS = frozenset({
     "route_start",
     "agent_start",
     "project_start",
+    "queue_resume",
+    "queue_run_once",
 })
 
 QUEUE_DISPATCH_ACTIONS = frozenset({

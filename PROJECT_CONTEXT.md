@@ -25,7 +25,7 @@ Terminal MCP durable queue submission is retired for normal coding work.
 
 ### Verification
 - Compact/direct/session + queue-policy suite: 138 passed.
-- Combined compact/native/policy/queue suite: 199 passed, 8 deselected.
+- Post-main-sync compact/native/policy/queue suite: 215 passed, 8 deselected.
 - Native fail-closed regression proves terminal_enqueue_task and terminal_route_start create no queued row when server opt-in is absent.
 - Legacy queue engine tests opt in with `TERMINAL_MCP_ENABLE_QUEUE=1`; only inside tests.
 
