@@ -149,6 +149,11 @@ class SessionMeta:
     created_at: float
     rows: int = 24
     cols: int = 80
+    # Di kem `child_pid`: dau hieu phan biet DUNG tien trinh con do voi mot PID da bi dung
+    # lai. Host tu ghi heartbeat nen `host_state` xac nhan duoc bang cach do, con CON la lenh
+    # bat ky cua nguoi dung, khong hop tac, nen phai lay tu OS. Rong = ban ghi cu hoac khong
+    # doc duoc, va khi do khong ai duoc phep ra tay voi PID do.
+    child_start_token: str = ""
     agent_generation: str | None = None
     protocol_version: int = PROTOCOL_VERSION
     extra: dict[str, Any] = field(default_factory=dict)
@@ -159,6 +164,7 @@ class SessionMeta:
             "host_generation": self.host_generation, "child_pid": self.child_pid,
             "cwd": self.cwd, "argv": list(self.argv), "created_at": self.created_at,
             "rows": self.rows, "cols": self.cols,
+            "child_start_token": self.child_start_token,
             "agent_generation": self.agent_generation,
             "protocol_version": self.protocol_version, "extra": dict(self.extra),
         }
@@ -172,6 +178,7 @@ class SessionMeta:
             cwd=str(raw.get("cwd") or ""), argv=list(raw.get("argv") or []),
             created_at=float(raw.get("created_at") or 0.0),
             rows=int(raw.get("rows") or 24), cols=int(raw.get("cols") or 80),
+            child_start_token=str(raw.get("child_start_token") or ""),
             agent_generation=raw.get("agent_generation"),
             protocol_version=int(raw.get("protocol_version") or PROTOCOL_VERSION),
             extra=dict(raw.get("extra") or {}))
@@ -269,6 +276,67 @@ def pid_alive(pid: int | None) -> bool:
     except PermissionError:
         return True  # exists, owned by someone else
     return not _posix_is_zombie(pid)
+
+
+def process_start_token(pid: int | None) -> str:
+    """Khi nao tien trinh nay bat dau — dung de biet PID co bi dung lai hay chua.
+
+    Tra ve '' khi khong doc duoc, va goi PHAI coi '' la "khong xac nhan duoc" chu khong
+    phai "khop". Cai gia cua mot lan xac nhan sai o day la SIGKILL vao mot tien trinh vo
+    can, dung loai sai lam ma `_cleanup` trong bo test da tung mac (no giet chinh test
+    runner) va la ly do `host_state` doi heartbeat thay vi chi doi PID con song.
+    """
+    if not pid or pid <= 0:
+        return ""
+    if os.name == "nt":  # pragma: no cover - exercised only on Windows
+        return _win32_process_start_token(pid)
+    try:
+        raw = Path("/proc/%d/stat" % int(pid)).read_text()
+    except OSError:
+        return ""
+    try:
+        # `comm` nam trong ngoac va CO THE chua dau cach hoac dau ngoac, nen phai cat sau
+        # ')' CUOI CUNG — tach bang khoang trang tu dau la sai voi tien trinh dat ten la.
+        sau = raw[raw.rindex(")") + 2:].split()
+        return sau[19]          # starttime: truong 22 cua proc(5), tinh tu khi may khoi dong
+    except (ValueError, IndexError):
+        return ""
+
+
+def _win32_process_start_token(pid: int) -> str:  # pragma: no cover - Windows only
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return ""
+    try:
+        creation = wintypes.FILETIME()
+        rest = (wintypes.FILETIME(), wintypes.FILETIME(), wintypes.FILETIME())
+        if not kernel32.GetProcessTimes(handle, ctypes.byref(creation),
+                                        *(ctypes.byref(x) for x in rest)):
+            return ""
+        return "%d" % ((creation.dwHighDateTime << 32) | creation.dwLowDateTime)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def child_reapable(meta: SessionMeta) -> bool:
+    """Tien trinh con ghi trong ban ghi nay co con song VA co dung la no khong?
+
+    Chi tra True khi xac nhan duoc CA HAI. Mot ban ghi cu khong co `child_start_token` thi
+    tra False: de lai mot tien trinh mo coi con do hon la SIGKILL vao mot PID da doi chu.
+    """
+    pid = meta.child_pid
+    if not pid or pid <= 0 or pid == os.getpid():
+        return False
+    if not pid_alive(pid):
+        return False
+    if not meta.child_start_token:
+        return False
+    return process_start_token(pid) == meta.child_start_token
 
 
 def _posix_is_zombie(pid: int) -> bool:
@@ -662,9 +730,46 @@ def terminate_host(paths: SessionPaths, meta: SessionMeta, *,
     send = killer or _default_kill
     try:
         send(meta.host_pid)
-        return True
     except (OSError, ProcessLookupError):
         return False
+    # Day dai, cho truong hop host bi SIGKILL: khong handler nao chay duoc, nen chinh o day
+    # phai don con. Tren Windows `taskkill /T` da lam viec nay.
+    reap_child_group(meta)
+    return True
+
+
+def reap_child_group(meta: SessionMeta, *, grace_seconds: float = 1.5) -> bool:
+    """Don tien trinh con cua mot session, doi xung voi `taskkill /T` tren Windows.
+
+    Con duoc sinh voi `start_new_session=True` nen no la session/pgroup leader RIENG: giet
+    host khong gui tin hieu nao den no. Do that 25/09/2026: file test xanh 28/28 ma van de
+    lai 2 tien trinh quay 98% CPU moi luot chay.
+
+    Chi ra tay khi `child_reapable` xac nhan dung tien trinh do — mot PID da doi chu thi
+    tuyet doi khong, va TUYET DOI khong killpg vao nhom cua chinh minh.
+    """
+    if os.name == "nt":  # pragma: no cover - `taskkill /T` da don ca cay
+        return False
+    if not child_reapable(meta):
+        return False
+    pid = int(meta.child_pid)
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        pgid = pid
+    if pgid <= 0 or pgid == os.getpgid(0):
+        return False
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except (OSError, ProcessLookupError):
+            return not pid_alive(pid)
+        deadline = time.monotonic() + grace_seconds
+        while time.monotonic() < deadline and pid_alive(pid):
+            time.sleep(0.05)
+        if not pid_alive(pid):
+            return True
+    return not pid_alive(pid)
 
 
 def _default_kill(pid: int) -> None:
@@ -761,11 +866,28 @@ def main(argv: list[str] | None = None) -> int:
     host.publish(SessionMeta(
         name=args.name, host_pid=os.getpid(), host_generation=host.generation,
         child_pid=getattr(process, "pid", None), cwd=args.cwd, argv=command,
+        child_start_token=process_start_token(getattr(process, "pid", None)),
         created_at=time.time(), rows=args.rows, cols=args.cols,
         agent_generation=os.environ.get("TERMINAL_MCP_AGENT_GENERATION")))
     _log(paths, f"host up pid={os.getpid()} child={getattr(process, 'pid', None)} argv={command!r}")
 
     stop = threading.Event()
+
+    if os.name != "nt":
+        # Tren POSIX, `terminate_host` gui SIGTERM. Khong co handler thi host chet NGAY va
+        # khoi `finally` ben duoi — noi duy nhat giet con — KHONG BAO GIO chay, nen moi lan
+        # tat cuong che la de lai mot con mo coi tren mot pty da chet, quay 98% CPU vinh vien.
+        # Tren Windows `taskkill /T` don ca cay nen khong co lo nay; day la cai gia cua mot
+        # module viet cho Windows truoc ma chay that tren Linux.
+        def _xin_dung(signum, frame):  # noqa: ANN001, ARG001
+            _log(paths, f"nhan tin hieu {signum}: dung tu te de con duoc don theo")
+            host.stop()
+
+        for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            try:
+                signal.signal(_sig, _xin_dung)
+            except (OSError, ValueError):  # pragma: no cover - tin hieu khong dat duoc
+                pass
 
     def _input_pump() -> None:
         """Feed queued input to the child. Its own thread because the output
