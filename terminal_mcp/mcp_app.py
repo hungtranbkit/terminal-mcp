@@ -105,7 +105,7 @@ def _fleet_session_names(controller: "ControllerService") -> list[str]:
 
 
 def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_session,
-                     enqueue_task, route_start, task_status, task_batch_status,
+                     enqueue_task, queue_resume, route_start, task_status, task_batch_status,
                      task_checkpoint,
                      agent_start, list_agents, get_agent, create_agent, update_agent,
                      list_skills, register_skill, bind_agent_skill, cleanup_candidates,
@@ -133,6 +133,7 @@ def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_sessio
         "create_session": create_session,
         "delete_session": delete_session,
         "enqueue_task": enqueue_task,
+        "queue_resume": queue_resume,
         "route_start": route_start,
         # Phase B. Every one of these is the SAME function its standalone tool
         # is registered from -- the one-tool surface must never be a weaker or
@@ -756,6 +757,9 @@ def build_mcp(service: TerminalService | None = None,
           enqueue_task  | enqueue  durable, restart-safe task for `target`
                     with prompt `text`; `title`/`priority`/`metadata`/
                     `request_key` apply
+          queue_resume  target=session; operator-requested lane recovery via
+                    the existing authorized queue handler. Rechecks coordinator
+                    safety on dispatch; never an approval override.
           task_status   | task     one task by `task_id`
           task_batch_status | tasks up to 100 states by `task_ids`
           browser_verify | verify  target=URL, args={assertions, wait_for,
@@ -3501,6 +3505,9 @@ def build_mcp(service: TerminalService | None = None,
     def terminal_queue_resume(session: str) -> dict:
         """Resume a paused lane -- restores any PAUSED task to whatever
         status it was paused from, and allows dispatch again."""
+        allowed, reason = terminal._input_authorized(session)
+        if not allowed:
+            return {"error": reason or "INPUT_RESTRICTED", "session": session}
         return queue.resume(session)
 
     @server.tool()
@@ -6251,6 +6258,7 @@ def build_mcp(service: TerminalService | None = None,
         create_session=terminal_create_session,
         delete_session=terminal_delete_session,
         enqueue_task=terminal_enqueue_task,
+        queue_resume=terminal_queue_resume,
         route_start=terminal_route_start,
         agent_start=terminal_agent_start,
         list_agents=terminal_list_agents,

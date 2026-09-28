@@ -182,6 +182,7 @@ TURN_HANDLER_ACTIONS: dict[str, str] = {
     "create_session": "create_session",
     "delete_session": "delete_session",
     "enqueue_task": "enqueue_task",
+    "queue_resume": "queue_resume",
     # TMCP-TASK-ROUTER-001. `start` needs a target; this one finds it. The
     # two are deliberately separate actions rather than one action with an
     # optional target: `start(target=...)` is HARD AFFINITY and must never
@@ -1360,6 +1361,8 @@ class CompactTerminalTools:
                        ("task_id", "session", "node_id", "routing_state", "routing_outcome",
                         "routing_reason", "score", "task_state", "dispatched", "poll")
                        if isinstance(result, dict) and key in result}}
+        if action == "queue_resume" and (not isinstance(target, str) or not target.strip()):
+            return {"status": "FAILED", "error": "TARGET_REQUIRED", "action": action}
         if action == "task_status" and (not isinstance(task_id, str) or not task_id.strip()):
             return {"status": "FAILED", "error": "TASK_ID_REQUIRED", "action": action}
         if action == "task_batch_status" and not isinstance(task_ids, list):
@@ -1414,6 +1417,7 @@ class CompactTerminalTools:
             "enqueue_task": lambda: handler(
                 target.strip(), text, title=title, priority=priority,
                 metadata=metadata, request_key=request_key),
+            "queue_resume": lambda: handler(target.strip()),
             "task_status": lambda: handler(task_id.strip()),
             "task_batch_status": lambda: handler(task_ids),
         }

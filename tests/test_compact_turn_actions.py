@@ -533,3 +533,42 @@ def test_start_returns_the_task_id_without_driving_the_lane_by_default(monkeypat
     ticks, state, _reason = tools._drive_start("lane-1", "task-1")
     assert ticks == 0 and ticked == [], "start drove the lane on the caller's thread"
     assert state == "QUEUED"
+
+
+def test_queue_resume_routes_to_registered_native_handler():
+    recorder = Recorder({"session": "lane-a", "paused": False})
+    result = _tools({"queue_resume": recorder}).turn(action="queue_resume", target=" lane-a ")
+    assert recorder.calls == [(("lane-a",), {})]
+    assert result["status"] == "OK"
+    assert result["result"]["paused"] is False
+
+@pytest.mark.parametrize("target", [None, "", "   "])
+def test_queue_resume_requires_explicit_target(target):
+    recorder = Recorder()
+    result = _tools({"queue_resume": recorder}).turn(action="queue_resume", target=target)
+    assert result["error"] == "TARGET_REQUIRED"
+    assert recorder.calls == []
+
+def test_queue_resume_keeps_native_authorization_denial():
+    result = _tools({"queue_resume": Recorder({"error": "INPUT_RESTRICTED"})}).turn(action="queue_resume", target="lane-a")
+    assert result["status"] == "FAILED"
+    assert result["result"]["error"] == "INPUT_RESTRICTED"
+
+
+@pytest.mark.parametrize("allowed,reason", [(False, "INPUT_RESTRICTED"), (False, "PROTECTED_SESSION"), (True, None)])
+def test_queue_resume_native_handler_checks_session_input_rights(monkeypatch, allowed, reason):
+    import asyncio
+    from terminal_mcp import core, mcp_app
+    from terminal_mcp.queue_service import QueueService
+    terminal_cls = next(cls for cls in vars(core).values() if isinstance(cls, type) and "_input_authorized" in cls.__dict__)
+    monkeypatch.setattr(terminal_cls, "_input_authorized", lambda self, session: (allowed, reason))
+    calls = []
+    def resume(self, session):
+        calls.append(session)
+        return {"session": session, "paused": False}
+    monkeypatch.setattr(QueueService, "resume", resume)
+    server = mcp_app.build_mcp()
+    result = asyncio.run(server.call_tool("terminal_turn", {"action": "queue_resume", "target": "lane-a"}))
+    assert calls == (["lane-a"] if allowed else [])
+    if not allowed:
+        assert reason in str(result)
