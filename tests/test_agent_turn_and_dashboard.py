@@ -11,6 +11,12 @@ from __future__ import annotations
 import pytest
 from starlette.testclient import TestClient
 
+@pytest.fixture(autouse=True)
+def _enable_legacy_queue_for_existing_engine_tests(monkeypatch):
+    """Legacy engine tests opt in explicitly; runtime default stays disabled."""
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "1")
+
+
 from terminal_mcp.agent_registry import AgentRegistryStore
 from terminal_mcp.agent_service import AgentService
 from terminal_mcp.compact_tools import (

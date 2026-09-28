@@ -268,7 +268,7 @@ def compact_instructions() -> str:
         "this surface exists to avoid.\n"
         "If the tool list you can see offers more than that one tool, you are "
         "attached to a STALE CACHED CATALOG. Those older names (terminal_batch_"
-        "inspect, terminal_enqueue_task, terminal_wait_for_state, "
+        "inspect, direct terminal_send_task/send_wait, terminal_wait_for_state, "
         "terminal_list_sessions, terminal_status, terminal_send_text and the "
         "other v1 names) still work: this surface TRANSLATES each one into the "
         "equivalent terminal_turn action, so you get the current behaviour "

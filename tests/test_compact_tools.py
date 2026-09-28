@@ -2,6 +2,12 @@ import inspect
 import tempfile
 from pathlib import Path
 
+import pytest
+
+@pytest.fixture(autouse=True)
+def _enable_legacy_queue_for_existing_engine_tests(monkeypatch):
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "1")
+
 from terminal_mcp.compact_tools import (
     DEFAULT_WAIT_SECONDS,
     MAX_SEND_WAIT_SECONDS,

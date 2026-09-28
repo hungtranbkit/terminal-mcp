@@ -17,6 +17,12 @@ from pathlib import Path
 
 import pytest
 
+@pytest.fixture(autouse=True)
+def _enable_legacy_queue_for_existing_engine_tests(monkeypatch):
+    """Legacy engine tests opt in explicitly; runtime default stays disabled."""
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "1")
+
+
 from terminal_mcp.compact_tools import (TURN_ACTION_ALIASES, TURN_ACTIONS,
                                         TURN_HANDLER_ACTIONS, TURN_PANE_ACTIONS,
                                         CompactTerminalTools)
@@ -533,3 +539,67 @@ def test_start_returns_the_task_id_without_driving_the_lane_by_default(monkeypat
     ticks, state, _reason = tools._drive_start("lane-1", "task-1")
     assert ticks == 0 and ticked == [], "start drove the lane on the caller's thread"
     assert state == "QUEUED"
+
+
+# ---------------------------------------------------------------------------
+# Queue retirement: public compact submissions fail closed by default.
+# ---------------------------------------------------------------------------
+
+def test_queue_submission_actions_are_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("TERMINAL_MCP_ENABLE_QUEUE", raising=False)
+    recorder = Recorder({"status": "TASK_ACCEPTED", "task_id": "should-not-exist"})
+    tools = _tools({
+        "enqueue_task": recorder,
+        "route_start": recorder,
+        "agent_start": recorder,
+        "project_start": recorder,
+        "task_status": Recorder({"task": {"status": "QUEUED"}}),
+        "dispatch_tick": Recorder({"status": "OK"}),
+        "follow_task": Recorder({"status": "OK"}),
+    })
+
+    attempts = [
+        tools.turn(action="start", target="worker", text="queued work"),
+        tools.turn(action="enqueue_task", target="worker", text="queued work"),
+        tools.turn(action="route_start", text="queued work"),
+        tools.turn(action="agent_start", target="agent-1", text="queued work"),
+        tools.turn(action="project_start", target="project-1", text="queued work"),
+        tools.turn(action="send", target="worker", text="queued work", long_task=True),
+        tools.turn(action="run", target="worker", text="queued work"),
+        tools.turn(action="enqueue", target="worker", text="queued work"),
+    ]
+
+    for result in attempts:
+        assert result["status"] == "FAILED"
+        assert result["error"] == "QUEUE_DISABLED_USE_DIRECT_SESSION"
+        assert result["next_action"] == "create_session_then_send"
+    assert recorder.calls == []
+
+
+def test_queue_submission_can_only_be_enabled_by_server_environment(monkeypatch):
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "1")
+    recorder = Recorder({"status": "TASK_ACCEPTED", "task_id": "T-1"})
+    tools = _tools({"enqueue_task": recorder})
+    result = tools.turn(action="enqueue_task", target="worker", text="queued work")
+    assert result["status"] == "OK"
+    assert result["result"]["status"] == "TASK_ACCEPTED"
+    assert len(recorder.calls) == 1
+
+
+def test_direct_create_and_send_remain_available_when_queue_disabled(monkeypatch):
+    monkeypatch.delenv("TERMINAL_MCP_ENABLE_QUEUE", raising=False)
+    created = Recorder({"session": "direct-worker", "state": "READY"})
+    tools = _tools({"create_session": created})
+    create_result = tools.turn(
+        action="create_session", target="direct-worker", agent_type="shell",
+        working_directory="/tmp",
+    )
+    assert create_result["action"] == "create_session"
+    assert created.calls
+
+    send_result = tools.turn(action="send", target="direct-worker", text="echo ok")
+    assert send_result["action"] == "send"
+    assert send_result["status"] in {"SUBMIT_CONFIRMED", "FAILED", "BLOCKED"}
+    # Whatever the fake terminal reports, this must be the direct-send path,
+    # never the queue-retirement error.
+    assert send_result.get("error") != "QUEUE_DISABLED_USE_DIRECT_SESSION"

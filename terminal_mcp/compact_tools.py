@@ -12,6 +12,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .redaction import redact_text
+from .queue_policy import QUEUE_SUBMISSION_ACTIONS, queue_disabled_response, queue_submission_enabled
 
 
 MAX_TARGETS = 25
@@ -882,6 +883,12 @@ class CompactTerminalTools:
             return {"status": "FAILED", "error": "INVALID_ACTION",
                     "allowed": list(TURN_ACTIONS),
                     "aliases": dict(TURN_ACTION_ALIASES)}
+
+        # Queue submission is retired for normal public use.  The legacy
+        # engine remains for historical/running tasks, but no new queue row is
+        # created unless the server operator explicitly opts in.
+        if (normalized in QUEUE_SUBMISSION_ACTIONS or (normalized == "send" and long_task)) and not queue_submission_enabled():
+            return queue_disabled_response(action=normalized)
 
         if normalized in TURN_HANDLER_ACTIONS:
             return self._handler_turn(

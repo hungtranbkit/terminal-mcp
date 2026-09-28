@@ -14,6 +14,10 @@ import json
 
 import pytest
 
+@pytest.fixture(autouse=True)
+def _enable_legacy_queue_for_existing_engine_tests(monkeypatch):
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "1")
+
 from terminal_mcp.mcp_app import build_mcp
 from terminal_mcp.queue_service import QueueService
 from terminal_mcp.queue_store import QueueStore

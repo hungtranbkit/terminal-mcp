@@ -12,6 +12,10 @@ import time
 
 import pytest
 
+@pytest.fixture(autouse=True)
+def _enable_legacy_queue_for_existing_engine_tests(monkeypatch):
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "1")
+
 from terminal_mcp.mcp_app import build_mcp
 from terminal_mcp.queue_service import QueueService
 from terminal_mcp.queue_store import QueueStore
@@ -91,3 +95,23 @@ async def test_queue_metrics_reports_zero_missed_dropped_and_real_depth(server):
     assert metrics["queued_depth"] == 3
     assert metrics["missed_count"] == 0
     assert metrics["dropped_count"] == 0
+
+
+@pytest.mark.anyio
+async def test_native_queue_submit_tools_fail_closed_without_server_opt_in(server, monkeypatch):
+    monkeypatch.delenv("TERMINAL_MCP_ENABLE_QUEUE", raising=False)
+    mcp_server, _queue = server
+    before = await _call(mcp_server, "terminal_queue_metrics", session="lane-a")
+    assert before["queued_depth"] == 0
+
+    enqueued = await _call(
+        mcp_server, "terminal_enqueue_task", session="lane-a", prompt="must not persist"
+    )
+    assert enqueued["error"] == "QUEUE_DISABLED_USE_DIRECT_SESSION"
+    assert enqueued["next_action"] == "create_session_then_send"
+
+    routed = await _call(mcp_server, "terminal_route_start", prompt="must not route")
+    assert routed["error"] == "QUEUE_DISABLED_USE_DIRECT_SESSION"
+
+    after = await _call(mcp_server, "terminal_queue_metrics", session="lane-a")
+    assert after["queued_depth"] == 0

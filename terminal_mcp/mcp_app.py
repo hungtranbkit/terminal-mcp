@@ -72,6 +72,7 @@ from .worker_registry import ALL_ROLES, WorkerRegistry
 _LOGGER = logging.getLogger(__name__)
 _LOCAL_HEARTBEAT_MIN_INTERVAL_SECONDS = 5.0
 from .queue_service import QueueService
+from .queue_policy import queue_disabled_response, queue_submission_enabled
 from .release_service import ReleaseService
 from .release_store import ReleaseStore
 from .supervisor import SupervisorService, SupervisorStore
@@ -713,83 +714,36 @@ def build_mcp(service: TerminalService | None = None,
                       url: str | None = None, args: dict | None = None,
                       path: str | None = None, content_b64: str | None = None,
                       overwrite: bool = False, mode: str | None = None) -> dict:
-        """THE terminal surface: one logical orchestration step, one MCP call.
+        """THE terminal surface: direct session control only.
 
-        NORMAL FLOW IS ONE CALL. To give a session work, use action="start":
-        it durably persists the task, dispatches it, and returns a task_id,
-        all in this one call. Then STOP. Do not call wait, resume or inspect
-        to watch it -- the server carries it from there and the receipt says
-        `poll: false` for exactly that reason. Call action="task" with the
-        task_id ONLY when the user explicitly asks to check on it. A wall of
-        "Called tool" rows is the failure this surface exists to prevent.
+NORMAL FLOW:
+1. `create_session` creates a fresh session for real work.
+2. `send` or `send_wait` sends work directly to that session.
+3. `inspect` is used only when a user explicitly asks for a status check.
+4. When work is complete, merge/test as appropriate and clean up the finished
+   session/worktree/branch.
 
-        For a plain shell command use send_wait with an idempotency_key.
-        Long-running shell commands return PENDING with a durable resume_token;
-        use action="resume" with that token to continue an explicitly requested
-        watch. Never resend the command because a wait returned PENDING.
-        Wait slices default to 10 seconds (configuration hard cap: 15 seconds).
-        MATCHED means the requested session state was observed, not that the
-        shell command succeeded; inspect its output/exit status separately.
+The durable task queue is RETIRED and disabled by default. Queue-producing
+actions (`start`, `enqueue_task`, `route_start`, `agent_start`,
+`project_start`, aliases such as `run`/`dispatch`, and `send` with
+`long_task=true`) return `QUEUE_DISABLED_USE_DIRECT_SESSION` and do not create
+a new queue row. Read-only task/task-batch/history/metrics and cleanup/cancel
+operations remain available for historical or already-running tasks.
 
-        `action` is one of:
+A server operator can deliberately opt back in only by starting Terminal MCP
+with `TERMINAL_MCP_ENABLE_QUEUE=1`; client arguments cannot enable the queue.
 
-          start     THE DEFAULT for giving a session work: persist `text` as
-                    a durable task for `target`, dispatch it server-side, and
-                    return {task_id, task_state, poll: false}. Restart-safe,
-                    `request_key`-deduplicated, and never polled by the
-                    client. Prefer this over send/send_wait for anything that
-                    takes real time.
-          inspect   status + bounded tail + `resource` health for one `target`
-                    or many `targets` (this IS batch inspect)
-          send      guarded, idempotent submission of `text`; pass
-                    `long_task=true` to persist+dispatch through the durable
-                    queue and return a task receipt in this one call
-          send_wait send once, then wait within the remaining call budget
-          wait      durable bounded wait for `desired_states`
-          resume    continue a wait that returned PENDING (`resume_token`)
-          list_sessions | list  every session, with node and access info
-          list_nodes    | nodes the fleet
-          create_session | create  `target` is the new name; `agent_type`,
-                    `working_directory`, `initial_prompt`, `grant_mode`,
-                    `binding`, `node` apply
-          delete_session | delete  `target` is the name; args={confirm: true} required
-          enqueue_task  | enqueue  durable, restart-safe task for `target`
-                    with prompt `text`; `title`/`priority`/`metadata`/
-                    `request_key` apply
-          task_status   | task     one task by `task_id`
-          task_batch_status | tasks up to 100 states by `task_ids`
-          browser_verify | verify  target=URL, args={assertions, wait_for,
-                    timeout_seconds, screenshot, viewport_width, viewport_height}
-          browser_run_task  target=optional URL, text=deterministic steps:
-                    fill SELECTOR with VALUE; click SELECTOR; assert text contains: TEXT
-                    args={timeout_seconds, screenshot, session_id, allow_mutations};
-                    fresh context. click/fill/press need allow_mutations=true
-          browser_screenshot | screenshot  target=URL, args={full_page,
-                    timeout_seconds, viewport_width, viewport_height}
-          browser_stop      release any browser work still in flight; IDLE when
-                    nothing is running
-          browser_status | browser  args={probe: true} launches local Chromium
-          Browser actions use local Playwright, disabled by default. Loopback,
-          private networks and screenshots require explicit operator opt-in.
-          Browser timeout_seconds is independent of terminal wait timeout.
+Direct actions:
+  inspect       status + bounded tail + resource health
+  send          guarded direct text submission
+  send_wait     direct send, then bounded wait in one call
+  wait/resume   continue an explicitly requested watch
+  list_sessions/list, list_nodes/nodes
+  create_session/create, delete_session/delete
+  task_status/task, task_batch_status/tasks (read-only historical task state)
+  browser_verify/browser_screenshot/browser_status/browser_stop
 
-        Long work returns a durable task receipt AND is actually dispatched in
-        that same call; the server follower advances it afterwards. The client
-        must not automatically issue inspect/wait/resume calls after `start`,
-        `SUBMIT_CONFIRMED` or `PENDING` unless the user explicitly asks for a
-        check. `target` is the session for every action that names one and
-        `text` is the prompt for start, send and enqueue. Each action routes
-        to the exact
-        same implementation the standalone tool uses, so authorization,
-        allowed-cwd, protected-session and idempotency rules are identical.
-
-        When to use what: `start` (or the equivalent `send` with
-        `long_task=True`) for real work -- one call, durable, dispatched, no
-        polling; plain `send` when you need the submit receipt itself and
-        nothing long follows; `enqueue` to add to a lane's backlog WITHOUT
-        dispatching now; `wait`/`resume` only when the user asked you to watch
-        something specific, never as a routine follow-up to a start or a
-        confirmed send.
+For direct work, prefer one useful session per task and avoid stale duplicates.
         """
         _refresh_local_heartbeat()
         return compact_tools.turn(
@@ -3553,8 +3507,8 @@ def build_mcp(service: TerminalService | None = None,
     @server.tool()
     def terminal_enqueue_task(session: str, prompt: str, title: str | None = None, priority: int = 0,
                               metadata: dict | None = None, request_key: str | None = None) -> dict:
-        """THE RECOMMENDED default for any normal ChatGPT/UI/API-
-        originated task (item 12) -- creates a durable, restart-safe
+        """QUEUE SUBMISSION IS DISABLED BY DEFAULT. Historical compatibility tool only;
+        when explicitly re-enabled by a server operator it creates a durable, restart-safe
         task record for `session`'s own queue BEFORE anything is ever
         sent, then returns immediately with a TASK_ACCEPTED
         acknowledgment: {status: "TASK_ACCEPTED", task_id, session,
@@ -3564,6 +3518,8 @@ def build_mcp(service: TerminalService | None = None,
         progress. Always appends (never cancels anything already
         queued). The task's own prompt is stored VERBATIM -- nothing
         here rewrites it."""
+        if not queue_submission_enabled():
+            return queue_disabled_response(action="enqueue_task")
         return queue.enqueue(session, prompt, title=title, priority=priority, metadata=metadata,
                              request_key=request_key)
 
@@ -3591,6 +3547,8 @@ def build_mcp(service: TerminalService | None = None,
 
         `target`, if given, is HARD AFFINITY: that session or a clear
         refusal, never a silent reroute. Omit it to let the router decide."""
+        if not queue_submission_enabled():
+            return queue_disabled_response(action="route_start")
         if queue.router is None:
             return {"error": "ROUTER_UNAVAILABLE"}
         return queue.router.route_start(
@@ -3605,6 +3563,8 @@ def build_mcp(service: TerminalService | None = None,
         The manual form of what the rescue sweep does automatically -- useful
         when an operator wants a specific stuck task placed right now, or
         wants to see the routing decision for it without waiting a cycle."""
+        if not queue_submission_enabled():
+            return queue_disabled_response(action="task_route")
         if queue.router is None:
             return {"error": "ROUTER_UNAVAILABLE"}
         return queue.router.route_task(task_id).as_dict()
@@ -3615,6 +3575,8 @@ def build_mcp(service: TerminalService | None = None,
 
         One pass of Queue Rescue, on demand. Reports what was routed, what
         stayed queued, and why -- per task."""
+        if not queue_submission_enabled():
+            return queue_disabled_response(action="queue_rescue_once")
         if queue.router is None:
             return {"error": "ROUTER_UNAVAILABLE"}
         return queue.router.rescue_once()
@@ -3770,6 +3732,8 @@ def build_mcp(service: TerminalService | None = None,
 
         When no agent can take the work you get NEEDS_TEAM_REVIEW with the
         per-candidate reasons, never a randomly chosen session."""
+        if not queue_submission_enabled():
+            return queue_disabled_response(action="project_start")
         return project_runtime.project_start(project_id, prompt, title=title,
                                       capabilities=capabilities or (), approval=approval,
                                       agent_id=agent_id, priority=priority, metadata=metadata,
@@ -3815,6 +3779,8 @@ def build_mcp(service: TerminalService | None = None,
         session may be released and re-bound any number of times; `agent_id`
         never moves. An agent already at its max_sessions limit gets its task
         durably queued with that stated as the reason, not a second runtime."""
+        if not queue_submission_enabled():
+            return queue_disabled_response(action="agent_start")
         return agents.agent_start(
             agent_id, prompt, title=title, priority=priority, metadata=metadata,
             request_key=request_key, skill_ids=skill_ids,
@@ -4599,6 +4565,8 @@ def build_mcp(service: TerminalService | None = None,
         one extra step immediately rather than waiting for the next
         automatic cycle. Never bypasses the Coordinator gate and never
         auto-dispatches into a paused lane."""
+        if not queue_submission_enabled():
+            return queue_disabled_response(action="queue_run_once")
         return queue_engine.tick(session).to_dict()
 
     @server.tool()
@@ -4624,6 +4592,8 @@ def build_mcp(service: TerminalService | None = None,
         is still completely inert. terminal_queue_run_once above is
         never gated by either gate -- it can always be called manually,
         regardless."""
+        if enabled and not queue_submission_enabled():
+            return queue_disabled_response(action="queue_set_auto_dispatch")
         return queue.set_auto_dispatch(session, enabled)
 
     @server.tool()
@@ -4647,6 +4617,8 @@ def build_mcp(service: TerminalService | None = None,
         is currently running. Useful for tests/smoke or to force
         immediate progress without waiting for the next automatic
         interval."""
+        if not queue_submission_enabled():
+            return queue_disabled_response(action="queue_loop_run_once")
         if queue.loop is None:
             return {"error": "QUEUE_LOOP_NOT_CONFIGURED"}
         return {"results": queue.loop.run_one_cycle()}
