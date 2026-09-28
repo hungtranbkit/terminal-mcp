@@ -129,6 +129,9 @@ Callers must rely on the verified receipt and must not add a manual second
 Enter. The shared watchdog injects text once, sends one Enter, waits for
 bounded composer/execution evidence, and sends at most one recovery Enter only
 when the exact draft is still present and no execution evidence exists. A
+recovery also requires two consecutive identical pane captures while that
+draft evidence remains true. Wrapped Codex drafts are matched against their
+durable prompt prefix, so the full buffer need not fit in one capture. A
 normal first-Enter submit stops immediately. Receipts expose
 `first_enter_effect`, `recovery_enter_sent`, `composer_before`,
 `composer_after`, `submit_reason`, and `submit_latency_ms`. An unresolved

@@ -393,11 +393,12 @@ class VerifiedSubmitWatchdog:
                 self.store.update(submission_id, ack_state=ACK_SUBMITTING,
                                   last_action="watcher_cycle_complete")
                 return finish()
-            # A slow TUI may still be consuming the previous Enter. Require
-            # either a composer redraw or two stable polls (~0.8s by default)
-            # before another Enter; this preserves recovery for swallowed
-            # Enter while preventing queued duplicate submissions.
-            if unchanged and unchanged_polls < 2 and current.enter_count > 0:
+            # A recovery Enter is safe only after the post-submit pane has
+            # settled. A redraw is not sufficient: it can be the TUI consuming
+            # the first Enter or beginning execution. Require two consecutive
+            # identical captures while the evidence callback still proves
+            # this submission's draft remains in the composer.
+            if current.enter_count > 0 and unchanged_polls < 2:
                 time.sleep(self.config.poll_interval_seconds)
                 continue
             if current.enter_count == 0:
