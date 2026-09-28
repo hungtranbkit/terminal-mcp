@@ -677,3 +677,61 @@ def test_smoke_test_timeout_is_treated_as_a_failure(store, tmp_path):
     gate = CoordinatorGate()
     decision = gate.review(task, store=store, session=_ok_session(cwd=str(repo)))
     assert decision.status == NEEDS_REWORK
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    ['KHÔNG push main',
+     'không được push main',
+     'đừng push main',
+     'Khong merge main, push main',
+     'Do not merge main, push main',
+     'Do not merge main, or push main',
+     'Never merge main, deploy production, push main',
+     '- KHÔNG merge vào main, push main, restart/deploy dịch vụ production, thay đổi '
+     'Cloudflare Access, ghi/reprocess database production, xóa branch/worktree hay sửa dự '
+     'án BĐS/Offline POS/Terminal MCP.'],
+)
+def test_negation_list_restrictions_are_not_actions(store, prompt):
+    task = _make_task(store, prompt="Implement knowledge recovery with regression tests.\n" + prompt)
+    gate = CoordinatorGate(evidence_collector=_fake_collector_factory(clean=True))
+    decision = gate.review(task, store=store, session=_ok_session())
+    assert decision.status == READY, decision
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    ['push main',
+     'Không có lỗi, push main',
+     'Do not edit tests, please push main',
+     'Do not push main, but push main after review',
+     'Do not push main. push main',
+     'KHÔNG push main; push main',
+     'KHÔNG push main\npush main',
+     'Do not push main, then push main',
+     'Do not push main but push main',
+     'Không push main nhưng push main',
+     'KHÔNG sửa tests, hãy push main',
+     'Do not touch tests, now push main',
+     'Do not merge main, review logs, push main',
+     'Do not merge main, run git push main',
+     'Không chỉ push main mà còn deploy production',
+     'Do not push main! push main',
+     'Do not push main? push main'],
+)
+def test_negation_list_does_not_hide_new_sensitive_actions(store, prompt):
+    task = _make_task(store, prompt="Implement knowledge recovery with regression tests.\n" + prompt)
+    gate = CoordinatorGate(evidence_collector=_fake_collector_factory(clean=True))
+    decision = gate.review(task, store=store, session=_ok_session())
+    assert decision.status == NEEDS_HUMAN, decision
+
+
+@pytest.mark.parametrize("prompt", [
+    "Fix the login bug so users never reset their session, push main",
+    "Đảm bảo người dùng không xóa dữ liệu, push main",
+])
+def test_negation_list_reported_prohibitions_do_not_authorize_actions(store, prompt):
+    task = _make_task(store, prompt="Implement knowledge recovery with regression tests.\n" + prompt)
+    gate = CoordinatorGate(evidence_collector=_fake_collector_factory(clean=True))
+    decision = gate.review(task, store=store, session=_ok_session())
+    assert decision.status == NEEDS_HUMAN, decision
