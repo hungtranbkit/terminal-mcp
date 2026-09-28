@@ -346,6 +346,14 @@ def _target_state_from_status(status: dict) -> str | None:
     return None
 
 
+def _is_agent_cli(status: dict[str, Any]) -> bool:
+    """Is the pane's foreground program an agent CLI (Codex/Claude)?"""
+    from .adapters import select_adapter
+    resource = status.get("resource") if isinstance(status.get("resource"), dict) else {}
+    command = str(status.get("current_command") or resource.get("agent") or "")
+    return select_adapter(command).name in {"codex", "claude"}
+
+
 class QueueEngine:
     def __init__(self, store: QueueStore, ops: SessionOps, *, coordinator: CoordinatorGate | None = None,
                 claimed_by: str = DEFAULT_CLAIMED_BY, lease_seconds: float = DEFAULT_LEASE_SECONDS,
@@ -485,7 +493,16 @@ class QueueEngine:
                     else:
                         target = WAITING_SESSION
                         reason = f"STALE_ACTIVE_TIMEOUT: {error}; released admission after {timeout:g}s"
-                elif not error and state in {"IDLE", "WAITING_INPUT", "WAITING_APPROVAL", "PAGER"}:
+                elif not error and (state in {"IDLE", "WAITING_INPUT", "WAITING_APPROVAL", "PAGER"}
+                                    or (state == "UNKNOWN" and _is_agent_cli(observation))):
+                    # UNKNOWN counts for an agent CLI only: a working Codex/
+                    # Claude is classified RUNNING and its ticking footer
+                    # changes the output hash, so an agent pane that stays
+                    # UNKNOWN and byte-identical for the whole timeout is not
+                    # working. Excluding it left a task whose prompt never
+                    # left the composer RUNNING for ~50 min (2026-09-28, task
+                    # 34afa005). A quiet shell command stays excluded -- it
+                    # can legitimately print nothing for longer than that.
                     capture = self.ops.terminal_tail(task.session, 200)
                     if capture.get("error"):
                         self._inactive_active_observations.pop(task.id, None)
@@ -1012,6 +1029,8 @@ class QueueEngine:
             "dispatch_idempotency_key": idempotency_key,
             "node_id": response.get("node_id") or baseline_status.get("node_id"),
             "signal": verdict.acceptance,
+            "enter_sent": response.get("enter_sent"),
+            "submit_key": response.get("submit_key"),
             "observed_at": iso_now(),
         })
         if response.get("error"):
@@ -1246,10 +1265,20 @@ class QueueEngine:
         baseline_hash = observation.get("output_sha256")
         current_output = str(capture.get("output") or "")
         current_hash = hashlib.sha256(current_output.encode()).hexdigest() if current_output else None
-        output_changed = bool(baseline_hash and current_hash and current_hash != baseline_hash and output.strip())
+        # The baseline is captured BEFORE the text is injected, so a draft
+        # still sitting in the composer changes the hash by itself. That is
+        # our own input, never evidence that the target executed anything.
+        output_changed = bool(baseline_hash and current_hash and current_hash != baseline_hash
+                              and output.strip() and target_state != TARGET_COMPOSER)
         accepted = False
         signal = None
-        if status_response.get("execution_started") is True:
+        if observation.get("enter_sent") is False and not observation.get("submit_key"):
+            # The receipt proves no activation key ever reached the pane
+            # (live incident 2026-09-28, task 34afa005). Nothing we sent can
+            # be running; only the nonce-bound completion marker above may
+            # settle this task.
+            pass
+        elif status_response.get("execution_started") is True:
             accepted, signal = True, "process_started"
         elif status_response.get("ack_state") in {"ACCEPTED", "RUNNING", "EXECUTION_STARTED"}:
             accepted, signal = True, "agent_acceptance"

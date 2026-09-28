@@ -175,6 +175,15 @@ def classify_activation(send_result: dict[str, Any]) -> tuple[str, str, str | No
         if error:
             return UNCERTAIN, SEND_ERROR, f"SUBMIT_CONFIRMED alongside error={error!r}"
         return DELIVERED, ACTIVATION_CONFIRMED, None
+    if (state == DELIVERY_UNKNOWN and send_result.get("press_enter") is True
+            and send_result.get("enter_sent") is False and send_result.get("enter_count") == 0
+            and not send_result.get("submit_key") and not send_result.get("queue_followup_sent")):
+        # An older node's verified Codex path reported UNKNOWN even when it
+        # gave up before sending any activation key. The receipt itself
+        # proves nothing was submitted -- the same answer as TEXT_SENT.
+        return REFUSED, ACTIVATION_TEXT_ONLY, (
+            "text was written but no activation key was ever sent (enter_count=0) -- the prompt "
+            "is still in the target's input box, unsubmitted")
     if state == DELIVERY_UNKNOWN:
         return UNCERTAIN, ACTIVATION_UNKNOWN, (
             "Enter was written but no evidence confirms the target processed it -- "

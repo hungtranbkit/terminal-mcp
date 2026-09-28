@@ -2862,7 +2862,7 @@ class QueueStore:
         allowed = {key: observation[key] for key in (
             "submission_id", "dispatch_idempotency_key", "node_id", "state",
             "output_sha256", "observed_at", "signal", "reconciliation_attempts",
-            "requires_human",
+            "requires_human", "enter_sent", "submit_key",
         ) if key in observation}
         with self._connection() as connection:
             row = connection.execute("SELECT metadata FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()

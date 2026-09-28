@@ -97,7 +97,70 @@ def render_working_followup() -> None:
     sys.stdout.flush()
 
 
+def run_scrolled_multiline_composer() -> None:
+    """Bracketed-paste aware, chunked reader for scrolled_multiline_composer."""
+    import os
+    import textwrap
+    width, visible_rows = 60, 6
+    draft = ""
+    submitted_count = 0
+    in_paste = False
+    pending = ""
+    rendered_rows = 0
+
+    def redraw() -> None:
+        nonlocal rendered_rows
+        rows: list[str] = []
+        for paragraph in draft.split("\n"):
+            rows.extend(textwrap.wrap(paragraph, width) or [""])
+        rows = rows[-visible_rows:]
+        body = [("› " if index == 0 else "  ") + row for index, row in enumerate(rows)]
+        frame = body + ["", "  GPT-5.6-Sol high · ~/workspace"]
+        if rendered_rows:
+            sys.stdout.write(f"\x1b[{rendered_rows - 1}A\r")
+        sys.stdout.write("\x1b[J" + "\r\n".join(frame))
+        sys.stdout.flush()
+        rendered_rows = len(frame)
+
+    sys.stdout.write("codex composer ready\r\n")
+    redraw()
+    while True:
+        chunk = os.read(fd, 65536).decode("utf-8", "replace")
+        if not chunk:
+            return
+        pending += chunk
+        while pending:
+            if pending.startswith("\x1b[200~"):
+                in_paste, pending = True, pending[6:]
+                continue
+            if pending.startswith("\x1b[201~"):
+                in_paste, pending = False, pending[6:]
+                continue
+            if pending.startswith("\x1b") and len(pending) < 6:
+                break  # wait for the rest of a paste marker
+            ch, pending = pending[0], pending[1:]
+            if ch == "\x03":
+                return
+            # Like the real CLI: Enter (CR) submits; a literal LF from
+            # `send-keys -l` (Ctrl-J) or any newline inside a bracketed
+            # paste only inserts a line break.
+            if ch == "\r" and not in_paste:
+                submitted_count += 1
+                sys.stdout.write(f"\x1b[{rendered_rows - 1}A\r\x1b[J"
+                                 f"SUBMITTED[{submitted_count}]: {len(draft)} chars\r\n"
+                                 "esc to interrupt\r\n")
+                sys.stdout.flush()
+                draft, rendered_rows = "", 0
+                redraw()
+                continue
+            draft += "\n" if ch in ("\r", "\n") else ch
+        redraw()
+
+
 try:
+    if MODE == "scrolled_multiline_composer":
+        run_scrolled_multiline_composer()
+        raise SystemExit(0)
     sys.stdout.write("codex composer ready\r\n> ")
     sys.stdout.flush()
     while True:

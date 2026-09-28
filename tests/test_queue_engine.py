@@ -1216,3 +1216,46 @@ printf b""", "metadata": {"execution_mode": "shell"}}])[0]
     assert len(ops.sent) == 1
     assert "base64 -d" in ops.sent[0]["text"]
     assert "\n" not in ops.sent[0]["text"]
+
+
+def test_uncertain_dispatch_never_activated_cannot_become_running_from_its_own_draft(store, ops):
+    """Live 2026-09-28 (task 34afa005): the send injected the draft but no
+    activation key was ever sent. The pane differed from the pre-injection
+    baseline only because the draft itself was sitting in the composer, and
+    that was accepted as post_submit_output -> RUNNING."""
+    task_id = _make_task(store)
+    ops.set_status("lane-a", {"state": "IDLE", "node_id": "local", "cwd": "/repo/a"})
+
+    class NeverActivatedOps(FakeOps):
+        def terminal_send_text(self, session, text, press_enter=False, dry_run=False, **kwargs):
+            self.sent.append({"session": session, "text": text})
+            return {"sent": True, "press_enter": True, "enter_sent": False, "enter_count": 0,
+                    "delivery_state": "DELIVERY_UNKNOWN"}
+
+    never_ops = NeverActivatedOps()
+    never_ops.status_by_session = ops.status_by_session
+    engine = QueueEngine(store, never_ops, coordinator=_always_ready_gate())
+    engine.tick("lane-a")
+    engine.tick("lane-a")
+    engine.tick("lane-a")
+    task = store.get_task(task_id)
+    # The delivery gate now answers this definitively: text only, unsubmitted.
+    assert task.status == "BLOCKED"
+    assert "ACTIVATION_TEXT_ONLY" in (task.last_error or "")
+    assert len(never_ops.sent) == 1
+
+
+def test_recheck_uncertain_ignores_output_change_when_no_key_was_sent(store, ops):
+    task_id = _make_task(store)
+    store.transition_task(task_id, "PRECHECK", event_type="CLAIMED")
+    store.transition_task(task_id, "READY", event_type="READY")
+    store.transition_task(task_id, "DISPATCHING", event_type="DISPATCHED")
+    store.record_dispatch_observation(task_id, {"output_sha256": "baseline-before-injection",
+                                                "enter_sent": False, "submit_key": None})
+    store.mark_dispatch_uncertain(task_id, reason="legacy receipt")
+    ops.set_status("lane-a", {"state": "UNKNOWN", "node_id": "local"})
+    ops.set_capture("lane-a", {"output": "› the injected draft still sitting in the composer\n"})
+    engine = QueueEngine(store, ops, coordinator=_always_ready_gate())
+    result = engine._recheck_uncertain("lane-a", task_id)
+    assert result.action == "DISPATCH_UNCERTAIN"
+    assert store.get_task(task_id).status == "DISPATCH_UNCERTAIN"

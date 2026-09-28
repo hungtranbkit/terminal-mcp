@@ -230,9 +230,51 @@ def _codex_composer_buffer_complete(snapshot: list[str], text: str) -> bool:
     """
     if _sent_text_echoed(snapshot, text):
         return True
+    if _codex_draft_tail_in_live_composer(snapshot, text):
+        return True
     visible = " ".join(snapshot)
     match = re.search(r"\[Pasted Content\s+(\d+)\s+chars\]", visible, re.IGNORECASE)
     return bool(match and int(match.group(1)) >= len(text))
+
+
+# How much of the draft's END must be visible to prove the whole injection
+# landed. Whitespace is ignored, so word-wrap and continuation indent cannot
+# break the match.
+CODEX_DRAFT_TAIL_CHARS = 64
+
+
+def _codex_live_composer_rows(snapshot: list[str]) -> list[str] | None:
+    """Rows from the last composer marker down, or None when that marker
+    is scrollback of an already-submitted turn rather than the live input."""
+    marker_indexes = [index for index, line in enumerate(snapshot)
+                      if re.match(r"^\s*[>›]\s*", line.strip())]
+    if not marker_indexes:
+        return None
+    last_marker = marker_indexes[-1]
+    after = snapshot[last_marker + 1:]
+    if any(re.search(r"SUBMITTED\[", line, re.IGNORECASE) for line in after):
+        return None
+    if (not _codex_followup_queue_prompt_present(snapshot)
+            and any(re.search(r"esc to interrupt", line, re.IGNORECASE) for line in after)):
+        return None
+    return [re.sub(r"^\s*[>›]\s*", "", snapshot[last_marker].strip()), *after]
+
+
+def _codex_draft_tail_in_live_composer(snapshot: list[str], text: str) -> bool:
+    """The END of this draft is visible inside the live composer.
+
+    A long multi-line prompt is word-wrapped and Codex only shows the
+    composer's last rows, so the prefix scrolls out of view (live incident
+    2026-09-28, queue task 34afa005: prefix-only checks never matched, the
+    verified path never sent Enter and the prompt sat unsent for ~50 min).
+    Injection is ordered, so seeing the tail after the live marker proves
+    the whole buffer landed and is still unsubmitted.
+    """
+    tail = "".join(text.split())[-CODEX_DRAFT_TAIL_CHARS:]
+    if not tail:
+        return False
+    rows = _codex_live_composer_rows(snapshot)
+    return rows is not None and tail in "".join("".join(rows).split())
 
 
 def _codex_followup_queue_prompt_present(snapshot: list[str]) -> bool:
@@ -287,7 +329,7 @@ def _codex_draft_in_composer(snapshot: list[str], text: str) -> bool:
         match = re.search(r"\[Pasted Content\s+(\d+)\s+chars\]", body, re.IGNORECASE)
         if match and int(match.group(1)) >= len(text):
             return True
-    return False
+    return _codex_draft_tail_in_live_composer(snapshot, text)
 
 
 def _codex_composer_marker_present(snapshot: list[str]) -> bool:
@@ -2591,6 +2633,13 @@ class TerminalService:
         )
         if queue_followup_sent and state in (ACK_ACCEPTED, ACK_RUNNING):
             delivery = DELIVERY_SUBMIT_CONFIRMED
+        elif not activation_key:
+            # No Enter and no Tab ever reached the pane: the draft is still
+            # sitting in the composer. That is a definite answer, not an
+            # unknown one -- DELIVERY_UNKNOWN ("Enter was written") parked
+            # the queue task as uncertain and let it mistake the injected
+            # draft for post-submit output.
+            delivery = DELIVERY_TEXT_SENT
         return {
             "sent": True, "enter_sent": activation_key == "Enter",
             "characters": len(text), "press_enter": True, "correlation_id": correlation_id,

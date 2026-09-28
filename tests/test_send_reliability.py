@@ -992,3 +992,54 @@ def test_claude_staged_editor_that_never_submits_is_never_confirmed(tmux_session
     pane = service.terminal_tail(session, 20)["output"]
     assert "SUBMITTED[" not in pane
     assert "ctrl+x ctrl+s to send now" in pane  # still staged, honestly reported
+
+
+# The live 2026-09-28 incident prompt shape (queue task 34afa005): a long,
+# multi-paragraph dispatch whose opening line has scrolled out of Codex's
+# composer by the time the whole draft is rendered.
+_SCROLLED_PROMPT = (
+    "Implement the overview hotfix in this isolated worktree. " + "Render one employee per line; " * 30
+    + "\n\n---\nBefore coding: read docs/REQUIREMENTS.md and update it if behavior changes.\n\n"
+    "When (and only when) the above task is FULLY complete, print exactly one line:\n"
+    "###TERMINAL_MCP_COMPLETION task_id=34afa005 attempt=1 nonce=2b31a47a status=completion_candidate###"
+)
+
+
+def test_codex_scrolled_multiline_draft_is_activated_not_left_in_composer(tmux_session_factory, tmp_path):
+    """Regression: the draft's prefix is scrolled out of the composer, so
+    only its tail proves the injection landed. Before the fix the verified
+    path returned pre_activation_evidence_withheld with enter_count=0 and
+    left the prompt sitting unsent while the queue believed it RUNNING."""
+    session = _codex_session(tmux_session_factory, "test-codex-scrolled", "scrolled_multiline_composer")
+    time.sleep(0.3)
+    config = AppConfig(
+        PermissionsConfig(True, True), ("test-*",), 200, 100,
+        InputPolicyConfig(allowed_session_patterns=("test-*",), max_text_length=4000),
+    )
+    service = TerminalService(config, audit=AuditStore(tmp_path / "audit.db"))
+    result = service.terminal_send_text(session, _SCROLLED_PROMPT, press_enter=True)
+    assert result["enter_sent"] is True, (result.get("evidence"), result.get("delivery_state"))
+    assert result["enter_count"] == 1, result
+    assert result["submit_status"] == "SUBMIT_CONFIRMED", result
+    pane = service.terminal_tail(session, 20)["output"]
+    assert pane.count("SUBMITTED[") == 1
+
+
+def test_codex_draft_never_activated_is_reported_text_sent_not_unknown(tmux_session_factory, tmp_path,
+                                                                       monkeypatch):
+    """A verified Codex send that gave up before any activation key must
+    say so (TEXT_SENT), never DELIVERY_UNKNOWN ("Enter was written").
+    Otherwise the queue parks it as uncertain and later mistakes the
+    injected draft itself for post-submit output."""
+    from terminal_mcp import core as core_module
+    monkeypatch.setattr(core_module, "_codex_composer_buffer_complete", lambda *_a, **_k: False)
+    monkeypatch.setattr(core_module, "_codex_draft_in_composer", lambda *_a, **_k: False)
+    session = _codex_session(tmux_session_factory, "test-codex-never-activated", "scrolled_multiline_composer")
+    time.sleep(0.3)
+    service = _service(tmp_path)
+    result = service.terminal_send_text(session, "hello there", press_enter=True)
+    assert result["enter_count"] == 0
+    assert result["enter_sent"] is False
+    assert result["delivery_state"] == "TEXT_SENT"
+    pane = service.terminal_tail(session, 20)["output"]
+    assert "SUBMITTED[" not in pane

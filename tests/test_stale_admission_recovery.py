@@ -257,3 +257,37 @@ def test_dispatch_uncertain_idle_is_cancelled_after_grace(tmp_path, monkeypatch)
     assert task.status == "CANCELLED"
     assert "STALE_ACTIVE_TIMEOUT" in task.last_error
     assert governor.status()["global_reserved"] == 0
+
+
+def test_codex_running_task_stuck_in_unknown_static_pane_is_released(tmp_path, monkeypatch):
+    """Live 2026-09-28 (task 34afa005): the prompt never left Codex's
+    composer, status stayed UNKNOWN with a byte-identical pane, and the
+    sweep skipped UNKNOWN -- the task held its lane RUNNING indefinitely."""
+    store, ops, governor, engine, task_id = setup_case(tmp_path)
+    clock = [0.0]
+    monkeypatch.setattr("terminal_mcp.queue_engine.time.monotonic", lambda: clock[0])
+    pane = {"state": "UNKNOWN", "resource": {"agent": "codex"}, "last_output": "› draft still here"}
+    ops.set_status("old-lane", pane)
+    engine.reconcile_stale_active_tasks()
+    assert store.get_task(task_id).status == "RUNNING"
+    clock[0] = 901.0
+    with sqlite3.connect(store.path) as c:
+        stamp = (datetime.now(timezone.utc) - timedelta(seconds=901)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        c.execute("UPDATE queue_tasks SET inactive_observed_at=? WHERE id=?", (stamp, task_id))
+    assert engine.reconcile_stale_active_tasks() == [task_id]
+    task = store.get_task(task_id)
+    assert task.status == "BLOCKED"
+    assert "STALE_ACTIVE_TIMEOUT" in task.last_error
+    assert governor.status()["global_reserved"] == 0
+    assert not ops.sent
+
+
+def test_quiet_shell_command_in_unknown_state_is_not_reaped(tmp_path, monkeypatch):
+    store, ops, governor, engine, task_id = setup_case(tmp_path)
+    clock = [0.0]
+    monkeypatch.setattr("terminal_mcp.queue_engine.time.monotonic", lambda: clock[0])
+    ops.set_status("old-lane", {"state": "UNKNOWN", "current_command": "python3"})
+    engine.reconcile_stale_active_tasks()
+    clock[0] = 86400.0
+    assert engine.reconcile_stale_active_tasks() == []
+    assert store.get_task(task_id).status == "RUNNING"
