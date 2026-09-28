@@ -572,3 +572,43 @@ def test_queue_resume_native_handler_checks_session_input_rights(monkeypatch, al
     assert calls == (["lane-a"] if allowed else [])
     if not allowed:
         assert reason in str(result)
+
+
+def test_queue_run_once_routes_to_registered_native_handler():
+    recorder = Recorder({"session": "lane-a", "paused": False})
+    result = _tools({"queue_run_once": recorder}).turn(action="queue_run_once", target=" lane-a ")
+    assert recorder.calls == [(("lane-a",), {})]
+    assert result["status"] == "OK"
+    assert result["result"]["paused"] is False
+
+@pytest.mark.parametrize("target", [None, "", "   "])
+def test_queue_run_once_requires_explicit_target(target):
+    recorder = Recorder()
+    result = _tools({"queue_run_once": recorder}).turn(action="queue_run_once", target=target)
+    assert result["error"] == "TARGET_REQUIRED"
+    assert recorder.calls == []
+
+def test_queue_run_once_keeps_native_authorization_denial():
+    result = _tools({"queue_run_once": Recorder({"error": "INPUT_RESTRICTED"})}).turn(action="queue_run_once", target="lane-a")
+    assert result["status"] == "FAILED"
+    assert result["result"]["error"] == "INPUT_RESTRICTED"
+
+
+@pytest.mark.parametrize("allowed,reason", [(False, "INPUT_RESTRICTED"), (False, "PROTECTED_SESSION"), (True, None)])
+def test_queue_run_once_native_handler_checks_session_input_rights(monkeypatch, tmp_path, allowed, reason):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    import asyncio
+    from terminal_mcp import core, mcp_app
+    from terminal_mcp.queue_engine import QueueEngine, TickResult
+    terminal_cls = next(cls for cls in vars(core).values() if isinstance(cls, type) and "_input_authorized" in cls.__dict__)
+    monkeypatch.setattr(terminal_cls, "_input_authorized", lambda self, session: (allowed, reason))
+    calls = []
+    def step(self, session):
+        calls.append(session)
+        return TickResult(session, "IDLE")
+    monkeypatch.setattr(QueueEngine, "tick", step)
+    server = mcp_app.build_mcp()
+    result = asyncio.run(server.call_tool("terminal_turn", {"action": "queue_run_once", "target": "lane-a"}))
+    assert calls == (["lane-a"] if allowed else [])
+    if not allowed:
+        assert reason in str(result)

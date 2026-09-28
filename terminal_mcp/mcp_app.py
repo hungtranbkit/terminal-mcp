@@ -105,7 +105,7 @@ def _fleet_session_names(controller: "ControllerService") -> list[str]:
 
 
 def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_session,
-                     enqueue_task, queue_resume, route_start, task_status, task_batch_status,
+                     enqueue_task, queue_resume, queue_run_once, route_start, task_status, task_batch_status,
                      task_checkpoint,
                      agent_start, list_agents, get_agent, create_agent, update_agent,
                      list_skills, register_skill, bind_agent_skill, cleanup_candidates,
@@ -134,6 +134,7 @@ def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_sessio
         "delete_session": delete_session,
         "enqueue_task": enqueue_task,
         "queue_resume": queue_resume,
+        "queue_run_once": queue_run_once,
         "route_start": route_start,
         # Phase B. Every one of these is the SAME function its standalone tool
         # is registered from -- the one-tool surface must never be a weaker or
@@ -757,6 +758,7 @@ def build_mcp(service: TerminalService | None = None,
           enqueue_task  | enqueue  durable, restart-safe task for `target`
                     with prompt `text`; `title`/`priority`/`metadata`/
                     `request_key` apply
+          queue_run_once target=session; one authorized native queue step
           queue_resume  target=session; operator-requested lane recovery via
                     the existing authorized queue handler. Rechecks coordinator
                     safety on dispatch; never an approval override.
@@ -4606,6 +4608,9 @@ def build_mcp(service: TerminalService | None = None,
         one extra step immediately rather than waiting for the next
         automatic cycle. Never bypasses the Coordinator gate and never
         auto-dispatches into a paused lane."""
+        allowed, reason = terminal._input_authorized(session)
+        if not allowed:
+            return {"error": reason or "INPUT_RESTRICTED", "session": session}
         return queue_engine.tick(session).to_dict()
 
     @server.tool()
@@ -6259,6 +6264,7 @@ def build_mcp(service: TerminalService | None = None,
         delete_session=terminal_delete_session,
         enqueue_task=terminal_enqueue_task,
         queue_resume=terminal_queue_resume,
+        queue_run_once=terminal_queue_run_once,
         route_start=terminal_route_start,
         agent_start=terminal_agent_start,
         list_agents=terminal_list_agents,
