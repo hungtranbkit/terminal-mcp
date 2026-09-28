@@ -106,14 +106,48 @@ _NEGATION_RE = re.compile(
     r"(?:" + "|".join(_NEGATORS) + r")[^.\n]{0,%d}$" % _NEGATION_WINDOW, re.IGNORECASE)
 
 
-def _negated(text: str, start: int) -> bool:
-    """Is the match at `start` governed by a negation just before it?
+# A comma may continue a prohibition list, but a new instruction never does.
+# Keep this grammar conservative: unclear language must still need review.
+_NEGATION_BOUNDARY_RE = re.compile(
+    r"[.!?;\n]|\b(?:but|however|then|instead|please|now|actually|"
+    r"nhưng|nhung|rồi|roi|sau\s+đó|sau\s+do|hãy|hay)\b", re.IGNORECASE)
+_PROHIBITION_WORDS = (
+    r"(?:do\s+not|don['’]?t|never|avoid|không(?:\s+được)?|"
+    r"khong(?:\s+duoc)?|đừng|cấm)")
+_PROHIBITION_END_RE = re.compile(r"\b" + _PROHIBITION_WORDS + r"\s*$", re.IGNORECASE)
+_PROHIBITION_HEAD_RE = re.compile(
+    r"^(?:[-*+]\s+)?" + _PROHIBITION_WORDS + r"\s+(?P<action>.+)$", re.IGNORECASE)
+_LIST_CONNECTOR = r"(?:(?:and|or|nor|và|hoặc)\s+)?"
+_LIST_ACTION_RE = re.compile(
+    r"^" + _LIST_CONNECTOR +
+    r"(?:merge|push|deploy|restart|delete|remove|reset|drop|truncate|"
+    r"wipe|force|publish|write|reprocess|expose|print|reveal|leak|"
+    r"disable|change|modify|edit|touch|xóa|xoá|sửa|ghi|thay\s+đổi)\b", re.IGNORECASE)
+_LIST_TAIL_RE = re.compile(r"(?:and|or|nor|và|hoặc)?", re.IGNORECASE)
+_NEGATION_LIST_WINDOW = 320
 
-    Looks only at the text back to the start of the current clause, so a
-    "do not" in a previous sentence never reaches forward into this one."""
-    window = text[max(0, start - (_NEGATION_WINDOW + 24)):start]
-    clause = re.split(r"[.\n;,]", window)[-1]
-    return bool(_NEGATION_RE.search(clause))
+
+def _negated(text: str, start: int) -> bool:
+    """Recognize local prohibitions and bounded, explicit comma action lists.
+
+    Sentence boundaries, contrast words, new imperatives, and non-action list
+    entries stop inheritance. Ambiguous continuations remain fail-closed.
+    This is a prompt preflight heuristic, not authorization to execute an action.
+    """
+    prefix = text[max(0, start - _NEGATION_LIST_WINDOW):start]
+    sentence = _NEGATION_BOUNDARY_RE.split(prefix)[-1]
+    clause = sentence.rsplit(",", 1)[-1]
+    local = clause[-(_NEGATION_WINDOW + 24):]
+    if _NEGATION_RE.search(local) or _PROHIBITION_END_RE.search(local):
+        return True
+    parts = [part.strip() for part in sentence.split(",")]
+    if len(parts) < 2 or not _LIST_TAIL_RE.fullmatch(parts[-1]):
+        return False
+    head = _PROHIBITION_HEAD_RE.search(parts[0])
+    if head is None:
+        return False
+    actions = [head.group("action"), *parts[1:-1]]
+    return all(_LIST_ACTION_RE.match(action) for action in actions)
 
 
 # Tier 1: DESTRUCTIVE. An instruction to destroy, force-publish, or escalate
