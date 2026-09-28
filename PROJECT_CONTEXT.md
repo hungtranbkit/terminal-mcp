@@ -29,6 +29,12 @@ Terminal MCP durable queue submission is retired for normal coding work.
 - Native fail-closed regression proves terminal_enqueue_task and terminal_route_start create no queued row when server opt-in is absent.
 - Legacy queue engine tests opt in with `TERMINAL_MCP_ENABLE_QUEUE=1`; only inside tests.
 
-### Deployment/merge state
-- Work is implemented on `fix/disable-terminal-queue-20260928`.
-- Before considering this task complete: run `git diff --check`, commit, fast-forward/merge into `main`, push, restart the active Terminal MCP service, then live-verify a mistaken queue submission is rejected while direct `create_session` + `send` still works.
+### Live deployment/merge state
+- Queue-disable implementation was merged to local `main` and pushed; Terminal MCP HTTP was restarted from `/home/dell/workspace/terminal-mcp`.
+- `terminal-mcp-http.service` is active and its unit/environment does not set `TERMINAL_MCP_ENABLE_QUEUE`.
+- Live mistaken `terminal_turn(action=start)` returns `QUEUE_DISABLED_USE_DIRECT_SESSION` with `next_action=create_session_then_send`.
+- Queue DB row count stayed `21 -> 21` across that rejected live submission, proving no row was persisted.
+- The last historical queue record (`memory-knowledge-complete-claude-0928`) became `QUEUED` after restart and was cancelled; active queue records are now `0`. The Memory session itself was not killed.
+- Live direct flow was verified with a disposable shell: `create_session` followed by direct `send_wait` returned `DIRECT_OK`; the disposable session was then exited.
+- The unrelated root worktree modification `.projectflow/knowledge/KNOWLEDGE_STATE.json` was intentionally left untouched.
+- Temporary queue-disable branch/worktree/session are removed after this context update is merged; `main` is the canonical code line.
