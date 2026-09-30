@@ -91,3 +91,37 @@ TMPC-002 is live on Dell Linux. Paperclip `2026.916.1` uses instance `default` a
 ## Paperclip TMPC-003 direct contract — 2026-09-30
 
 TMPC-003 establishes an explicit independence boundary between Paperclip and Terminal MCP. `terminal_mcp/direct_contract.py` is the machine-readable contract for direct actions/tools; `docs/operations/paperclip-routing.md` documents routing and break-glass recovery. Orchestration policy v1.3.0 says Paperclip is an optional separate layer for project/issue orchestration, while direct Terminal MCP remains first-class for inspection/debugging, remote-machine operations, browser verification, targeted commands, and recovery. The same direct-contract/policy suite passed 25/25 both with Paperclip active and with Paperclip stopped. Paperclip was restored healthy after the stopped-mode test. Next slice is TMPC-004 native Claude/Codex pilot through Paperclip.
+
+## Native Claude pilot (Paperclip TER-2) — 2026-09-30
+
+A native Claude agent driven by the Paperclip control plane ran end-to-end
+against this repository and succeeded. Full record:
+`docs/paperclip-integration/pilots/CLAUDE_PILOT.md`.
+
+- Observed branch `main`, HEAD `8c4ff34` at pilot start; rebased onto `575afb9`
+  after the concurrent TER-1 run pushed TMPC-002/TMPC-003 mid-pilot.
+- Verification: `pytest -q tests/test_direct_contract.py tests/test_orchestration_policy.py`
+  -> **25 passed** on the rebased tree. Before the rebase,
+  `tests/test_direct_contract.py` did not exist (it arrived with `575afb9`), so the
+  pilot had also run the nearest equivalents — `tests/test_orchestration_policy.py`,
+  `tests/test_direct_task_lifecycle.py`, `tests/test_contract_handshake.py`
+  -> 44 passed.
+- Nothing was deployed; no service, config, or queue row was touched.
+
+### Facts future agents must preserve
+
+- Paperclip provisioned this run with `PAPERCLIP_WORKSPACE_STRATEGY=project_primary`,
+  i.e. the **shared primary checkout** at `/home/dell/workspace/terminal-mcp`, held
+  concurrently by another Paperclip run. It is *not* an isolated workspace: TER-1 and
+  TER-2 ran in the same tree at the same time and collided on `PROJECT_CONTEXT.md`.
+  Agents on this path must stage only files they authored, fetch before pushing, and
+  rebase rather than force-push.
+- Unfinished work: to get real isolation for Paperclip coding tasks, the project's
+  repository config needs a worktree/clone workspace strategy. Tracked as a
+  follow-up for TMPC-007 (workspace cutover).
+- Bare `python` and `timeout` are not on the Paperclip agent shell's PATH; use
+  `.venv/bin/python`.
+- `tests/conftest.py` repoints `XDG_STATE_HOME` at a temp dir in `pytest_configure`,
+  so running the suite no longer migrates live `~/.local/state/terminal-mcp/*.db`.
+- The unrelated dirty entries `.projectflow/knowledge/KNOWLEDGE_STATE.json` and
+  untracked `.claude/` were deliberately left uncommitted, as before.
