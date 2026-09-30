@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import time
 import logging
 import os
 import secrets
@@ -631,6 +632,29 @@ def main() -> None:
     register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2, controller,
                                queue=queue, run_journal=run_journal)
     register_health(server, terminal, supervisor)
+
+    # Supervised direct tasks (direct_task.py): unconditional because it only
+    # ever acts on tasks a caller explicitly started with `supervise`, and a
+    # started task must keep being continued after the caller's call returns.
+    # Abandoned wait continuations are reaped on the same cadence.
+    direct_tasks = getattr(server, "direct_task_supervisor", None)
+    if direct_tasks is not None:
+        from .direct_task import DirectTaskLoop
+
+        class _SupervisionTicker:
+            def __init__(self) -> None:
+                self._last_reap = 0.0
+
+            def tick(self) -> None:
+                direct_tasks.tick()
+                now = time.monotonic()
+                if now - self._last_reap >= 60:
+                    self._last_reap = now
+                    run_journal.reap_stale_waits()
+
+        direct_loop = DirectTaskLoop(_SupervisionTicker())
+        direct_loop.start()
+        atexit.register(direct_loop.stop)
 
     # Periodic demand for execution probes means false-online prevention and
     # opt-in self-heal continue even with no dashboard client connected. The

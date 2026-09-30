@@ -25,7 +25,17 @@ MAX_METADATA_CHARS = 4_000
 MAX_METADATA_KEY_CHARS = 128
 MAX_METADATA_VALUE_CHARS = 512
 MAX_WAIT_REASON_CHARS = 500
-DEFAULT_WAIT_TTL_SECONDS = 7 * 24 * 60 * 60
+# A wait is one bounded observation slice (<= 15s) that a client resumes
+# within seconds. A PENDING wait nobody has touched for STALE_WAIT_SECONDS was
+# abandoned (the client started a new wait or went away). Before 2026-09-30 a
+# PENDING wait lived for 7 days and was only ever finalized by a resume, so
+# long direct sessions accumulated hundreds of orphaned PENDING rows that also
+# blocked delete_session.
+DEFAULT_WAIT_TTL_SECONDS = 60 * 60
+STALE_WAIT_SECONDS = 15 * 60
+WAIT_PROJECT_ID = "terminal-wait"
+#: Every wait status except PENDING is terminal and immutable.
+WAIT_TERMINAL_STATUSES = frozenset({"MATCHED", "FAILED", "SUPERSEDED", "EXPIRED", "CANCELLED"})
 
 _FORBIDDEN_METADATA_KEYS = (
     "prompt", "argument", "args", "input", "output", "transcript",
@@ -362,13 +372,15 @@ class RunJournalStore:
 
         Qualified fleet names and their bare owning-node name are treated as
         the same target.  Completed rows remain available in the journal but
-        never prevent cleanup.
+        never prevent cleanup.  Passive wait continuations are excluded: a
+        wait only observes a pane and can never execute work, so it must not
+        block deletion (see cancel_waits_for_target).
         """
         bare = session.split("/", 1)[-1]
         with self._connection() as connection:
             rows = connection.execute(
                 "SELECT * FROM journal_runs WHERE completed_at IS NULL AND session IN (?, ?) "
-                "ORDER BY updated_at DESC", (session, bare),
+                "AND project_id != ? ORDER BY updated_at DESC", (session, bare, WAIT_PROJECT_ID),
             ).fetchall()
         return [self._run(row) for row in rows]
 
@@ -376,7 +388,8 @@ class RunJournalStore:
         """All active runs grouped by session for a single dashboard read."""
         with self._connection() as connection:
             rows = connection.execute(
-                "SELECT * FROM journal_runs WHERE completed_at IS NULL ORDER BY updated_at DESC"
+                "SELECT * FROM journal_runs WHERE completed_at IS NULL AND project_id != ? "
+                "ORDER BY updated_at DESC", (WAIT_PROJECT_ID,),
             ).fetchall()
         result: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
@@ -483,13 +496,24 @@ class RunJournalStore:
         now = now_dt.isoformat()
         expires_at = (now_dt + timedelta(seconds=float(ttl_seconds))).isoformat()
         run = self.start_run(
-            "terminal-wait", target if target_type == "session" else "",
+            WAIT_PROJECT_ID, target if target_type == "session" else "",
             target if target_type == "binding" else "", run_id=resume_token,
             state="PENDING", next_action="poll terminal_resume_wait",
             metadata={"kind": "terminal_wait_for_state"},
         )
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            # One live wait per target. A client that starts a new wait
+            # instead of resuming the old token has abandoned the old one;
+            # finalize it now instead of leaving it PENDING forever.
+            self._finalize_waits(
+                connection, "target = ? AND resume_token != ?", (target, resume_token),
+                status="SUPERSEDED", reason=f"superseded by {resume_token}", now=now)
+            self._finalize_waits(
+                connection, "(updated_at < ? OR expires_at <= ?)",
+                ((now_dt - timedelta(seconds=STALE_WAIT_SECONDS)).isoformat(), now),
+                status="EXPIRED", reason="abandoned: not resumed within the stale-wait window",
+                now=now)
             connection.execute(
                 """
                 INSERT INTO wait_continuations (
@@ -534,7 +558,11 @@ class RunJournalStore:
         polls: int,
         waited_ms: int,
     ) -> dict[str, Any]:
-        """Atomically checkpoint one bounded slice; retries never dispatch work."""
+        """Atomically checkpoint one bounded slice; retries never dispatch work.
+
+        A wait finalized concurrently (superseded/expired/cancelled) is
+        returned unchanged: terminal results are immutable.
+        """
         if status not in {"PENDING", "MATCHED", "FAILED"}:
             raise ValueError(f"invalid wait status: {status}")
         now = _now_iso()
@@ -599,3 +627,74 @@ class RunJournalStore:
             assert entry.lastrowid is not None
         assert row is not None
         return self._wait(row)
+
+    @staticmethod
+    def _finalize_waits(connection: sqlite3.Connection, where: str, params: tuple,
+                        *, status: str, reason: str, now: str) -> list[str]:
+        """Terminalize matching PENDING waits and their journal runs.
+
+        Runs inside the caller's transaction. Returns the finalized tokens.
+        """
+        assert status in WAIT_TERMINAL_STATUSES
+        tokens = [row["resume_token"] for row in connection.execute(
+            f"SELECT resume_token FROM wait_continuations "
+            f"WHERE status = 'PENDING' AND completed_at IS NULL AND {where}", params,
+        ).fetchall()]
+        safe_reason = _bounded(reason, MAX_WAIT_REASON_CHARS)
+        for token in tokens:
+            connection.execute(
+                "UPDATE wait_continuations SET status = ?, reason = ?, updated_at = ?, "
+                "completed_at = ? WHERE resume_token = ? AND completed_at IS NULL",
+                (status, safe_reason, now, now, token),
+            )
+            connection.execute(
+                "UPDATE journal_runs SET state = ?, next_action = 'result retained', "
+                "result_summary = ?, updated_at = ?, completed_at = COALESCE(completed_at, ?) "
+                "WHERE run_id = ?",
+                (status, safe_reason, now, now, token),
+            )
+        return tokens
+
+    def reap_stale_waits(self, *, stale_seconds: float = STALE_WAIT_SECONDS) -> int:
+        """Finalize abandoned/expired PENDING waits. Idempotent and cheap."""
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        cutoff = (now_dt - timedelta(seconds=float(stale_seconds))).isoformat()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            tokens = self._finalize_waits(
+                connection, "(updated_at < ? OR expires_at <= ?)", (cutoff, now),
+                status="EXPIRED", reason="abandoned: not resumed within the stale-wait window",
+                now=now)
+            # Orphaned wait runs whose continuation row is already terminal
+            # (or missing) must not stay "active" either.
+            connection.execute(
+                "UPDATE journal_runs SET completed_at = ?, updated_at = ? "
+                "WHERE project_id = ? AND completed_at IS NULL AND updated_at < ? AND run_id NOT IN "
+                "(SELECT resume_token FROM wait_continuations WHERE status = 'PENDING')",
+                (now, now, WAIT_PROJECT_ID, cutoff),
+            )
+        return len(tokens)
+
+    def cancel_waits_for_target(self, target: str, *, reason: str) -> int:
+        """Cancel every PENDING wait on a session (qualified or bare name)."""
+        bare = target.split("/", 1)[-1]
+        now = _now_iso()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            tokens = self._finalize_waits(
+                connection, "target IN (?, ?)", (target, bare),
+                status="CANCELLED", reason=reason, now=now)
+        return len(tokens)
+
+    def pending_wait_count(self, target: str | None = None) -> int:
+        with self._connection() as connection:
+            if target is None:
+                row = connection.execute(
+                    "SELECT COUNT(*) FROM wait_continuations WHERE status = 'PENDING'").fetchone()
+            else:
+                bare = target.split("/", 1)[-1]
+                row = connection.execute(
+                    "SELECT COUNT(*) FROM wait_continuations WHERE status = 'PENDING' "
+                    "AND target IN (?, ?)", (target, bare)).fetchone()
+        return int(row[0])

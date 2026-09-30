@@ -87,6 +87,8 @@ _RETIRED_PUBLIC_QUEUE_TOOLS = (
 )
 _DIRECT_ACTION_SCHEMA_HELP = (
     "Direct Terminal MCP action. Normal public actions: inspect, send, send_wait, wait, resume, "
+    "supervise (long task continued server-side until explicit DONE), supervise_status, "
+    "supervise_complete, supervise_cancel, "
     "list_sessions, list_nodes, create_session, delete_session, task_status, task_batch_status, "
     "browser_verify, browser_screenshot, browser_status, browser_stop."
 )
@@ -334,6 +336,23 @@ def build_mcp(service: TerminalService | None = None,
         except Exception:  # noqa: BLE001 -- other tools remain available
             _LOGGER.exception("durable run journal unavailable")
     compact_tools = CompactTerminalTools(terminal, controller, run_journal=run_journal)
+    # Supervised direct tasks (direct_task.py). Every dispatch/observation
+    # goes through compact_tools' own guarded, bounded send/status/tail.
+    from .direct_task import DirectTaskStore, DirectTaskSupervisor
+    try:
+        direct_tasks = DirectTaskSupervisor(
+            DirectTaskStore(),
+            send=lambda target, text, key: compact_tools.send_task(target, text, idempotency_key=key),
+            status=lambda target: compact_tools._bounded_read(
+                ("direct-task-status", target),
+                lambda: compact_tools._status(target, timeout_seconds=8), 10),
+            tail=lambda target, lines: compact_tools._bounded_read(
+                ("direct-task-tail", target, lines),
+                lambda: compact_tools._tail(target, lines), 10),
+        )
+    except Exception:  # noqa: BLE001 -- never block startup; supervise* reports unavailable
+        direct_tasks = None
+    compact_tools.direct_tasks = direct_tasks
     recovery = recovery or RecoveryEngine(terminal.session_registry, controller, terminal.leases,
                                           terminal.config.auto_recovery)
     recovery.loop = recovery.loop or RecoveryLoop(
@@ -763,6 +782,13 @@ Direct actions:
   send          guarded direct text submission
   send_wait     direct send, then bounded wait in one call
   wait/resume   continue an explicitly requested watch
+  supervise     LONG direct task: send `text` (or args.steps) and let the server
+                continue it after every turn end until an explicit outcome.
+                IDLE/composer only means a turn ended. The task ends on the
+                target printing `TMCP-DONE:<task_id>` / `TMCP-BLOCKED:<task_id>
+                reason`, WAITING_INPUT, supervise_complete/supervise_cancel, or
+                args.max_continuations (default 6). Do not resend.
+  supervise_status/supervise_complete/supervise_cancel  (task_id)
   list_sessions/list, list_nodes/nodes
   create_session/create, delete_session/delete
   task_status/task, task_batch_status/tasks (read-only historical task state)
@@ -1184,7 +1210,8 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         deleted) rather than left pointing at a session that no longer
         exists."""
         _refresh_local_heartbeat()
-        preflight = deletion_preflight(name, queue=queue, run_journal=run_journal, supervisor=supervisor)
+        preflight = deletion_preflight(name, queue=queue, run_journal=run_journal, supervisor=supervisor,
+                                       direct_tasks=direct_tasks)
         if "error" in preflight:
             terminal.audit.record(action="delete_session", session=name, result="BLOCKED",
                                   reason=preflight["error"], actor="mcp")
@@ -1222,7 +1249,8 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         null -- nothing was actually killed by this call, so nothing new
         was captured), not an error."""
         _refresh_local_heartbeat()
-        preflight = deletion_preflight(name, queue=queue, run_journal=run_journal, supervisor=supervisor)
+        preflight = deletion_preflight(name, queue=queue, run_journal=run_journal, supervisor=supervisor,
+                                       direct_tasks=direct_tasks)
         if "error" in preflight:
             terminal.audit.record(action="kill_session", session=name, result="BLOCKED",
                                   reason=preflight["error"], actor="mcp")
@@ -6299,6 +6327,8 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         for tool_name in _RETIRED_PUBLIC_QUEUE_TOOLS:
             server.remove_tool(tool_name)
 
+    # server_http starts the background ticker; import-time builds do not.
+    server.direct_task_supervisor = direct_tasks
     return server
 
 

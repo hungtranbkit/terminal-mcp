@@ -43,7 +43,11 @@ _MAX_TARGET_CHARS = 512
 # and idempotency. This table is the single place the vocabulary is defined --
 # the MCP tool layer validates nothing of its own.
 # --------------------------------------------------------------------------
-TURN_PANE_ACTIONS = ("inspect", "send", "send_wait", "wait", "resume", "start")
+TURN_PANE_ACTIONS = ("inspect", "send", "send_wait", "wait", "resume", "start",
+                     # Supervised direct tasks (direct_task.py): an agent turn
+                     # ending (IDLE) is not the task ending.
+                     "supervise", "supervise_status", "supervise_complete",
+                     "supervise_cancel")
 # How many QueueEngine ticks one `start` call may spend driving the lane from
 # QUEUED to actually dispatched. The engine makes at most ONE transition per
 # tick on purpose (claim -> coordinator gate -> dispatch), so a handful is the
@@ -291,6 +295,9 @@ TURN_ACTION_ALIASES: dict[str, str] = {
     "harness_runs": "harness_status",
     "review": "harness_review",
     "start_task": "start",
+    "supervised": "supervise",
+    "supervise_start": "supervise",
+    "long_send": "supervise",
     "dispatch": "start",
     "run": "start",
 }
@@ -409,6 +416,8 @@ class CompactTerminalTools:
         self.terminal = terminal
         self.controller = controller
         self.run_journal = run_journal
+        # DirectTaskSupervisor, injected by mcp_app. None disables supervise*.
+        self.direct_tasks: Any = None
         # Late-bound implementations for the discovery/lifecycle/queue actions
         # `turn` routes but does not own (see TURN_HANDLER_ACTIONS). They are
         # the very same functions the individual MCP tools are registered
@@ -700,6 +709,10 @@ class CompactTerminalTools:
             "untrusted_output": True,
             "untrusted_fields": ["tail"],
         }
+        if status in {"SUPERSEDED", "EXPIRED", "CANCELLED"}:
+            result["next_action"] = (
+                "This wait is closed and will not be polled again; start a new wait "
+                "only if you still need to observe the target")
         if status == "PENDING":
             result.update({
                 "next_poll_after_ms": NEXT_POLL_MIN_MS,
@@ -714,7 +727,7 @@ class CompactTerminalTools:
                     poll_interval: float, deadline: float | None = None) -> dict[str, Any]:
         # Terminal results are immutable and returned from SQLite without
         # consulting or redispatching the underlying target.
-        if wait["status"] in {"MATCHED", "FAILED"}:
+        if wait["status"] != "PENDING":
             return self._durable_result(wait)
 
         slice_seconds = min(float(timeout), float(SYNC_WAIT_BUDGET_SECONDS))
@@ -913,16 +926,26 @@ class CompactTerminalTools:
             if not resolved_targets:
                 return {"status": "FAILED", "error": "TARGET_REQUIRED"}
             result = self.batch_inspect(resolved_targets, tail_lines=tail_lines, compact=compact)
+            for row in result.get("targets", []) if isinstance(result, dict) else []:
+                note = self._supervised_note(row.get("target"))
+                if note is not None:
+                    row["supervised_task"] = note
             return {"status": "OK" if "error" not in result else "FAILED",
                     "action": normalized, "result": result}
+
+        if normalized.startswith("supervise"):
+            return self._supervise_turn(normalized, target=target, text=text,
+                                        task_id=task_id, args=args,
+                                        idempotency_key=idempotency_key)
 
         if normalized == "resume":
             if not resume_token:
                 return {"status": "FAILED", "error": "RESUME_TOKEN_REQUIRED"}
             result = self.resume_wait(resume_token, timeout=timeout,
                                       poll_interval=poll_interval)
-            return {"status": result.get("status", "FAILED"),
-                    "action": normalized, "result": result}
+            return self._annotate({"status": result.get("status", "FAILED"),
+                                   "action": normalized, "result": result},
+                                  result.get("target"))
 
         if not target:
             return {"status": "FAILED", "error": "TARGET_REQUIRED"}
@@ -1000,8 +1023,8 @@ class CompactTerminalTools:
             result = self.wait_for_state(target, states, timeout=timeout,
                                          poll_interval=poll_interval,
                                          tail_lines=tail_lines)
-            return {"status": result.get("status", "FAILED"),
-                    "action": normalized, "result": result}
+            return self._annotate({"status": result.get("status", "FAILED"),
+                                   "action": normalized, "result": result}, target)
 
         # send_wait: send first, and only wait if the guarded submit was
         # positively confirmed. A blocked/failed send never creates a wait.
@@ -1019,8 +1042,65 @@ class CompactTerminalTools:
         waited = self.wait_for_state(target, states, timeout=timeout,
                                      poll_interval=poll_interval,
                                      tail_lines=tail_lines, _deadline=deadline)
-        return {"status": waited.get("status", "FAILED"),
-                "action": normalized, "send": sent, "wait": waited}
+        return self._annotate({"status": waited.get("status", "FAILED"),
+                               "action": normalized, "send": sent, "wait": waited}, target)
+
+    def _supervised_note(self, target: Any) -> dict[str, Any] | None:
+        if self.direct_tasks is None or not isinstance(target, str) or not target:
+            return None
+        try:
+            return self.direct_tasks.annotation(target.strip())
+        except Exception:  # noqa: BLE001 -- an annotation must never break a read
+            return None
+
+    def _annotate(self, response: dict[str, Any], target: Any) -> dict[str, Any]:
+        """A matched IDLE must not read as DONE while a supervised task is active."""
+        note = self._supervised_note(target)
+        if note is not None:
+            response["supervised_task"] = note
+            response["business_complete"] = False
+        return response
+
+    def _supervise_turn(self, action: str, *, target: str | None, text: str | None,
+                        task_id: str | None, args: dict | None,
+                        idempotency_key: str | None) -> dict[str, Any]:
+        """Supervised direct task: keep a long task going across turn ends.
+
+        - supervise: `target` + `text` (and/or args.steps list). Optional
+          args.max_continuations (default 6, max 30), args.continue_text,
+          args.mode ("auto"|"agent"|"shell").
+        - supervise_status: `task_id`, or `target` for its active tasks.
+        - supervise_complete: `task_id`; args.outcome DONE|BLOCKED, args.reason.
+        - supervise_cancel: `task_id`; args.reason.
+        """
+        if self.direct_tasks is None:
+            return {"status": "FAILED", "error": "ACTION_UNAVAILABLE", "action": action}
+        args = args if isinstance(args, dict) else {}
+        if action == "supervise":
+            if not target:
+                return {"status": "FAILED", "error": "TARGET_REQUIRED", "action": action}
+            steps = args.get("steps")
+            if steps is not None and not isinstance(steps, list):
+                return {"status": "FAILED", "error": "INVALID_STEPS", "action": action}
+            result = self.direct_tasks.start(
+                target.strip(), text=text, steps=steps,
+                max_continuations=args.get("max_continuations"),
+                continue_text=args.get("continue_text"),
+                mode=str(args.get("mode") or "auto"),
+                idempotency_key=idempotency_key)
+        elif action == "supervise_status":
+            if task_id:
+                result = self.direct_tasks.get(task_id)
+            elif target:
+                result = {"status": "OK", "tasks": self.direct_tasks.active_for(target.strip())}
+            else:
+                return {"status": "FAILED", "error": "TASK_ID_REQUIRED", "action": action}
+        elif action == "supervise_complete":
+            result = self.direct_tasks.complete(task_id or "", outcome=str(args.get("outcome") or "DONE"),
+                                                reason=args.get("reason"))
+        else:
+            result = self.direct_tasks.cancel(task_id or "", reason=args.get("reason"))
+        return {**result, "action": action}
 
 
     def _start_turn(self, target: str, text: str, *, title: str | None,
