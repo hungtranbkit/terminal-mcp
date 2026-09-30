@@ -882,9 +882,15 @@ class CompactTerminalTools:
         normalized = str(action or "").strip().lower().replace("-", "_")
         normalized = TURN_ACTION_ALIASES.get(normalized, normalized)
         if normalized not in TURN_ACTIONS:
+            # Recovery guidance is intentionally direct-only even when an
+            # operator has temporarily opted the retired queue back in.  The
+            # escape hatch permits controlled rollback/testing; it must never
+            # make public client guidance queue-first again.
+            allowed = [action for action in TURN_ACTIONS if action not in QUEUE_SUBMISSION_ACTIONS]
+            aliases = {alias: canonical for alias, canonical in TURN_ACTION_ALIASES.items()
+                       if canonical not in QUEUE_SUBMISSION_ACTIONS}
             return {"status": "FAILED", "error": "INVALID_ACTION",
-                    "allowed": list(TURN_ACTIONS),
-                    "aliases": dict(TURN_ACTION_ALIASES)}
+                    "allowed": allowed, "aliases": aliases}
 
         # Queue submission is retired for normal public use.  The legacy
         # engine remains for historical/running tasks, but no new queue row is

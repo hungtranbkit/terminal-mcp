@@ -18,6 +18,7 @@ import mcp.types as types
 import pytest
 
 from terminal_mcp import chatgpt_sidecar as sidecar
+from terminal_mcp import orchestration_policy
 from terminal_mcp.chatgpt_sidecar import (BACKEND_UNAVAILABLE, CATALOG, SERVER_NAME,
                                           Backend, BackendUnavailable, build_app,
                                           build_sidecar, backend_url, sidecar_port)
@@ -282,13 +283,20 @@ def test_the_instructions_carry_a_machine_readable_discovery_signal():
     assert "USE terminal_turn FOR EVERYTHING" in text
     assert "NO terminal_send_text/terminal_send_keys" in text, \
         "the compatibility bridge must not advertise raw send in tools/list"
-    # Every action has to be named, or a model cannot find the capability that
-    # used to be its own tool.
+    # Every direct action has to be named, or a model cannot find the
+    # capability that used to be its own tool.
     for action in ("inspect", "send", "send_wait", "wait", "resume",
                    "list_sessions", "list_nodes", "create_session",
-                   "delete_session", "enqueue_task", "task_status",
-                   "task_batch_status"):
+                   "delete_session", "task_status", "task_batch_status",
+                   "browser_verify", "browser_screenshot", "browser_status",
+                   "browser_stop"):
         assert action in text, f"action {action} must be named in the instructions"
+
+    public_guidance = text.split("\n\n" + orchestration_policy.server_instructions(), 1)[0]
+    for retired in ("start", "enqueue_task", "route_start", "agent_start",
+                    "project_start", "queue_resume", "queue_run_once",
+                    "long_task"):
+        assert retired not in public_guidance, retired
 
 
 # ---------------------------------------------------------------------------

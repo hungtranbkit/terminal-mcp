@@ -88,7 +88,17 @@ def test_an_unknown_action_is_refused_and_names_what_is_allowed():
     assert result["status"] == "FAILED"
     assert result["error"] == "INVALID_ACTION"
     # A model that guessed wrong must be able to recover from the error alone.
-    assert "list_sessions" in result["allowed"]
+    for action in ("inspect", "send", "send_wait", "wait", "resume",
+                   "list_sessions", "list_nodes", "create_session",
+                   "delete_session", "browser_verify", "browser_screenshot",
+                   "browser_status", "browser_stop"):
+        assert action in result["allowed"]
+    for retired in ("start", "enqueue_task", "route_start", "agent_start",
+                    "project_start", "queue_resume", "queue_run_once"):
+        assert retired not in result["allowed"], retired
+    for retired_alias in ("enqueue", "start_auto", "run_agent", "auto",
+                          "route", "start_task", "dispatch", "run"):
+        assert retired_alias not in result["aliases"], retired_alias
     assert result["aliases"]["list"] == "list_sessions"
 
 

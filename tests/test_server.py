@@ -472,6 +472,28 @@ async def test_server_registers_v1_and_binding_tools():
     }
 
 
+@pytest.mark.anyio
+async def test_terminal_turn_schema_guides_clients_to_direct_actions_only():
+    """The generated MCP schema is the client-visible action picker/help."""
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    schema = tools["terminal_turn"].input_schema["properties"]
+    action_help = schema["action"]["description"]
+
+    for action in ("inspect", "send", "send_wait", "wait", "resume",
+                   "list_sessions", "list_nodes", "create_session",
+                   "delete_session", "browser_verify", "browser_screenshot",
+                   "browser_status", "browser_stop"):
+        assert action in action_help
+    for retired in ("start", "enqueue_task", "route_start", "agent_start",
+                    "project_start", "queue_resume", "queue_run_once"):
+        assert retired not in action_help, retired
+
+    assert schema["long_task"]["default"] is False
+    assert schema["long_task"]["deprecated"] is True
+    assert "operator" in schema["long_task"]["description"].lower()
+    assert "normal direct execution" in schema["long_task"]["description"].lower()
+
+
 @pytest.fixture
 def anyio_backend():
     return "asyncio"

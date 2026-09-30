@@ -4,7 +4,9 @@ import logging
 import os
 import threading
 import time
+from typing import Annotated
 
+from pydantic import Field
 from mcp.server.mcpserver import MCPServer
 
 from . import tool_metrics
@@ -71,6 +73,15 @@ from .worker_registry import ALL_ROLES, WorkerRegistry
 
 _LOGGER = logging.getLogger(__name__)
 _LOCAL_HEARTBEAT_MIN_INTERVAL_SECONDS = 5.0
+_DIRECT_ACTION_SCHEMA_HELP = (
+    "Direct Terminal MCP action. Normal public actions: inspect, send, send_wait, wait, resume, "
+    "list_sessions, list_nodes, create_session, delete_session, task_status, task_batch_status, "
+    "browser_verify, browser_screenshot, browser_status, browser_stop."
+)
+_LONG_TASK_SCHEMA_HELP = (
+    "Legacy operator-only queue switch. Deprecated for normal direct execution and rejected "
+    "unless the server operator explicitly enables the retired queue."
+)
 from .queue_service import QueueService
 from .queue_policy import queue_disabled_response, queue_submission_enabled
 from .release_service import ReleaseService
@@ -698,7 +709,7 @@ def build_mcp(service: TerminalService | None = None,
         return controller.terminal_status(session)
 
     @server.tool()
-    def terminal_turn(action: str, target: str | None = None,
+    def terminal_turn(action: Annotated[str, Field(description=_DIRECT_ACTION_SCHEMA_HELP)], target: str | None = None,
                       targets: list[str] | None = None, text: str | None = None,
                       desired_states: list[str] | None = None,
                       resume_token: str | None = None, timeout: float = 20,
@@ -712,7 +723,7 @@ def build_mcp(service: TerminalService | None = None,
                       metadata: dict | None = None, request_key: str | None = None,
                       task_id: str | None = None,
                       task_ids: list[str] | None = None,
-                      long_task: bool = False,
+                      long_task: Annotated[bool, Field(description=_LONG_TASK_SCHEMA_HELP, deprecated=True)] = False,
                       url: str | None = None, args: dict | None = None,
                       path: str | None = None, content_b64: str | None = None,
                       overwrite: bool = False, mode: str | None = None) -> dict:
