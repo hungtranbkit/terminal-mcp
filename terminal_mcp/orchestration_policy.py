@@ -37,7 +37,7 @@ Design commitments:
 
 from __future__ import annotations
 
-ORCHESTRATION_POLICY_VERSION = "1.2.0"
+ORCHESTRATION_POLICY_VERSION = "1.3.0"
 
 #: Where the expanded, human-readable form lives, relative to the repo root.
 POLICY_DOC_PATH = "docs/CHATGPT_ORCHESTRATION_POLICY.md"
@@ -60,7 +60,7 @@ TOOL_EFFICIENCY = (
     "The durable task queue is retired and disabled by default. For coding work, create a fresh session when needed, then use terminal_turn action=send or action=send_wait directly on that session. "
     "Queue-producing actions start, enqueue_task, route_start, agent_start, project_start, aliases run/dispatch/enqueue, and send with long_task=true must not be used in normal operation. "
     "Use inspect only when the user explicitly asks for a status check. After direct send, avoid polling unless the user asks for a check. "
-    "Read-only task history/status and cleanup remain available for historical tasks. When work is complete, verify it, merge to the intended branch, and clean up finished sessions/worktrees/branches."
+    "Read-only task history/status and cleanup remain available for historical tasks. Paperclip is a separate optional orchestration layer for project/issue assignment, heartbeats, budgets and managed workspaces; it is not a dependency of direct Terminal MCP inspection, remote execution, browser verification or break-glass recovery. When work is complete, verify it, merge to the intended branch, and clean up finished sessions/worktrees/branches."
 )
 
 ROLES = (

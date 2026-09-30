@@ -1,7 +1,7 @@
 # TMPC-003 - Direct ChatGPT compatibility contract
 
 Priority: P0
-Status: TODO
+Status: DONE
 Depends on: TMPC-001
 
 ## Purpose
@@ -53,3 +53,14 @@ If a later task introduces a restriction on direct AI session creation, it must 
 
 - Implementing the Paperclip adapter.
 - Forcing normal project work through Paperclip at the transport layer.
+
+## Implementation evidence — 2026-09-30
+
+- Added `terminal_mcp/direct_contract.py`, a pure-data capability contract with no Paperclip runtime imports.
+- Contract pins the canonical direct `terminal_turn` actions and standalone terminal/browser tools that must remain usable independently of Paperclip.
+- Added `docs/operations/paperclip-routing.md` with the routing rule and break-glass procedure.
+- Orchestration policy is now v1.3.0 and explicitly states that Paperclip is a separate optional orchestration layer, not a dependency of direct inspection, remote execution, browser verification, or recovery.
+- Regression suite `tests/test_direct_contract.py tests/test_orchestration_policy.py` passed 25/25 with `paperclipai.service` active.
+- The exact same suite passed 25/25 with `paperclipai.service` stopped and port 3100 closed.
+- While Paperclip was stopped, direct Terminal MCP commands continued to execute successfully; Paperclip was then restored healthy on `127.0.0.1:3100`.
+- Required browser and remote/session tools are asserted in the public MCP tool registry with the queue disabled.
