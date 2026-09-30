@@ -5,7 +5,7 @@
 | TMPC-001 | P0 | Public orchestration surface cleanup | - | DONE |
 | TMPC-002 | P0 | Local Paperclip bootstrap | TMPC-001 recommended | DONE |
 | TMPC-003 | P0 | Direct ChatGPT compatibility contract | TMPC-001 | DONE |
-| TMPC-004 | P1 | Native Claude/Codex pilot | TMPC-002, TMPC-003 | TODO |
+| TMPC-004 | P1 | Native Claude/Codex pilot | TMPC-002, TMPC-003 | DONE |
 | TMPC-005 | P1 | External Terminal MCP adapter | TMPC-002, TMPC-003, TMPC-004 | TODO |
 | TMPC-006 | P1 | Deterministic session lifecycle | TMPC-005 | TODO |
 | TMPC-007 | P1 | Workspace/worktree cutover | TMPC-004, TMPC-005, TMPC-006 | TODO |

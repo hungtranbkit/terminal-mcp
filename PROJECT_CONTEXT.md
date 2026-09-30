@@ -125,3 +125,7 @@ against this repository and succeeded. Full record:
   so running the suite no longer migrates live `~/.local/state/terminal-mcp/*.db`.
 - The unrelated dirty entries `.projectflow/knowledge/KNOWLEDGE_STATE.json` and
   untracked `.claude/` were deliberately left uncommitted, as before.
+## Paperclip TMPC-004 native-agent gate — 2026-10-01
+
+TMPC-004 is accepted after isolated reruns. Paperclip native Codex (TER-3/run aee5ef6f..., commit f0227dc) and Claude (TER-4/run afb108c9..., commit 5c55759) each completed on a dedicated git worktree based on origin/main, passed 25/25 focused tests, updated PROJECT_CONTEXT.md, and committed without pushing/merging/deploying. Root cause of the earlier shared-checkout pilots was instance-level enableIsolatedWorkspaces=false; it is now true while enableIsolatedWorkspacesByDefault remains false, so only projects with explicit isolation policy change behavior. Assignment already auto-wakes agents; do not also invoke heartbeat manually or duplicate runs can occur. Paperclip may now be treated as the default route for durable local Claude/Codex project work, but direct ChatGPT -> Terminal MCP remains first-class and independent. Next integration slice is TMPC-005 external Terminal MCP adapter.
+
