@@ -326,3 +326,21 @@ def test_compact_wait_matching_idle_reports_task_not_complete(tmp_path):
     cancelled = tools.turn(action="supervise_cancel", task_id=task_id)
     assert cancelled["task"]["state"] == "CANCELLED"
     assert "supervised_task" not in tools.turn(action="wait", target="pos", timeout=2)
+
+
+def test_shell_task_self_completes_via_task_id_placeholder(tmp_path):
+    clock = Clock()
+
+    def script(n, text):
+        # a real shell prints printf's output, not the command line
+        return text.replace("printf 'TMCP-%s:%s\\n' DONE ", "TMCP-DONE:") if "printf" in text else f"out {n}"
+
+    pane = FakePane(agent="bash", busy_ticks=1, script=script)
+    sup = _supervisor(tmp_path, pane, clock)
+    started = sup.start("sh", steps=["echo a", "echo b", "echo c",
+                                     "printf 'TMCP-%s:%s\\n' DONE {TMCP_TASK_ID}"])
+    task_id = started["task"]["task_id"]
+    _run(sup, clock, 30)
+    assert pane.sent[-1][0] == f"printf 'TMCP-%s:%s\\n' DONE {task_id}"
+    task = sup.get(task_id, refresh=False)["task"]
+    assert task["state"] == "DONE" and len(pane.sent) == 4

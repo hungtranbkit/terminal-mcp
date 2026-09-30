@@ -64,6 +64,7 @@ MAX_SEND_FAILURES = 3
 MAX_OBSERVE_FAILURES = 20
 MARKER_TAIL_LINES = 60
 LOOP_INTERVAL_SECONDS = 3.0
+TASK_ID_PLACEHOLDER = "{TMCP_TASK_ID}"
 _TASK_ID = re.compile(r"^dt_[0-9a-f]{16}$")
 # Leading decoration an agent UI may put before its own output line (Claude's
 # ●/⏺, Codex's •, list bullets, box-drawing borders). `>` is deliberately NOT
@@ -289,6 +290,9 @@ class DirectTaskSupervisor:
             hint = f"{observed.get('reason', '')}".lower()
             mode = "agent" if any(agent in hint for agent in _AGENT_HINTS) else "shell"
         task_id = f"dt_{uuid.uuid4().hex[:16]}"
+        # Lets a step reference its own task, e.g. a final shell step
+        # `printf 'TMCP-%s:%s\n' DONE {TMCP_TASK_ID}` completes explicitly.
+        items = [item.replace(TASK_ID_PLACEHOLDER, task_id) for item in items]
         if mode == "agent":
             # One line: a raw newline can submit an agent composer early.
             items[0] = f"{items[0]} {completion_instruction(task_id)}"
