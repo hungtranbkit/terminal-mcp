@@ -13,7 +13,7 @@ async def test_server_registers_v1_and_binding_tools():
     assert wait_tool.input_schema["properties"]["timeout"]["default"] == 20
     assert resume_tool.input_schema["properties"]["timeout"]["default"] == 20
     assert by_name["terminal_send_task"].input_schema["properties"]["timeout"]["default"] == 20
-    assert "one compact tool per logical terminal operation" in mcp.instructions
+    assert "GIVING A SESSION WORK IS DIRECT SESSION SEND" in mcp.instructions
     assert "PREFERRED inspection" in (by_name["terminal_batch_inspect"].description or "")
     assert "PREFERRED send" in (by_name["terminal_send_task"].description or "")
     assert names == {
@@ -181,7 +181,6 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_verify_handoff",
         "terminal_verify_complete",
         "terminal_verify_fail",
-        "terminal_verify_requeue",
         "terminal_verify_trace",
         "terminal_verify_reconcile",
         # P0.6 named-resource ownership lock (advisory, project-scoped).
@@ -264,16 +263,13 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_queue_status",
         "terminal_queue_list_all",
         "terminal_queue_pause",
-        "terminal_queue_resume",
         "terminal_queue_retry",
         "terminal_queue_skip",
         "terminal_queue_cancel",
         "terminal_queue_reorder",
         "terminal_queue_clear",
         "terminal_queue_events",
-        "terminal_queue_run_once",
         "terminal_queue_verify",
-        "terminal_queue_set_auto_dispatch",
         "terminal_integration_configure",
         "terminal_integration_status",
         "terminal_integration_list_handoffs",
@@ -286,7 +282,6 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_integration_force_regression",
         "terminal_integration_promote",
         "terminal_integration_events",
-        "terminal_enqueue_task",
         "terminal_task_status",
         "terminal_task_batch_status",
         "terminal_queue_metrics",
@@ -299,7 +294,6 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_session_tasks",
         "terminal_fleet_task_summary",
         "terminal_queue_loop_status",
-        "terminal_queue_loop_run_once",
         "terminal_queue_global_inbox",
         "terminal_queue_recent_events",
         "terminal_integration_fleet_overview",
@@ -420,8 +414,6 @@ async def test_server_registers_v1_and_binding_tools():
         # Task router (landed with the router lane; this inventory had not
         # been updated for it).
         "terminal_task_route",
-        "terminal_route_start",
-        "terminal_queue_rescue_once",
         "terminal_session_cleanup_candidates",
         # UI workflow policy (TMCP-UI-WORKFLOW-001). Read-only decision tools:
         # they pick the project profile, order the precedence layers and grade
@@ -440,7 +432,6 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_get_agent",
         "terminal_list_agents",
         "terminal_update_agent",
-        "terminal_agent_start",
         "terminal_register_skill",
         "terminal_get_skill",
         "terminal_list_skills",
@@ -455,7 +446,6 @@ async def test_server_registers_v1_and_binding_tools():
         # Plain tools, NOT terminal_turn actions -- same reason as above.
         "terminal_project_bootstrap",
         "terminal_project_plan",
-        "terminal_project_start",
         "terminal_project_advance",
         "terminal_project_archive",
         "terminal_project_update",

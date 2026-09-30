@@ -1,7 +1,7 @@
 # TMPC-001 - Public orchestration surface cleanup
 
 Priority: P0
-Status: TODO
+Status: DONE
 Depends on: none
 
 ## Purpose
@@ -74,3 +74,11 @@ At minimum:
 - Installing Paperclip.
 - Removing direct Claude/Codex access.
 - Deleting historical queue data.
+
+## Implementation evidence — 2026-09-30
+
+- `terminal_turn` client guidance is direct-session only; retired queue submission actions are no longer suggested by schema/error guidance.
+- `long_task` remains compatibility-only and is marked deprecated; queue submission remains fail-closed unless `TERMINAL_MCP_ENABLE_QUEUE=1` is set by the server operator.
+- When queue submission is disabled, the public MCP catalog now removes queue submission/runner tools (`terminal_enqueue_task`, route/project/agent start, queue resume/run/rescue/auto-dispatch/requeue) while preserving direct execution, read-only task/history/metrics, and cleanup/cancel capabilities.
+- Focused verification: `tests/test_chatgpt_sidecar.py tests/test_compact_turn_actions.py tests/test_server.py` = 175 passed.
+- Live HTTP `/mcp` verification is required after service restart before closing deployment evidence.

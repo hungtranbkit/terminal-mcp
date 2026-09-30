@@ -73,6 +73,18 @@ from .worker_registry import ALL_ROLES, WorkerRegistry
 
 _LOGGER = logging.getLogger(__name__)
 _LOCAL_HEARTBEAT_MIN_INTERVAL_SECONDS = 5.0
+_RETIRED_PUBLIC_QUEUE_TOOLS = (
+    "terminal_queue_resume",
+    "terminal_enqueue_task",
+    "terminal_route_start",
+    "terminal_queue_rescue_once",
+    "terminal_project_start",
+    "terminal_agent_start",
+    "terminal_queue_run_once",
+    "terminal_queue_set_auto_dispatch",
+    "terminal_queue_loop_run_once",
+    "terminal_verify_requeue",
+)
 _DIRECT_ACTION_SCHEMA_HELP = (
     "Direct Terminal MCP action. Normal public actions: inspect, send, send_wait, wait, resume, "
     "list_sessions, list_nodes, create_session, delete_session, task_status, task_batch_status, "
@@ -6282,6 +6294,10 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         harness_cancel=harness.cancel,
         harness_review=harness.review,
     ))
+
+    if not queue_submission_enabled():
+        for tool_name in _RETIRED_PUBLIC_QUEUE_TOOLS:
+            server.remove_tool(tool_name)
 
     return server
 

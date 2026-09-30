@@ -2,7 +2,7 @@
 
 | ID | Priority | Task | Depends on | Status |
 | --- | --- | --- | --- | --- |
-| TMPC-001 | P0 | Public orchestration surface cleanup | - | TODO |
+| TMPC-001 | P0 | Public orchestration surface cleanup | - | DONE |
 | TMPC-002 | P0 | Local Paperclip bootstrap | TMPC-001 recommended | TODO |
 | TMPC-003 | P0 | Direct ChatGPT compatibility contract | TMPC-001 | TODO |
 | TMPC-004 | P1 | Native Claude/Codex pilot | TMPC-002, TMPC-003 | TODO |
