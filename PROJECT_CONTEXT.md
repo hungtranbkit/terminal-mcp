@@ -38,3 +38,24 @@ Terminal MCP durable queue submission is retired for normal coding work.
 - Live direct flow was verified with a disposable shell: `create_session` followed by direct `send_wait` returned `DIRECT_OK`; the disposable session was then exited.
 - The unrelated root worktree modification `.projectflow/knowledge/KNOWLEDGE_STATE.json` was intentionally left untouched.
 - Temporary queue-disable branch/worktree/session are removed after this context update is merged; `main` is the canonical code line.
+
+## Planned Paperclip control-plane integration — 2026-09-30
+
+A task epic was added under `docs/paperclip-integration/` to migrate default durable project orchestration to Paperclip while preserving Terminal MCP as a first-class direct ChatGPT execution surface.
+
+### Architectural decision
+
+- Paperclip is the planned owner of durable project/issue lifecycle, default agent assignment, budget/governance, and default isolated coding workspaces.
+- Terminal MCP remains independently and directly usable by ChatGPT for low-level execution, inspection, difficult diagnostics, recovery, remote nodes, browser verification, and explicit expert/manual sessions.
+- The migration must not make Terminal MCP dependent on Paperclip availability.
+- Direct `terminal_turn` access is a compatibility contract, not a temporary migration artifact.
+- Legacy durable queue/dispatcher behavior remains retired by default and must not be reintroduced inside the Paperclip adapter.
+- Capability retirement is gated: install replacement, prove end-to-end behavior, prove recovery, preserve direct compatibility, then disable only the overlapping orchestration capability.
+
+### Planned task sequence
+
+See `docs/paperclip-integration/TASK_INDEX.md` and `docs/paperclip-integration/README.md`.
+
+The planned slices are TMPC-001 through TMPC-009: public surface cleanup, Paperclip bootstrap, direct ChatGPT contract, native agent pilot, Terminal MCP adapter, deterministic session lifecycle, workspace cutover, hardening/recovery, then final legacy-orchestration retirement.
+
+No Paperclip runtime integration is claimed complete by this planning commit.
