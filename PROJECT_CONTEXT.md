@@ -159,3 +159,40 @@ TMPC-004 is accepted after isolated reruns. Paperclip native Codex (TER-3/run ae
 - Dell node agent process still runs pre-`e3ab229` code (only affects the `next_action` hint on node-agent-routed deletes); restart only when tmux cgroup placement is handled.
 - Preserved-but-idle sessions worth a human look: `nf21-run-0930`, `nf32-run-0930`, `nf52-run-0930`, `offlinepos-disabled-controls-finish-1001` (IDLE_PRIMARY_CHECKOUT, clean/merged), `memory-knowledge-complete-claude-0928` (DIRTY_WORKTREE), `social-commerce-p0-1001` (NO_REPO). Set `close_clean_primary_checkouts: true` only if primary-checkout agents should also auto-close.
 - Dashboard delete routes still don't check supervised tasks (from 2026-09-30).
+
+## Hard lifecycle rule: RECOVERY_REQUIRED -> CLEANUP_ELIGIBLE — 2026-10-02 (`d847baa`)
+
+### Rule (code-enforced, not an operational note)
+No agent session may be retained indefinitely. `terminal_mcp/session_reconciler.py` layers a persisted lifecycle state machine over the existing `classify()`:
+- `CONTROLLED`: PROTECTED, ATTACHED, SHELL (shell reaper governs), ACTIVE_TASK (queue task / supervised task / active run / lease-recovery), AGENT_RECENT (< `idle_hours`), AGENT_RUNNING (agent footer shows a turn in flight), REQUIRED_SERVICE (declared in `required_services` AND verified healthy: pane alive + optional `health_url` < 500), SERVICE_RECENT.
+- `RECOVERY_REQUIRED`: uncontrolled/unbound/uninspectable/UNKNOWN — idle agent with no owner and unprovable completion (DIRTY_WORKTREE, UNMERGED_BRANCH, NO_REPO, NO_BASE_REF, UNKNOWN_CWD, AGENT_NOT_IDLE incl. UNKNOWN/WAITING_INPUT, IDLE_PRIMARY_CHECKOUT) or a service pane not verified-healthy-and-required (SERVICE). Each real pass: re-probe the pane (deeper capture when UNKNOWN), re-check ownership, checkpoint unique git work. Regained control (owner appears, attach, activity, pane output hash changes, becomes provably complete) -> CONTROLLED with `recovered_at`, timer reset.
+- `CLEANUP_ELIGIBLE`: grace (`recovery_grace_minutes`, default 30, range 5..1440) expired without regained control, or provably complete (COMPLETED_CLEAN / ORPHAN_WORKTREE_MISSING, immediate as before). Closed on the next real pass via the guarded `terminal_delete_session(confirm=True)` after fresh re-classification, checkpoint, preflight and scrollback capture -> `CLOSED`.
+- `BLOCKED` (fail closed): checkpoint of dirty/unmerged work failed (retried every pass; closes once it succeeds) or an interactive editor is open (EDITOR_OPEN).
+- `GONE`: vanished on its own. CLOSED/GONE rows pruned after 14 days.
+- Worst-case lifetime of an abandoned session = `idle_hours` + grace + one interval.
+
+### Checkpoint (preserve unique work)
+`checkpoint_git()`: temp `GIT_INDEX_FILE` (read-tree HEAD, `add -u`, add untracked files outside `REGENERABLE_DIRS` like .venv/node_modules/dist/caches) -> `commit-tree` on HEAD -> `refs/terminal-mcp/checkpoints/<session>/<stamp>` + `<scrollback_dir>/checkpoints/<stamp>-<session>.patch`; worktree and real index untouched; verified by rev-parse. Clean-but-unmerged: same ref pinned at HEAD. Only-regenerable dirt -> `kind: none` (no unique work). Untracked > `checkpoint_max_untracked_mb` (200) -> BLOCKED. Reused when content unchanged. Needs git >= 2.26 (`--pathspec-from-file`).
+
+### State/exposure
+- Store: `~/.local/state/terminal-mcp/session_lifecycle.db` (`LifecycleStore`, override `TERMINAL_MCP_SESSION_LIFECYCLE_DB`), keyed by session name + tmux identity (`session_id@created_epoch`) so a reused name starts fresh; timers survive restarts. Created lazily (import-time builds don't create it).
+- `terminal_session_lifecycle` / compact `session_lifecycle`: per-row `lifecycle_state`, `action` (close/recover/preserve), `lifecycle` {state, reason, classification, first_uncontrolled_at, grace_expires_at, last_observed_at, recovery_attempts, last_recovery_at, recovered_at, closed_at, checkpoint}; top-level `lifecycle_states`, `close_candidates`, `recovery_required`, `blocked`. Read-only (no store writes).
+- `terminal_session_reconcile` runs record observations/timers even in dry run (no checkpoints/closes). Real pass still needs `dry_run=false` + `confirm=true`.
+- `terminal_list_sessions` (local-node rows) and compact `inspect` rows carry `lifecycle`.
+- Config (`AgentCleanupConfig`): new `recovery_grace_minutes`, `checkpoint_dirty_work`, `checkpoint_max_untracked_mb`, `required_services` (pattern string or `{session, health_url}`; `RequiredServiceConfig`). Example in `config.example.yaml`.
+- `classify_status` is now called with the reconciler clock (`now=`).
+
+### Tests
+`tests/test_session_lifecycle_reconciler.py` 31 passed: uncontrolled->recover->keep, pane-output reset, grace expiry->cleanup (NO_REPO + UNKNOWN pane), dirty->checkpoint->cleanup (worktree/index untouched, untracked captured, patch written, checkpoint reused), unmerged pinned->cleanup, checkpoint failure->BLOCKED->retry closes, regenerable-only dirt, active task exemption, required service exempt only while healthy, recent service/editor, repeated cleanup idempotency + name reuse, restart persistence, read-only inspect/dry run, compact inspect annotation, config validation. Related suites: 421 passed, 3 failed = the same pre-existing failures on main (`test_transports.py` x2, `test_observer.py::test_observer_exposes_no_tool_that_can_change_anything`).
+
+### Deployment (Dell, 2026-10-02 11:01)
+- `d847baa` fast-forwarded to `main` and pushed; `terminal-mcp-http` restarted (tmux verified in `terminal-node-agent.service` cgroup, KillMode=process). `/version` = d847baa, `/health/ready` ready, tunnels + node agent active, every session kept its created timestamp. Journal: reconciler started (dry_run=False, idle_hours=2, interval=900s).
+- `~/.config/terminal-mcp/runtime-config.yaml` (backup `runtime-config.yaml.bak-20261002-recovery`): `recovery_grace_minutes: 30`, `checkpoint_dirty_work: true`, `checkpoint_max_untracked_mb: 200`, `required_services`: `novafactory-live-0930` (health_url `http://127.0.0.1:8100/`, verified 200) and `novafactory-named-tunnel2-0929` (cloudflared up 2.5 days). Remove them when that preview is no longer needed.
+- Pre-deploy read-only preview of live sessions under the rule: RECOVERY_REQUIRED would be `chrome-audit-cleanup-1001` (codex UNKNOWN pane, cwd ~, 26h idle), `facebook-policyfix-check-1632` (ssh stuck at an interactive provider picker, 18h), `memory-knowledge-complete-claude-0928` (DIRTY only by untracked `.venv` -> no unique work), `nf21/nf32/nf52-run-0930`, `offlinepos-disabled-controls-finish-1001` (IDLE_PRIMARY_CHECKOUT), `social-commerce-p0-1001` (NO_REPO, cwd ~/workspace). CONTROLLED: `cdtm-shopee-api-audit-1001` (now RUNNING), the two novafactory services, the shell, the lifecycle-fix session.
+- A manual confirmed real pass via MCP was denied by the agent permission classifier and NOT performed. Reconciliation of existing sessions is therefore left to the deployed loop: first pass ~11:17 starts timers (+ checkpoints), closes follow at the first pass after the 30-min grace (~11:47-12:02). NOT yet verified live — next agent: check `terminal_session_lifecycle`, `~/tmux-reaped/`, audit `reconcile_agent_session`, and `git for-each-ref refs/terminal-mcp` in affected repos.
+
+### Open follow-ups
+- Pre-existing, unrelated: fleet projector errors `node:node:local is owned by 'dell-linux', not 'local'` (~400/day in the journal since at least 00:02 today).
+- HP controller still not deployed (see previous section); remote node agents not redeployed.
+- Dashboard delete routes still don't check supervised tasks.
+
