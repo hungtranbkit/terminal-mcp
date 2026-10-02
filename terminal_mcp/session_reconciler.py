@@ -489,6 +489,7 @@ class SessionReconciler:
                  git_probe: Callable[[str], dict[str, Any]] = probe_git,
                  health_check: Callable[[Any, Any], tuple[bool, str]] = check_service_health,
                  store: LifecycleStore | None = None,
+                 last_input: Callable[[str], float | None] | None = None,
                  clock: Callable[[], float] = time.time) -> None:
         self.terminal = terminal
         self._policy = policy
@@ -498,6 +499,7 @@ class SessionReconciler:
         self._git_probe = git_probe
         self._health_check = health_check
         self._store = store
+        self._last_input = last_input
         self._clock = clock
         self._lock = threading.Lock()
 
@@ -539,10 +541,23 @@ class SessionReconciler:
         except Exception:  # noqa: BLE001 -- unreadable pane is not IDLE
             return None
 
+    def _last_input_epoch(self, name: str) -> float | None:
+        lookup = self._last_input or getattr(getattr(self.terminal, "audit", None), "last_input_epoch", None)
+        if lookup is None:
+            return None
+        try:
+            return lookup(name)
+        except Exception:  # noqa: BLE001 -- missing evidence is just missing
+            return None
+
     def classify_session(self, info: Any) -> dict[str, Any]:
+        # Activity = tmux's own stamp OR the controller's last delivered input
+        # (send/create). Ink agent CLIs never advance the tmux stamp, so an
+        # operator-driven session would otherwise look idle and be reaped.
+        last_input = self._last_input_epoch(info.name)
         row = {"name": info.name, "attached": bool(info.attached),
                "command": info.pane_current_command, "cwd": info.pane_current_path or None,
-               "activity_epoch": info.activity_epoch}
+               "activity_epoch": max(float(info.activity_epoch or 0), float(last_input or 0))}
         policy, now = self.policy, self._clock()
         protected = self._protected()
         spec = _match_required(info.name, tuple(getattr(policy, "required_services", ()) or ()))

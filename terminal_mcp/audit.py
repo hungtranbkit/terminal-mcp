@@ -206,6 +206,24 @@ class AuditStore:
                  actor, node_id, latency_ms, policy_source, policy_version),
             )
 
+    def last_input_epoch(self, session: str) -> float | None:
+        """Epoch of the controller's most recent delivered input to (or
+        creation of) `session`. Activity evidence for the agent-session
+        lifecycle reconciler: Ink agent CLIs never advance tmux's own
+        activity stamp, so a session an operator is actively driving
+        through Terminal MCP would otherwise look idle."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT MAX(timestamp) FROM input_audit WHERE session = ? AND "
+                "((action IN ('send_text', 'send_keys') AND result IN ('SENT', 'SENT_UNCONFIRMED')) "
+                "OR (action = 'create_session' AND result = 'CREATED'))", (session,)).fetchone()
+        if not row or not row[0]:
+            return None
+        try:
+            return datetime.fromisoformat(row[0]).timestamp()
+        except ValueError:
+            return None
+
     def prune(self, retention: int) -> int:
         """P1 hardening item #9: input_audit has no other retention limit
         -- every terminal_send_text/_keys call ever recorded stays forever

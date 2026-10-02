@@ -557,3 +557,25 @@ def test_regenerable_untracked_dirs_are_not_unique_work(repo, tmp_path):
     assert [r["session"] for r in report["closed"]] == ["venv-agent"]
     assert report["closed"][0]["checkpoint"]["kind"] == "none"
     assert git_out(repo, "for-each-ref", "refs/terminal-mcp") == ""
+
+
+def test_recent_controller_input_counts_as_activity(repo, tmp_path):
+    wt = add_worktree(repo, "task-driven", commit=True, merge=False)
+    (wt / "wip.txt").write_text("in progress\n")
+    term = FakeTerminal([Info("driven-agent", "claude", str(wt))])  # tmux stamp 5h old
+    clock, last = Clock(), {"driven-agent": NOW - 600}
+    rec = reconciler(term, tmp_path, clock=clock, last_input=lambda name: last.get(name))
+    row = by_name(rec.run())["driven-agent"]
+    assert row["classification"] == "AGENT_RECENT" and row["lifecycle_state"] == "CONTROLLED"
+    clock.now += 3 * 3600  # operator went quiet: the rule applies again
+    assert by_name(rec.run())["driven-agent"]["lifecycle_state"] == "RECOVERY_REQUIRED"
+
+
+def test_audit_last_input_epoch(tmp_path):
+    from terminal_mcp.audit import AuditStore
+    audit = AuditStore(tmp_path / "audit.db")
+    assert audit.last_input_epoch("s1") is None
+    audit.record(action="send_text", session="s1", result="BLOCKED", text="x")
+    assert audit.last_input_epoch("s1") is None
+    audit.record(action="send_text", session="s1", result="SENT", text="x")
+    assert abs(audit.last_input_epoch("s1") - __import__("time").time()) < 60
