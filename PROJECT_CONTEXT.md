@@ -238,3 +238,39 @@ Direct dispatch (`create_session` -> `send`/`send_wait`) leaves no queue row, so
 - `_mutation_guard` and `_origin_allowed` are unchanged. /app mutations still need Origin, and the login token is never accepted for them (a test covers this).
 - Tests: 8 new tests in `tests/test_webauth_dashboard.py`. Full file: 42 passed. Related suites (webauth, live_sessions, global_nav, notes_auth, output_redaction, observer, bootstrap ingress/setup) ran 273 passed, 1 failed. The failure is `test_observer.py::test_observer_exposes_no_tool_that_can_change_anything` (`terminal_enqueue_task` is missing from the full tool set). It fails the same way on base `f3f82a4`, so it predates this change and is unrelated. Run the tests with `/home/dell/workspace/terminal-mcp/.venv/bin/python -m pytest` because system python lacks starlette.
 - Next: merge, deploy, then have the real user reload /login (the old cached form has no token and still depends on the header fallback) and confirm POST /login -> 303.
+
+## Session current-task label ("Task hiện tại") — 2026-10-02 (branch `feat/session-task-label-1002`, not merged/deployed)
+
+### What / why
+`/dashboard/live` and `/app/live` showed only the last raw send preview, which after a "y"/"continue" no longer described the work, and a session re-used for a new task kept showing stale info. Every session now carries a persisted **current task label** shown prominently under its name.
+
+### Storage (existing audit DB, no new service/DB)
+- `audit.db` migration 5: table `session_task_labels(node_id, session, summary, source, task_id, request_key, updated_at)`, PK `(node_id, session)`, replaced in place. `AuditStore.set_task_label/get_task_label/delete_task_label/task_label_index`.
+- Local sessions are keyed by `controller.local_node_id`; `node/session` targets by that node. The monitor also tries `local`/`""` aliases for local rows.
+
+### Label rule (`terminal_mcp/task_labels.py`, `TaskLabeler`) — preserve
+- Explicit `title` (or `metadata.task_summary`/`metadata.title`) on send / send_wait / supervise / create_session / enqueue / start always replaces the label (`source=title`).
+- `create_session` with `initial_prompt` uses the prompt summary (`initial_prompt`). Without one, it **clears** any label a same-named earlier session left, so the UI shows "Chưa gắn task".
+- Durable enqueue/start uses the title, else the prompt summary (`durable_task`, with `task_id`/`request_key`). `supervise` does the same (`supervised`, with `task_id`).
+- An untitled send/send_wait **never replaces** an existing label. It may set the first label of an unlabeled session, but only when the text is substantial new work: not a continuation, at least 6 words and at least 40 chars after summarizing (`prompt_fallback`). Continuations include y/yes/continue/tiếp tục/approve/ok go ahead, and anything of 3 words or fewer and 24 chars or fewer.
+- Labels are written only after acceptance (SUBMIT_CONFIRMED / task_id / created). Every label write is best-effort and can never fail the real action.
+- IDLE never clears a label. `delete_session` (native + compact) deletes the row. The monitor ignores a label older than the session's creation by more than 5s (an orphan from a session deleted outside MCP).
+- Summarizer (deterministic, no LLM): redact → strip fences/headings/bullets/emphasis/links → first meaningful line (skip a bare "# Task"/"Goal:" label) → first sentence if ≥12 chars → cap 140 chars on a word boundary with "…".
+
+### Wiring
+- `compact_tools.py`: `task_labels` attribute. send/send_wait label after confirmation (send_wait labels **before** the wait so the monitor updates while the turn runs). supervise labels. create_session with a title overrides the prompt summary. Responses gain an additive `current_task`, and `send_task` results gain `node_id`.
+- `mcp_app.py`: builds `TaskLabeler(terminal.audit)`. Hooks are in `terminal_create_session`, `terminal_enqueue_task` (which covers compact start/enqueue/long_task, still queue-gated) and `terminal_delete_session`. Exposes `server.task_labels` / `server.compact_tools`. The `terminal_turn` docstring and action schema help tell callers to pass `title="<short summary>"` and omit it for continuations.
+- `orchestration_policy.py` → v1.4.0 adds the TASK LABEL rule (and a critical invariant). `docs/CHATGPT_ORCHESTRATION_POLICY.md` was regenerated.
+- `live_sessions.py`: each entry has `current_task {summary, summary_withheld, updated_at, source, task_id, request_key, origin: label|task}`. Fallback is the mapped supervised/queue/run task, else `null`. Prompt-derived summaries (and supervised-task titles) are withheld when `include_previews=False` (dashboard viewer role); `title`-sourced ones are always shown. Label read failures go to `source_errors`. `change_token` includes summary + updated_at.
+- `live_sessions_page.py`: a "TASK HIỆN TẠI" block under the name row: 2-line clamp, age refreshed every poll, Vietnamese source + state, "Chưa gắn task" when empty. When the label changes between polls the block flashes amber with a "TASK MỚI" badge for about 4-6s. Search also matches the label.
+
+### Verification
+- `tests/test_session_task_label.py`: 28 passed (summarizer/continuation units, explicit title persist/replace, continuation does not replace, untitled fallback only on an unlabeled session, failed send, send_wait direct path, metadata alias, remote node key, store failure isolation, compact create title, supervise, native create initial_prompt + empty create clears + failed create, queue-opt-in enqueue, queue-disabled no label, help text, live payload/IDLE keeps label/change_token, durable fallback, label beats task, orphan ignored, preview withholding, remote + OFFLINE rows, source failure, old audit without support, page UI, migration idempotency).
+- Related suites (live_sessions, compact tools/turn actions, orchestration policy, direct contract/task, schema, server, transports, observer, global nav, webauth, lifecycle reconciler, audit, sidecar, delete safety): 498 passed, 3 failed. The 3 failures are the known pre-existing ones (`test_transports.py` x2, `test_observer.py::test_observer_exposes_no_tool_that_can_change_anything`), and they fail identically on base `9385a17`.
+- Dashboard/sidecar/contract suites: 928 passed. `test_dashboard.py::test_dashboard_mobile_batch_no_unexpected_route_changes` fails on base too: its route allowlist lacks the live-monitor routes from 21a5874. `test_dashboard_nodes.py::test_nodes_list_shows_local_node_online_after_a_get` is a host-load flake (`capacity_status` busy at load ~20). The file passed 30/30 on this branch twice at lower load.
+- Not deployed and no live canary. Next: merge, restart `terminal-mcp-http`, then from a fresh ChatGPT chat `create_session` + `send_wait(title=...)` and watch the card relabel within about 2s. A follow-up send of "continue" must leave the label unchanged.
+
+### Known limits / follow-ups
+- Remote node-agents don't write labels themselves. Labels for remote sessions are written by the controller when it routes the send (keyed by the node it returned), so sends issued directly on a remote node's own MCP are not labeled.
+- Native `terminal_send_text` / dashboard sends have no `title` parameter. Only `terminal_turn` send/send_wait/supervise/create and native create/enqueue label.
+- Fix the pre-existing route allowlist in `test_dashboard_mobile_batch_no_unexpected_route_changes` to include `/dashboard/live` + `/dashboard/api/live-sessions`.

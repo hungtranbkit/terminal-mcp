@@ -90,7 +90,10 @@ _DIRECT_ACTION_SCHEMA_HELP = (
     "supervise (long task continued server-side until explicit DONE), supervise_status, "
     "supervise_complete, supervise_cancel, "
     "list_sessions, list_nodes, create_session, delete_session, task_status, task_batch_status, "
-    "browser_verify, browser_screenshot, browser_status, browser_stop."
+    "browser_verify, browser_screenshot, browser_status, browser_stop. "
+    "When assigning or changing a session's task (send/send_wait/supervise/create_session), "
+    "pass title=\"<short task summary>\" so the live monitor shows it; omit title for "
+    "continuations (y, continue, approvals, follow-ups)."
 )
 _LONG_TASK_SCHEMA_HELP = (
     "Legacy operator-only queue switch. Deprecated for normal direct execution and rejected "
@@ -356,6 +359,11 @@ def build_mcp(service: TerminalService | None = None,
     except Exception:  # noqa: BLE001 -- never block startup; supervise* reports unavailable
         direct_tasks = None
     compact_tools.direct_tasks = direct_tasks
+    # Per-session "current task" label (task_labels.py) in the audit DB.
+    from .task_labels import TaskLabeler
+    task_labels = TaskLabeler(terminal.audit,
+                              local_node_id=lambda: getattr(controller, "local_node_id", None))
+    compact_tools.task_labels = task_labels
     recovery = recovery or RecoveryEngine(terminal.session_registry, controller, terminal.leases,
                                           terminal.config.auto_recovery)
     recovery.loop = recovery.loop or RecoveryLoop(
@@ -806,6 +814,15 @@ Direct actions:
   task_status/task, task_batch_status/tasks (read-only historical task state)
   browser_verify/browser_screenshot/browser_status/browser_stop
 
+TASK LABEL (shown as "Task hiện tại" on /dashboard/live and /app/live):
+  When you ASSIGN or CHANGE a session's task, pass title="<short summary>"
+  (<= 140 chars) on send / send_wait / supervise / create_session. Omit title
+  for continuations ("y", "continue", approvals, small follow-ups): an untitled
+  send never replaces the session's existing label (it may only set the first
+  label of an unlabeled session when the text is clearly substantial new work).
+  create_session with initial_prompt labels from the prompt; metadata.task_summary
+  is accepted as an alias of title.
+
 For direct work, prefer one useful session per task and avoid stale duplicates.
         """
         _refresh_local_heartbeat()
@@ -1169,10 +1186,20 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         failing the create outright. Always False (no-op) on Linux/tmux
         nodes, which have no such concept."""
         _refresh_local_heartbeat()
-        return controller.terminal_create_session(
+        result = controller.terminal_create_session(
             name, agent_type, working_directory, node=node, initial_prompt=initial_prompt,
             grant_mode=grant_mode, binding=binding, requested_by="mcp", show_on_desktop=show_on_desktop,
         )
+        if isinstance(result, dict) and "error" not in result:
+            # A fresh session's label: its initial_prompt, else none (this
+            # also clears a label left by an earlier session of this name).
+            label = task_labels.on_create(node_id=result.get("node_id"),
+                                          session=result.get("session") or name,
+                                          initial_prompt=initial_prompt)
+            if label is not None:
+                result["current_task"] = {key: label.get(key) for key in
+                                          ("summary", "source", "updated_at", "task_id")}
+        return result
 
     @server.tool()
     def terminal_detach_session(name: str) -> dict:
@@ -1232,6 +1259,8 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         if "error" not in result:
             result.setdefault("references", {}).update(preflight["references"])
         if "error" not in result:
+            node_id, bare = TaskLabeler.split_target(name)
+            task_labels.clear(result.get("node_id") or node_id, bare)
             # Same wiring-layer coordination supervisor_watch/supervisor_
             # unwatch above already do for v1/v2 policy purge -- disable
             # (never hard-delete: keep the watch's history), only once
@@ -3589,8 +3618,14 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         here rewrites it."""
         if not queue_submission_enabled():
             return queue_disabled_response(action="enqueue_task")
-        return queue.enqueue(session, prompt, title=title, priority=priority, metadata=metadata,
-                             request_key=request_key)
+        accepted = queue.enqueue(session, prompt, title=title, priority=priority, metadata=metadata,
+                                 request_key=request_key)
+        if isinstance(accepted, dict) and not accepted.get("error") and accepted.get("task_id"):
+            node_id, bare = TaskLabeler.split_target(session)
+            task_labels.on_task(node_id=node_id, session=bare, text=prompt, title=title,
+                                metadata=metadata, task_id=accepted.get("task_id"),
+                                request_key=accepted.get("request_key") or request_key)
+        return accepted
 
     @server.tool()
     def terminal_route_start(prompt: str, title: str | None = None, priority: int = 0,
@@ -6393,6 +6428,8 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
 
     # server_http starts the background ticker; import-time builds do not.
     server.direct_task_supervisor = direct_tasks
+    server.task_labels = task_labels
+    server.compact_tools = compact_tools
     server.session_reconciler = session_reconciler
     compact_tools.lifecycle_lookup = session_reconciler.lifecycle_for
     return server

@@ -11,7 +11,10 @@ Rendering rules that matter:
     flight and while the tab is hidden;
   * a card is rebuilt only when the server's `change_token` moves, so an
     expanded tail does not jump while you read it;
-  * all pane text and previews are inserted with textContent, never HTML.
+  * all pane text and previews are inserted with textContent, never HTML;
+  * "TASK HIỆN TẠI" (current_task, task_labels.py) sits right under the
+    session name; when its summary/updated_at changes between polls the block
+    is highlighted for a few seconds (class `cur-changed`).
 """
 
 LIVE_SESSIONS_HTML = r"""<!doctype html>
@@ -62,6 +65,17 @@ LIVE_SESSIONS_HTML = r"""<!doctype html>
     .card.new { box-shadow:0 0 0 1px var(--accent), 0 0 18px rgba(91,140,255,.25) }
     .card.flash { animation:arrive 2.5s ease-out }
     @keyframes arrive { from { background:#1d3366 } to { background:var(--panel) } }
+    .cur { background:#14203a; border:1px solid #2a3f6e; border-radius:9px; padding:6px 9px; min-width:0 }
+    .cur .lbl { color:#9fb8ff; font-weight:700 }
+    .cur-sum { font-size:14px; font-weight:600; line-height:1.35; color:#fff; overflow-wrap:anywhere;
+               display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden }
+    .cur-sub { font-size:11.5px; color:var(--muted); margin-top:2px }
+    .cur.none { background:transparent; border-style:dashed; border-color:var(--line) }
+    .cur.none .cur-sum { color:var(--muted); font-weight:500; font-style:italic }
+    .cur.cur-changed { animation:relabel 4s ease-out }
+    @keyframes relabel { 0%,30% { background:#4a3a0e; box-shadow:0 0 0 2px var(--amber) }
+                         100% { background:#14203a; box-shadow:none } }
+    .b-RELABEL { color:#111; background:var(--amber); border-color:var(--amber) }
     .row1 { display:flex; align-items:center; gap:8px; flex-wrap:wrap; min-width:0 }
     .name { font:600 14px var(--mono); overflow-wrap:anywhere }
     .badge { font-size:10.5px; font-weight:700; letter-spacing:.03em; padding:2px 8px; border-radius:999px;
@@ -119,6 +133,8 @@ LIVE_SESSIONS_HTML = r"""<!doctype html>
   const expanded = new Set();
   const cards = new Map();      // key -> {el, token}
   const known = new Set();      // keys seen in an earlier poll (arrival flash)
+  const labels = new Map();     // key -> current task signature (relabel highlight)
+  const relabeledAt = new Map(); // key -> ms when its label last changed
   let first = true, inflight = false, lastOk = 0, data = null;
 
   const $ = (id) => document.getElementById(id);
@@ -148,13 +164,46 @@ LIVE_SESSIONS_HTML = r"""<!doctype html>
     const q = $('q').value.trim().toLowerCase();
     if (q) {
       const hay = [s.session, s.node_name, s.node_id, s.agent, s.repo, s.branch,
-                   s.task && s.task.title].join(' ').toLowerCase();
+                   s.task && s.task.title, s.current_task && s.current_task.summary].join(' ').toLowerCase();
       if (!hay.includes(q)) return false;
     }
     return true;
   }
   function stat(label, value) {
     const span = el('span'); span.append(label + ' '); span.append(el('b', null, value)); return span;
+  }
+  const SOURCE_VI = {title: 'tiêu đề', initial_prompt: 'prompt khởi tạo', durable_task: 'task bền',
+    supervised: 'task giám sát', prompt_fallback: 'từ prompt', queue_task: 'queue', supervised_task: 'task giám sát',
+    run_task: 'run'};
+  function labelSig(s) {
+    const t = s.current_task;
+    return t ? (t.summary || '') + '|' + (t.updated_at || '') + '|' + (t.task_id || '') : '';
+  }
+  function currentTask(s, now) {
+    const t = s.current_task;
+    const box = el('div', 'cur' + (t ? '' : ' none'));
+    const head = el('div');
+    head.append(el('span', 'lbl', 'Task hiện tại'));
+    const at = relabeledAt.get(s.key);
+    if (at && Date.now() - at < 4000) {
+      box.classList.add('cur-changed');
+      const badge = el('span', 'badge b-RELABEL', 'TASK MỚI');
+      head.append(badge);
+      setTimeout(() => { badge.remove(); box.classList.remove('cur-changed'); }, 6000);
+    }
+    box.append(head);
+    if (!t) { box.append(el('div', 'cur-sum', 'Chưa gắn task')); return box; }
+    const sum = el('div', 'cur-sum', t.summary_withheld ? '(nội dung ẩn — cần quyền operator)' : (t.summary || '—'));
+    if (t.summary) sum.title = t.summary;
+    box.append(sum);
+    const sub = el('div', 'cur-sub');
+    const ageSpan = el('span', 'cur-age', t.updated_at ? 'cập nhật ' + age(now - t.updated_at) + ' trước' : '');
+    if (t.updated_at) ageSpan.dataset.at = t.updated_at;
+    sub.append(ageSpan);
+    sub.append(' · ' + (SOURCE_VI[t.source] || t.source || '') + (t.task_id ? ' · ' + t.task_id : '')
+      + ' · ' + s.state);
+    box.append(sub);
+    return box;
   }
   function build(s, now) {
     const card = el('div', 'card s-' + s.state + (s.is_new ? ' new' : ''));
@@ -167,6 +216,7 @@ LIVE_SESSIONS_HTML = r"""<!doctype html>
     if (s.agent) r1.append(el('span', 'badge b-IDLE', s.agent));
     if (s.attached) r1.append(el('span', 'muted', '· attached'));
     card.append(r1);
+    card.append(currentTask(s, now));
 
     const meta = el('div', 'meta');
     meta.append(stat('Tạo', clock(s.created_at)));
@@ -252,6 +302,11 @@ LIVE_SESSIONS_HTML = r"""<!doctype html>
     const keep = new Set(visible.map(s => s.key));
     for (const [key, c2] of cards) if (!keep.has(key)) { c2.el.remove(); cards.delete(key); }
     let prev = null;
+    for (const s of sessions) {
+      const sig = labelSig(s), before = labels.get(s.key);
+      if (!first && before !== undefined && before !== sig && sig) relabeledAt.set(s.key, Date.now());
+      labels.set(s.key, sig);
+    }
     for (const s of visible) {
       let entry = cards.get(s.key);
       if (!entry || entry.token !== s.change_token) {
@@ -265,6 +320,8 @@ LIVE_SESSIONS_HTML = r"""<!doctype html>
       if (want !== entry.el) list.insertBefore(entry.el, want);
       prev = entry.el;
     }
+    for (const span of list.querySelectorAll('.cur-age[data-at]'))
+      span.textContent = 'cập nhật ' + age(now - Number(span.dataset.at)) + ' trước';
     for (const s of sessions) known.add(s.key);
     $('empty').hidden = visible.length > 0;
     first = false;

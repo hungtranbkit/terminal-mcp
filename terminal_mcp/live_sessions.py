@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from . import terminal_wall
+from .task_labels import PROMPT_DERIVED_SOURCES
 from .terminal_wall import (STATE_DONE, STATE_ERROR, STATE_IDLE, STATE_OFFLINE, STATE_RUNNING,
                             STATE_UNKNOWN, STATE_WAITING, OutputChangeTracker, command_from,
                             derive_state)
@@ -59,6 +60,9 @@ AUDIT_LOOKBACK_HOURS = 24
 TASK_LOOKBACK_HOURS = 24
 SUMMARY_CHARS = 240
 FANOUT_WORKERS = terminal_wall.FANOUT_WORKERS
+# A label written this long before the session's creation belongs to an
+# earlier session of the same name (deleted outside Terminal MCP).
+LABEL_ORPHAN_SKEW_SECONDS = 5.0
 
 _SHELLS = {"bash", "zsh", "sh", "fish", "dash"}
 _TERMINAL_TASK_STATUSES = {"COMPLETED", "FAILED", "CANCELLED", "SKIPPED", "DONE", "BLOCKED"}
@@ -220,6 +224,15 @@ class LiveSessionMonitor:
             index.setdefault(target.split("/", 1)[-1], row)
         return index
 
+    def _label_index(self, errors: list[str]) -> dict[tuple[str, str], dict[str, Any]]:
+        if self.audit is None or not hasattr(self.audit, "task_label_index"):
+            return {}
+        try:
+            return self.audit.task_label_index()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"task_labels: {type(exc).__name__}: {exc}")
+            return {}
+
     def _run_index(self, errors: list[str]) -> dict[str, list[dict[str, Any]]]:
         if self.run_journal is None:
             return {}
@@ -247,12 +260,13 @@ class LiveSessionMonitor:
         tasks = self._queue_index(now, errors)
         supervised = self._supervised_index(errors)
         runs = self._run_index(errors)
+        labels = self._label_index(errors)
 
         def fetch(row: dict[str, Any]) -> dict[str, Any]:
             try:
                 return self._session_entry(row, now=now, local_node_id=local_node_id,
                                            inputs=inputs, tasks=tasks, supervised=supervised,
-                                           runs=runs, expand=expand,
+                                           runs=runs, labels=labels, expand=expand,
                                            include_previews=include_previews)
             except Exception as exc:  # noqa: BLE001 -- one bad row never blanks the page
                 name = row.get("name") or "?"
@@ -312,7 +326,8 @@ class LiveSessionMonitor:
 
     def _session_entry(self, row: dict[str, Any], *, now: float, local_node_id: str,
                        inputs: dict, tasks: dict, supervised: dict, runs: dict,
-                       expand: set[str], include_previews: bool) -> dict[str, Any]:
+                       expand: set[str], include_previews: bool,
+                       labels: dict | None = None) -> dict[str, Any]:
         name = row.get("name") or "?"
         node_id = row.get("node_id") or local_node_id
         is_local = node_id == local_node_id
@@ -372,6 +387,10 @@ class LiveSessionMonitor:
                     "created_at": _epoch(run.get("created_at")), "completed_at": None,
                     "blocker": None, "result": _clip(run.get("result_summary"))}
         task_open = bool(task and str(task.get("status") or "").upper() not in _TERMINAL_TASK_STATUSES)
+        current_task = self._current_task(labels or {}, node_id=node_id, name=name,
+                                          is_local=is_local, local_node_id=local_node_id,
+                                          created_at=created_at, task=task,
+                                          include_previews=include_previews)
 
         # Last activity = newest of witnessed output change and delivered input.
         output_change_at = (now - change.age_seconds) if (change and change.witnessed) else None
@@ -472,14 +491,52 @@ class LiveSessionMonitor:
             "usage_percent": usage.get("percent"),
             "usage_reset_in_minutes": usage.get("reset_in_minutes"),
             "task": task,
+            "current_task": current_task,
             "completion": completion,
             "lifecycle_state": (lifecycle or {}).get("state") or row.get("lifecycle_state"),
             "lines": lines,
             "tail_full": tail_full,
             "error": status.get("error"),
             "change_token": hashlib.sha256(
-                f"{state}|{reason}|{last_activity_at}|{task and task.get('status')}|".encode()
+                f"{state}|{reason}|{last_activity_at}|{task and task.get('status')}|"
+                f"{current_task and current_task.get('summary')}|"
+                f"{current_task and current_task.get('updated_at')}|".encode()
                 + "\n".join(lines).encode("utf-8", "replace")
                 + ("\n".join(tail_full).encode("utf-8", "replace") if tail_full else b"")
             ).hexdigest()[:16],
         }
+
+    @staticmethod
+    def _current_task(labels: dict, *, node_id: str, name: str, is_local: bool,
+                      local_node_id: str, created_at: float | None, task: dict | None,
+                      include_previews: bool) -> dict[str, Any] | None:
+        """What this session is working on now: its task label
+        (task_labels.py), else the mapped durable task, else None
+        ("Chưa gắn task"). Never cleared by IDLE -- the last task stays."""
+        label = labels.get((node_id, name))
+        if label is None and is_local:
+            for alias in ("local", local_node_id, ""):
+                label = labels.get((alias, name))
+                if label is not None:
+                    break
+        updated_at = _epoch(label.get("updated_at")) if label else None
+        if label is not None and created_at and updated_at is not None \
+                and updated_at < created_at - LABEL_ORPHAN_SKEW_SECONDS:
+            label = None  # left behind by an earlier session of this name
+        if label is not None:
+            source = label.get("source") or "title"
+            withheld = (not include_previews) and source in PROMPT_DERIVED_SOURCES
+            return {"summary": None if withheld else _clip(label.get("summary"), 160),
+                    "summary_withheld": withheld,
+                    "updated_at": updated_at, "source": source,
+                    "task_id": label.get("task_id"), "request_key": label.get("request_key"),
+                    "origin": "label"}
+        if task and (task.get("title") or task.get("summary")):
+            # A supervised task's "title" is its first prompt step.
+            withheld = (not include_previews) and (task["kind"] == "supervised"
+                                                   or not task.get("title"))
+            return {"summary": None if withheld else (task.get("title") or task.get("summary")),
+                    "summary_withheld": withheld,
+                    "updated_at": task.get("created_at"), "source": f"{task['kind']}_task",
+                    "task_id": task.get("id"), "request_key": None, "origin": "task"}
+        return None

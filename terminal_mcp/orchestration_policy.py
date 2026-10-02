@@ -37,7 +37,7 @@ Design commitments:
 
 from __future__ import annotations
 
-ORCHESTRATION_POLICY_VERSION = "1.3.0"
+ORCHESTRATION_POLICY_VERSION = "1.4.0"
 
 #: Where the expanded, human-readable form lives, relative to the repo root.
 POLICY_DOC_PATH = "docs/CHATGPT_ORCHESTRATION_POLICY.md"
@@ -101,7 +101,8 @@ FAILURE_RECOVERY = (
 EFFICIENCY = (
     "EFFICIENCY. Prefer compact/batch inspection when inspection is actually needed, and avoid repeated status/tail polling. A normal coding dispatch is create_session once, then one direct send/send_wait to that session. "
     "Do not call start/enqueue/route_start as a shortcut. Do not keep completed sessions, worktrees or obsolete branches around. Reuse a still-valid active session for the same task; create a new one for a new task when resources allow. "
-    "Terminal MCP stays the single control plane; auxiliary coding/review tools do not become a second dispatcher."
+    "Terminal MCP stays the single control plane; auxiliary coding/review tools do not become a second dispatcher. "
+    "TASK LABEL: when assigning or changing a session's task, pass title=\"<short summary>\" on send/send_wait/supervise/create_session so the live session monitor shows what that session is doing now; omit title for continuations (y, continue, approvals, small follow-ups)."
 )
 
 _REFERENCE = (
@@ -144,6 +145,9 @@ CRITICAL_INVARIANTS: tuple[str, ...] = (
     "GIVING A SESSION WORK IS DIRECT SESSION SEND",
     "After direct send, avoid polling unless the user asks for a check",
     "PRODUCTION DEPLOYMENT AND RELEASE REMAIN A SEPARATE, EXPLICIT USER APPROVAL STEP",
+    # Session task label: new chats only keep the live monitor accurate if
+    # they are told to title task assignments.
+    "pass title=\"<short summary>\" on send/send_wait",
 )
 
 

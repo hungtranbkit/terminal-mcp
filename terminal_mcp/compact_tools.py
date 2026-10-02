@@ -12,6 +12,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .redaction import redact_text
+from .task_labels import title_from
 from .queue_policy import QUEUE_SUBMISSION_ACTIONS, queue_disabled_response, queue_submission_enabled
 
 
@@ -438,6 +439,9 @@ class CompactTerminalTools:
         # SessionReconciler.lifecycle_for, injected by mcp_app. Annotates
         # inspect rows with the agent-session lifecycle state.
         self.lifecycle_lookup: Callable[[str], Any] | None = None
+        # task_labels.TaskLabeler, injected by mcp_app. Records the session's
+        # "current task" label for the Live Session Monitor; None = off.
+        self.task_labels: Any = None
         # Late-bound implementations for the discovery/lifecycle/queue actions
         # `turn` routes but does not own (see TURN_HANDLER_ACTIONS). They are
         # the very same functions the individual MCP tools are registered
@@ -669,6 +673,7 @@ class CompactTerminalTools:
             "target": target,
             "target_type": kind,
             "session": result.get("session"),
+            "node_id": result.get("node_id"),
             "correlation_id": result.get("correlation_id"),
             "submission_id": result.get("submission_id") or result.get("correlation_id"),
             "reason": reason,
@@ -962,7 +967,8 @@ class CompactTerminalTools:
         if normalized.startswith("supervise"):
             return self._supervise_turn(normalized, target=target, text=text,
                                         task_id=task_id, args=args,
-                                        idempotency_key=idempotency_key)
+                                        idempotency_key=idempotency_key,
+                                        title=title)
 
         if normalized == "resume":
             if not resume_token:
@@ -1041,8 +1047,9 @@ class CompactTerminalTools:
             result = self.send_task(target, text, wait_for_accept=True,
                                     timeout=min(float(timeout), MAX_SEND_WAIT_SECONDS),
                                     idempotency_key=idempotency_key)
-            return {"status": result.get("status", "FAILED"),
-                    "action": normalized, "result": result}
+            return self._with_label({"status": result.get("status", "FAILED"),
+                                     "action": normalized, "result": result},
+                                    self._label_send(target, text, result, title, metadata))
 
         states = desired_states or ["IDLE", "WAITING_INPUT"]
         if normalized == "wait":
@@ -1065,11 +1072,46 @@ class CompactTerminalTools:
         if sent.get("status") != "SUBMIT_CONFIRMED":
             return {"status": sent.get("status", "FAILED"),
                     "action": normalized, "send": sent, "wait": None}
+        # Label before waiting: the monitor must show the new task while the
+        # turn runs, not after send_wait returns.
+        label = self._label_send(target, text, sent, title, metadata)
         waited = self.wait_for_state(target, states, timeout=timeout,
                                      poll_interval=poll_interval,
                                      tail_lines=tail_lines, _deadline=deadline)
-        return self._annotate({"status": waited.get("status", "FAILED"),
-                               "action": normalized, "send": sent, "wait": waited}, target)
+        return self._with_label(
+            self._annotate({"status": waited.get("status", "FAILED"),
+                            "action": normalized, "send": sent, "wait": waited}, target),
+            label)
+
+    # -- current task label (task_labels.py) ---------------------------------
+
+    @staticmethod
+    def _with_label(response: dict[str, Any], label: dict[str, Any] | None) -> dict[str, Any]:
+        if label is not None:
+            response["current_task"] = {key: label.get(key) for key in
+                                        ("summary", "source", "updated_at", "task_id")}
+        return response
+
+    def _label_session(self, target: Any, result: Any) -> tuple[Any, Any]:
+        node_id, name = (self.task_labels.split_target(target) if self.task_labels
+                         else (None, None))
+        if isinstance(result, dict):
+            node_id = result.get("node_id") or node_id
+            name = result.get("session") or name
+        return node_id, name
+
+    def _label_send(self, target: Any, text: Any, sent: dict[str, Any], title: Any,
+                    metadata: Any) -> dict[str, Any] | None:
+        """Titled send -> replace the label; untitled send -> only a first
+        label for substantial new work (task_labels.TaskLabeler.on_send)."""
+        if self.task_labels is None or sent.get("status") != "SUBMIT_CONFIRMED":
+            return None
+        node_id, name = self._label_session(target, sent)
+        try:
+            return self.task_labels.on_send(node_id=node_id, session=name, text=text,
+                                            title=title, metadata=metadata)
+        except Exception:  # noqa: BLE001 -- a label never breaks a send
+            return None
 
     def _supervised_note(self, target: Any) -> dict[str, Any] | None:
         if self.direct_tasks is None or not isinstance(target, str) or not target:
@@ -1097,7 +1139,8 @@ class CompactTerminalTools:
 
     def _supervise_turn(self, action: str, *, target: str | None, text: str | None,
                         task_id: str | None, args: dict | None,
-                        idempotency_key: str | None) -> dict[str, Any]:
+                        idempotency_key: str | None,
+                        title: str | None = None) -> dict[str, Any]:
         """Supervised direct task: keep a long task going across turn ends.
 
         - supervise: `target` + `text` (and/or args.steps list). Optional
@@ -1122,6 +1165,18 @@ class CompactTerminalTools:
                 continue_text=args.get("continue_text"),
                 mode=str(args.get("mode") or "auto"),
                 idempotency_key=idempotency_key)
+            if (self.task_labels is not None and isinstance(result, dict)
+                    and not result.get("error") and result.get("status") != "FAILED"):
+                node_id, name = self.task_labels.split_target(target)
+                try:
+                    label = self.task_labels.on_task(
+                        node_id=node_id, session=name,
+                        text=text or (steps[0] if steps else None),
+                        title=title, task_id=result.get("task_id"),
+                        source="supervised")
+                except Exception:  # noqa: BLE001
+                    label = None
+                self._with_label(result, label)
         elif action == "supervise_status":
             if task_id:
                 result = self.direct_tasks.get(task_id)
@@ -1554,4 +1609,18 @@ class CompactTerminalTools:
         }
         result = calls[action]()
         failed = isinstance(result, dict) and ("error" in result or result.get("status") == "FAILED")
-        return {"status": "FAILED" if failed else "OK", "action": action, "result": result}
+        response = {"status": "FAILED" if failed else "OK", "action": action, "result": result}
+        if action == "create_session" and not failed and self.task_labels is not None \
+                and title_from(title, metadata):
+            # The handler already labeled from initial_prompt (or cleared a
+            # stale label); an explicit title is the better label.
+            node_id, name = self._label_session(target, result)
+            name = (result.get("session") or result.get("name") or name) if isinstance(result, dict) else name
+            try:
+                label = self.task_labels.on_create(node_id=node_id, session=name,
+                                                   initial_prompt=initial_prompt,
+                                                   title=title_from(title, metadata))
+            except Exception:  # noqa: BLE001
+                label = None
+            self._with_label(response, label)
+        return response

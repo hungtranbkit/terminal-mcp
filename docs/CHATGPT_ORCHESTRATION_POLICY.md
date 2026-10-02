@@ -1,10 +1,10 @@
-<!-- ORCHESTRATION_POLICY_VERSION: 1.3.0 -->
+<!-- ORCHESTRATION_POLICY_VERSION: 1.4.0 -->
 <!-- GENERATED from terminal_mcp/orchestration_policy.py -- do not edit by hand. -->
 <!-- Regenerate: python -m terminal_mcp.orchestration_policy > docs/CHATGPT_ORCHESTRATION_POLICY.md -->
 
 # ChatGPT Orchestration Policy
 
-**Version 1.3.0.** This is the workflow a ChatGPT
+**Version 1.4.0.** This is the workflow a ChatGPT
 client follows when it drives coding work through Terminal MCP. It is not
 documentation *about* a policy that lives somewhere else: the text in §2
 below is byte-for-byte the string this server puts in the MCP `instructions`
@@ -45,9 +45,9 @@ client receives it.
 >
 > FAILURE RECOVERY. Do not leave queued, idle or stale work behind. If a direct send fails, inspect the same session only when useful, repair the routine blocker, and retry the direct send without spawning duplicate sessions. If a session is irrecoverably stale, preserve any unmerged work, close it and create one clean replacement session. If Terminal MCP itself restarts, recover from Git/worktree state and live session state; do not create durable queue work as a fallback. Surface BLOCKED/NEEDS_HUMAN only for genuine credentials, authorization, destructive-action approval, or ambiguous unsafe states.
 >
-> EFFICIENCY. Prefer compact/batch inspection when inspection is actually needed, and avoid repeated status/tail polling. A normal coding dispatch is create_session once, then one direct send/send_wait to that session. Do not call start/enqueue/route_start as a shortcut. Do not keep completed sessions, worktrees or obsolete branches around. Reuse a still-valid active session for the same task; create a new one for a new task when resources allow. Terminal MCP stays the single control plane; auxiliary coding/review tools do not become a second dispatcher.
+> EFFICIENCY. Prefer compact/batch inspection when inspection is actually needed, and avoid repeated status/tail polling. A normal coding dispatch is create_session once, then one direct send/send_wait to that session. Do not call start/enqueue/route_start as a shortcut. Do not keep completed sessions, worktrees or obsolete branches around. Reuse a still-valid active session for the same task; create a new one for a new task when resources allow. Terminal MCP stays the single control plane; auxiliary coding/review tools do not become a second dispatcher. TASK LABEL: when assigning or changing a session's task, pass title="<short summary>" on send/send_wait/supervise/create_session so the live session monitor shows what that session is doing now; omit title for continuations (y, continue, approvals, small follow-ups).
 >
-> The expanded form of this policy, with rationale, is docs/CHATGPT_ORCHESTRATION_POLICY.md in the terminal-mcp repository (orchestration policy v1.3.0); this text and that document are generated from one source and cannot disagree.
+> The expanded form of this policy, with rationale, is docs/CHATGPT_ORCHESTRATION_POLICY.md in the terminal-mcp repository (orchestration policy v1.4.0); this text and that document are generated from one source and cannot disagree.
 
 ## 3. What this policy does NOT do
 

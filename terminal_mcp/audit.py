@@ -52,6 +52,24 @@ def _add_operator_debugging_columns(connection: sqlite3.Connection) -> None:
             f"ON input_audit({column})")
 
 
+def _add_session_task_labels(connection: sqlite3.Connection) -> None:
+    """Current task label per session (task_labels.py). One row per
+    (node_id, session); replaced in place, so the table stays bounded by the
+    number of sessions ever labeled. Summaries are redacted, <= 140 chars."""
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS session_task_labels (
+            node_id TEXT NOT NULL,
+            session TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            source TEXT NOT NULL,
+            task_id TEXT,
+            request_key TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (node_id, session)
+        )
+    """)
+
+
 AUDIT_MIGRATIONS: list[Migration] = [
     Migration(1, "baseline: input_audit + idempotent_sends as of the P1 hardening pass", lambda connection: None),
     # P0 Part A.5: every send attempt (not just idempotency-keyed ones) now
@@ -75,6 +93,10 @@ AUDIT_MIGRATIONS: list[Migration] = [
     Migration(4, "add input_audit.actor/node_id/latency_ms/policy_source/policy_version "
                  "+ query indexes for operator debugging",
                _add_operator_debugging_columns),
+    # Live Session Monitor "TASK HIỆN TẠI": what each session is working on
+    # now, set by titled sends / task starts / create_session initial_prompt.
+    Migration(5, "add session_task_labels for the per-session current task label",
+              _add_session_task_labels),
 ]
 
 
@@ -251,6 +273,47 @@ class AuditStore:
                 entry["last_input_action"] = row["action"]
                 entry["last_input_preview"] = row["text_preview"]
         return index
+
+    # -- per-session current task label (task_labels.py) ------------------
+
+    def set_task_label(self, *, node_id: str, session: str, summary: str, source: str,
+                       task_id: str | None = None,
+                       request_key: str | None = None) -> dict[str, Any]:
+        """Replace the current task label of (node_id, session)."""
+        row = {"node_id": node_id, "session": session, "summary": summary,
+               "source": source, "task_id": task_id, "request_key": request_key,
+               "updated_at": datetime.now(timezone.utc).isoformat()}
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT INTO session_task_labels "
+                "(node_id, session, summary, source, task_id, request_key, updated_at) "
+                "VALUES (:node_id, :session, :summary, :source, :task_id, :request_key, :updated_at) "
+                "ON CONFLICT(node_id, session) DO UPDATE SET summary = excluded.summary, "
+                "source = excluded.source, task_id = excluded.task_id, "
+                "request_key = excluded.request_key, updated_at = excluded.updated_at", row)
+        return row
+
+    def get_task_label(self, node_id: str, session: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM session_task_labels WHERE node_id = ? AND session = ?",
+                (node_id, session)).fetchone()
+        return dict(row) if row else None
+
+    def delete_task_label(self, node_id: str, session: str) -> int:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "DELETE FROM session_task_labels WHERE node_id = ? AND session = ?",
+                (node_id, session))
+        return cursor.rowcount
+
+    def task_label_index(self, *, limit: int = 5000) -> dict[tuple[str, str], dict[str, Any]]:
+        """Every label as {(node_id, session): row} -- one read per monitor build."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM session_task_labels ORDER BY updated_at DESC LIMIT ?",
+                (max(1, int(limit)),)).fetchall()
+        return {(row["node_id"], row["session"]): dict(row) for row in rows}
 
     def prune(self, retention: int) -> int:
         """P1 hardening item #9: input_audit has no other retention limit
