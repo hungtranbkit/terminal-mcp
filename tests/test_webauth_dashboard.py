@@ -204,6 +204,23 @@ def test_login_without_origin_is_blocked(tmp_path):
     assert client.cookies.get("terminal_mcp_session") is None
 
 
+def test_login_without_origin_accepts_same_origin_fetch_metadata(tmp_path):
+    server, _service, _webauth = _build(tmp_path)
+    client = TestClient(server.streamable_http_app(), base_url=BASE_URL,
+                        headers={"Sec-Fetch-Site": "same-origin"})
+    r = _login(client)
+    assert r.status_code == 303
+    assert r.headers["location"] == "/app"
+
+
+def test_login_without_origin_rejects_cross_site_fetch_metadata(tmp_path):
+    server, _service, _webauth = _build(tmp_path)
+    client = TestClient(server.streamable_http_app(), base_url=BASE_URL,
+                        headers={"Sec-Fetch-Site": "cross-site"})
+    r = _login(client)
+    assert r.status_code == 403
+
+
 def test_login_with_cross_site_origin_is_blocked(tmp_path):
     server, _service, _webauth = _build(tmp_path)
     client = TestClient(server.streamable_http_app(), base_url=BASE_URL,

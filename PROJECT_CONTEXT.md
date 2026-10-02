@@ -225,3 +225,8 @@ Direct dispatch (`create_session` -> `send`/`send_wait`) leaves no queue row, so
 - Production runtime config now allows  and ; wrong-credential probe changed from 403 (Origin rejected) to 401 (auth reached), confirming the CSRF gate is no longer blocking login.
 -  password was reset via ; existing web sessions were invalidated.
 - Targeted  + dashboard allowed-origins config test passed (exit 0).
+
+## Login Fetch Metadata fallback — 2026-10-02
+- Browser login attempts at 15:12–15:13 still returned 403 even after public origins were configured, proving Origin/Referer can be absent through this browser+tunnel path.
+- Webauth CSRF guard now accepts missing Origin/Referer only when browser Fetch Metadata reports ; missing headers without that signal and cross-site requests remain blocked.
+-  covers same-origin fallback and cross-site rejection; full file passes.

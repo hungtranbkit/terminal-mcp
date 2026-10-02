@@ -204,7 +204,11 @@ def _origin_allowed(request: Request, allowed_origins: tuple[str, ...]) -> bool:
     # the request touches anything.
     origin = request.headers.get("origin") or request.headers.get("referer")
     if not origin:
-        return False
+        # Some privacy-preserving browsers / Cloudflare Tunnel paths omit both
+        # Origin and Referer on a same-origin form POST. Fetch Metadata is a
+        # browser-controlled CSRF signal: cross-site form submissions arrive as
+        # cross-site, while a POST from our own /login page is same-origin.
+        return request.headers.get("sec-fetch-site", "").lower() == "same-origin"
     parsed = urlparse(origin)
     origin_value = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
     if not origin_value:
