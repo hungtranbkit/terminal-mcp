@@ -18,6 +18,7 @@ for reasons having nothing to do with the actual application logic.
 """
 from __future__ import annotations
 
+import re
 from datetime import timedelta
 
 from starlette.testclient import TestClient
@@ -28,7 +29,11 @@ from terminal_mcp.core import TerminalService
 from terminal_mcp.dashboard import register_dashboard
 from terminal_mcp.mcp_app import build_mcp
 from terminal_mcp.webauth import WebAuthStore
-from terminal_mcp.webauth_dashboard import register_webauth_dashboard
+from terminal_mcp.webauth_dashboard import (
+    LOGIN_CSRF_COOKIE_NAME,
+    LOGIN_CSRF_FIELD,
+    register_webauth_dashboard,
+)
 
 ADMIN_PASSWORD = "correct horse battery staple 123"
 
@@ -227,6 +232,127 @@ def test_login_with_cross_site_origin_is_blocked(tmp_path):
                         headers={"Origin": "https://evil.example.com"})
     r = _login(client)
     assert r.status_code == 403
+
+
+def _bare_client(server, **kwargs) -> TestClient:
+    # No Origin, Referer or Sec-Fetch-* at all -- the header set a real
+    # user's browser + tunnel path was observed delivering on POST /login.
+    return TestClient(server.streamable_http_app(), base_url=BASE_URL, **kwargs)
+
+
+def _form_token(html: str) -> str:
+    match = re.search(rf'name="{LOGIN_CSRF_FIELD}" value="([^"]+)"', html)
+    assert match, "login form has no CSRF hidden field"
+    return match.group(1)
+
+
+def _csrf_login(client: TestClient, token: str, password: str = ADMIN_PASSWORD):
+    return client.post("/login", data={"username": "admin", "password": password,
+                                       LOGIN_CSRF_FIELD: token}, follow_redirects=False)
+
+
+def test_login_get_sets_csrf_cookie_and_hidden_field(tmp_path):
+    server, _service, _webauth = _build(tmp_path)
+    client = _bare_client(server)
+    r = client.get("/login")
+    assert r.status_code == 200
+    token = _form_token(r.text)
+    assert len(token) >= 32
+    assert client.cookies.get(LOGIN_CSRF_COOKIE_NAME) == token
+    set_cookie = r.headers["set-cookie"]
+    assert set_cookie.startswith(f"{LOGIN_CSRF_COOKIE_NAME}=")
+    lowered = set_cookie.lower()
+    for attribute in ("httponly", "secure", "samesite=strict", "path=/"):
+        assert attribute in lowered, attribute
+    assert "domain=" not in lowered
+    # A fresh, unpredictable token per rendered form.
+    assert _form_token(client.get("/login").text) != token
+
+
+def test_login_with_valid_csrf_token_needs_no_origin_or_fetch_metadata(tmp_path):
+    server, _service, _webauth = _build(tmp_path)
+    client = _bare_client(server)
+    token = _form_token(client.get("/login").text)
+    r = _csrf_login(client, token)
+    assert r.status_code == 303
+    assert r.headers["location"] == "/app"
+    assert r.cookies.get("terminal_mcp_session")
+    # The one-shot login CSRF cookie is expired on success.
+    expired = [h for h in r.headers.get_list("set-cookie") if h.startswith(f"{LOGIN_CSRF_COOKIE_NAME}=")]
+    assert expired and "max-age=0" in expired[0].lower()
+    assert client.cookies.get(LOGIN_CSRF_COOKIE_NAME) is None
+    assert client.get("/app", follow_redirects=False).status_code == 200
+
+
+def test_login_failed_credentials_render_fresh_token_so_retry_works(tmp_path):
+    server, _service, _webauth = _build(tmp_path)
+    client = _bare_client(server)
+    token = _form_token(client.get("/login").text)
+    r = _csrf_login(client, token, password="totally wrong")
+    assert r.status_code == 401
+    retry_token = _form_token(r.text)
+    assert client.cookies.get(LOGIN_CSRF_COOKIE_NAME) == retry_token
+    r = _csrf_login(client, retry_token)
+    assert r.status_code == 303
+    assert r.headers["location"] == "/app"
+
+
+def test_login_with_mismatched_csrf_token_and_no_origin_is_blocked(tmp_path):
+    server, _service, _webauth = _build(tmp_path)
+    client = _bare_client(server)
+    client.get("/login")
+    r = _csrf_login(client, "not-the-cookie-value")
+    assert r.status_code == 403
+    assert client.cookies.get("terminal_mcp_session") is None
+
+
+def test_login_with_form_token_but_no_cookie_is_blocked_cross_site(tmp_path):
+    # What a cross-site attacker can actually send: a guessed/stolen form
+    # value, but never the victim's SameSite=Strict cookie.
+    server, _service, _webauth = _build(tmp_path)
+    token = _form_token(_bare_client(server).get("/login").text)
+    evil = _bare_client(server, headers={"Origin": "https://evil.example.com",
+                                         "Sec-Fetch-Site": "cross-site"})
+    r = _csrf_login(evil, token)
+    assert r.status_code == 403
+    assert evil.cookies.get("terminal_mcp_session") is None
+
+
+def test_login_with_cookie_but_no_form_token_falls_back_to_origin_guard(tmp_path):
+    server, _service, _webauth = _build(tmp_path)
+    cross_site = _bare_client(server, headers={"Sec-Fetch-Site": "cross-site"})
+    cross_site.get("/login")
+    assert _login(cross_site).status_code == 403
+    same_origin = _bare_client(server, headers={"Origin": BASE_URL})
+    same_origin.get("/login")
+    assert _login(same_origin).status_code == 303
+
+
+def test_login_valid_csrf_pair_is_sufficient_even_with_cross_site_headers(tmp_path):
+    # Deliberate: a matching cookie + form token proves the POST came from
+    # our own rendered form -- a cross-site page can neither read the token
+    # nor make the browser attach a SameSite=Strict cookie, so a client that
+    # presents both IS the user's own client. Headers do not override that.
+    server, _service, _webauth = _build(tmp_path)
+    client = _bare_client(server, headers={"Origin": "https://evil.example.com",
+                                           "Sec-Fetch-Site": "cross-site"})
+    token = _form_token(client.get("/login").text)
+    r = _csrf_login(client, token)
+    assert r.status_code == 303
+
+
+def test_mutation_ignores_login_csrf_token(tmp_path):
+    # The login token never stands in for the /app mutation Origin guard.
+    server, _service, _webauth = _build(tmp_path)
+    client = _bare_client(server)
+    token = _form_token(client.get("/login").text)
+    session = _csrf_login(client, token).cookies.get("terminal_mcp_session")
+    probe = _bare_client(server, cookies={"terminal_mcp_session": session,
+                                          LOGIN_CSRF_COOKIE_NAME: token})
+    r = probe.post("/app/api/session/input", json={"name": "test-x", "text": "hi",
+                                                   LOGIN_CSRF_FIELD: token})
+    assert r.status_code == 403
+    assert r.json() == {"error": "ORIGIN_NOT_ALLOWED"}
 
 
 def test_mutation_without_origin_is_blocked_even_with_valid_session(tmp_path):

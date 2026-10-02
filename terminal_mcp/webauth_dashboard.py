@@ -35,6 +35,7 @@ Security posture, load-bearing and worth stating precisely:
 from __future__ import annotations
 
 import logging
+import secrets
 from urllib.parse import urlparse
 
 import anyio
@@ -136,7 +137,7 @@ _PAGE_STYLE = """
 """
 
 
-def _login_page_html(error: str = "") -> str:
+def _login_page_html(error: str = "", csrf_token: str = "") -> str:
     error_html = f'<div class="error">{error}</div>' if error else ""
     return f"""<!doctype html>
 <html lang="vi"><head><meta charset="utf-8">
@@ -146,6 +147,7 @@ def _login_page_html(error: str = "") -> str:
   <h1>Terminal MCP</h1>
   <p class="sub">Đăng nhập bằng tài khoản cục bộ.</p>
   <form method="POST" action="/login">
+    <input type="hidden" name="{LOGIN_CSRF_FIELD}" value="{csrf_token}">
     <label for="username">Tên đăng nhập</label>
     <input type="text" id="username" name="username" autocomplete="username" required autofocus maxlength="128">
     <label for="password">Mật khẩu</label>
@@ -187,6 +189,43 @@ def _password_form_html(username: str, *, forced: bool, error: str = "") -> str:
   {error_html}
   {logout_form}
 </div></body></html>"""
+
+
+# Login CSRF double-submit token. Browser login must never depend on
+# Origin/Referer/Sec-Fetch-Site surviving the browser + tunnel path (found
+# live: a real browser's POST /login arrived with none of them -> 403 before
+# credentials were ever checked). GET /login (and every re-rendered login
+# form) mints a random token into BOTH this cookie and a hidden form field;
+# POST /login accepts when the two match. A cross-site attacker can neither
+# read the HttpOnly/SameSite=Strict cookie nor the same-origin form, and a
+# cross-site POST never carries a Strict cookie at all, so a match is
+# sufficient on its own. The __Host- prefix (Secure, Path=/, no Domain)
+# stops a sibling subdomain from tossing in a cookie of its own choosing.
+# Only /login uses this; /app mutations keep the Origin guard unchanged.
+LOGIN_CSRF_COOKIE_NAME = "__Host-terminal_mcp_login_csrf"
+LOGIN_CSRF_FIELD = "csrf_token"
+LOGIN_CSRF_TTL_SECONDS = 2 * 60 * 60
+
+
+def _login_csrf_ok(request: Request, form) -> bool:
+    cookie_token = request.cookies.get(LOGIN_CSRF_COOKIE_NAME) or ""
+    form_token = str(form.get(LOGIN_CSRF_FIELD) or "")
+    if not cookie_token or not form_token:
+        return False
+    return secrets.compare_digest(cookie_token.encode(), form_token.encode())
+
+
+def _login_form_response(error: str = "", status_code: int = 200) -> HTMLResponse:
+    # Every rendered login form carries a fresh token pair, so a retry after
+    # a failed/rate-limited/refused attempt works without another GET.
+    token = secrets.token_urlsafe(32)
+    response = HTMLResponse(_login_page_html(error, token), status_code=status_code,
+                            headers={"Cache-Control": "no-store"})
+    response.set_cookie(
+        LOGIN_CSRF_COOKIE_NAME, token, max_age=LOGIN_CSRF_TTL_SECONDS,
+        httponly=True, secure=True, samesite="strict", path="/",
+    )
+    return response
 
 
 _GENERIC_LOGIN_ERROR = "Sai tên đăng nhập hoặc mật khẩu."
@@ -298,22 +337,25 @@ def register_webauth_dashboard(server: MCPServer, terminal: TerminalService, web
     async def login_page(request: Request):
         if _session_user(request) is not None:
             return RedirectResponse("/app", status_code=303)
-        return HTMLResponse(_login_page_html(), headers={"Cache-Control": "no-store"})
+        return _login_form_response()
 
     @server.custom_route("/login", methods=["POST"], include_in_schema=False)
     async def login_submit(request: Request):
-        if not _origin_allowed(request, terminal.config.dashboard.allowed_origins):
-            return HTMLResponse(_login_page_html(_GENERIC_LOGIN_ERROR), status_code=403,
-                                headers={"Cache-Control": "no-store"})
-        client_key = _client_key(request)
-        wait = await anyio.to_thread.run_sync(webauth.seconds_until_allowed, client_key)
-        if wait > 0:
-            return HTMLResponse(_login_page_html(_rate_limited_error(wait)), status_code=429,
-                                headers={"Cache-Control": "no-store"})
         try:
             form = await request.form()
         except Exception:
             form = {}
+        # A matching double-submit token is sufficient on its own; without
+        # one, the legacy Origin/Referer/Fetch-Metadata rule still admits a
+        # same-origin POST (e.g. a form rendered before this token existed)
+        # and still refuses anything cross-site.
+        if not (_login_csrf_ok(request, form)
+                or _origin_allowed(request, terminal.config.dashboard.allowed_origins)):
+            return _login_form_response(_GENERIC_LOGIN_ERROR, 403)
+        client_key = _client_key(request)
+        wait = await anyio.to_thread.run_sync(webauth.seconds_until_allowed, client_key)
+        if wait > 0:
+            return _login_form_response(_rate_limited_error(wait), 429)
         username = str(form.get("username") or "")[:128]
         password = str(form.get("password") or "")[:256]
         user = None
@@ -322,8 +364,7 @@ def register_webauth_dashboard(server: MCPServer, terminal: TerminalService, web
         if user is None:
             await anyio.to_thread.run_sync(webauth.record_failure, client_key)
             _log.info("webauth login failed username=%s client=%s", username or "(empty)", client_key)
-            return HTMLResponse(_login_page_html(_GENERIC_LOGIN_ERROR), status_code=401,
-                                headers={"Cache-Control": "no-store"})
+            return _login_form_response(_GENERIC_LOGIN_ERROR, 401)
         await anyio.to_thread.run_sync(webauth.record_success, client_key)
         token = await anyio.to_thread.run_sync(webauth.create_session, user.username)
         _log.info("webauth login succeeded username=%s client=%s", user.username, client_key)
@@ -332,6 +373,8 @@ def register_webauth_dashboard(server: MCPServer, terminal: TerminalService, web
             SESSION_COOKIE_NAME, token, max_age=int(SESSION_TTL.total_seconds()),
             httponly=True, secure=True, samesite="strict", path="/",
         )
+        response.delete_cookie(LOGIN_CSRF_COOKIE_NAME, path="/", secure=True,
+                               httponly=True, samesite="strict")
         return response
 
     @server.custom_route("/logout", methods=["POST"], include_in_schema=False)
