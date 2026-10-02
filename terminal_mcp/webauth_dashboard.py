@@ -45,9 +45,11 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket
 
-from .controller import ControllerService
+from .controller import ControllerService, build_default_controller
 from .core import TerminalService
 from .dashboard import DASHBOARD_HTML, INPUT_ERROR_STATUS, SESSIONS_ADMIN_HTML, WEBTERM_HTML
+from .live_sessions import EXPANDED_TAIL_LINES, MAX_EXPANDED, LiveSessionMonitor
+from .live_sessions_page import LIVE_SESSIONS_HTML
 from .permissions import valid_session_name
 from .supervisor import SupervisorService, SupervisorStore
 from .supervisor2 import SupervisorV2Service, build_supervisor_v2
@@ -104,6 +106,13 @@ APP_WEBTERM_HTML = (
     WEBTERM_HTML.replace('href="/dashboard/sessions"', 'href="/app/sessions"')
     .replace("/dashboard/assets/", "/app/assets/")
     .replace("const WS_PATH = '/dashboard/ws/terminal';", "const WS_PATH = '/app/ws/terminal';")
+)
+
+# Live Session Monitor, mounted under /app/live -- same complete-substring
+# rewrite convention as every page above.
+APP_LIVE_SESSIONS_HTML = (
+    LIVE_SESSIONS_HTML.replace("/dashboard/api/", "/app/api/")
+    .replace("`/dashboard#", "`/app#")
 )
 
 _PAGE_STYLE = """
@@ -354,6 +363,46 @@ def register_webauth_dashboard(server: MCPServer, terminal: TerminalService, web
         if user.must_change_password:
             return RedirectResponse("/app/password", status_code=303)
         return HTMLResponse(_app_page(APP_SESSIONS_ADMIN_HTML, "app-sessions"), headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
+
+    @server.custom_route("/app/live", methods=["GET"], include_in_schema=False)
+    async def app_live_sessions_page(request: Request):
+        blocked, user = _require_session_page(request)
+        if blocked is not None:
+            return blocked
+        if user.must_change_password:
+            return RedirectResponse("/app/password", status_code=303)
+        return HTMLResponse(_app_page(APP_LIVE_SESSIONS_HTML, "app-live"),
+                            headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
+
+    # The SAME monitor /dashboard/live uses when register_dashboard ran first
+    # (server_http always does): one change tracker, so both surfaces agree on
+    # what is RUNNING. Standalone embeddings get their own, read-only one.
+    def _live_monitor() -> LiveSessionMonitor:
+        monitor = getattr(server, "live_session_monitor", None)
+        if monitor is None:
+            monitor = LiveSessionMonitor(
+                controller or build_default_controller(terminal), audit=terminal.audit,
+                queue_store=getattr(queue, "store", None), run_journal=run_journal,
+                direct_tasks=lambda: getattr(server, "direct_task_supervisor", None))
+            server.live_session_monitor = monitor
+        return monitor
+
+    @server.custom_route("/app/api/live-sessions", methods=["GET"], include_in_schema=False)
+    async def app_live_sessions(request: Request):
+        blocked, _user = _require_session_api(request)
+        if blocked is not None:
+            return blocked
+        expand = tuple(part for part in request.query_params.get("expand", "").split(",")
+                       if part)[:MAX_EXPANDED]
+        monitor = _live_monitor()
+        try:
+            payload = await anyio.to_thread.run_sync(
+                lambda: monitor.snapshot(expand=expand, include_previews=True))
+        except Exception as exc:  # noqa: BLE001
+            payload = {"error": "LIVE_SESSIONS_FAILED", "detail": str(exc), "sessions": [],
+                       "counts": {}}
+        payload["expanded_tail_lines"] = EXPANDED_TAIL_LINES
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/app/password", methods=["GET"], include_in_schema=False)
     async def app_password_page(request: Request):

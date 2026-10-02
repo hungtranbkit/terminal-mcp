@@ -56,6 +56,9 @@ from .node_client import NodeClientError, RemoteNodeClient
 from .core import TerminalService
 from .ai_usage_service import AiUsageService
 from . import terminal_wall
+from .live_sessions import EXPANDED_TAIL_LINES, MAX_EXPANDED, LiveSessionMonitor
+from .live_sessions_page import LIVE_SESSIONS_HTML
+from .session_resource import probe_git_state
 from .recovery_engine import RecoveryEngine
 from .harness_service import HarnessService
 from .integration_service import IntegrationService
@@ -14617,6 +14620,49 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         except Exception as exc:  # noqa: BLE001 -- a monitor never 5xxs the screen
             return JSONResponse({"error": "TERMINAL_WALL_FAILED", "detail": str(exc),
                                  "boxes": [], "counts": {}}, status_code=200)
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    # Live Session Monitor (live_sessions.py). One monitor per registration,
+    # shared by every open tab: its change tracker is what turns "output
+    # differs from the last poll" into RUNNING, so it must outlive requests.
+    # The supervised-task supervisor is read off `server` lazily because
+    # build_mcp attaches it there and this route must also work without it.
+    live_monitor = LiveSessionMonitor(
+        controller, audit=terminal.audit, queue_store=_queue_store_for_worktrees(),
+        run_journal=run_journal,
+        direct_tasks=lambda: getattr(server, "direct_task_supervisor", None),
+        git_probe=probe_git_state)
+    server.live_session_monitor = live_monitor
+
+    @server.custom_route("/dashboard/live", methods=["GET"], include_in_schema=False)
+    async def dashboard_live_sessions_page(request: Request) -> HTMLResponse | JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return HTMLResponse(
+            _nav_page(LIVE_SESSIONS_HTML, "live"),
+            headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
+        )
+
+    @server.custom_route("/dashboard/api/live-sessions", methods=["GET"], include_in_schema=False)
+    async def dashboard_live_sessions(request: Request) -> JSONResponse:
+        """Read-only aggregation for /dashboard/live. _read_guard only: it
+        exposes the same status/tail the session views already do, plus the
+        redacted send preview the audit page already serves to operators."""
+        blocked, identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        expand = tuple(part for part in request.query_params.get("expand", "").split(",")
+                       if part)[:MAX_EXPANDED]
+        previews = _role(identity) in ("operator", "owner")
+        force = request.query_params.get("refresh") == "1"
+        try:
+            payload = await anyio.to_thread.run_sync(
+                lambda: live_monitor.snapshot(expand=expand, include_previews=previews, force=force))
+        except Exception as exc:  # noqa: BLE001 -- a monitor never 5xxs the screen
+            payload = {"error": "LIVE_SESSIONS_FAILED", "detail": str(exc), "sessions": [],
+                       "counts": {}}
+        payload["expanded_tail_lines"] = EXPANDED_TAIL_LINES
         return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/ai-usage", methods=["GET"], include_in_schema=False)

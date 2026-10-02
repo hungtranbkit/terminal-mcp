@@ -1555,6 +1555,35 @@ class QueueStore:
             sessions = [row["session"] for row in connection.execute("SELECT session FROM queue_lanes").fetchall()]
         return [self.lane_status(session) for session in sessions]
 
+    def live_task_rows(self, *, since: str, limit: int = 500) -> list[dict[str, Any]]:
+        """Recent or still-open task rows for the Live Session Monitor.
+
+        One bounded, read-only query (no `_ensure_lane` writes, no per-lane
+        N+1 like list_all_lanes) because the monitor polls every ~2s. Rows are
+        newest-first; the caller maps them to sessions via
+        execution_session/session.
+        """
+        terminal = ("COMPLETED", "FAILED", "CANCELLED", "SKIPPED")
+        marks = ",".join("?" for _ in terminal)
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM queue_tasks WHERE status NOT IN (" + marks + ") OR updated_at >= ? "
+                "ORDER BY updated_at DESC LIMIT ?",
+                (*terminal, since, max(1, int(limit)))).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            keys = row.keys()
+            out.append({
+                "id": row["id"], "session": row["session"], "title": row["title"],
+                "prompt": row["prompt"], "status": row["status"],
+                "created_at": row["created_at"], "started_at": row["started_at"],
+                "completed_at": row["completed_at"], "updated_at": row["updated_at"],
+                "last_error": row["last_error"], "node_id": row["node_id"],
+                "execution_session": row["execution_session"] if "execution_session" in keys else None,
+                "execution_node_id": row["execution_node_id"] if "execution_node_id" in keys else None,
+            })
+        return out
+
     def tasks_with_statuses(self, statuses: Sequence[str]) -> list[QueueTask]:
         """Bounded-shape governor read from local durable state only."""
         if not statuses:

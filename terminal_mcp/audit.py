@@ -224,6 +224,34 @@ class AuditStore:
         except ValueError:
             return None
 
+    def latest_input_index(self, since: str, *, limit: int = 2000) -> dict[str, dict[str, Any]]:
+        """Newest delivered input and creation per session since `since` (ISO).
+
+        ONE bounded read for the Live Session Monitor, which must show a
+        direct `send`/`send_wait` session (no durable task row exists for it)
+        as soon as the controller delivered input to it. Returns
+        `{session: {"last_input_at", "last_input_action", "last_input_preview",
+        "created_at"}}`; the preview is the already-redacted 240-char
+        `text_preview`, so callers must still role-gate it.
+        """
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT session, action, timestamp, text_preview FROM input_audit "
+                "WHERE timestamp >= ? AND session IS NOT NULL AND "
+                "((action IN ('send_text', 'send_keys') AND result IN ('SENT', 'SENT_UNCONFIRMED')) "
+                "OR (action = 'create_session' AND result = 'CREATED')) "
+                "ORDER BY id DESC LIMIT ?", (since, max(1, int(limit)))).fetchall()
+        index: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            entry = index.setdefault(row["session"], {})
+            if row["action"] == "create_session":
+                entry.setdefault("created_at", row["timestamp"])
+            elif "last_input_at" not in entry:
+                entry["last_input_at"] = row["timestamp"]
+                entry["last_input_action"] = row["action"]
+                entry["last_input_preview"] = row["text_preview"]
+        return index
+
     def prune(self, retention: int) -> int:
         """P1 hardening item #9: input_audit has no other retention limit
         -- every terminal_send_text/_keys call ever recorded stays forever

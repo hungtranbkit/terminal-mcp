@@ -196,3 +196,26 @@ No agent session may be retained indefinitely. `terminal_mcp/session_reconciler.
 - HP controller still not deployed (see previous section); remote node agents not redeployed.
 - Dashboard delete routes still don't check supervised tasks.
 
+
+## Live Session Monitor (`/dashboard/live`) — 2026-10-02 (branch `feat/live-session-monitor-1002`, not merged/deployed)
+
+### What / why
+Direct dispatch (`create_session` -> `send`/`send_wait`) leaves no queue row, so no task board could show what ChatGPT is running. New top-level page **Đang chạy / Live Sessions** shows every session fleet-wide, active first, auto-refreshing every 2s without reload.
+
+### Files
+- `terminal_mcp/live_sessions.py` (new): `LiveSessionMonitor.snapshot(expand=(), include_previews=True)`. Read-only aggregation over existing sources only (no new DB): `controller.terminal_list_sessions` + per-session `controller.terminal_status` (remote rows called as `node/session`), Terminal Wall's `OutputChangeTracker`/`derive_state`, `AuditStore.latest_input_index` (direct sends + creations, local node only), `QueueStore.live_task_rows`, `server.direct_task_supervisor.store.active()` (read lazily), `RunJournalStore.active_session_index`, git via status `resource.git` or `session_resource.probe_git_state(cwd)` (local only, 10s cache). 1.5s TTL cache shared by all tabs; one tracker per monitor (`server.live_session_monitor`, shared by `/dashboard` and `/app`).
+- State rules (`live_state`): WAITING/OFFLINE from wall rules; raw RUNNING from a non-shell foreground command/agent footer = RUNNING; a shell prompt/agent composer back and output still >= `SETTLE_SECONDS` (4s) = IDLE (so finished work leaves RUNNING within seconds, not the wall's 90s); witnessed output change <= 90s = RUNNING; delivered input <= `INPUT_ACTIVE_SECONDS` (45s) with no finished evidence = RUNNING (`activity_source=direct_input`). Open supervised/queue task keeps a row business-active. NEW = created <= 10 min ago or seen transitioning into activity (first build adopts existing activity as baseline). `completion` from a finished task, or from an observed active->inactive transition (last non-blank tail line).
+- Per-row isolation: status exceptions -> that row OFFLINE with `error`; listing failure / audit / queue / direct-task / run-journal failures -> `source_errors`, never 5xx. Unreachable nodes -> `unreachable_nodes` banner. Unreadable sessions -> RESTRICTED without any pane read.
+- Tail: the 20 lines `terminal_status` already carries; `?expand=node/session,...` (max 6) adds a 120-line `terminal_tail` for expanded cards only.
+- `terminal_mcp/live_sessions_page.py` (new): `LIVE_SESSIONS_HTML`; filters Đang chạy/Gần đây/Idle/Tất cả + search + node select; repaints a card only when `change_token` changes; textContent only; mobile + 1366px grid.
+- Routes: `dashboard.py` `/dashboard/live`, `/dashboard/api/live-sessions` (`_read_guard`; send preview only for operator/owner role — `text_preview` is SENSITIVE_METADATA). `webauth_dashboard.py` `/app/live`, `/app/api/live-sessions` (session cookie; same monitor). Nav: `dashboard_nav.py` primary item `live` and `app-live`.
+- Store helpers (read-only): `AuditStore.latest_input_index(since)`, `QueueStore.live_task_rows(since)` (single bounded query; avoids `list_all_lanes` N+1 + `_ensure_lane` writes).
+
+### Known limits
+- Direct-send preview/last-input time exists only for sessions on the controller's own node (remote nodes audit their own sends); remote rows still go active from pane evidence.
+- Observed while setting up a manual harness (abandoned, not a production path): `build_default_controller` with the host runtime config reported node `local` offline, so wall and live lists were empty there. Production `server_http` builds its own ControllerService; verify during the live canary.
+
+### Verification
+- `pytest tests/test_live_sessions.py` -> 17 passed (direct send without task, previews withheld, new session appears + sorts first, RUNNING -> IDLE with completion, queue + supervised task mapping, failing status/listing/sources isolation, restricted, expand, TTL cache, `/dashboard/live` + API, `/app/live` login/rewrite, CF Access 403).
+- `pytest tests/test_global_nav.py tests/test_webauth_dashboard.py tests/test_terminal_wall.py` -> 482 passed (includes route coverage for the new page).
+- No live/production canary yet: next step is merge + restart `terminal-mcp-http` and run the acceptance (open `/dashboard/live`, create session + direct send a multi-step command, watch it appear/RUN/IDLE without reload, queue disabled).

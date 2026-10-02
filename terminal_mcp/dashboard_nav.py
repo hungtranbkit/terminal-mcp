@@ -88,6 +88,9 @@ DASHBOARD_NAV = NavSurface(
     home="/dashboard",
     items=(
         NavItem("home", "Home", "/dashboard"),
+        # What is running right now, direct sends included -- the first
+        # place to look after asking ChatGPT to start something.
+        NavItem("live", "Đang chạy", "/dashboard/live"),
         NavItem("projects", "Projects", "/dashboard/projects"),
         NavItem("agents", "Agents", "/dashboard/agents"),
         NavItem("tasks", "Global Tasks", "/dashboard/tasks"),
@@ -119,6 +122,7 @@ APP_NAV = NavSurface(
     home="/app",
     items=(
         NavItem("app-home", "Home", "/app"),
+        NavItem("app-live", "Đang chạy", "/app/live"),
         NavItem("app-sessions", "Sessions", "/app/sessions"),
         NavItem("app-terminal", "Terminal", "/app/terminal"),
         NavItem("app-password", "Password", "/app/password", secondary=True),
