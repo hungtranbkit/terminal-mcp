@@ -425,6 +425,9 @@ class CompactTerminalTools:
         self.run_journal = run_journal
         # DirectTaskSupervisor, injected by mcp_app. None disables supervise*.
         self.direct_tasks: Any = None
+        # SessionReconciler.lifecycle_for, injected by mcp_app. Annotates
+        # inspect rows with the agent-session lifecycle state.
+        self.lifecycle_lookup: Callable[[str], Any] | None = None
         # Late-bound implementations for the discovery/lifecycle/queue actions
         # `turn` routes but does not own (see TURN_HANDLER_ACTIONS). They are
         # the very same functions the individual MCP tools are registered
@@ -940,6 +943,9 @@ class CompactTerminalTools:
                 note = self._supervised_note(row.get("target"))
                 if note is not None:
                     row["supervised_task"] = note
+                lifecycle = self._lifecycle_note(row.get("target"))
+                if lifecycle is not None:
+                    row["lifecycle"] = lifecycle
             return {"status": "OK" if "error" not in result else "FAILED",
                     "action": normalized, "result": result}
 
@@ -1060,6 +1066,14 @@ class CompactTerminalTools:
             return None
         try:
             return self.direct_tasks.annotation(target.strip())
+        except Exception:  # noqa: BLE001 -- an annotation must never break a read
+            return None
+
+    def _lifecycle_note(self, target: Any) -> dict[str, Any] | None:
+        if self.lifecycle_lookup is None or not isinstance(target, str) or not target:
+            return None
+        try:
+            return self.lifecycle_lookup(target.strip())
         except Exception:  # noqa: BLE001 -- an annotation must never break a read
             return None
 

@@ -98,10 +98,16 @@ supervisor:
 #     codex: codex
 #   create_ready_timeout_seconds: 5
 #   default_grant_mode: none   # none | read | read_send
-#   # Agent-session lifecycle reconciler (session_reconciler.py). Closes only
-#   # detached, IDLE claude/codex panes whose worktree is clean and merged
-#   # (COMPLETED_CLEAN) or gone (ORPHAN_WORKTREE_MISSING). Dirty, unmerged,
-#   # active, protected/attached, service and shell sessions are preserved.
+#   # Agent-session lifecycle reconciler (session_reconciler.py). HARD RULE:
+#   # no indefinite retention. Provably complete agent sessions (clean+merged
+#   # worktree, or worktree gone) close at once. Any other idle agent session
+#   # with no verified owner (dirty, unmerged, no repo, UNKNOWN pane...) and
+#   # any service pane not listed healthy in required_services enters
+#   # RECOVERY_REQUIRED; if control is not regained within
+#   # recovery_grace_minutes it is CLEANUP_ELIGIBLE and closed after a git
+#   # checkpoint (refs/terminal-mcp/checkpoints/... + .patch). A failed
+#   # checkpoint or an open editor fails closed (BLOCKED). Protected,
+#   # attached, active-work and plain-shell sessions are never touched.
 #   agent_cleanup:
 #     enabled: false
 #     dry_run: true                       # log candidates only
@@ -111,6 +117,13 @@ supervisor:
 #     agent_commands: [claude, codex]
 #     close_clean_primary_checkouts: false
 #     scrollback_dir: ~/tmux-reaped
+#     recovery_grace_minutes: 30           # 5..1440; keep 15-30
+#     checkpoint_dirty_work: true
+#     checkpoint_max_untracked_mb: 200     # larger untracked snapshot -> BLOCKED
+#     required_services:                   # exempt only while verified healthy
+#       - session: "novafactory-live-*"
+#         health_url: http://127.0.0.1:3000/
+#       - "*-tunnel*"
 
 # Session Knowledge Store: captures every session's REAL (redacted) output
 # into a durable, searchable record (session_knowledge.py) for search/

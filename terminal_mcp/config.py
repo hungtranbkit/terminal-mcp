@@ -630,6 +630,15 @@ class SessionKnowledgeConfig:
 
 
 @dataclass(frozen=True)
+class RequiredServiceConfig:
+    """A persistent service/tunnel session the agent-cleanup rule must keep.
+    Exempt only while verified healthy: pane alive running a non-shell
+    process and, when health_url is set, that URL answering below 500."""
+    session: str  # fnmatch pattern on the tmux session name
+    health_url: str | None = None
+
+
+@dataclass(frozen=True)
 class AgentCleanupConfig:
     """Lifecycle reconciler for task-owned AGENT sessions (session_reconciler.py).
 
@@ -645,9 +654,14 @@ class AgentCleanupConfig:
       * ORPHAN_WORKTREE_MISSING -- detached, idle for idle_hours, and its
         working directory demonstrably no longer exists.
 
-    Dirty trees, unmerged branches, active work, protected/attached sessions
-    and every non-agent pane (servers, tunnels, plain shells) are preserved
-    by construction. dry_run reports without closing anything.
+    HARD RULE (no indefinite retention): any other idle agent session with no
+    verified owner (dirty, unmerged, no repo, UNKNOWN pane, ...) and any
+    service pane that is not a verified-healthy entry of required_services
+    enters RECOVERY_REQUIRED; if control is not regained within
+    recovery_grace_minutes it becomes CLEANUP_ELIGIBLE and is closed after
+    unique git work is checkpointed (checkpoint_dirty_work). A failed
+    checkpoint fails closed (BLOCKED). Protected/attached sessions, active
+    work and plain shells are never touched. dry_run reports without closing.
     """
     enabled: bool = False
     dry_run: bool = True
@@ -657,6 +671,10 @@ class AgentCleanupConfig:
     agent_commands: tuple[str, ...] = ("claude", "codex")
     close_clean_primary_checkouts: bool = False
     scrollback_dir: str = "~/tmux-reaped"
+    recovery_grace_minutes: float = 30.0
+    checkpoint_dirty_work: bool = True
+    checkpoint_max_untracked_mb: int = 200
+    required_services: tuple[RequiredServiceConfig, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2804,7 +2822,7 @@ def _load_agent_cleanup_config(raw: object) -> AgentCleanupConfig:
     if not isinstance(raw, dict):
         raise ValueError("session_lifecycle.agent_cleanup must be a mapping")
     defaults = AgentCleanupConfig()
-    for key in ("enabled", "dry_run", "close_clean_primary_checkouts"):
+    for key in ("enabled", "dry_run", "close_clean_primary_checkouts", "checkpoint_dirty_work"):
         if not isinstance(raw.get(key, getattr(defaults, key)), bool):
             raise ValueError(f"session_lifecycle.agent_cleanup.{key} must be a boolean")
     idle_hours = raw.get("idle_hours", defaults.idle_hours)
@@ -2822,13 +2840,36 @@ def _load_agent_cleanup_config(raw: object) -> AgentCleanupConfig:
     scrollback_dir = raw.get("scrollback_dir", defaults.scrollback_dir)
     if not isinstance(scrollback_dir, str) or not scrollback_dir:
         raise ValueError("session_lifecycle.agent_cleanup.scrollback_dir must be a string")
+    grace = raw.get("recovery_grace_minutes", defaults.recovery_grace_minutes)
+    if isinstance(grace, bool) or not isinstance(grace, (int, float)) or not 5 <= grace <= 1440:
+        raise ValueError("session_lifecycle.agent_cleanup.recovery_grace_minutes must be a number 5..1440")
+    max_mb = raw.get("checkpoint_max_untracked_mb", defaults.checkpoint_max_untracked_mb)
+    if isinstance(max_mb, bool) or not isinstance(max_mb, int) or max_mb < 1:
+        raise ValueError("session_lifecycle.agent_cleanup.checkpoint_max_untracked_mb must be a positive integer")
+    services_raw = raw.get("required_services", [])
+    if not isinstance(services_raw, list):
+        raise ValueError("session_lifecycle.agent_cleanup.required_services must be a list")
+    services = []
+    for item in services_raw:
+        if isinstance(item, str) and item:
+            services.append(RequiredServiceConfig(session=item))
+            continue
+        if not isinstance(item, dict) or not isinstance(item.get("session"), str) or not item["session"]:
+            raise ValueError("session_lifecycle.agent_cleanup.required_services entries must be a "
+                             "session pattern or {session, health_url}")
+        url = item.get("health_url")
+        if url is not None and (not isinstance(url, str) or not url.startswith(("http://", "https://"))):
+            raise ValueError("session_lifecycle.agent_cleanup.required_services health_url must be http(s)")
+        services.append(RequiredServiceConfig(session=item["session"], health_url=url))
     return AgentCleanupConfig(
         enabled=raw.get("enabled", defaults.enabled), dry_run=raw.get("dry_run", defaults.dry_run),
         idle_hours=float(idle_hours), interval_seconds=float(interval),
         max_closes_per_run=max_closes, agent_commands=tuple(commands),
         close_clean_primary_checkouts=raw.get("close_clean_primary_checkouts",
                                               defaults.close_clean_primary_checkouts),
-        scrollback_dir=scrollback_dir,
+        scrollback_dir=scrollback_dir, recovery_grace_minutes=float(grace),
+        checkpoint_dirty_work=raw.get("checkpoint_dirty_work", defaults.checkpoint_dirty_work),
+        checkpoint_max_untracked_mb=max_mb, required_services=tuple(services),
     )
 
 

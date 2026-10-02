@@ -706,9 +706,17 @@ def build_mcp(service: TerminalService | None = None,
         session with no separate grant). On a multi-node deployment, each
         row additionally carries node_id/node_name; a node currently
         unreachable is reported separately under unreachable_nodes, never
-        silently dropped."""
+        silently dropped. Rows on this host also carry `lifecycle` (state,
+        reason, timestamps) once the agent-session reconciler has observed
+        them -- see terminal_session_lifecycle."""
         _refresh_local_heartbeat()
-        return controller.terminal_list_sessions()
+        listing = controller.terminal_list_sessions()
+        index = session_reconciler.lifecycle_index()
+        local_id = getattr(controller, "local_node_id", None)
+        for row in listing.get("sessions", []) if index else []:
+            if isinstance(row, dict) and row.get("node_id") in (None, local_id) and row.get("name") in index:
+                row["lifecycle"] = index[row["name"]]
+        return listing
 
     @server.tool()
     def terminal_tail(session: str, lines: int = 200) -> dict:
@@ -3702,17 +3710,26 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         (one, or all). Read-only. Classes: PROTECTED, ATTACHED, SERVICE, SHELL,
         ACTIVE_TASK, AGENT_RECENT, AGENT_NOT_IDLE, DIRTY_WORKTREE,
         UNMERGED_BRANCH, NO_REPO, NO_BASE_REF, IDLE_PRIMARY_CHECKOUT, UNKNOWN_CWD
-        (all preserved) and COMPLETED_CLEAN, ORPHAN_WORKTREE_MISSING (closable)."""
+        (all preserved) and COMPLETED_CLEAN, ORPHAN_WORKTREE_MISSING (closable).
+        Each row also carries lifecycle_state + lifecycle {state, reason,
+        first_uncontrolled_at, grace_expires_at, recovery_attempts,
+        recovered_at, closed_at, checkpoint}: CONTROLLED, RECOVERY_REQUIRED
+        (uncontrolled; recovery being attempted within the grace period),
+        CLEANUP_ELIGIBLE (closed on the next real pass after checkpointing
+        unique git work), BLOCKED (fail closed: unique work would be lost)."""
         return session_reconciler.inspect(session)
 
     @server.tool()
     def terminal_session_reconcile(dry_run: bool = True, confirm: bool = False) -> dict:
-        """Close high-confidence stale AGENT sessions on this host: completed
-        clean (merged, clean tree) and orphaned (worktree gone). Defaults to a
-        dry run. A real pass needs dry_run=false AND confirm=true; each close
+        """Drive the agent-session lifecycle rule on this host: provably
+        complete sessions (merged clean tree, worktree gone) close at once;
+        uncontrolled ones enter RECOVERY_REQUIRED and close once the grace
+        period expires without regained control, after a verified git
+        checkpoint of any dirty/unmerged work. Defaults to a dry run. A real pass needs dry_run=false AND confirm=true; each close
         re-classifies fresh, runs the delete preflight, saves scrollback and
         uses the ordinary guarded delete. Dirty/unmerged/active/protected/
-        attached sessions and service or shell panes are never closed."""
+        attached sessions, active work, plain shells and verified-healthy
+        required services are never closed."""
         if not dry_run and confirm is not True:
             return {"error": "CONFIRMATION_REQUIRED",
                     "next_action": "re-run with dry_run=false and confirm=true after reviewing the dry run"}
@@ -6377,6 +6394,7 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
     # server_http starts the background ticker; import-time builds do not.
     server.direct_task_supervisor = direct_tasks
     server.session_reconciler = session_reconciler
+    compact_tools.lifecycle_lookup = session_reconciler.lifecycle_for
     return server
 
 
