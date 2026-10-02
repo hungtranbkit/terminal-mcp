@@ -579,3 +579,12 @@ def test_audit_last_input_epoch(tmp_path):
     assert audit.last_input_epoch("s1") is None
     audit.record(action="send_text", session="s1", result="SENT", text="x")
     assert abs(audit.last_input_epoch("s1") - __import__("time").time()) < 60
+
+
+def test_compact_list_sessions_keeps_lifecycle_state():
+    tools = CompactTerminalTools(None, None, handlers={"list_sessions": lambda: {"sessions": [
+        {"name": "a", "node_id": "local", "lifecycle": {"state": "RECOVERY_REQUIRED", "reason": "x"}},
+        {"name": "b", "node_id": "local"}]}})
+    rows = tools.turn(action="list_sessions")["result"]["sessions"]
+    assert rows[0]["lifecycle_state"] == "RECOVERY_REQUIRED" and "lifecycle" not in rows[0]
+    assert "lifecycle_state" not in rows[1]

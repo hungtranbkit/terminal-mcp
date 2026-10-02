@@ -176,8 +176,18 @@ def _project_sessions(result: Any, compact: bool) -> Any:
     if not isinstance(sessions, list):
         return result
     projected = dict(result)
-    projected["sessions"] = [_slim(row, _SESSION_COMPACT_FIELDS) for row in sessions]
+    projected["sessions"] = [_slim_session(row) for row in sessions]
     return projected
+
+
+def _slim_session(row: Any) -> Any:
+    slim = _slim(row, _SESSION_COMPACT_FIELDS)
+    # Agent-session lifecycle (session_reconciler.py): the state alone is
+    # what a caller acts on; the full record is on compact=false/session_lifecycle.
+    lifecycle = row.get("lifecycle") if isinstance(row, dict) else None
+    if isinstance(slim, dict) and isinstance(lifecycle, dict) and lifecycle.get("state"):
+        slim["lifecycle_state"] = lifecycle["state"]
+    return slim
 
 
 TURN_HANDLER_ACTIONS: dict[str, str] = {
