@@ -219,3 +219,9 @@ Direct dispatch (`create_session` -> `send`/`send_wait`) leaves no queue row, so
 - `pytest tests/test_live_sessions.py` -> 17 passed (direct send without task, previews withheld, new session appears + sorts first, RUNNING -> IDLE with completion, queue + supervised task mapping, failing status/listing/sources isolation, restricted, expand, TTL cache, `/dashboard/live` + API, `/app/live` login/rewrite, CF Access 403).
 - `pytest tests/test_global_nav.py tests/test_webauth_dashboard.py tests/test_terminal_wall.py` -> 482 passed (includes route coverage for the new page).
 - No live/production canary yet: next step is merge + restart `terminal-mcp-http` and run the acceptance (open `/dashboard/live`, create session + direct send a multi-step command, watch it appear/RUN/IDLE without reload, queue disabled).
+
+## Login origin hotfix — 2026-10-02
+- Fixed password-login POST 403 behind : Cloudflare Tunnel public Origin must be present in  because the origin service may see a local Host.
+- Production runtime config now allows  and ; wrong-credential probe changed from 403 (Origin rejected) to 401 (auth reached), confirming the CSRF gate is no longer blocking login.
+-  password was reset via ; existing web sessions were invalidated.
+- Targeted  + dashboard allowed-origins config test passed (exit 0).

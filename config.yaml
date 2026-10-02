@@ -122,6 +122,11 @@ queue:
 dashboard:
   cloudflare_access_team_domain: "falling-field-15e3.cloudflareaccess.com"
   cloudflare_access_audience: "2c67fa84f87699170bd7b68a9591e58a586fab4e2689932118a02a662bd28c32"
+  # Cloudflare Tunnel terminates publicly on these hosts while the origin sees
+  # its local service host; allow the public browser origins for CSRF checks.
+  allowed_origins:
+    - "https://terminal-login.mesflow.net"
+    - "https://terminal-dashboard.mesflow.net"
   # Web terminal (xterm.js over a WebSocket, attaching a browser directly
   # to an existing tmux session's real pty -- webterm.py/dashboard.py's
   # "Open Terminal" button). Opt-in, same posture as session_lifecycle.
