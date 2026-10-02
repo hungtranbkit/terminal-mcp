@@ -1699,6 +1699,9 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         # cannot send input to a session.
         "/dashboard/terminal-wall": {"GET", "HEAD"},
         "/dashboard/api/terminal-wall": {"GET", "HEAD"},
+        # Live Session Monitor (live_sessions.py), a later separate feature.
+        "/dashboard/live": {"GET", "HEAD"},
+        "/dashboard/api/live-sessions": {"GET", "HEAD"},
         # Auto Recovery -- another later, separate feature.
         "/dashboard/api/recovery": {"GET", "HEAD"},
         "/dashboard/api/recovery/recover": {"POST"},
