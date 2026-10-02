@@ -208,6 +208,11 @@ TURN_HANDLER_ACTIONS: dict[str, str] = {
     "bind_agent_skill": "bind_agent_skill",
     # Read-only: proposes, never deletes. See stale_sessions.py.
     "cleanup_candidates": "cleanup_candidates",
+    # Agent-session lifecycle (session_reconciler.py): classification is
+    # read-only; reconcile is a dry run unless args.dry_run=false and
+    # args.confirm=true.
+    "session_lifecycle": "session_lifecycle",
+    "session_reconcile": "session_reconcile",
     # TMCP-PROJECT-BOOTSTRAP-001. One logical operation, one turn call.
     "project_plan": "project_plan",
     "project_bootstrap": "project_bootstrap",
@@ -333,6 +338,8 @@ AGENT_ARGS: dict[str, frozenset[str]] = {
     "register_skill": frozenset({"skill_id", "version", "body", "name", "summary", "metadata"}),
     "bind_agent_skill": frozenset({"agent_id", "skill_id", "kind", "version"}),
     "cleanup_candidates": frozenset({"limit"}),
+    "session_lifecycle": frozenset({"session"}),
+    "session_reconcile": frozenset({"dry_run", "confirm"}),
     "project_plan": frozenset({"name", "description", "repo_root", "project_id",
                                  "complexity", "runtime", "max_agents"}),
     "project_bootstrap": frozenset({"name", "description", "repo_root", "project_id",
@@ -878,7 +885,10 @@ class CompactTerminalTools:
         - list_sessions (list, sessions), list_nodes (nodes)
         - create_session (create): `target` is the new name; agent_type,
           working_directory, initial_prompt, grant_mode, binding, node apply.
-        - delete_session (delete, kill): `target` is the name.
+        - delete_session (delete, kill): `target` is the name; requires
+          `args={"confirm": true}` (omitted -> CONFIRMATION_REQUIRED). Attached,
+          leased, recovering, protected and active-work sessions are refused
+          regardless of confirmation.
         - enqueue_task (enqueue): `target` is the session, `text` the prompt;
           title, priority, metadata, request_key apply.
         - task_status (task): `task_id`. task_batch_status (tasks): `task_ids`.
@@ -1397,6 +1407,8 @@ class CompactTerminalTools:
             required = AGENT_REQUIRED.get(action, ())
             if target and required and required[0] in allowed:
                 extra.setdefault(required[0], target)
+            elif target and not required and "session" in allowed:
+                extra.setdefault("session", target)
             elif target and not required and "project_id" in allowed:
                 # An action with no REQUIRED argument still has a conventional
                 # positional. `project_recover` sweeps the whole fleet when

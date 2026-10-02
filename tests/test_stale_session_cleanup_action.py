@@ -45,7 +45,11 @@ class _Controller:
     def __init__(self):
         self.deleted: list[str] = []
 
-    def terminal_delete_session(self, name, requested_by=None):
+    def terminal_delete_session(self, name, *, confirm=False, requested_by=None):
+        # Mirrors the real boundary: an unconfirmed delete is refused, which
+        # is exactly how every operator cleanup used to fail.
+        if confirm is not True:
+            return {"error": "CONFIRMATION_REQUIRED", "session": name}
         self.deleted.append(name)
         return {"deleted": name}
 

@@ -170,6 +170,8 @@ _LEGACY_TRANSLATIONS: dict[str, dict[str, Any]] = {
     },
     "terminal_delete_session": {
         "action": "delete_session", "rename": {"name": "target"}, "required": ("target",),
+        # The legacy tool's own `confirm` flag; terminal_turn carries it in args.
+        "args_keys": ("confirm",),
     },
     "terminal_send_text": {
         "action": "send", "rename": {"session": "target"}, "keep": ("text",),
@@ -227,6 +229,9 @@ def translate_legacy_call(name: str, arguments: dict[str, Any]) -> dict[str, Any
     for key in spec.get("keep") or ():
         if key in arguments:
             translated[key] = arguments[key]
+    for key in spec.get("args_keys") or ():
+        if key in arguments:
+            translated.setdefault("args", {})[key] = arguments[key]
     translated.update(spec.get("constants") or {})
     for key in spec.get("required") or ():
         value = translated.get(key)

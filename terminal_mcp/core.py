@@ -4180,7 +4180,9 @@ class TerminalService:
         for item in self._idle_reap_candidates():
             if len(reclaimed) >= needed:
                 break
-            result = self.terminal_delete_session(item.name)
+            # An internal, policy-authorized delete: the confirmation is
+            # supplied here, while every runtime blocker still applies.
+            result = self.terminal_delete_session(item.name, confirm=True, requested_by="idle-reaper")
             if "error" not in result:
                 reclaimed.append(item.name)
                 self.audit.record(action="reap_idle_session", session=item.name,
@@ -4605,7 +4607,10 @@ class TerminalService:
         if confirm is not True:
             self.audit.record(action=action, session=name, result="BLOCKED", reason="CONFIRMATION_REQUIRED",
                               actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
-            return {"error": "CONFIRMATION_REQUIRED", "session": name}
+            return {"error": "CONFIRMATION_REQUIRED", "session": name,
+                    "next_action": ("retry with confirm=true (terminal_delete_session) or "
+                                    "terminal_turn(action='delete_session', target=<name>, "
+                                    "args={'confirm': true})")}
         try:
             info = self.tmux.get_session(name)
         except TmuxError as exc:

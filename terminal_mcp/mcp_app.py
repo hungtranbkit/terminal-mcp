@@ -135,6 +135,7 @@ def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_sessio
                      task_checkpoint,
                      agent_start, list_agents, get_agent, create_agent, update_agent,
                      list_skills, register_skill, bind_agent_skill, cleanup_candidates,
+                     session_lifecycle, session_reconcile,
                      project_plan, project_bootstrap, project_list, project_get,
                      project_update, project_archive, project_phase_status,
                      project_advance, project_reconcile_team, project_start,
@@ -174,6 +175,8 @@ def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_sessio
         "register_skill": register_skill,
         "bind_agent_skill": bind_agent_skill,
         "cleanup_candidates": cleanup_candidates,
+        "session_lifecycle": session_lifecycle,
+        "session_reconcile": session_reconcile,
         # TMCP-PROJECT-BOOTSTRAP-001. One logical operation = one turn call.
         "project_plan": project_plan,
         "project_bootstrap": project_bootstrap,
@@ -790,7 +793,8 @@ Direct actions:
                 args.max_continuations (default 6). Do not resend.
   supervise_status/supervise_complete/supervise_cancel  (task_id)
   list_sessions/list, list_nodes/nodes
-  create_session/create, delete_session/delete
+  create_session/create, delete_session/delete (args={"confirm": true})
+  session_lifecycle (read-only classification), session_reconcile (dry run by default)
   task_status/task, task_batch_status/tasks (read-only historical task state)
   browser_verify/browser_screenshot/browser_status/browser_stop
 
@@ -3673,6 +3677,47 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         return cleanup_session(queue.router, session, controller=controller,
                                config=terminal.config, requested_by=requested_by)
 
+    # -- Agent-session lifecycle reconciler (session_reconciler.py) ---------
+
+    def _reconcile_active_refs(name: str) -> list[str]:
+        refs: list[str] = []
+        if queue is not None and queue.deletion_references(name):
+            refs.append("queue task")
+        if direct_tasks is not None and direct_tasks.active_for(name):
+            refs.append("supervised task")
+        if run_journal is not None and run_journal.active_for_session(name):
+            refs.append("active run")
+        return refs
+
+    from .session_reconciler import SessionReconciler
+    session_reconciler = SessionReconciler(
+        terminal, active_refs=_reconcile_active_refs,
+        preflight=lambda name: deletion_preflight(name, queue=queue, run_journal=run_journal,
+                                                  supervisor=supervisor, direct_tasks=direct_tasks),
+        after_delete=lambda name: supervisor.unwatch(session=name, delete=False))
+
+    @server.tool()
+    def terminal_session_lifecycle(session: str | None = None) -> dict:
+        """Lifecycle classification + reason for this host's tmux sessions
+        (one, or all). Read-only. Classes: PROTECTED, ATTACHED, SERVICE, SHELL,
+        ACTIVE_TASK, AGENT_RECENT, AGENT_NOT_IDLE, DIRTY_WORKTREE,
+        UNMERGED_BRANCH, NO_REPO, NO_BASE_REF, IDLE_PRIMARY_CHECKOUT, UNKNOWN_CWD
+        (all preserved) and COMPLETED_CLEAN, ORPHAN_WORKTREE_MISSING (closable)."""
+        return session_reconciler.inspect(session)
+
+    @server.tool()
+    def terminal_session_reconcile(dry_run: bool = True, confirm: bool = False) -> dict:
+        """Close high-confidence stale AGENT sessions on this host: completed
+        clean (merged, clean tree) and orphaned (worktree gone). Defaults to a
+        dry run. A real pass needs dry_run=false AND confirm=true; each close
+        re-classifies fresh, runs the delete preflight, saves scrollback and
+        uses the ordinary guarded delete. Dirty/unmerged/active/protected/
+        attached sessions and service or shell panes are never closed."""
+        if not dry_run and confirm is not True:
+            return {"error": "CONFIRMATION_REQUIRED",
+                    "next_action": "re-run with dry_run=false and confirm=true after reviewing the dry run"}
+        return session_reconciler.run(dry_run=dry_run)
+
     # -- Project runtime (TMCP-PROJECT-BOOTSTRAP-001) -----------------------
 
     @server.tool()
@@ -6295,6 +6340,8 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         register_skill=terminal_register_skill,
         bind_agent_skill=terminal_bind_agent_skill,
         cleanup_candidates=terminal_session_cleanup_candidates,
+        session_lifecycle=terminal_session_lifecycle,
+        session_reconcile=terminal_session_reconcile,
         project_plan=terminal_project_plan,
         project_bootstrap=terminal_project_bootstrap,
         project_list=terminal_project_registry_list,
@@ -6329,6 +6376,7 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
 
     # server_http starts the background ticker; import-time builds do not.
     server.direct_task_supervisor = direct_tasks
+    server.session_reconciler = session_reconciler
     return server
 
 

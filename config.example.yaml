@@ -98,6 +98,19 @@ supervisor:
 #     codex: codex
 #   create_ready_timeout_seconds: 5
 #   default_grant_mode: none   # none | read | read_send
+#   # Agent-session lifecycle reconciler (session_reconciler.py). Closes only
+#   # detached, IDLE claude/codex panes whose worktree is clean and merged
+#   # (COMPLETED_CLEAN) or gone (ORPHAN_WORKTREE_MISSING). Dirty, unmerged,
+#   # active, protected/attached, service and shell sessions are preserved.
+#   agent_cleanup:
+#     enabled: false
+#     dry_run: true                       # log candidates only
+#     idle_hours: 2
+#     interval_seconds: 900
+#     max_closes_per_run: 10
+#     agent_commands: [claude, codex]
+#     close_clean_primary_checkouts: false
+#     scrollback_dir: ~/tmux-reaped
 
 # Session Knowledge Store: captures every session's REAL (redacted) output
 # into a durable, searchable record (session_knowledge.py) for search/

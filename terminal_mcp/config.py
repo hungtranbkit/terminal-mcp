@@ -3,7 +3,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit as _urlsplit
 
@@ -630,6 +630,36 @@ class SessionKnowledgeConfig:
 
 
 @dataclass(frozen=True)
+class AgentCleanupConfig:
+    """Lifecycle reconciler for task-owned AGENT sessions (session_reconciler.py).
+
+    The shell reaper above never touches a pane running claude/codex, so a
+    finished agent session lingered forever holding hundreds of MB of RAM
+    once its work had been merged and its worktree removed. This closes
+    exactly two high-confidence classes, and only on an opted-in host:
+
+      * COMPLETED_CLEAN -- detached, at an IDLE prompt for idle_hours, no
+        active task/run/lease, working tree clean and HEAD already contained
+        in the repository's default branch (nothing unmerged can be lost).
+        A primary checkout additionally needs close_clean_primary_checkouts.
+      * ORPHAN_WORKTREE_MISSING -- detached, idle for idle_hours, and its
+        working directory demonstrably no longer exists.
+
+    Dirty trees, unmerged branches, active work, protected/attached sessions
+    and every non-agent pane (servers, tunnels, plain shells) are preserved
+    by construction. dry_run reports without closing anything.
+    """
+    enabled: bool = False
+    dry_run: bool = True
+    idle_hours: float = 2.0
+    interval_seconds: float = 900.0
+    max_closes_per_run: int = 10
+    agent_commands: tuple[str, ...] = ("claude", "codex")
+    close_clean_primary_checkouts: bool = False
+    scrollback_dir: str = "~/tmux-reaped"
+
+
+@dataclass(frozen=True)
 class SessionLifecycleConfig:
     """New tmux session create/detach/delete (dashboard + the parallel
     terminal_create_session/_detach_session/_delete_session MCP tools --
@@ -722,6 +752,7 @@ class SessionLifecycleConfig:
     # 8 MiB of DECODED bytes. base64 inflates by 4/3, so the request itself is
     # bounded at roughly 10.7 MiB.
     max_put_file_bytes: int = 8 * 1024 * 1024
+    agent_cleanup: AgentCleanupConfig = field(default_factory=AgentCleanupConfig)
 
     def __post_init__(self) -> None:
         # The "terminal-mcp is always protected, even if omitted" guarantee
@@ -2763,6 +2794,41 @@ def _load_session_lifecycle_config(raw: object) -> SessionLifecycleConfig:
         allow_put_file=allow_put_file, max_put_file_bytes=max_put_file_bytes,
         max_session_ram_mb=max_session_ram_mb, reap_idle_sessions=reap,
         reap_idle_hours=float(reap_hours), reap_idle_commands=tuple(reap_cmds),
+        agent_cleanup=_load_agent_cleanup_config(raw.get("agent_cleanup")),
+    )
+
+
+def _load_agent_cleanup_config(raw: object) -> AgentCleanupConfig:
+    if raw is None:
+        return AgentCleanupConfig()
+    if not isinstance(raw, dict):
+        raise ValueError("session_lifecycle.agent_cleanup must be a mapping")
+    defaults = AgentCleanupConfig()
+    for key in ("enabled", "dry_run", "close_clean_primary_checkouts"):
+        if not isinstance(raw.get(key, getattr(defaults, key)), bool):
+            raise ValueError(f"session_lifecycle.agent_cleanup.{key} must be a boolean")
+    idle_hours = raw.get("idle_hours", defaults.idle_hours)
+    if isinstance(idle_hours, bool) or not isinstance(idle_hours, (int, float)) or idle_hours < 0.5:
+        raise ValueError("session_lifecycle.agent_cleanup.idle_hours must be a number >= 0.5")
+    interval = raw.get("interval_seconds", defaults.interval_seconds)
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval < 60:
+        raise ValueError("session_lifecycle.agent_cleanup.interval_seconds must be a number >= 60")
+    max_closes = raw.get("max_closes_per_run", defaults.max_closes_per_run)
+    if isinstance(max_closes, bool) or not isinstance(max_closes, int) or not 1 <= max_closes <= 100:
+        raise ValueError("session_lifecycle.agent_cleanup.max_closes_per_run must be an integer 1..100")
+    commands = raw.get("agent_commands", list(defaults.agent_commands))
+    if not isinstance(commands, list) or not commands or not all(isinstance(c, str) and c for c in commands):
+        raise ValueError("session_lifecycle.agent_cleanup.agent_commands must be a non-empty list of strings")
+    scrollback_dir = raw.get("scrollback_dir", defaults.scrollback_dir)
+    if not isinstance(scrollback_dir, str) or not scrollback_dir:
+        raise ValueError("session_lifecycle.agent_cleanup.scrollback_dir must be a string")
+    return AgentCleanupConfig(
+        enabled=raw.get("enabled", defaults.enabled), dry_run=raw.get("dry_run", defaults.dry_run),
+        idle_hours=float(idle_hours), interval_seconds=float(interval),
+        max_closes_per_run=max_closes, agent_commands=tuple(commands),
+        close_clean_primary_checkouts=raw.get("close_clean_primary_checkouts",
+                                              defaults.close_clean_primary_checkouts),
+        scrollback_dir=scrollback_dir,
     )
 
 

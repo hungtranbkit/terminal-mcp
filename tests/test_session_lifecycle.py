@@ -428,7 +428,8 @@ def test_delete_requires_explicit_confirmation(tmp_path, tmux_session_factory):
     service = TerminalService(_lifecycle_config(tmp_path))
     name = tmux_session_factory("lifecycle-confirm-required")
     result = service.terminal_delete_session(name, requested_by="tester@example")
-    assert result == {"error": "CONFIRMATION_REQUIRED", "session": name}
+    assert result["error"] == "CONFIRMATION_REQUIRED" and result["session"] == name
+    assert "confirm" in result["next_action"]
     assert service.tmux.get_session(name) is not None
     event = service.audit.list(limit=1, session=name)[0]
     assert event["result"] == "BLOCKED"

@@ -224,7 +224,7 @@ def test_reclaim_frees_only_the_shortfall(tmp_path):
     _inventory(service, [_Info("cap-1", idle_h=9), _Info("cap-2", idle_h=8),
                          _Info("cap-3", idle_h=7)])
     killed: list[str] = []
-    service.terminal_delete_session = lambda n: (killed.append(n), {"action": "deleted"})[1]  # type: ignore[method-assign]
+    service.terminal_delete_session = lambda n, **kw: (killed.append(n), {"action": "deleted"})[1]  # type: ignore[method-assign]
     assert service._reclaim_idle_sessions(1)["reclaimed"] == ["cap-1"]
     assert killed == ["cap-1"]
 

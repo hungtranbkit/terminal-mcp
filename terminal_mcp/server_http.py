@@ -656,6 +656,19 @@ def main() -> None:
         direct_loop.start()
         atexit.register(direct_loop.stop)
 
+    # Agent-session lifecycle reconciler (session_reconciler.py). Opt-in per
+    # host; with dry_run it only logs what it would close.
+    agent_cleanup = config.session_lifecycle.agent_cleanup
+    session_reconciler = getattr(server, "session_reconciler", None)
+    if agent_cleanup.enabled and session_reconciler is not None:
+        from .session_reconciler import SessionReconcileLoop
+
+        reconcile_loop = SessionReconcileLoop(session_reconciler, agent_cleanup.interval_seconds)
+        reconcile_loop.start()
+        atexit.register(reconcile_loop.stop)
+        _log.info("agent session reconciler started (dry_run=%s, idle_hours=%s, interval=%ss)",
+                  agent_cleanup.dry_run, agent_cleanup.idle_hours, agent_cleanup.interval_seconds)
+
     # Periodic demand for execution probes means false-online prevention and
     # opt-in self-heal continue even with no dashboard client connected. The
     # durable circuit breaker and resource lock in NodeHealthService remain

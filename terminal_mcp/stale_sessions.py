@@ -194,10 +194,12 @@ def cleanup_session(router: Any, session: str, *, controller: Any = None,
     # The same delete every other caller uses. `requested_by` is passed when
     # the controller accepts one (it is an audit attribution, not a
     # permission) and omitted otherwise -- never a second delete path.
+    # The operator's explicit cleanup request IS the confirmation; without it
+    # every call here was refused CONFIRMATION_REQUIRED.
     try:
-        result = controller.terminal_delete_session(name, requested_by=requested_by)
+        result = controller.terminal_delete_session(name, confirm=True, requested_by=requested_by)
     except TypeError:
-        result = controller.terminal_delete_session(name)
+        result = controller.terminal_delete_session(name, confirm=True)
     if isinstance(result, dict) and result.get("error"):
         return {**result, "session": name, "candidate": candidate}
     return {"deleted": True, "session": name, "node_id": candidate.get("node_id"),

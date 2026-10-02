@@ -459,6 +459,8 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_project_recover",
         # Stale-session cleanup: the report and the one confirmed action.
         "terminal_session_cleanup",
+        "terminal_session_lifecycle",
+        "terminal_session_reconcile",
     }
 
 
