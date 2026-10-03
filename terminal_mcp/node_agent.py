@@ -769,6 +769,40 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
         ))
         return JSONResponse(result)
 
+    def _forget_task_label(name: str, result: object) -> None:
+        """A deleted/killed session's node-local task label goes with it.
+        Best-effort: an orphan row is harmless (the monitor ignores a label
+        older than the session) and must never turn a success into an error."""
+        if isinstance(result, dict) and "error" not in result:
+            try:
+                client.clear_task_label(name)
+            except Exception:  # noqa: BLE001
+                _log.debug("task label clear failed for %s", name, exc_info=True)
+
+    async def session_task_label(request: Request) -> JSONResponse:
+        """Set (POST) or clear (DELETE) this node's own copy of a session's
+        current task label (task_labels.py). Only summary/source/task_id/
+        request_key are accepted, bounded and re-normalized; stored under
+        node_id "local" so this host's own Live Monitor matches its rows."""
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        name = request.path_params["name"]
+        if request.method == "DELETE":
+            result = await anyio.to_thread.run_sync(lambda: client.clear_task_label(name))
+        else:
+            try:
+                body = await request.json()
+            except ValueError:
+                return JSONResponse({"error": "INVALID_JSON"}, status_code=400)
+            if not isinstance(body, dict):
+                return JSONResponse({"error": "INVALID_JSON"}, status_code=400)
+            result = await anyio.to_thread.run_sync(lambda: client.set_task_label(
+                name, body.get("summary"), source=body.get("source") or "title",
+                task_id=body.get("task_id"), request_key=body.get("request_key")))
+        if isinstance(result, dict):
+            result["node_id"] = node_id
+        return JSONResponse(result)
+
     async def delete_session(request: Request) -> JSONResponse:
         if (blocked := require_auth(request)) is not None:
             return blocked
@@ -776,9 +810,11 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
             body = await request.json()
         except ValueError:
             body = {}
+        name = request.path_params["name"]
         result = await anyio.to_thread.run_sync(lambda: client.delete_session(
-            request.path_params["name"], confirm=body.get("confirm") is True,
+            name, confirm=body.get("confirm") is True,
             requested_by=body.get("requested_by")))
+        await anyio.to_thread.run_sync(lambda: _forget_task_label(name, result))
         return JSONResponse(result)
 
     async def kill_session(request: Request) -> JSONResponse:
@@ -791,6 +827,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
         result = await anyio.to_thread.run_sync(lambda: client.kill_session(
             request.path_params["name"], body.get("confirm_name", ""), requested_by=body.get("requested_by"),
         ))
+        await anyio.to_thread.run_sync(lambda: _forget_task_label(request.path_params["name"], result))
         return JSONResponse(result)
 
     async def rename_session(request: Request) -> JSONResponse:
@@ -1093,6 +1130,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
         Route("/v1/sessions/{name}/send-keys", session_send_keys, methods=["POST"]),
         Route("/v1/input-context", input_context, methods=["GET"]),
         Route("/v1/sessions/{name}/detach", detach_session, methods=["POST"]),
+        Route("/v1/sessions/{name}/task-label", session_task_label, methods=["POST", "DELETE"]),
         Route("/v1/sessions/{name}", delete_session, methods=["DELETE"]),
         Route("/v1/files", put_file, methods=["POST"]),
         Route("/v1/sessions/{name}/kill", kill_session, methods=["POST"]),

@@ -51,6 +51,10 @@ if TYPE_CHECKING:
 LOCAL_NODE_ID = "local"
 MAX_BOUNDED_NODE_PROBE_SECONDS = 3.0
 MIN_BOUNDED_NODE_PROBE_SECONDS = 0.05
+# A node-local task label mirror is best-effort and rides on a send/create
+# response, so a slow node must not hold that response for the full HTTP
+# timeout.
+TASK_LABEL_SYNC_TIMEOUT_SECONDS = 3.0
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -805,6 +809,32 @@ class ControllerService:
 
     def terminal_detach_session(self, name: str) -> dict[str, Any]:
         return self._route(name, "detach", lambda client, bare: client.detach_session(bare))
+
+    def terminal_set_task_label(self, target: str, *, summary: str, source: str = "title",
+                                task_id: str | None = None,
+                                request_key: str | None = None) -> dict[str, Any]:
+        """Mirror a session's current task label onto the node that owns it
+        (task_labels.py NODE-LOCAL MIRROR). Bare names resolve fleet-wide,
+        `node/session` routes directly. Never raises: an offline node, an
+        old agent without the endpoint (404) or any other failure comes back
+        as {"error": ...} -- callers treat this as best-effort only."""
+        return self._task_label_call(target, "set_task_label", lambda client, bare: client.set_task_label(
+            bare, summary, source=source, task_id=task_id, request_key=request_key,
+            timeout_seconds=TASK_LABEL_SYNC_TIMEOUT_SECONDS))
+
+    def terminal_clear_task_label(self, target: str) -> dict[str, Any]:
+        return self._task_label_call(target, "clear_task_label", lambda client, bare: client.clear_task_label(
+            bare, timeout_seconds=TASK_LABEL_SYNC_TIMEOUT_SECONDS))
+
+    def _task_label_call(self, target: str, op: str, call) -> dict[str, Any]:
+        def guarded(client, bare):
+            if not hasattr(client, op):
+                return {"error": "ACTION_UNAVAILABLE", "detail": f"node client has no {op}"}
+            return call(client, bare)
+        try:
+            return self._route(target, op, guarded)
+        except Exception as exc:  # noqa: BLE001 -- a label mirror never breaks the caller
+            return {"error": "TASK_LABEL_SYNC_FAILED", "detail": f"{type(exc).__name__}: {exc}"}
 
     def terminal_delete_session(self, name: str, *, confirm: bool = False,
                                 requested_by: str | None = None) -> dict[str, Any]:

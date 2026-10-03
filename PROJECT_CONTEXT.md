@@ -272,7 +272,7 @@ Direct dispatch (`create_session` -> `send`/`send_wait`) leaves no queue row, so
 - Not deployed and no live canary. Next: merge, restart `terminal-mcp-http`, then from a fresh ChatGPT chat `create_session` + `send_wait(title=...)` and watch the card relabel within about 2s. A follow-up send of "continue" must leave the label unchanged.
 
 ### Known limits / follow-ups
-- Remote node-agents don't write labels themselves. Labels for remote sessions are written by the controller when it routes the send (keyed by the node it returned), so sends issued directly on a remote node's own MCP are not labeled.
+- Remote node-agents don't derive labels themselves. The controller that routes the send writes its central copy (keyed by the node it returned) and, since 2026-10-03, mirrors it to the owning node (see "Node-local task label mirror" below). Sends issued directly on a remote node's own MCP are labeled only by that node's own controller.
 - Native `terminal_send_text` / dashboard sends have no `title` parameter. Only `terminal_turn` send/send_wait/supervise/create and native create/enqueue label.
 
 ## Session task label compatibility hotfix — 2026-10-03
@@ -280,3 +280,30 @@ Direct dispatch (`create_session` -> `send`/`send_wait`) leaves no queue row, so
 - Sending the same summary in both title and metadata.task_summary updated labels reliably on back-to-back calls; an untitled continue preserved the last label.
 - Contract/tool guidance now requires both fields for assignment/change and neither for continuations. metadata.task_summary remains a first-class alias, providing compatibility with cached clients that may omit/drop title.
 - Regression coverage verifies metadata-only replacement and continuation preservation. Focused suite: 46 passed (tests/test_session_task_label.py tests/test_live_sessions.py).
+
+## Node-local task label mirror — 2026-10-03 (branch `hotfix/session-task-node-sync-1003`, not merged/deployed)
+
+### Why (production evidence)
+- Dell runs its own controller + web UI (`node_id` "local", https://terminal-login.mesflow.net/app/live) AND `terminal-node-agent --node-id dell-linux --controller-url http://100.67.53.117:8766` registered with the HP controller.
+- ChatGPT work assigned through the HP controller wrote `session_task_labels` only into HP's AuditStore. Dell's `/app/live` reads Dell's AuditStore, so it never showed the label. A controller-local row is not enough. The label must also live on the node that owns the tmux session.
+
+### Data flow (preserve)
+- `TaskLabeler._write` / `clear` (task_labels.py) is the single choke point. It writes the central row as before and then calls `node_sync.terminal_set_task_label(target, summary=, source=, task_id=, request_key=)` / `terminal_clear_task_label(target)`. `node_sync` is the Controller, injected in `mcp_app.py`. Every labeling path inherits the mirror: compact send/send_wait/supervise/create(title), native create_session (initial_prompt or the clear on an empty create), enqueue/start, delete. Continuations never write, so they never sync.
+- Target: `node/session` when the node is known (send/create results carry the resolved `node_id`), else the bare name, which the controller resolves fleet-wide via `resolve_session`.
+- `Controller.terminal_set_task_label/terminal_clear_task_label` -> `_route` -> `NodeClient.set_task_label/clear_task_label`, with a 3s timeout (`TASK_LABEL_SYNC_TIMEOUT_SECONDS`). It never raises. Offline node, old agent (404), or a client without the method all come back as `{"error": ...}`, and the labeler ignores the result. The central row is written first and is never replaced.
+- `RemoteNodeClient` -> node-agent `POST|DELETE /v1/sessions/{name}/task-label` (bearer auth + throttle like every route). Body is `summary/source/task_id/request_key` only. `validate_label_payload` checks the session name, raw summary <= 2000 chars re-normalized to <= 140 and redacted, source must be a known source, and ids <= 200 chars. Extra fields are ignored. Validation errors come back as 200 `{"error": ...}` like other agent app errors. Non-object JSON gets a 400.
+- `LocalNodeClient` writes directly to `TerminalService.audit`.
+- Node copies are keyed `node_id="local"` (`NODE_LOCAL_LABEL_ID`). Every LiveSessionMonitor already folds "local" into its own local sessions whatever its canonical `local_node_id` is. The configured fleet id (e.g. `dell-linux`) is deliberately NOT written as a second row: it adds nothing a local monitor reads and would be one more row that can go stale.
+- `LiveSessionMonitor._current_task`: for a local session it now picks the NEWEST of the exact row and the `local`/canonical aliases (before, the exact row won). So a fresh mirror from another controller is never shadowed by an older own-controller row. On HP (`hp-linux`), a local session routed through HP gets both `(hp-linux, s)` and `(local, s)` rows with the same content, and the UI shows one label.
+- Node-agent `DELETE /v1/sessions/{name}` and `POST .../kill` clear the node-local label after a successful result, best-effort. Orphans are already ignored by the monitor's label-older-than-session rule.
+- No new service, DB, or migration.
+
+### Deploy notes
+- Remote agents running an older build answer 404 on the new route. That is swallowed, so the mirror only starts working on a node once its node-agent is redeployed. Dell needs BOTH `terminal-mcp-http` (controller/UI monitor change) and the `dell-linux` node-agent restarted. HP's controller needs the new `node_client`/`controller` code to start sending.
+
+### Verification (2026-10-03)
+- `tests/test_session_task_label_node_sync.py` (new) -> 31 passed. Covers remote titled send (central `dell-linux` row + node `local` row via a real in-process node agent, 3s timeout), qualified target, local send, replacement on the node, continuation with no sync, NodeClientError/RuntimeError/offline/404 swallowed with the send still SUBMIT_CONFIRMED, compact and native create sync, supervise with bare-target resolution, clear mirror, endpoint auth/validation/replace/redaction/extra-field ignore, delete+kill clearing, monitor on the node store with ui id `local` and a canonical id, and newest-row-wins.
+- `tests/test_session_task_label.py tests/test_live_sessions.py` -> 46 passed (unchanged).
+- `test_node_agent.py test_node_client_permissions.py test_controller.py test_compact_tools.py test_compact_turn_actions.py test_compact_delete_confirmation.py test_mcp_app_wiring.py test_observer.py test_webauth_dashboard.py` -> 299 passed, 1 failed: `test_observer.py::test_observer_exposes_no_tool_that_can_change_anything`, which fails identically on base d0560a0 (pre-existing, unrelated).
+- Next: merge, redeploy the HP controller + Dell `terminal-mcp-http` + the `dell-linux` (and other) node-agents, then assign a titled task via HP to a Dell session and confirm Dell `/app/live` shows it.
+

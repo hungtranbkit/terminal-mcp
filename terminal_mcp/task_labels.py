@@ -32,6 +32,19 @@ LABEL RULE (keep in sync with terminal_turn's help text)
   / task accepted / session created); a blocked or failed send changes nothing.
 * nothing clears a label when a session goes IDLE; the last task stays
   visible until a new one replaces it. delete_session removes the row.
+
+NODE-LOCAL MIRROR (hotfix 2026-10-03)
+-------------------------------------
+The row above lives in the AuditStore of the CONTROLLER that took the
+request. A host can run its own controller + UI (node_id "local") AND a
+node-agent registered under a different id with another controller (Dell:
+UI "local", agent "dell-linux" -> HP controller). Work assigned through the
+other controller was invisible to that host's /app/live. So every write and
+clear is also pushed, best-effort, to the node that owns the tmux session
+(TaskLabeler.node_sync -> Controller.terminal_set_task_label -> NodeClient
+.set_task_label -> node-agent POST /v1/sessions/{name}/task-label), which
+stores it under NODE_LOCAL_LABEL_ID ("local") in ITS OWN AuditStore. The
+controller copy is never replaced; the node copy is an additional mirror.
 """
 from __future__ import annotations
 
@@ -51,6 +64,18 @@ SOURCE_FALLBACK = "prompt_fallback"
 # caller chose to publish. The monitor role-gates these like text previews.
 PROMPT_DERIVED_SOURCES = frozenset({SOURCE_INITIAL_PROMPT, SOURCE_DURABLE,
                                     SOURCE_SUPERVISED, SOURCE_FALLBACK})
+KNOWN_SOURCES = PROMPT_DERIVED_SOURCES | {SOURCE_TITLE}
+
+# Node-local mirror rows are keyed by this id: every LiveSessionMonitor
+# already folds "local" into its own local sessions whatever its canonical
+# local_node_id is, so one row serves both a "local"-id UI and e.g. an
+# "hp-linux"-id one. The agent's configured fleet id is deliberately NOT
+# written as a second row: it would add nothing a local monitor reads and
+# would be one more row to keep from going stale.
+NODE_LOCAL_LABEL_ID = "local"
+LABEL_RAW_MAX_CHARS = 2000
+LABEL_ID_MAX_CHARS = 200
+SESSION_NAME_MAX_CHARS = 128
 
 # Words that only steer a turn already in progress.
 _CONTINUATION_WORDS = {
@@ -177,16 +202,71 @@ def is_substantial_prompt(text: Any) -> bool:
     return len(summary) >= 40 and len(summary.split()) >= 6
 
 
+def validate_label_payload(session: Any, summary: Any, source: Any = SOURCE_TITLE,
+                           task_id: Any = None, request_key: Any = None
+                           ) -> tuple[dict[str, Any] | None, str | None]:
+    """Clean a node-local label write -> (fields, None) or (None, error).
+
+    Only these five fields can ever reach session_task_labels through the
+    node API; lengths are bounded and the summary is re-normalized
+    (one line, capped, redacted) even though the controller already did.
+    """
+    from .permissions import valid_session_name
+
+    if (not isinstance(session, str) or len(session) > SESSION_NAME_MAX_CHARS
+            or not valid_session_name(session)):
+        return None, "INVALID_SESSION_NAME"
+    if not isinstance(summary, str) or len(summary) > LABEL_RAW_MAX_CHARS:
+        return None, "INVALID_SUMMARY"
+    cleaned = normalize_title(summary)
+    if not cleaned:
+        return None, "INVALID_SUMMARY"
+    source = source or SOURCE_TITLE
+    if source not in KNOWN_SOURCES:
+        return None, "INVALID_SOURCE"
+    ids: dict[str, str | None] = {}
+    for key, value in (("task_id", task_id), ("request_key", request_key)):
+        if value is None or value == "":
+            ids[key] = None
+        elif isinstance(value, (str, int)) and len(str(value)) <= LABEL_ID_MAX_CHARS:
+            ids[key] = str(value)
+        else:
+            return None, f"INVALID_{key.upper()}"
+    return {"session": session, "summary": cleaned, "source": source, **ids}, None
+
+
 class TaskLabeler:
     """Applies the label rule against an AuditStore-compatible store.
 
     Every method is best-effort: a label must never break a send, a create
     or a start, so storage errors are swallowed and reported as None.
+
+    `node_sync` (injected by mcp_app, usually the Controller) mirrors each
+    write/clear to the node that owns the session: it needs
+    `terminal_set_task_label(target, summary=, source=, task_id=,
+    request_key=)` and `terminal_clear_task_label(target)`. Its result and
+    any exception are ignored -- the central row is already written.
     """
 
-    def __init__(self, store: Any, *, local_node_id: Any = None) -> None:
+    def __init__(self, store: Any, *, local_node_id: Any = None, node_sync: Any = None) -> None:
         self.store = store
         self._local_node_id = local_node_id
+        self.node_sync = node_sync
+
+    @staticmethod
+    def _sync_target(node_id: Any, session: Any) -> str:
+        # The caller's node when known (send results carry the resolved
+        # one); a bare name is resolved fleet-wide by the controller.
+        return f"{node_id}/{session}" if node_id else str(session)
+
+    def _mirror(self, method: str, node_id: Any, session: Any, **fields: Any) -> None:
+        sync = getattr(self.node_sync, method, None) if self.node_sync is not None else None
+        if sync is None:
+            return
+        try:
+            sync(self._sync_target(node_id, session), **fields)
+        except Exception:  # noqa: BLE001 -- the node mirror never breaks the real action
+            pass
 
     def _node(self, node_id: Any) -> str:
         if node_id:
@@ -208,13 +288,19 @@ class TaskLabeler:
                task_id: Any = None, request_key: Any = None) -> dict[str, Any] | None:
         if not session or not summary:
             return None
+        task_id = str(task_id) if task_id else None
+        request_key = str(request_key) if request_key else None
         try:
-            return self.store.set_task_label(
+            row = self.store.set_task_label(
                 node_id=self._node(node_id), session=str(session), summary=summary,
-                source=source, task_id=(str(task_id) if task_id else None),
-                request_key=(str(request_key) if request_key else None))
+                source=source, task_id=task_id, request_key=request_key)
         except Exception:  # noqa: BLE001 -- a label never breaks the real action
-            return None
+            row = None
+        # Mirrored even if the central write failed: the owning node's own
+        # Live Monitor should still learn what the session is doing.
+        self._mirror("terminal_set_task_label", node_id, session, summary=summary,
+                     source=source, task_id=task_id, request_key=request_key)
+        return row
 
     def current(self, node_id: Any, session: Any) -> dict[str, Any] | None:
         try:
@@ -258,3 +344,4 @@ class TaskLabeler:
             self.store.delete_task_label(self._node(node_id), str(session))
         except Exception:  # noqa: BLE001
             pass
+        self._mirror("terminal_clear_task_label", node_id, session)

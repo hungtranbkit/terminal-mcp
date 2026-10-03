@@ -64,6 +64,10 @@ class NodeClient(Protocol):
                        show_on_desktop: bool = False,
                        resume_session_id: str | None = None) -> dict[str, Any]: ...
     def detach_session(self, name: str) -> dict[str, Any]: ...
+    def set_task_label(self, session: str, summary: str, *, source: str = "title",
+                       task_id: str | None = None, request_key: str | None = None,
+                       timeout_seconds: float | None = None) -> dict[str, Any]: ...
+    def clear_task_label(self, session: str, *, timeout_seconds: float | None = None) -> dict[str, Any]: ...
     def delete_session(self, name: str, *, confirm: bool = False,
                        requested_by: str | None = None) -> dict[str, Any]: ...
     def put_file(self, path: str, content_b64: str, *, overwrite: bool = False,
@@ -165,6 +169,29 @@ class LocalNodeClient:
 
     def detach_session(self, name: str) -> dict[str, Any]:
         return self._terminal.terminal_detach_session(name)
+
+    def set_task_label(self, session: str, summary: str, *, source: str = "title",
+                       task_id: str | None = None, request_key: str | None = None,
+                       timeout_seconds: float | None = None) -> dict[str, Any]:
+        """Node-local mirror of a session's current task label
+        (task_labels.py), keyed NODE_LOCAL_LABEL_ID in this process's own
+        AuditStore so the Live Monitor of THIS host sees it."""
+        from .task_labels import NODE_LOCAL_LABEL_ID, validate_label_payload
+
+        fields, error = validate_label_payload(session, summary, source, task_id, request_key)
+        if error is not None:
+            return {"error": error, "session": session}
+        row = self._terminal.audit.set_task_label(node_id=NODE_LOCAL_LABEL_ID, **fields)
+        return {"status": "OK", "label": row}
+
+    def clear_task_label(self, session: str, *, timeout_seconds: float | None = None) -> dict[str, Any]:
+        from .permissions import valid_session_name
+        from .task_labels import NODE_LOCAL_LABEL_ID
+
+        if not isinstance(session, str) or not valid_session_name(session):
+            return {"error": "INVALID_SESSION_NAME", "session": session}
+        removed = self._terminal.audit.delete_task_label(NODE_LOCAL_LABEL_ID, session)
+        return {"status": "OK", "session": session, "removed": removed}
 
     def delete_session(self, name: str, *, confirm: bool = False,
                        requested_by: str | None = None) -> dict[str, Any]:
@@ -522,6 +549,17 @@ class RemoteNodeClient:
 
     def detach_session(self, name: str) -> dict[str, Any]:
         return self._request("POST", f"/v1/sessions/{urllib.parse.quote(name)}/detach")
+
+    def set_task_label(self, session: str, summary: str, *, source: str = "title",
+                       task_id: str | None = None, request_key: str | None = None,
+                       timeout_seconds: float | None = None) -> dict[str, Any]:
+        return self._request("POST", f"/v1/sessions/{urllib.parse.quote(session)}/task-label", body={
+            "summary": summary, "source": source, "task_id": task_id, "request_key": request_key,
+        }, timeout_seconds=timeout_seconds)
+
+    def clear_task_label(self, session: str, *, timeout_seconds: float | None = None) -> dict[str, Any]:
+        return self._request("DELETE", f"/v1/sessions/{urllib.parse.quote(session)}/task-label",
+                             timeout_seconds=timeout_seconds)
 
     def delete_session(self, name: str, *, confirm: bool = False,
                        requested_by: str | None = None) -> dict[str, Any]:

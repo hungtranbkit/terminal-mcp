@@ -359,10 +359,13 @@ def build_mcp(service: TerminalService | None = None,
     except Exception:  # noqa: BLE001 -- never block startup; supervise* reports unavailable
         direct_tasks = None
     compact_tools.direct_tasks = direct_tasks
-    # Per-session "current task" label (task_labels.py) in the audit DB.
+    # Per-session "current task" label (task_labels.py) in the audit DB,
+    # mirrored best-effort to the node that owns the session (node_sync) so
+    # that host's own Live Monitor sees work assigned through this controller.
     from .task_labels import TaskLabeler
     task_labels = TaskLabeler(terminal.audit,
-                              local_node_id=lambda: getattr(controller, "local_node_id", None))
+                              local_node_id=lambda: getattr(controller, "local_node_id", None),
+                              node_sync=controller)
     compact_tools.task_labels = task_labels
     recovery = recovery or RecoveryEngine(terminal.session_registry, controller, terminal.leases,
                                           terminal.config.auto_recovery)

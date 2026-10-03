@@ -514,11 +514,16 @@ class LiveSessionMonitor:
         (task_labels.py), else the mapped durable task, else None
         ("Chưa gắn task"). Never cleared by IDLE -- the last task stays."""
         label = labels.get((node_id, name))
-        if label is None and is_local:
+        if is_local:
+            # A local session can carry this controller's own row (canonical
+            # id) AND the node-local mirror ("local") written by ANOTHER
+            # controller routing work here (task_labels.py NODE-LOCAL
+            # MIRROR). The newest one is the current task.
             for alias in ("local", local_node_id, ""):
-                label = labels.get((alias, name))
-                if label is not None:
-                    break
+                other = labels.get((alias, name))
+                if other is not None and (label is None or (_epoch(other.get("updated_at")) or 0)
+                                          > (_epoch(label.get("updated_at")) or 0)):
+                    label = other
         updated_at = _epoch(label.get("updated_at")) if label else None
         if label is not None and created_at and updated_at is not None \
                 and updated_at < created_at - LABEL_ORPHAN_SKEW_SECONDS:
