@@ -274,3 +274,9 @@ Direct dispatch (`create_session` -> `send`/`send_wait`) leaves no queue row, so
 ### Known limits / follow-ups
 - Remote node-agents don't write labels themselves. Labels for remote sessions are written by the controller when it routes the send (keyed by the node it returned), so sends issued directly on a remote node's own MCP are not labeled.
 - Native `terminal_send_text` / dashboard sends have no `title` parameter. Only `terminal_turn` send/send_wait/supervise/create and native create/enqueue label.
+
+## Session task label compatibility hotfix — 2026-10-03
+- Production canary on 7084d54 showed intermittent loss of a new task label when callers supplied only title: task 1 persisted, task 2 could execute without updating session_task_labels. Persistence/upsert itself is correct.
+- Sending the same summary in both title and metadata.task_summary updated labels reliably on back-to-back calls; an untitled continue preserved the last label.
+- Contract/tool guidance now requires both fields for assignment/change and neither for continuations. metadata.task_summary remains a first-class alias, providing compatibility with cached clients that may omit/drop title.
+- Regression coverage verifies metadata-only replacement and continuation preservation. Focused suite: 46 passed (tests/test_session_task_label.py tests/test_live_sessions.py).

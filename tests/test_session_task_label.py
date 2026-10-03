@@ -133,6 +133,19 @@ def test_untitled_substantial_send_only_labels_an_unlabeled_session(rig):
     assert label["summary"].startswith("Refactor the billing module")
 
 
+def test_metadata_task_summary_replaces_label_when_title_is_missing(rig):
+    compact, _controller, audit = rig
+    first = compact.turn(action="send_wait", target="local/worker", text="run first task",
+                         title="First task", timeout=2, poll_interval=1)
+    assert first["current_task"]["summary"] == "First task"
+    second = compact.turn(action="send_wait", target="worker", text="run second task",
+                          metadata={"task_summary": "Second task"}, timeout=2, poll_interval=1)
+    assert second["current_task"]["summary"] == "Second task"
+    assert _label(audit, "worker")["summary"] == "Second task"
+    compact.turn(action="send_wait", target="worker", text="continue", timeout=2, poll_interval=1)
+    assert _label(audit, "worker")["summary"] == "Second task"
+
+
 def test_failed_send_does_not_label(rig):
     compact, controller, audit = rig
     controller.send_result = {"delivery_state": "BLOCKED", "error": "ACCESS_DENIED"}
@@ -263,7 +276,8 @@ def test_terminal_turn_help_tells_callers_to_pass_title(tmp_path):
     server, _service = _server(tmp_path)
     tool = next(t for t in server._tool_manager.list_tools() if t.name == "terminal_turn")
     assert 'title="<short summary>"' in tool.description
-    assert "Omit title" in tool.description
+    assert "metadata.task_summary" in tool.description
+    assert "Omit both" in tool.description
 
 
 # -- live monitor payload -----------------------------------------------------

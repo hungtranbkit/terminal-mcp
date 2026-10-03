@@ -815,9 +815,10 @@ Direct actions:
   browser_verify/browser_screenshot/browser_status/browser_stop
 
 TASK LABEL (shown as "Task hiện tại" on /dashboard/live and /app/live):
-  When you ASSIGN or CHANGE a session's task, pass title="<short summary>"
-  (<= 140 chars) on send / send_wait / supervise / create_session. Omit title
-  for continuations ("y", "continue", approvals, small follow-ups): an untitled
+  When you ASSIGN or CHANGE a session's task, pass BOTH title="<short summary>"
+  and metadata.task_summary="<same summary>" (<= 140 chars) on send / send_wait /
+  supervise / create_session. The duplicate field is intentional compatibility
+  hardening for cached clients. Omit both for continuations ("y", "continue", approvals, small follow-ups): an untitled
   send never replaces the session's existing label (it may only set the first
   label of an unlabeled session when the text is clearly substantial new work).
   create_session with initial_prompt labels from the prompt; metadata.task_summary
