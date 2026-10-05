@@ -398,3 +398,40 @@ Direct dispatch (`create_session` -> `send`/`send_wait`) leaves no queue row, so
 - `tests/test_session_task_label.py tests/test_live_sessions.py` -> 46 passed (unchanged).
 - `test_node_agent.py test_node_client_permissions.py test_controller.py test_compact_tools.py test_compact_turn_actions.py test_compact_delete_confirmation.py test_mcp_app_wiring.py test_observer.py test_webauth_dashboard.py` -> 299 passed, 1 failed: `test_observer.py::test_observer_exposes_no_tool_that_can_change_anything`, which fails identically on base d0560a0 (pre-existing, unrelated).
 - Next: merge, redeploy the HP controller + Dell `terminal-mcp-http` + the `dell-linux` (and other) node-agents, then assign a titled task via HP to a Dell session and confirm Dell `/app/live` shows it.
+
+## 2026-10-05 — Session ownership / resurrection hotfix deployed
+
+### Root cause
+- `resolve_session` could lose a session's routing after the short in-memory location cache expired when a node heartbeat/list probe was transiently unavailable. The session runtime could still exist, but later `inspect/send/delete` calls returned `SESSION_LOCATION_UNKNOWN`.
+- Session existence/ownership was being inferred from multiple partially independent sources (live node listing, cache, registry/fleet state). An incomplete probe could therefore erase routing knowledge even though there was prior positive ownership evidence.
+- Deleted/missing sessions also needed generation/tombstone protection so stale inventories could not make an old runtime look live again.
+- User session capacity could saturate normal slots and block repair/maintenance work.
+
+### Deployed fix
+- Main commit `29cd75d777e035717a7bed9103b62c6865f81f4f` (`fix(controller): durable session ownership; never lose a known owner`).
+- Session create now records authoritative durable ownership before success is returned: owner node, generation and runtime instance id.
+- Routing falls back to durable positive ownership. If the known owner cannot currently be probed, the result is `NODE_UNREACHABLE` / known-owner-unreachable, not `SESSION_LOCATION_UNKNOWN`.
+- Only an authoritative successful probe of the known owner can transition a runtime to missing.
+- Delete/kill records tombstone/generation state; stale observations from an older generation cannot resurrect a deleted runtime.
+- Same-name recreation is treated as a new generation / instance.
+- Controller/node-agent restart reconstructs routing from durable state.
+- Maintenance-prefixed sessions can use reserved control capacity even when normal user-session capacity is full; this is separate from raising the normal global limit.
+
+### Verification
+- Focused final-tree regression gate: **333 passed**.
+- Production live acceptance log: **21 PASS, 0 FAIL — `SUMMARY ALL PASS (21 checks)`**.
+- Verified live cases include:
+  - create -> cache TTL expiry (>20 s) -> inspect/send/list;
+  - controller restart and node-agent restart while tmux survives;
+  - temporary owner-node unavailability returns `NODE_UNREACHABLE`, never location loss;
+  - explicit delete/tombstone remains deleted through reconcile/restart;
+  - same-name recreation routes as a new generation/instance;
+  - maintenance reserve can create control sessions above normal capacity;
+  - existing historically resurrecting CDTM sessions remained absent after deploy.
+- During acceptance the controller was intentionally restarted and recovered; sessions became routable again from durable ownership.
+- `origin/main` was pushed to `29cd75d777e035717a7bed9103b62c6865f81f4f` before live acceptance.
+
+### Operational state / cleanup
+- Dell controller/node-agent/http services were restarted as part of live acceptance.
+- Canary runtimes were deleted/made missing as expected after the acceptance sequence.
+- Remaining task after this note: remove the merged hotfix worktree/branch and temporary maintenance inspection session; do not remove unrelated legacy worktrees/sessions.
