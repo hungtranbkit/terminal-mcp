@@ -4198,6 +4198,17 @@ class TerminalService:
                                   result="DELETED", reason="NODE_AT_SESSION_CAPACITY")
         return {"reclaimed": reclaimed, "enabled": True}
 
+    def _is_maintenance_session(self, name: str) -> bool:
+        lifecycle = self.config.session_lifecycle
+        return lifecycle.maintenance_reserve_sessions > 0 and any(
+            name.startswith(prefix) for prefix in lifecycle.maintenance_session_prefixes)
+
+    def _maintenance_session_count(self) -> int:
+        try:
+            return sum(1 for item in self.tmux.list_sessions() if self._is_maintenance_session(item.name))
+        except TmuxError:
+            return 0
+
     def _session_capacity(self) -> tuple[int, int]:
         """(limit, current) session counts for admission control.
 
@@ -4422,6 +4433,23 @@ class TerminalService:
         # named error is strictly better than breaking every session that
         # already works.
         limit, current = self._session_capacity()
+        lifecycle_cfg = self.config.session_lifecycle
+        maintenance = self._is_maintenance_session(name)
+        if limit and maintenance:
+            # Reserved maintenance capacity: never touches the user limit
+            # and never reclaims anyone's session to make room.
+            in_reserve = self._maintenance_session_count()
+            reserve = lifecycle_cfg.maintenance_reserve_sessions
+            if in_reserve >= reserve:
+                self.audit.record(action=action, session=name, result="BLOCKED",
+                                  reason="MAINTENANCE_RESERVE_FULL")
+                return {"error": "MAINTENANCE_RESERVE_FULL", "session": name,
+                        "maintenance_sessions": in_reserve, "reserve": reserve,
+                        "detail": "every reserved maintenance slot is in use -- delete a finished "
+                                  "maintenance session first"}
+            limit = 0  # admitted from the reserve
+        elif limit:
+            current -= self._maintenance_session_count()  # the reserve is not user capacity
         reclaimed: list[str] = []
         if limit and current >= limit:
             # Reclaim before refusing: an idle shell holding a slot should
@@ -4430,6 +4458,7 @@ class TerminalService:
             reclaimed = self._reclaim_idle_sessions(current - limit + 1)["reclaimed"]
             if reclaimed:
                 limit, current = self._session_capacity()
+                current -= self._maintenance_session_count()
         if limit and current >= limit:
             self.audit.record(action=action, session=name, result="BLOCKED",
                               reason="NODE_AT_SESSION_CAPACITY")

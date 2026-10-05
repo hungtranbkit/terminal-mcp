@@ -738,6 +738,15 @@ class SessionLifecycleConfig:
     # each get a limit that fits them without an operator hand-tuning a
     # number per host. Set a positive value to pin it explicitly.
     max_sessions: int = 0
+    # Reserved maintenance/control capacity ON TOP of the user limit. A node
+    # full of user sessions (dell-linux sat at 20/20 on 2026-10-05) must
+    # still admit the short-lived repair/lifecycle helper sessions that fix
+    # it. Only names starting with one of maintenance_session_prefixes may
+    # use the reserve, at most maintenance_reserve_sessions of them at once;
+    # they never count against the user limit, and user sessions can never
+    # spill into the reserve. 0 disables it.
+    maintenance_reserve_sessions: int = 2
+    maintenance_session_prefixes: tuple[str, ...] = ("tmcp-maint-",)
     # Conservative RAM slice assumed per session when deriving the limit.
     # A pane may run a real agent (claude/codex), not just a shell, so
     # this is deliberately not the few MB the pipe itself costs.
@@ -2780,6 +2789,17 @@ def _load_session_lifecycle_config(raw: object) -> SessionLifecycleConfig:
     max_sessions = raw.get("max_sessions", SessionLifecycleConfig.max_sessions)
     if not isinstance(max_sessions, int) or isinstance(max_sessions, bool) or max_sessions < 0:
         raise ValueError("session_lifecycle.max_sessions must be a non-negative integer (0 = derive from machine RAM)")
+    maintenance_reserve = raw.get("maintenance_reserve_sessions",
+                                  SessionLifecycleConfig.maintenance_reserve_sessions)
+    if not isinstance(maintenance_reserve, int) or isinstance(maintenance_reserve, bool) \
+            or not 0 <= maintenance_reserve <= 10:
+        raise ValueError("session_lifecycle.maintenance_reserve_sessions must be an integer between 0 and 10")
+    maintenance_prefixes = raw.get("maintenance_session_prefixes",
+                                   list(SessionLifecycleConfig.maintenance_session_prefixes))
+    if not isinstance(maintenance_prefixes, list) or not all(
+            isinstance(p, str) and len(p) >= 4 for p in maintenance_prefixes):
+        raise ValueError("session_lifecycle.maintenance_session_prefixes must be a list of strings "
+                         "(at least 4 characters each)")
     max_session_ram_mb = raw.get("max_session_ram_mb", SessionLifecycleConfig.max_session_ram_mb)
     if not isinstance(max_session_ram_mb, int) or isinstance(max_session_ram_mb, bool) or max_session_ram_mb < 16:
         raise ValueError("session_lifecycle.max_session_ram_mb must be an integer >= 16")
@@ -2808,6 +2828,8 @@ def _load_session_lifecycle_config(raw: object) -> SessionLifecycleConfig:
         launch_commands=tuple(sorted(launch_raw.items())), create_ready_timeout_seconds=timeout,
         default_grant_mode=grant_mode, resume_capable_agent_types=tuple(resume_capable_raw),
         codex_yolo=codex_yolo_raw, max_sessions=max_sessions,
+        maintenance_reserve_sessions=maintenance_reserve,
+        maintenance_session_prefixes=tuple(maintenance_prefixes),
         allow_put_file=allow_put_file, max_put_file_bytes=max_put_file_bytes,
         max_session_ram_mb=max_session_ram_mb, reap_idle_sessions=reap,
         reap_idle_hours=float(reap_hours), reap_idle_commands=tuple(reap_cmds),

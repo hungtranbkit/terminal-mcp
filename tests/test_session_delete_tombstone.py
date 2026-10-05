@@ -358,3 +358,27 @@ def test_stale_snapshot_never_reopens_a_closed_lifecycle(repo, tmp_path):  # noq
     rows = by_name(reconciler(term, tmp_path, store=store).run())
     assert rows["closed-agent"]["lifecycle_state"] == CLOSED
     assert store.get("closed-agent")["state"] == CLOSED and term.deletes == []
+
+
+# -- reserved maintenance capacity ------------------------------------------------
+
+def test_maintenance_reserve_admits_repair_sessions_when_user_capacity_is_full(tmp_path, name):
+    service = _service(tmp_path, max_sessions=1, maintenance_reserve_sessions=1,
+                       maintenance_session_prefixes=("lifecycle-maint-",))
+    maint = tmux_isolation.owned_name("x", prefix="lifecycle-maint")
+    maint2 = tmux_isolation.owned_name("y", prefix="lifecycle-maint")
+    user2 = tmux_isolation.owned_name("u2", prefix="lifecycle")
+    try:
+        for session in [s.name for s in service.tmux.list_sessions()]:
+            subprocess.run([*tmux_cmd(), "kill-session", "-t", session], capture_output=True, check=False)
+        assert service.terminal_create_session(name, agent_type="shell", cwd=str(tmp_path))["state"] == "READY"
+        # User capacity is full; a maintenance helper still gets in...
+        assert service.terminal_create_session(maint, agent_type="shell", cwd=str(tmp_path))["state"] == "READY"
+        # ...but only up to the reserve, and the reserve never becomes user capacity.
+        assert service.terminal_create_session(maint2, agent_type="shell",
+                                               cwd=str(tmp_path))["error"] == "MAINTENANCE_RESERVE_FULL"
+        assert service.terminal_create_session(user2, agent_type="shell",
+                                               cwd=str(tmp_path))["error"] == "NODE_AT_SESSION_CAPACITY"
+    finally:
+        for session in (maint, maint2, user2):
+            tmux_isolation.kill_session(session)

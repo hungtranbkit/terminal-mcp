@@ -37,6 +37,8 @@ from .node_models import (
 )
 from .node_health import NodeHealthPolicy, NodeHealthService
 from .node_registry import NodeRegistry
+from .session_ownership import (ACTIVE as OWNER_ACTIVE, KILLED as OWNER_KILLED,
+                                MISSING as OWNER_MISSING, SessionOwnershipStore, epoch_from_iso)
 from .session_resource import (ContextPolicy, build_resource_block,
                               parse_session_resources)
 from .config import NodeHealthConfig
@@ -194,8 +196,13 @@ class ControllerService:
                 local_hostname: str | None = None, local_workspace_root: str = "/",
                 node_health_config: NodeHealthConfig | None = None,
                 node_health: NodeHealthService | None = None,
-                session_health: Any = None) -> None:
+                session_health: Any = None,
+                ownership: SessionOwnershipStore | None = None) -> None:
         self.registry = registry
+        # Durable positive ownership (session_ownership.py): the routing
+        # evidence that survives cache expiry, a failed listing and a
+        # controller restart. Lives next to nodes.db, like leases.db.
+        self.ownership = ownership or SessionOwnershipStore(registry.path.with_name("session_ownership.db"))
         # TMCP-SESSION-HEALTH-001: thresholds for the controller-side
         # enrichment below (_with_resource_health). Taken from THIS process's
         # own AppConfig via the local client when not passed explicitly, so a
@@ -549,6 +556,7 @@ class ControllerService:
             return {"node_id": cached.node_id, "session": session}
 
         found_on: list[str] = []
+        probed_ok: set[str] = set()
         # Nodes this pass could NOT look inside. Previously all three of these
         # `continue`s were silent, so an incomplete probe was indistinguishable
         # from a complete one -- see the SESSION_NOT_FOUND block below for the
@@ -574,6 +582,14 @@ class ControllerService:
             except NodeClientError as exc:
                 unprobed.append({"node_id": node.id, "reason": f"session listing failed: {exc}"})
                 continue
+            if not isinstance(listing, dict) or "error" in listing or "sessions" not in listing:
+                # An error-shaped answer is not a listing: it proves nothing
+                # about absence (e.g. TMUX_ERROR), so the node stays unprobed.
+                unprobed.append({"node_id": node.id, "reason": "session listing returned no inventory: "
+                                 f"{(listing or {}).get('error') if isinstance(listing, dict) else listing!r}"})
+                continue
+            probed_ok.add(node.id)
+            self._reconcile_ownership(node.id, listing)
             names = {row["name"] for row in listing.get("sessions", [])}
             if session in names:
                 found_on.append(node.id)
@@ -624,12 +640,41 @@ class ControllerService:
             # A probe that DID reach every node and found nothing still
             # reports SESSION_NOT_FOUND, unchanged.
             unprobed_ids = {entry["node_id"] for entry in unprobed}
+            # Durable ownership (session_ownership.py) -- the same "known
+            # location" argument as the cache below, but it survives TTL
+            # expiry and restarts: a known owner that could not be probed is
+            # routed to, never forgotten.
+            owners = self._owners(session)
+            known = [row for row in owners if row.state == OWNER_ACTIVE and row.node_id in unprobed_ids]
+            if len(known) > 1:
+                return {"error": "AMBIGUOUS_SESSION", "session": session,
+                        "nodes": [row.node_id for row in known], "unprobed_nodes": unprobed,
+                        "detail": f"session {session!r} is recorded on several nodes that could not be "
+                                  f"probed -- use a qualified name like '{known[0].node_id}/{session}'"}
+            if known:
+                return {"node_id": known[0].node_id, "session": session, "stale_location": True,
+                        "known_owner": known[0].public(), "unprobed_nodes": unprobed}
             if cached is not None and cached.node_id in unprobed_ids:
                 # Deliberately not re-cached: the original timestamp stays, so
                 # the next call re-probes for real instead of pinning a stale
                 # location for another full TTL.
                 return {"node_id": cached.node_id, "session": session,
                         "stale_location": True, "unprobed_nodes": unprobed}
+            # The known owner itself answered and no longer has it: a
+            # definite answer about THAT node, with its identity attached --
+            # not a lost mapping, whatever other nodes could not be asked.
+            confirmed = [row for row in owners if row.node_id in probed_ok
+                         and row.state in (OWNER_MISSING, OWNER_KILLED)]
+            if confirmed:
+                newest = max(confirmed, key=lambda row: row.updated_at)
+                deleted = newest.state == OWNER_KILLED
+                return {"error": "SESSION_DELETED" if deleted else "SESSION_RUNTIME_MISSING",
+                        "session": session, "node_id": newest.node_id, "known_owner": newest.public(),
+                        "unprobed_nodes": unprobed,
+                        "detail": (f"session {session!r} was explicitly deleted on {newest.node_id!r}"
+                                   if deleted else
+                                   f"the owning node {newest.node_id!r} answered and no longer runs "
+                                   f"{session!r} (its process exited or was killed outside this controller)")}
             if unprobed:
                 return {"error": "SESSION_LOCATION_UNKNOWN", "session": session,
                         "unprobed_nodes": unprobed,
@@ -644,6 +689,40 @@ class ControllerService:
         self._session_location_cache[session] = SessionLocation(node_id=found_on[0], cached_at=now)
         return {"node_id": found_on[0], "session": session}
 
+    # -- durable ownership helpers (never raise: routing must not break on them) --
+
+    def _owners(self, session: str) -> list[Any]:
+        try:
+            return self.ownership.owners(session)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("controller: ownership store unreadable for %s", session)
+            return []
+
+    def _reconcile_ownership(self, node_id: str, listing: dict[str, Any]) -> None:
+        """Apply one COMPLETE node listing to the ownership store."""
+        try:
+            self.ownership.reconcile_node(node_id, {
+                str(row["name"]): epoch_from_iso(row.get("created"))
+                for row in listing.get("sessions", []) if isinstance(row, dict) and row.get("name")})
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("controller: ownership reconcile failed for node %s", node_id)
+
+    def _tombstone_ownership(self, node_id: str, bare: str, result: dict[str, Any]) -> None:
+        receipt = result.get("receipt") if isinstance(result.get("receipt"), dict) else {}
+        instance = receipt.get("instance")
+        created = None
+        if isinstance(instance, str) and "@" in instance:
+            tail = instance.rsplit("@", 1)[1]
+            created = int(tail) if tail.isdigit() else None
+        try:
+            row = self.ownership.tombstone(bare, node_id, instance_id=instance, created_epoch=created)
+            receipt = dict(receipt)
+            receipt["controller_ownership"] = row.public()
+            result["receipt"] = receipt
+        except Exception as exc:  # noqa: BLE001 -- the node already acted; report it
+            result.setdefault("warnings", []).append(f"ownership tombstone failed: {exc}")
+        self._session_location_cache.pop(bare, None)
+
     # -- routed operations ---------------------------------------------------
     # Each one: resolve -> get client -> call -> merge node_id/node_name in.
     # A session-not-found/ambiguous resolution short-circuits with the
@@ -653,20 +732,33 @@ class ControllerService:
     def _route(self, session: str, op: str, call) -> dict[str, Any]:
         resolution = self.resolve_session(session)
         if "error" in resolution:
-            return resolution
+            if op in ("delete", "kill") and resolution.get("error") in ("SESSION_DELETED",
+                                                                         "SESSION_RUNTIME_MISSING"):
+                # Idempotent delete: the known owner says it is gone. Let the
+                # owner answer already_gone and write its own tombstone.
+                resolution = {"node_id": resolution["node_id"], "session": resolution["session"]}
+            else:
+                return resolution
         node_id, bare = resolution["node_id"], resolution["session"]
+        context = {key: resolution[key] for key in ("known_owner", "stale_location", "unprobed_nodes")
+                   if key in resolution}
         client = self._clients.get(node_id)
         if client is None:
-            return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": "no client configured for this node"}
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id, "session": bare,
+                    "detail": "no client configured for this node", **context}
         node = self.node_status(node_id)
         if node is None or (node.status != NODE_ONLINE and node_id != self.local_node_id):
-            return {"error": "NODE_UNREACHABLE", "node_id": node_id,
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id, "session": bare,
                     "health_state": node.health_state if node else "UNKNOWN",
-                    "detail": (node.last_error if node else None) or "node execution health is not OK"}
+                    "detail": (node.last_error if node else None) or "node execution health is not OK",
+                    **context}
         try:
             result = call(client, bare)
         except NodeClientError as exc:
-            return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": str(exc)}
+            return {"error": "NODE_UNREACHABLE", "node_id": node_id, "session": bare, "detail": str(exc),
+                    **context}
+        if op in ("delete", "kill") and isinstance(result, dict) and "error" not in result:
+            self._tombstone_ownership(node_id, bare, result)
         if isinstance(result, dict):
             result.setdefault("node_id", node_id)
             result.setdefault("node_name", node.display_name if node else node_id)
@@ -1053,6 +1145,10 @@ class ControllerService:
         if isinstance(result, dict) and "error" not in result:
             self._session_location_cache.pop(bare_old, None)
             self._session_location_cache[bare_new] = SessionLocation(node_id=node_id, cached_at=time.monotonic())
+            try:
+                self.ownership.rename(bare_old, bare_new, node_id)
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("controller: ownership rename failed %s -> %s", bare_old, bare_new)
             # Collapse any EXISTING alias chain pointing at bare_old onto
             # bare_new too (A renamed to B, B now renamed to C -> a
             # caller still using "A" should redirect straight to "C",
@@ -1505,6 +1601,12 @@ class ControllerService:
             return stop_result
 
         self._session_location_cache[bare] = SessionLocation(node_id=target_node_id, cached_at=time.monotonic())
+        try:
+            self.ownership.tombstone(bare, source_node_id)
+            self.ownership.record_created(bare, target_node_id, instance_id=None,
+                                          created_epoch=epoch_from_iso(create_result.get("created_epoch")))
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("controller: ownership update failed for moved session %s", bare)
         return {
             "session": bare, "moved_from": source_node_id, "moved_to": target_node_id,
             "node_id": target_node_id, "node_name": target_node.display_name,
@@ -1619,6 +1721,18 @@ class ControllerService:
             node_row = self.registry.get(node_id)
             result.setdefault("node_id", node_id)
             result.setdefault("node_name", node_row.display_name if node_row else node_id)
+            # Success is not reported until ownership is DURABLE: the cache
+            # below expires in 20s and dies with the process.
+            session_id, created_epoch = result.get("session_id"), result.get("created_epoch")
+            instance = f"{session_id}@{created_epoch}" if session_id and created_epoch else None
+            try:
+                row = self.ownership.record_created(name, node_id, instance_id=instance,
+                                                    created_epoch=epoch_from_iso(created_epoch))
+            except Exception as exc:  # noqa: BLE001
+                return {"error": "OWNERSHIP_NOT_RECORDED", "session": name, "node_id": node_id,
+                        "session_created": True, "detail": f"{type(exc).__name__}: {exc}",
+                        "next_action": f"address it as '{node_id}/{name}' until ownership is recorded"}
+            result["ownership"] = row.public()
             self._session_location_cache[name] = SessionLocation(node_id=node_id, cached_at=time.monotonic())
         return result
 
@@ -1679,6 +1793,8 @@ class ControllerService:
                                     "status": status, "detail": str(value)})
                 continue
             listing = value if isinstance(value, dict) else {}
+            if "sessions" in listing and "error" not in listing:
+                self._reconcile_ownership(node.id, listing)
             for row in listing.get("sessions", []):
                 row = dict(row)
                 row.setdefault("node_id", node.id)

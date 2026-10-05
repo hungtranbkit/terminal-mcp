@@ -140,7 +140,7 @@ GROUPS.setdefault('prompt_submission', []).extend(['composer.py', 'delivery_gate
 GROUPS.setdefault('queue', []).extend(['analysis_gate.py', 'queue_event_drain.py'])
 GROUPS.setdefault('security', []).extend(['replay_guard.py', 'token_rotation.py'])
 GROUPS.setdefault('session_ops', []).extend(['lifecycle_service.py', 'lifecycle_store.py', 'session_deletion.py', 'session_matcher.py', 'session_resource.py'])
-GROUPS.setdefault('session_registry', []).extend(['registry_cleanup.py', 'stale_sessions.py'])
+GROUPS.setdefault('session_registry', []).extend(['registry_cleanup.py', 'stale_sessions.py', 'session_ownership.py'])
 GROUPS.setdefault('windows', []).extend(['windows_detached.py', 'windows_session_host.py'])
 GROUPS.setdefault('work_runtime', []).extend(['run_journal.py', 'work_microtask.py', 'work_recovery.py', 'work_runtime.py'])
 GROUPS.setdefault('work_telemetry', []).extend(['tool_metrics.py', 'work_telemetry_service.py', 'work_telemetry_store.py'])
