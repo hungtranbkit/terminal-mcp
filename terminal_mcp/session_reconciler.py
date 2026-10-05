@@ -114,6 +114,7 @@ UNPROVEN_AGENT_CLASSES = frozenset({
     "AGENT_NOT_IDLE", "UNKNOWN_CWD", "NO_REPO", "NO_BASE_REF",
     "DIRTY_WORKTREE", "UNMERGED_BRANCH", "IDLE_PRIMARY_CHECKOUT",
 })
+_TERMINAL_STATES = frozenset({CLOSED, GONE})
 
 SHELL_COMMANDS = frozenset({"bash", "sh", "zsh", "fish", "dash"})
 EDITOR_COMMANDS = frozenset({"vim", "nvim", "vi", "nano", "emacs", "hx", "micro", "kak"})
@@ -359,6 +360,17 @@ def classify(row: dict[str, Any], *, policy: Any, protected: set[str], now: floa
         return out("UNKNOWN_CWD", "working directory could not be checked")
     if git.get("is_repo") is not True:
         return out("NO_REPO", "not inside a git repository; completion cannot be proven")
+    if git.get("unattributed_shared_state"):
+        # A primary checkout is where every agent starts; its uncommitted or
+        # unmerged state belongs to whoever made it, and nothing ties it to
+        # THIS session. Treated exactly like an idle agent in a clean primary
+        # checkout -- never as this session's unfinished work, never
+        # checkpointed under its name, and never closed early either (the
+        # close_clean_primary_checkouts shortcut is for proven-clean trees).
+        return out("IDLE_PRIMARY_CHECKOUT", "idle in a shared primary checkout; its "
+                   + git["unattributed_shared_state"] + " is not attributed to this session "
+                   "(no dedicated-worktree ownership recorded)", branch=git.get("branch"),
+                   shared_checkout_state=git["unattributed_shared_state"])
     if git.get("dirty") is not False:
         return out("DIRTY_WORKTREE", "uncommitted changes" if git.get("dirty") else "git status failed",
                    dirty_entries=git.get("dirty_entries"))
@@ -600,6 +612,8 @@ class SessionReconciler:
             if retry is not None:
                 output, pane_state = retry, classify_status(info, retry, now=int(now))[0]
         git = self._git_probe(row["cwd"]) if row["cwd"] and not is_service else None
+        if git is not None:
+            git = self._attribute_git(info.name, git)
         result = classify(row, policy=policy, protected=protected, now=now, active_refs=refs,
                           pane_state=pane_state, git=git, service_health=health)
         result["pane_state"] = pane_state
@@ -608,8 +622,44 @@ class SessionReconciler:
                                if output is not None else None)
         if git is not None:
             result["git"] = {k: git.get(k) for k in ("exists", "is_repo", "toplevel", "branch", "dirty",
-                                                       "dirty_entries", "unmerged", "linked_worktree")}
+                                                       "dirty_entries", "unmerged", "linked_worktree",
+                                                       "owned_worktree", "unattributed_shared_state")}
         return result
+
+    def _owned_worktree(self, name: str) -> str | None:
+        """The dedicated worktree recorded for this session at create time
+        (session_registry.worktree_path), or None. Never raises."""
+        registry = getattr(self.terminal, "session_registry", None)
+        if registry is None:
+            return None
+        try:
+            record = registry.get(getattr(self.terminal, "REGISTRY_LOCAL_NODE_ID", "local"), name)
+        except Exception:  # noqa: BLE001 -- missing ownership evidence is just missing
+            return None
+        return getattr(record, "worktree_path", None) or None
+
+    def _attribute_git(self, name: str, git: dict[str, Any]) -> dict[str, Any]:
+        """Decide whose git state this is. Ownership metadata wins: a
+        session with a recorded dedicated worktree is judged on THAT worktree
+        (gone -> ORPHAN_WORKTREE_MISSING, merged and clean -> COMPLETED_CLEAN)
+        wherever its pane happens to sit. Without it, a primary checkout's
+        dirty/unmerged state is unattributed -- the shared repo's state is
+        never evidence of this session's unfinished task."""
+        owned = self._owned_worktree(name)
+        if owned:
+            here = git.get("toplevel")
+            if not here or os.path.realpath(here) != os.path.realpath(owned):
+                git = self._git_probe(owned)
+            return {**git, "owned_worktree": owned}
+        if git.get("is_repo") is True and git.get("linked_worktree") is False \
+                and (git.get("dirty") or git.get("unmerged")):
+            parts = []
+            if git.get("dirty"):
+                parts.append(f"uncommitted state ({git.get('dirty_entries') or '?'} entries)")
+            if git.get("unmerged"):
+                parts.append(f"unmerged branch {git.get('branch')!r}")
+            return {**git, "unattributed_shared_state": " and ".join(parts)}
+        return git
 
     @staticmethod
     def _identity(info: Any) -> str:
@@ -622,6 +672,10 @@ class SessionReconciler:
         grace = float(getattr(self.policy, "recovery_grace_minutes", 30.0)) * 60
         if record is not None and record.get("identity") != identity:
             record = None  # same name, different tmux session: start fresh
+        if record is not None and record.get("state") == CLOSED:
+            # The exact instance that was closed/deleted, seen in a snapshot
+            # taken before it went away: never reopen its lifecycle.
+            return dict(record)
         previous_state = record.get("state") if record else None
         new = {"session": row["session"], "identity": identity,
                "classification": row["classification"], "reason": row["reason"],
@@ -711,15 +765,21 @@ class SessionReconciler:
                 "blocked": [r["session"] for r in rows if r["lifecycle_state"] == BLOCKED]}
 
     def lifecycle_for(self, session: str) -> dict[str, Any] | None:
-        """Stored lifecycle view for list/inspect annotations. Never raises."""
+        """Stored lifecycle view for list/inspect annotations. Never raises.
+        CLOSED/GONE records are omitted: they describe an instance that no
+        longer exists, so a live session by that name is a newer one the
+        reconciler has not observed yet -- it must not inherit them."""
         try:
-            return public_lifecycle(self.store.get(session))
+            record = self.store.get(session)
         except Exception:  # noqa: BLE001 -- an annotation must never break a read
             return None
+        return None if record is None or record.get("state") in _TERMINAL_STATES \
+            else public_lifecycle(record)
 
     def lifecycle_index(self) -> dict[str, dict[str, Any]]:
         try:
-            return {name: public_lifecycle(rec) for name, rec in self.store.all().items()}
+            return {name: public_lifecycle(rec) for name, rec in self.store.all().items()
+                    if rec.get("state") not in _TERMINAL_STATES}
         except Exception:  # noqa: BLE001
             return {}
 
@@ -743,6 +803,8 @@ class SessionReconciler:
             return None
         if git.get("is_repo") is not True or not (git.get("dirty") or git.get("unmerged")):
             return None
+        if git.get("unattributed_shared_state"):
+            return None  # someone else's work in a shared checkout
         return checkpoint_git(row["cwd"], row["session"],
                               patch_dir=Path(os.path.expanduser(self.policy.scrollback_dir)) / "checkpoints",
                               max_untracked_bytes=int(getattr(self.policy, "checkpoint_max_untracked_mb", 200))

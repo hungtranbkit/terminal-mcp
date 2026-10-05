@@ -779,7 +779,8 @@ def build_mcp(service: TerminalService | None = None,
                       long_task: Annotated[bool, Field(description=_LONG_TASK_SCHEMA_HELP, deprecated=True)] = False,
                       url: str | None = None, args: dict | None = None,
                       path: str | None = None, content_b64: str | None = None,
-                      overwrite: bool = False, mode: str | None = None) -> dict:
+                      overwrite: bool = False, mode: str | None = None,
+                      confirm: bool | None = None) -> dict:
         """THE terminal surface: direct session control only.
 
 NORMAL FLOW:
@@ -812,7 +813,7 @@ Direct actions:
                 args.max_continuations (default 6). Do not resend.
   supervise_status/supervise_complete/supervise_cancel  (task_id)
   list_sessions/list, list_nodes/nodes
-  create_session/create, delete_session/delete (args={"confirm": true})
+  create_session/create, delete_session/delete (confirm=true, or args={"confirm": true})
   session_lifecycle (read-only classification), session_reconcile (dry run by default)
   task_status/task, task_batch_status/tasks (read-only historical task state)
   browser_verify/browser_screenshot/browser_status/browser_stop
@@ -836,7 +837,7 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
             timeout=timeout, poll_interval=poll_interval, tail_lines=tail_lines,
             compact=compact, idempotency_key=idempotency_key,
             path=path, content_b64=content_b64, overwrite=overwrite, mode=mode,
-            agent_type=agent_type, working_directory=working_directory,
+            confirm=confirm, agent_type=agent_type, working_directory=working_directory,
             initial_prompt=initial_prompt, grant_mode=grant_mode, binding=binding,
             node=node, title=title, priority=priority, metadata=metadata,
             request_key=request_key, task_id=task_id, task_ids=task_ids,

@@ -885,7 +885,8 @@ class CompactTerminalTools:
              task_id: str | None = None,
              task_ids: list[str] | None = None,
              long_task: bool = False,
-             url: str | None = None, args: dict | None = None) -> dict[str, Any]:
+             url: str | None = None, args: dict | None = None,
+             confirm: bool | None = None) -> dict[str, Any]:
         """One MCP-call surface for one logical terminal turn.
 
         Pane actions, implemented here:
@@ -904,7 +905,8 @@ class CompactTerminalTools:
         - create_session (create): `target` is the new name; agent_type,
           working_directory, initial_prompt, grant_mode, binding, node apply.
         - delete_session (delete, kill): `target` is the name; requires
-          `args={"confirm": true}` (omitted -> CONFIRMATION_REQUIRED). Attached,
+          `confirm=true` (or `args={"confirm": true}`; omitted ->
+          CONFIRMATION_REQUIRED, nothing deleted). Attached,
           leased, recovering, protected and active-work sessions are refused
           regardless of confirmation.
         - enqueue_task (enqueue): `target` is the session, `text` the prompt;
@@ -938,6 +940,20 @@ class CompactTerminalTools:
         # created unless the server operator explicitly opts in.
         if (normalized in QUEUE_SUBMISSION_ACTIONS or (normalized == "send" and long_task)) and not queue_submission_enabled():
             return queue_disabled_response(action=normalized)
+
+        if normalized == "delete_session" and confirm is not None:
+            # Top-level `confirm` is the spelling the legacy
+            # terminal_delete_session tool taught every client. Before it was
+            # a parameter here, the schema silently dropped it and every such
+            # delete came back CONFIRMATION_REQUIRED -- live on 2026-10-04,
+            # three rounds of "deleted" CDTM sessions that were never killed.
+            if type(confirm) is not bool:
+                return {"status": "FAILED", "error": "INVALID_ARGUMENT", "action": normalized,
+                        "detail": "confirm must be a boolean"}
+            if isinstance(args, dict) and "confirm" in args and args["confirm"] is not confirm:
+                return {"status": "FAILED", "error": "INVALID_ARGUMENT", "action": normalized,
+                        "detail": "confirm and args.confirm disagree"}
+            args = {**(args if isinstance(args, dict) else {}), "confirm": confirm}
 
         if normalized in TURN_HANDLER_ACTIONS:
             return self._handler_turn(

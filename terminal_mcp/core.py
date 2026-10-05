@@ -36,7 +36,7 @@ from .redaction import (redact_ansi_safe, redact_output, redact_text,
                         redaction_marker, strip_ansi)
 from .session_backend import SessionBackend
 from .session_knowledge import SessionKnowledgeStore, make_instance_id
-from .session_registry import SessionRegistryStore
+from .session_registry import SessionRegistryStore, instance_identity, linked_worktree_root
 from .session_resource import (ContextPolicy, build_resource_block,
                               parse_session_resources, probe_git_state)
 from .status import classify_status
@@ -486,6 +486,9 @@ class TerminalService:
         # Kill/Reopen reopen-metadata store -- see killed_sessions.py and
         # terminal_kill_session/terminal_reopen_session below.
         self.killed_sessions = killed_sessions or KilledSessionStore()
+        # session_reconciler.LifecycleStore, resolved lazily on the first
+        # delete so an import-time server build never creates a state file.
+        self.lifecycle_store: Any = None
         # Persistent Session Registry -- durable record of every session
         # ever discovered/created, independent of the tmux/Windows-backend
         # process's own lifetime (session_registry.py's own module
@@ -678,6 +681,12 @@ class TerminalService:
                     "read_granted": bool(grant and grant.read_enabled),
                     "input_granted": bool(grant and grant.input_enabled),
                     "binding_names": tuple(bindings_by_session.get(item.name, ())),
+                    # Which tmux instance this snapshot saw: lets the registry
+                    # refuse to revive an instance deleted after the snapshot
+                    # was taken (session_registry._stale_sighting_of_tombstone).
+                    "identity": instance_identity(getattr(item, "session_id", None),
+                                                  getattr(item, "created_epoch", None)),
+                    "created_epoch": getattr(item, "created_epoch", None),
                 })
             # Watchdog: every session in this batch is seen ACTIVE right now,
             # so `mark_recovered` closes out any unrecovered drop event for
@@ -4479,6 +4488,10 @@ class TerminalService:
             # what its docstring always claimed.
             launch_command=self.lifecycle.launch_command_for(agent_type),
             launcher_type=agent_type,
+            # A session started inside a linked worktree owns that worktree;
+            # the lifecycle reconciler reads this instead of guessing from a
+            # shared checkout's state.
+            worktree_path=linked_worktree_root(result.get("cwd")),
             created_by_controller=True,
         )
 
@@ -4607,7 +4620,12 @@ class TerminalService:
         if confirm is not True:
             self.audit.record(action=action, session=name, result="BLOCKED", reason="CONFIRMATION_REQUIRED",
                               actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
-            return {"error": "CONFIRMATION_REQUIRED", "session": name,
+            # `deleted: false` + receipt: nothing was killed and nothing was
+            # tombstoned. Callers that skimmed past `error` used to report
+            # these refusals as successful deletes.
+            return {"error": "CONFIRMATION_REQUIRED", "session": name, "deleted": False,
+                    "receipt": {"node_id": self.REGISTRY_LOCAL_NODE_ID, "tmux_kill": "not_attempted",
+                                "registry_tombstone": None},
                     "next_action": ("retry with confirm=true (terminal_delete_session) or "
                                     "terminal_turn(action='delete_session', target=<name>, "
                                     "args={'confirm': true})")}
@@ -4626,12 +4644,75 @@ class TerminalService:
         ok = "error" not in result
         if ok:
             self._cleanup_after_session_gone(name)
-            self.session_registry.mark_killed(self.REGISTRY_LOCAL_NODE_ID, name, killed_by="dashboard:delete")
+            identity = instance_identity(getattr(info, "session_id", None),
+                                         getattr(info, "created_epoch", None)) if info is not None else None
+            result["receipt"] = self._delete_tombstone(name, identity, result,
+                                                       actor=requested_by or "dashboard:delete")
             result["references"] = references
         self.audit.record(action=action, session=name, result="DELETED" if ok else "BLOCKED",
                           reason=result.get("error") or result.get("action"), actor=requested_by,
                           node_id=self.REGISTRY_LOCAL_NODE_ID)
         return result
+
+    def _delete_tombstone(self, name: str, identity: str | None, result: dict[str, Any], *,
+                          actor: str) -> dict[str, Any]:
+        """Make an explicit delete durable, and say exactly what happened.
+
+        The tmux kill alone is not enough: the registry row must become a
+        KILLED tombstone naming the removed instance (so a stale inventory
+        cannot revive it), and the lifecycle row must stop advertising a
+        RECOVERY_REQUIRED state for a session the operator ended. Checkpoint
+        refs and patch files are archival and deliberately left alone.
+        """
+        receipt: dict[str, Any] = {
+            "node_id": self.REGISTRY_LOCAL_NODE_ID,
+            "tmux_kill": "killed" if result.get("deleted") else "already_gone",
+            "instance": identity,
+        }
+        try:
+            still_there = self.tmux.get_session(name)
+        except TmuxError:
+            still_there = None
+        # A same-named session that exists now is a different instance only
+        # if its identity differs; the deleted one must be gone.
+        receipt["tmux_absent_verified"] = still_there is None or (
+            identity is not None and instance_identity(getattr(still_there, "session_id", None),
+                                                       getattr(still_there, "created_epoch", None)) != identity)
+        try:
+            record = self.session_registry.mark_killed(self.REGISTRY_LOCAL_NODE_ID, name,
+                                                       killed_by=actor, identity=identity)
+            receipt["registry_tombstone"] = {
+                "status": record.status if record else None,
+                "generation": record.generation if record else None,
+                "tombstone_identity": record.tombstone_identity if record else None,
+            }
+        except Exception as exc:  # noqa: BLE001 -- the kill already happened; report, never raise
+            receipt["registry_tombstone"] = {"error": f"{type(exc).__name__}: {exc}"}
+        receipt["lifecycle"] = self._mark_lifecycle_deleted(name, actor=actor)
+        return receipt
+
+    def _mark_lifecycle_deleted(self, name: str, *, actor: str) -> str | None:
+        """Close this host's session_lifecycle row for an operator-ended
+        session. Only an existing row is touched (the reconciler owns
+        creating them). Returns the stored state, or None if there was no row
+        or the store is unavailable. Never raises."""
+        try:
+            from .session_reconciler import CLOSED, LifecycleStore
+            store = self.lifecycle_store or LifecycleStore()
+            self.lifecycle_store = store
+            record = store.get(name)
+            if record is None:
+                return None
+            if record.get("state") != CLOSED:
+                now = time.time()
+                record.update(state=CLOSED, closed_at=now, updated_at=now,
+                              first_uncontrolled_at=None, grace_expires_at=None,
+                              reason=f"deleted explicitly by {actor}")
+                store.put(record)
+            return CLOSED
+        except Exception:  # noqa: BLE001 -- lifecycle bookkeeping must never fail a delete
+            _log.warning("lifecycle tombstone failed for %s", name, exc_info=True)
+            return None
 
     def _cleanup_after_session_gone(self, session: str) -> None:
         """Called once terminal_delete_session has confirmed `session` no
@@ -4782,7 +4863,11 @@ class TerminalService:
                 cwd=metadata["working_directory"] if metadata else None,
                 agent_type=metadata["agent_type"] if metadata else None,
                 backend_type=self._registry_backend_type(),
+                identity=(instance_identity(getattr(info, "session_id", None),
+                                            getattr(info, "created_epoch", None))
+                          if info is not None else None),
             )
+            self._mark_lifecycle_deleted(name, actor=requested_by or "kill")
             result["references"] = references
         self.audit.record(action=action, session=name, result="KILLED" if ok else "BLOCKED",
                           reason=result.get("error") or result.get("action"), actor=requested_by,

@@ -147,6 +147,29 @@ def _add_launch_provenance_column(connection: sqlite3.Connection) -> None:
         "ALTER TABLE session_records ADD COLUMN created_by_controller INTEGER NOT NULL DEFAULT 0")
 
 
+def _add_tombstone_generation_columns(connection: sqlite3.Connection) -> None:
+    """Delete tombstones that a stale inventory cannot undo.
+
+    `generation`: the creation epoch of this NAME on this node. 1 for the
+    first instance (and every pre-existing row, which is the honest backfill:
+    nothing before this migration counted instances). It advances only when a
+    KILLED row is seen alive again as a genuinely NEW tmux instance, so "the
+    same name, created again on purpose" and "the instance that was deleted"
+    are never the same record.
+
+    `tombstone_identity`: `session_id@created_epoch` of the exact tmux
+    instance an explicit delete/kill removed. A reconcile pass that captured
+    the tmux list BEFORE the delete and writes it AFTER is replaying that very
+    instance; it used to flip KILLED back to ACTIVE (clearing killed_at), the
+    next pass then saw it gone and marked it MISSING, and MISSING is what
+    auto-recovery relaunches. Rows killed before this migration have no
+    identity; for those the kill time is the fallback (see
+    `_stale_sighting_of_tombstone`).
+    """
+    connection.execute("ALTER TABLE session_records ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
+    connection.execute("ALTER TABLE session_records ADD COLUMN tombstone_identity TEXT")
+
+
 REGISTRY_MIGRATIONS: list[Migration] = [
     Migration(1, "baseline: session_records", lambda connection: None),
     # Conversation-continuity follow-up (2026-09-07): `conversation_id`
@@ -166,6 +189,8 @@ REGISTRY_MIGRATIONS: list[Migration] = [
              _add_auto_recovery_columns),
     Migration(4, "record whether the controller created a session, rather than inferring it",
              _add_launch_provenance_column),
+    Migration(5, "delete tombstone identity + per-name creation generation",
+             _add_tombstone_generation_columns),
 ]
 
 #: What this process called its own node before the deployment gave the
@@ -231,6 +256,23 @@ def probe_project_info(cwd: str | None) -> dict[str, str | None]:
     }
 
 
+def linked_worktree_root(cwd: str | None) -> str | None:
+    """The toplevel of the LINKED git worktree `cwd` is in, or None (not a
+    repo, unreadable, or the repository's primary checkout). Recorded at
+    create time as the session's own dedicated worktree: the one piece of
+    ownership metadata the lifecycle reconciler treats as authoritative over
+    whatever state a shared primary checkout happens to be in."""
+    if not cwd or not os.path.isdir(cwd):
+        return None
+    out = _run_git(cwd, "rev-parse", "--show-toplevel", "--absolute-git-dir", "--git-common-dir")
+    lines = (out or "").splitlines()
+    if len(lines) < 3:
+        return None
+    toplevel, git_dir, common = lines[0], lines[1], lines[2]
+    common_abs = os.path.realpath(common if os.path.isabs(common) else os.path.join(toplevel, common))
+    return toplevel if os.path.realpath(git_dir) != common_abs else None
+
+
 def default_session_registry_path() -> Path:
     override = os.environ.get("TERMINAL_MCP_SESSION_REGISTRY_DB")
     if override:
@@ -285,6 +327,10 @@ class SessionRecord:
     # the lifecycle create path. Never inferred from what the pane happens
     # to be running -- see _add_launch_provenance_column.
     created_by_controller: bool = False
+    # Creation epoch of this name on this node, and the tmux instance an
+    # explicit delete tombstoned -- see _add_tombstone_generation_columns.
+    generation: int = 1
+    tombstone_identity: str | None = None
 
     @property
     def recoverable(self) -> bool:
@@ -390,7 +436,14 @@ _UPSERT_SEEN_SQL = (
                        -- and a discovery pass can never claim one it did not.
                        created_by_controller = MAX(excluded.created_by_controller,
                                                    session_records.created_by_controller),
-                       recovery_state = NULL, recovery_detail = NULL
+                       recovery_state = NULL, recovery_detail = NULL,
+                       -- A KILLED row seen alive again reaches here only as a NEW
+                       -- instance (stale sightings of the deleted one are
+                       -- filtered out before this statement): a new generation.
+                       generation = CASE WHEN session_records.status = 'KILLED'
+                                         THEN session_records.generation + 1
+                                         ELSE session_records.generation END,
+                       tombstone_identity = NULL
                 """
 )
 
@@ -423,7 +476,42 @@ def _from_row(row: sqlite3.Row | None) -> SessionRecord | None:
         last_checkpoint_at=row["last_checkpoint_at"], last_checkpoint_detail=row["last_checkpoint_detail"],
         recovery_generation=row["recovery_generation"], recovery_attempts=row["recovery_attempts"],
         created_by_controller=bool(row["created_by_controller"]),
+        generation=int(row["generation"] or 1), tombstone_identity=row["tombstone_identity"],
     )
+
+
+def instance_identity(session_id: Any, created_epoch: Any) -> str | None:
+    """`session_id@created_epoch` of one tmux instance, or None if unknown.
+    tmux never reuses a `$N` id within one server, and the epoch separates
+    servers, so the pair names exactly one instance."""
+    if session_id in (None, "") or created_epoch in (None, ""):
+        return None
+    return f"{session_id}@{created_epoch}"
+
+
+def _stale_sighting_of_tombstone(existing: "SessionRecord | None", identity: str | None,
+                                 created_epoch: Any) -> bool:
+    """True when a sighting is the very instance an explicit delete removed.
+
+    Only a KILLED row can be stale, and only a sighting that says which
+    instance it saw can be judged: an explicit create/reopen passes no
+    identity and always counts as a new generation. With a recorded tombstone
+    identity the answer is exact. Rows killed before identities were recorded
+    fall back to time: an instance created strictly before the kill cannot be
+    a later re-creation (same-second re-creation is treated as new, since
+    keeping a real session out of the registry is the worse error).
+    """
+    if existing is None or existing.status != STATUS_KILLED:
+        return False
+    if identity is not None and existing.tombstone_identity:
+        return identity == existing.tombstone_identity
+    if created_epoch in (None, "") or not existing.killed_at:
+        return False
+    try:
+        killed = datetime.fromisoformat(existing.killed_at).timestamp()
+        return float(created_epoch) < int(killed)
+    except (TypeError, ValueError):
+        return False
 
 
 class SessionRegistryStore:
@@ -617,6 +705,7 @@ class SessionRegistryStore:
                     binding_names: tuple[str, ...] = (), backfill_project: bool = True,
                     conversation_id: str | None = None, worktree_path: str | None = None,
                     created_by_controller: bool = False,
+                    identity: str | None = None, created_epoch: Any = None,
                     now: str | None = None) -> SessionRecord:
         """Called on every reconcile pass for a session CURRENTLY observed
         alive -- status always becomes ACTIVE (a session that reappears
@@ -639,8 +728,13 @@ class SessionRegistryStore:
         meaningful (mirrors killed_at/offline_at's own "clear on
         ACTIVE" treatment just below)."""
         now = now or _now_iso()
+        existing = self.get(node_id, session_name)
+        if _stale_sighting_of_tombstone(existing, identity, created_epoch):
+            # The instance an explicit delete removed, observed before the
+            # delete and written after it. Never undo the tombstone.
+            return existing
         params = _upsert_seen_params(
-            node_id, session_name, self.get(node_id, session_name), now=now,
+            node_id, session_name, existing, now=now,
             node_name=node_name, backend_type=backend_type, cwd=cwd, agent_type=agent_type,
             launch_command=launch_command, launcher_type=launcher_type,
             last_known_state=last_known_state, read_granted=read_granted,
@@ -677,7 +771,6 @@ class SessionRegistryStore:
         if not rows:
             return {}
         now = now or _now_iso()
-        names = [str(row["session_name"]) for row in rows]
         with self._connection() as connection:
             # ONE read of everything this pass might update, instead of two
             # per session. Bounded by the node's own row count, which is the
@@ -688,6 +781,13 @@ class SessionRegistryStore:
                 record = _from_row(found)
                 if record is not None:
                     existing[record.session_name] = record
+            # A pass whose tmux snapshot predates an explicit delete must not
+            # resurrect the deleted instance (see _stale_sighting_of_tombstone).
+            rows = [row for row in rows if not _stale_sighting_of_tombstone(
+                existing.get(str(row["session_name"])), row.get("identity"), row.get("created_epoch"))]
+            if not rows:
+                return {}
+            names = [str(row["session_name"]) for row in rows]
             params = [
                 _upsert_seen_params(
                     node_id, str(row["session_name"]), existing.get(str(row["session_name"])),
@@ -922,8 +1022,15 @@ class SessionRegistryStore:
     def mark_killed(self, node_id: str, session_name: str, *, killed_by: str | None = None,
                     reopen_metadata: dict[str, Any] | None = None, cwd: str | None = None,
                     agent_type: str | None = None, backend_type: str | None = None,
+                    identity: str | None = None,
                     now: str | None = None) -> SessionRecord | None:
-        """An UPSERT, not a plain UPDATE -- a session created and killed in
+        """`identity` (instance_identity of the tmux instance removed) is
+        the tombstone: a later sighting of that same instance -- a reconcile
+        pass that listed tmux before this kill -- can never bring the row back
+        (see _stale_sighting_of_tombstone). Unknown (None) keeps the previous
+        value only when the row was already KILLED, never a live instance's.
+
+        An UPSERT, not a plain UPDATE -- a session created and killed in
         quick succession, with no reconcile pass (no dashboard/MCP listing
         call) ever having run in between, would otherwise have NO row to
         update at all, silently losing the kill event and its metadata
@@ -947,9 +1054,13 @@ class SessionRegistryStore:
             connection.execute(
                 """INSERT INTO session_records
                    (node_id, session_name, backend_type, cwd, agent_type, created_at, last_seen_at,
-                    status, killed_at, metadata_complete, notes)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 'KILLED', ?, ?, ?)
+                    status, killed_at, metadata_complete, notes, tombstone_identity)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'KILLED', ?, ?, ?, ?)
                    ON CONFLICT(node_id, session_name) DO UPDATE SET
+                       tombstone_identity = CASE
+                           WHEN excluded.tombstone_identity IS NOT NULL THEN excluded.tombstone_identity
+                           WHEN session_records.status = 'KILLED' THEN session_records.tombstone_identity
+                           ELSE NULL END,
                        status = 'KILLED', killed_at = excluded.killed_at,
                        cwd = COALESCE(session_records.cwd, excluded.cwd),
                        agent_type = COALESCE(session_records.agent_type, excluded.agent_type),
@@ -957,7 +1068,7 @@ class SessionRegistryStore:
                        metadata_complete = excluded.metadata_complete,
                        notes = COALESCE(excluded.notes, session_records.notes)""",
                 (node_id, session_name, effective_backend, effective_cwd, effective_agent, created_at, now,
-                 now, int(metadata_complete), notes),
+                 now, int(metadata_complete), notes, identity),
             )
         return self.get(node_id, session_name)
 
