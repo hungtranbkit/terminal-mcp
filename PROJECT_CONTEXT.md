@@ -1,5 +1,99 @@
 # PROJECT_CONTEXT.md
 
+## Node registry flapping / list_nodes vs create_session — 2026-10-06 (fixed, deployed)
+
+Symptom from ChatGPT: m910 kept alternating online/offline. `list_nodes` showed m910 online and healthy, and the very next
+`create_session(node="m910")` returned `NODE_UNREACHABLE`. hp-linux was listed online, yet create returned `NODE_NOT_FOUND`.
+
+### Topology (verified 2026-10-06; supersedes older notes that call m910 or Dell "the controller")
+- **Canonical controller = HP** (`hp-linux`, `kimex@100.67.53.117`, `~/workspace/terminal-mcp`). Units:
+  `terminal-mcp-http` (8766 on loopback, plus the tailnet address for node heartbeats/enrollment only),
+  `terminal-mcp-chatgpt-v1` (127.0.0.1:8768, the compact one-tool ChatGPT surface), and `terminal-mcp-tunnel`. The tunnel is
+  tunnel-client profile `terminal-mcp`, tunnel id `tunnel_6a952da18e308191bfeb3c138409704b`, and points at 8768.
+- All node agents heartbeat to HP: m910 (`100.117.214.87:8790`, `~/terminal-mcp`), dell-linux (`100.81.85.120:8790`), and
+  dell-5530 (via m910's heartbeat relay). m910 runs **no controller** any more; it is a worker only.
+- **Dell is a fallback controller only** (`terminal-mcp-http` on 127.0.0.1:8766). Its registry is not fed by heartbeats: m910
+  has been offline there since 09-10 with a stale LAN endpoint, and hp-linux is missing. Dell still serves the dashboard
+  Cloudflare tunnel (`terminal-dashboard`/`terminal-login.mesflow.net`, tunnel `8c7346ce…`) because HP has that config but
+  does not run it. **The dashboard therefore still shows Dell's stale fleet view.** Follow-up: move that tunnel to HP
+  (check webauth/Access users first). It was not changed in this task.
+
+### Root causes
+1. **Split brain (main cause of the reported symptom).** Dell's `terminal-mcp-tunnel.service` (profile `terminal-mcp`, same
+   tunnel id, → Dell 8766 full surface) ran alongside HP's. In 24h, Dell forwarded 1791 ChatGPT calls and HP 1768. Dell's
+   unversioned `~/.local/bin/terminal-mcp-tunnel-guard` still treated **m910:8766** as the primary. m910 stopped serving 8766
+   when the controller moved to HP, so the guard always allowed Dell to join. The guard's `enforce` mode was not on any timer.
+   A list answered by HP followed by a create answered by Dell produced exactly the observed NODE_UNREACHABLE/NODE_NOT_FOUND.
+2. **Reconnect amplifier (code).** The execution-probe backoff (`next_retry_at`, up to 300s) earned during a host stall
+   survived the heartbeat gap. `NodeHealthService.evaluate` never probes a non-online node, so after heartbeats resumed the
+   node stayed DEGRADED/`EXECUTION_DOWN` for minutes. HP's `node_status_events` show m910 cycling online→degraded→offline
+   15:38–16:51 UTC on 10-05.
+3. **Stale "online" (code).** A successful probe is cached for `probe_interval_seconds` (20s). Transport failures in routed
+   create/send were not fed back into health, so `list_nodes` kept saying online while creates failed.
+4. **m910 host pressure (environment).** Swap at 2.7G and many Chrome profiles (facebook-radar, grok, gemini, chatgpt,
+   deepseek, muse) plus openclaw caused snapd and journald watchdog timeouts (journald at 23:51 local), and a global OOM
+   killed `facebook-radar-chrome`. The agent cgroup showed `sock_throttled`, and heartbeat pushes timed out
+   (22:43–22:57 local). This is still a risk: those browser services are other projects' and were not capped.
+
+### Changes (commit `d2d4417` on main)
+- `terminal_mcp/node_registry.py` `heartbeat()`: a heartbeat that ends a transport gap (no previous heartbeat, or the
+  previous one is older than `degraded_after_seconds`) clears **only** `next_retry_at`. The failure count and state stay, and
+  the next read must still earn ONLINE with a real probe. Heartbeats inside the fresh window keep backoff, as before.
+- `terminal_mcp/node_health.py` `record_operation_failure()`: records a routed operation's network failure as a failed probe.
+  `allow_self_heal=False`, so one slow operation never restarts an agent.
+- `terminal_mcp/controller.py` `_note_transport_failure()`: called from `terminal_create_session` and `_route` on
+  `NodeClientError` with `http_status is None`. Skipped for HTTP 4xx/5xx and for the local node. create_session
+  `NODE_NOT_FOUND` now carries `controller_node_id` and `known_node_ids`; `NODE_UNREACHABLE` carries `controller_node_id` and
+  `health_state`, so a misrouted call identifies the controller that answered it.
+- `deploy/tunnel/terminal-mcp-tunnel-guard` is now versioned. The primary is **required** in
+  `~/.config/terminal-mcp/tunnel-guard.env`; without it the guard fails closed. Modes: `condition`, `enforce`, `status`.
+  Supporting files: `deploy/tunnel/tunnel-guard.env.example` (HP 100.67.53.117:8766; units = `terminal-mcp-tunnel.service`
+  only) and `deploy/systemd/terminal-mcp-tunnel-guard.{service,timer}.example` (enforce every 60s). README updated.
+- `deploy/install-node-agent.sh` and `deploy/systemd/terminal-node-agent.service.example` gain `MemoryLow=256M` and
+  `CPUWeight=500`.
+
+### Tests
+- New `tests/test_node_flapping_consistency.py` (6) and `tests/test_tunnel_guard.py` (3). RED on the pre-fix main: 4 of the
+  6 consistency tests failed for the intended reasons.
+- Focused node/controller/routing run, 409 passed and 4 skipped (pre-existing "phase 2 not landed"). Files:
+  `test_node_health`, `test_controller_health_recovery`, `test_node_registry`, `test_controller`, `test_controller_affinity`,
+  `test_selfhost_controller_outage`, `test_session_ownership`, `test_dashboard_nodes{,_connect}`, `test_node_agent`,
+  `test_node_client_permissions`, `test_scheduler*`, `test_connection_manager`, `test_chatgpt_sidecar`,
+  `test_mcp_app_wiring`, `test_session_task_label_node_sync`. Also `test_node_agent_install`, with guard and consistency
+  tests: 35 passed. The full suite was not run.
+
+### Deploy (2026-10-06 ~06:40–06:45 +07)
+- **Dell:** installed the new guard (old copy kept as `~/.local/bin/terminal-mcp-tunnel-guard.bak-20261006-m910primary`),
+  `~/.config/terminal-mcp/tunnel-guard.env` (primary HP), and enabled `terminal-mcp-tunnel-guard.timer`. Enforce stopped
+  Dell's `terminal-mcp-tunnel.service`, and a manual start is now skipped (`exec-condition`). `cloudflared-terminal-mcp-dashboard`
+  was left running. `terminal-mcp-http` was restarted on `d2d4417` with tmux 19→19. Added
+  `terminal-node-agent.service.d/60-pressure-priority.conf` (MemoryLow and CPUWeight, applied by daemon-reload; the agent was
+  not restarted because its code is unchanged since 29cd75d).
+- **HP:** `git pull` to `d2d4417`, then restarted `terminal-mcp-http` and `terminal-mcp-chatgpt-v1`. `/version` is `d2d4417`
+  and tmux went 6→6.
+- **m910:** `~/terminal-mcp` moved from `f40e6a2` (09-28) to `d2d4417` with no dependency changes. Added the same
+  `60-pressure-priority.conf` and restarted `terminal-node-agent` (KillMode=process; tmux lives in a login scope). `/v1/health`
+  is ok. HP receives m910 heartbeats every 20s.
+
+### Live verification
+- Ran through HP's real ChatGPT surface: an MCP client calling `terminal_turn` on `http://127.0.0.1:8768/mcp`. 20 rounds,
+  each with `list_nodes` and then `create_session(node=X)` → `inspect X/name` → `delete_session(confirm)` for m910, hp-linux
+  and dell-linux. Result: **60/60 ok, 0 failures**. All three nodes listed `online` in every round, and every create landed
+  on the requested `node_id`. The final `list_sessions` showed no `test-flapcheck-*` leftovers.
+- An earlier single round left 3 probe sessions because of a verifier parsing bug; they were deleted through the same
+  surface, and `tmux ls` on HP, Dell and m910 shows none.
+- After deploy: HP `node_status_events` has no new m910 transition (the last one is still 10-05 16:51 UTC online). Dell
+  forwarded 0 calls after 06:41 +07 and its tunnel stays `inactive`; HP is the only tunnel client.
+- Not verified live: a real m910 stall/reconnect after deploy (covered by unit tests only).
+
+### Remaining risks / next actions
+- m910 memory pressure is not solved. Consider `MemoryHigh`/`MemoryMax` on its browser services (owned by the
+  chatgpt-gateway / facebook-radar lanes); if they are capped, the agent stays protected.
+- Move the dashboard Cloudflare tunnel to HP, or point Dell's dashboard at HP, so the browser Fleet view matches ChatGPT's.
+- If HP goes down, Dell takes the tunnel within one guard start and serves with its own stale registry: only dell-linux is
+  usable there. That is intended degraded behaviour.
+- Older notes below that describe Dell or m910 as the controller are historical.
+
 ## Open bug: menu guard deadlocks explicit numeric choices — 2026-10-05 (not fixed; owner = Terminal MCP lane)
 
 - Seen on Dell: Claude Code session `cdtm-runway-router-integration-1005` (Claude session `a92cfe50…`) waited on an AskUserQuestion
