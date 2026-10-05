@@ -10,7 +10,7 @@ closed the agent session itself. Each one keeps a full agent CLI resident
 (hundreds of MB), and on dell-linux they piled up until the host was deep in
 swap.
 
-HARD LIFECYCLE RULE -- NO INDEFINITE RETENTION
+EVIDENCE-BASED LIFECYCLE -- DO NOT INFER TASK COMPLETION FROM IDLENESS
 
 Every session this reconciler governs ends in one of these lifecycle states,
 persisted in session_lifecycle.db with reason and timestamps:
@@ -31,19 +31,23 @@ persisted in session_lifecycle.db with reason and timestamps:
                      Any regained control (owner appears, a client attaches,
                      activity resumes, pane output changes, it becomes
                      provably complete) returns it to CONTROLLED and resets the
-                     timer.
-  CLEANUP_ELIGIBLE   still uncontrolled after recovery_grace_minutes (or
-                     provably complete: COMPLETED_CLEAN, ORPHAN_WORKTREE_MISSING).
-                     Closed automatically on the next real pass, after a
-                     verified checkpoint of any unique git work.
+                     timer. An unproven Claude/Codex development session stays
+                     open after the grace period; a checkpoint is not proof of
+                     task completion.
+  CLEANUP_ELIGIBLE   provably complete: COMPLETED_CLEAN,
+                     ORPHAN_WORKTREE_MISSING. Unproven development-agent
+                     sessions never become cleanup-eligible from elapsed time
+                     alone; a checkpoint preserves files, not task completion.
+                     Unhealthy non-agent service panes retain the bounded grace.
   BLOCKED            fail closed: evidence says unique work would be lost --
                      dirty/unmerged work whose checkpoint failed, or an
                      interactive editor (possible unsaved buffer).
   CLOSED / GONE      closed by this reconciler / disappeared on its own.
 
 The idle_hours pre-filter still applies (a pane active within idle_hours is
-CONTROLLED), so the worst-case lifetime of an abandoned session is bounded:
-idle_hours + recovery_grace_minutes + one interval.
+CONTROLLED). The grace period only permits cleanup of unverified non-agent
+service panes; unproven development-agent sessions require proof of completion
+or explicit operator action.
 
 Closing a tmux session never deletes files on disk; what is lost is the agent
 process. "Unique work" therefore means uncommitted changes and commits not
@@ -103,6 +107,13 @@ BLOCKED = "BLOCKED"
 CLOSED = "CLOSED"
 GONE = "GONE"
 _OPEN_STATES = frozenset({RECOVERY_REQUIRED, CLEANUP_ELIGIBLE, BLOCKED})
+# These classifications are Claude/Codex development sessions whose task
+# completion cannot be proven. A checkpoint protects the tree, but killing the
+# process still interrupts the task; elapsed time is not completion evidence.
+UNPROVEN_AGENT_CLASSES = frozenset({
+    "AGENT_NOT_IDLE", "UNKNOWN_CWD", "NO_REPO", "NO_BASE_REF",
+    "DIRTY_WORKTREE", "UNMERGED_BRANCH", "IDLE_PRIMARY_CHECKOUT",
+})
 
 SHELL_COMMANDS = frozenset({"bash", "sh", "zsh", "fish", "dash"})
 EDITOR_COMMANDS = frozenset({"vim", "nvim", "vi", "nano", "emacs", "hx", "micro", "kak"})
@@ -648,8 +659,14 @@ class SessionReconciler:
         new.update(first_uncontrolled_at=first, grace_expires_at=expires)
         if now < expires:
             new.update(state=RECOVERY_REQUIRED,
-                       reason=f"uncontrolled ({cls}): {row['reason']}; cleanup after grace "
-                              f"unless control is regained")
+                       reason=f"uncontrolled ({cls}): {row['reason']}; recovery grace is active")
+        elif cls in UNPROVEN_AGENT_CLASSES:
+            # A safety checkpoint is not evidence that the user's long-running
+            # development task has finished. Keep the tmux session alive until
+            # it becomes controlled or completion can be proven.
+            new.update(state=RECOVERY_REQUIRED,
+                       reason=f"uncontrolled ({cls}) beyond {grace / 60:.0f}min grace; "
+                              f"retained because task completion is unproven: {row['reason']}")
         else:
             new.update(state=CLEANUP_ELIGIBLE,
                        reason=f"uncontrolled ({cls}) beyond {grace / 60:.0f}min grace: {row['reason']}")

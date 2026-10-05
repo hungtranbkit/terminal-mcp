@@ -286,7 +286,7 @@ def test_compact_reconcile_routes_args_and_target():
     assert tools.turn(action="session_reconcile", args={"force": True})["error"] == "UNKNOWN_ARGS"
 
 
-# -- hard lifecycle rule: RECOVERY_REQUIRED -> CLEANUP_ELIGIBLE ---------------
+# -- lifecycle: checkpoints never substitute for development-task completion --
 
 GRACE_S = 30 * 60
 
@@ -344,7 +344,7 @@ def test_pane_output_change_resets_the_grace_timer(tmp_path):
     assert term.deletes == []
 
 
-def test_uncontrolled_grace_expiry_closes_the_session(tmp_path):
+def test_agent_sessions_without_proven_completion_survive_recovery_grace(tmp_path):
     loose = tmp_path / "loose"
     loose.mkdir()
     unknown_tail = ["some output", "nothing recognisable here"]
@@ -358,13 +358,16 @@ def test_uncontrolled_grace_expiry_closes_the_session(tmp_path):
     assert "reprobed_pane" in by_name(first)["unknown-agent"]["recovery_actions"]
     clock.now += GRACE_S + 1
     report = rec.run()
-    assert sorted(r["session"] for r in report["closed"]) == ["loose-agent", "unknown-agent"]
-    assert all(r["lifecycle_state"] == "CLOSED" for r in report["closed"])
-    assert rec.store.get("loose-agent")["state"] == "CLOSED"
-    assert rec.store.get("loose-agent")["closed_at"] == clock.now
+    assert report["closed"] == []
+    assert set(report["recovery_required"]) == {"loose-agent", "unknown-agent"}
+    assert all(by_name(report)[name]["lifecycle_state"] == "RECOVERY_REQUIRED"
+               for name in ("loose-agent", "unknown-agent"))
+    assert rec.store.get("loose-agent")["state"] == "RECOVERY_REQUIRED"
+    assert rec.store.get("loose-agent")["closed_at"] is None
+    assert term.deletes == []
 
 
-def test_dirty_uncontrolled_is_checkpointed_then_closed(repo, tmp_path):
+def test_dirty_uncontrolled_is_checkpointed_but_session_is_retained(repo, tmp_path):
     wt = add_worktree(repo, "task-wip", commit=True, merge=False)
     (wt / "a.txt").write_text("edited\n")
     (wt / "new.txt").write_text("untracked work\n")
@@ -384,14 +387,17 @@ def test_dirty_uncontrolled_is_checkpointed_then_closed(repo, tmp_path):
     assert "untracked work" in open(checkpoint["patch"]).read()
     clock.now += GRACE_S + 1
     report = rec.run()
-    assert [r["session"] for r in report["closed"]] == ["wip-agent"]
-    closed = report["closed"][0]
-    assert closed["checkpoint"]["ok"] and closed["checkpoint"]["commit"] == checkpoint["commit"]  # reused
+    assert report["closed"] == []
+    assert "wip-agent" in report["recovery_required"]
+    record = rec.store.get("wip-agent")
+    assert record["state"] == "RECOVERY_REQUIRED"
+    assert record["checkpoint"]["ok"] and record["checkpoint"]["commit"] == checkpoint["commit"]
     assert git_out(repo, "rev-parse", checkpoint["ref"]) == checkpoint["commit"]
-    assert closed["lifecycle"]["checkpoint"]["ref"] == checkpoint["ref"]
+    assert record["checkpoint"]["ref"] == checkpoint["ref"]
+    assert term.deletes == []
 
 
-def test_unmerged_clean_branch_is_pinned_then_closed(repo, tmp_path):
+def test_unmerged_clean_branch_is_pinned_but_session_is_retained(repo, tmp_path):
     wt = add_worktree(repo, "task-unpushed", commit=True, merge=False)
     head = git_out(wt, "rev-parse", "HEAD")
     term = FakeTerminal([Info("unpushed-agent", "codex", str(wt))])
@@ -400,9 +406,11 @@ def test_unmerged_clean_branch_is_pinned_then_closed(repo, tmp_path):
     rec.run()
     clock.now += GRACE_S + 1
     report = rec.run()
-    closed = report["closed"][0]
-    assert closed["checkpoint"]["kind"] == "unmerged" and closed["checkpoint"]["commit"] == head
-    assert git_out(repo, "rev-parse", closed["checkpoint"]["ref"]) == head
+    assert report["closed"] == [] and "unpushed-agent" in report["recovery_required"]
+    checkpoint = rec.store.get("unpushed-agent")["checkpoint"]
+    assert checkpoint["kind"] == "unmerged" and checkpoint["commit"] == head
+    assert git_out(repo, "rev-parse", checkpoint["ref"]) == head
+    assert term.deletes == []
 
 
 def test_failed_checkpoint_fails_closed_and_retries(repo, tmp_path):
@@ -414,14 +422,16 @@ def test_failed_checkpoint_fails_closed_and_retries(repo, tmp_path):
     rec.run()
     clock.now += GRACE_S + 1
     report = rec.run()
-    assert report["closed"] == [] and report["refused"][0]["refused"] == "CHECKPOINT_FAILED"
-    assert rec.store.get("big-agent")["state"] == "BLOCKED"
-    assert by_name(rec.inspect())["big-agent"]["lifecycle_state"] == "BLOCKED"
+    assert report["closed"] == [] and "big-agent" in report["recovery_required"]
+    assert rec.store.get("big-agent")["state"] == "RECOVERY_REQUIRED"
+    assert by_name(rec.inspect())["big-agent"]["lifecycle_state"] == "RECOVERY_REQUIRED"
     assert term.deletes == []
     (wt / "huge.bin").unlink()
     (wt / "small.txt").write_text("small\n")
     clock.now += 60
-    assert [r["session"] for r in rec.run()["closed"]] == ["big-agent"]
+    assert rec.run()["closed"] == []
+    assert rec.store.get("big-agent")["state"] == "RECOVERY_REQUIRED"
+    assert term.deletes == []
 
 
 def test_active_task_is_exempt_however_long(repo, tmp_path):
@@ -474,7 +484,7 @@ def test_recent_service_and_open_editor_are_not_closed(tmp_path):
 def test_repeated_cleanup_is_idempotent_and_name_reuse_starts_fresh(tmp_path):
     loose = tmp_path / "loose"
     loose.mkdir()
-    term = FakeTerminal([Info("loose-agent", "codex", str(loose))])
+    term = FakeTerminal([Info("stray-service", "node", str(loose))])
     clock = Clock()
     rec = reconciler(term, tmp_path, clock=clock)
     rec.run()
@@ -484,13 +494,13 @@ def test_repeated_cleanup_is_idempotent_and_name_reuse_starts_fresh(tmp_path):
         clock.now += GRACE_S + 1
         again = rec.run()
         assert again["closed"] == [] and again["refused"] == []
-    assert term.deletes == [("loose-agent", "session-reconciler")]
-    assert rec.store.get("loose-agent")["state"] == "CLOSED"
+    assert term.deletes == [("stray-service", "session-reconciler")]
+    assert rec.store.get("stray-service")["state"] == "CLOSED"
     # A brand-new tmux session reusing the name does not inherit the old timer.
-    term.tmux.sessions["loose-agent"] = Info("loose-agent", "codex", str(loose), session_id="$9",
-                                             created_epoch=int(clock.now))
-    row = by_name(rec.run())["loose-agent"]
-    assert row["lifecycle_state"] == "RECOVERY_REQUIRED" and term.deletes == [("loose-agent", "session-reconciler")]
+    term.tmux.sessions["stray-service"] = Info("stray-service", "node", str(loose), session_id="$9",
+                                                 created_epoch=int(clock.now))
+    row = by_name(rec.run())["stray-service"]
+    assert row["lifecycle_state"] == "RECOVERY_REQUIRED" and term.deletes == [("stray-service", "session-reconciler")]
 
 
 def test_grace_timer_survives_a_restart(tmp_path):
@@ -502,7 +512,10 @@ def test_grace_timer_survives_a_restart(tmp_path):
     reconciler(term, tmp_path, clock=clock, store=LifecycleStore(store_path)).run()
     clock.now += GRACE_S + 1
     restarted = reconciler(term, tmp_path, clock=clock, store=LifecycleStore(store_path))
-    assert [r["session"] for r in restarted.run()["closed"]] == ["loose-agent"]
+    report = restarted.run()
+    assert report["closed"] == [] and "loose-agent" in report["recovery_required"]
+    assert restarted.store.get("loose-agent")["first_uncontrolled_at"] == NOW
+    assert term.deletes == []
 
 
 def test_inspect_is_read_only_and_dry_run_never_closes(tmp_path):
@@ -516,8 +529,8 @@ def test_inspect_is_read_only_and_dry_run_never_closes(tmp_path):
     rec.run(dry_run=True)  # dry run records the timer...
     clock.now += GRACE_S + 1
     dry = rec.run(dry_run=True)
-    assert dry["close_candidates"] == ["loose-agent"] and term.deletes == []  # ...but never closes
-    assert rec.lifecycle_for("loose-agent")["state"] == "CLEANUP_ELIGIBLE"
+    assert dry["close_candidates"] == [] and term.deletes == []
+    assert rec.lifecycle_for("loose-agent")["state"] == "RECOVERY_REQUIRED"
     assert rec.lifecycle_index()["loose-agent"]["grace_expires_at"]
 
 
@@ -554,9 +567,10 @@ def test_regenerable_untracked_dirs_are_not_unique_work(repo, tmp_path):
     assert by_name(rec.run())["venv-agent"]["classification"] == "DIRTY_WORKTREE"
     clock.now += GRACE_S + 1
     report = rec.run()
-    assert [r["session"] for r in report["closed"]] == ["venv-agent"]
-    assert report["closed"][0]["checkpoint"]["kind"] == "none"
+    assert report["closed"] == [] and "venv-agent" in report["recovery_required"]
+    assert rec.store.get("venv-agent")["checkpoint"] is None
     assert git_out(repo, "for-each-ref", "refs/terminal-mcp") == ""
+    assert term.deletes == []
 
 
 def test_recent_controller_input_counts_as_activity(repo, tmp_path):

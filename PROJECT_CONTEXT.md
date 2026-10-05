@@ -1,5 +1,97 @@
 # PROJECT_CONTEXT.md
 
+## Legacy `node="local"` create-session alias — 2026-10-04
+
+After the Dell controller was assigned canonical ID `dell-linux`, explicit
+`create_session(node="local")` still returned `NODE_NOT_FOUND`. The session
+lookup path already mapped `local/<session>` to the canonical local ID, but
+`ControllerService.terminal_create_session()` did an exact registry lookup for
+the explicit node argument without applying that alias.
+
+- `terminal_mcp/controller.py` now maps the legacy explicit node value `local`
+  to `self.local_node_id` only when this controller has a different canonical
+  ID. Unknown IDs remain fail-closed; no capacity checks or remote routing were
+  relaxed.
+- Added regression test
+  `test_create_legacy_local_node_alias_routes_to_canonical_local_node` in
+  `tests/test_controller.py`. TDD RED reproduced `NODE_NOT_FOUND`; after the
+  change the test passed.
+- Deployed by restarting the Dell user service. Live `list_nodes` showed
+  `dell-linux` online with Claude/Codex available (reported overloaded at that
+  moment). Live `create_session(node="local")` and `create_session(node="dell-linux")`
+  each returned `READY`, `node_id=dell-linux`; probes sent only the shell `exit`
+  command and subsequent inspect confirmed both absent. No audit task/session
+  or product code work was started.
+- Verification: MCP wiring 3 passed; identity + alias + explicit-node guard
+  tests 5 passed; `git diff --check` passed. A broader controller/MCP run had
+  12 failures and 53 passes; failures cascaded from tests using automatic
+  placement while this Dell host's live metrics classified it overloaded.
+  Full suite not rerun.
+- `m910` and `hp-linux` registry-vs-Fleet divergence documented above remains
+  unresolved; this fix only ensures the Dell controller's canonical and legacy
+  local IDs reach the same local node.
+
+## Dell local-node routing identity — 2026-10-04
+
+Reproduced `create_session(node="dell-linux") -> NODE_NOT_FOUND`: the live
+Terminal MCP execution controller listed this host as node ID `local`, while
+explicit create routing performs an exact `NodeRegistry` ID lookup. Fleet's
+display/telemetry did not make `dell-linux` an execution-registry key.
+
+- Set `TERMINAL_MCP_LOCAL_NODE_ID=dell-linux` and
+  `TERMINAL_MCP_LOCAL_NODE_NAME=Dell Linux` in the user service drop-in
+  `/home/dell/.config/systemd/user/terminal-mcp-http.service.d/95-node-identity.conf`.
+  This uses the repo's supported canonical-local identity mechanism; code and
+  remote-node credentials were not changed.
+- Reloaded/restarted local `terminal-mcp-http.service`; service is active. Live
+  `list_nodes` now returns `dell-linux` online with Claude/Codex available.
+  A temporary shell probe created with `node="dell-linux"` returned READY and
+  the correct node ID; subsequent inspect reported the probe absent. No audit
+  session/task was created and no prompt was sent.
+- Focused identity/controller tests: 12 passed. The existing full suite has
+  known unrelated failures (see above); it was not rerun for this env-only fix.
+- Remaining fleet divergence: the same execution-controller list still shows
+  `m910` offline and has no `hp-linux`, while the separately viewed Fleet says
+  those nodes are online/healthy. Reconcile the Fleet source with the execution
+  controller's `NodeRegistry`/connection config before claiming fleet-wide
+  routing consistency. Do not silently route a different host for those IDs.
+- The main worktree's pre-existing uncommitted lifecycle fix was preserved.
+
+## Session cleanup safety fix — 2026-10-04
+
+Terminal MCP lifecycle cleanup previously treated the recovery-grace timeout as
+proof that Claude/Codex work was abandoned. This could checkpoint dirty work and
+then close its tmux session even though task completion was unknown.
+
+- `terminal_mcp/session_reconciler.py` now retains agent/development sessions
+  with unproven completion as `RECOVERY_REQUIRED` after grace expiry. A checkpoint
+  preserves code but is not a completion signal. Cleanup remains automatic only
+  with positive completion/orphan evidence or for an expired non-agent service
+  pane; explicit operator lifecycle actions are unchanged.
+- Configuration and MCP tool docs in `terminal_mcp/config.py`,
+  `terminal_mcp/mcp_app.py`, and `config.example.yaml` document this policy.
+- Focused verification: `tests/test_session_lifecycle_reconciler.py`,
+  `tests/test_mcp_app_wiring.py`, and `tests/test_direct_task_lifecycle.py`:
+  51 passed before deployment and passed again after deployment (5.66s).
+  `git diff --check` passed.
+- Deployed to the local Dell `terminal-mcp-http.service` by restart on 2026-10-04;
+  service is active and uses `KillMode=process`. The four reported recovery tmux
+  sessions remained alive across restart: `cdtm-video-recover-1004`,
+  `cdtm-warranty-recover-1004`, `cdtm-p0-recover2-1004`, and
+  `cdtm-review-signals-recover-1004`. No production deployment was performed.
+- Full repository pytest: 9,396 passed, 13 skipped, 102 deselected, 52 failed
+  (30m35s). Failures are in legacy queue/start/router/transport assumptions,
+  queue transition/task-migration tests, knowledge-map completeness, and work
+  UI tests; no lifecycle-focused test failed. These project-wide failures were
+  not investigated as part of this lifecycle fix and should be triaged separately.
+- Worktree is on `main` based on `36468c3`; implementation and context changes
+  are currently uncommitted. Runtime YAML change was comments-only; no lifecycle
+  values were changed. No CDTM session was resumed, sent new work, or closed.
+
+Known follow-up: reconcile obsolete queue-focused tests and refresh the indexed
+knowledge map in a separate task. Agent tasks with no completion evidence now
+stay open for manual review rather than being lifecycle-closed.
+
 ## Verified current state — 2026-09-28
 
 Terminal MCP durable queue submission is retired for normal coding work.
@@ -306,4 +398,3 @@ Direct dispatch (`create_session` -> `send`/`send_wait`) leaves no queue row, so
 - `tests/test_session_task_label.py tests/test_live_sessions.py` -> 46 passed (unchanged).
 - `test_node_agent.py test_node_client_permissions.py test_controller.py test_compact_tools.py test_compact_turn_actions.py test_compact_delete_confirmation.py test_mcp_app_wiring.py test_observer.py test_webauth_dashboard.py` -> 299 passed, 1 failed: `test_observer.py::test_observer_exposes_no_tool_that_can_change_anything`, which fails identically on base d0560a0 (pre-existing, unrelated).
 - Next: merge, redeploy the HP controller + Dell `terminal-mcp-http` + the `dell-linux` (and other) node-agents, then assign a titled task via HP to a Dell session and confirm Dell `/app/live` shows it.
-

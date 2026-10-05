@@ -98,16 +98,13 @@ supervisor:
 #     codex: codex
 #   create_ready_timeout_seconds: 5
 #   default_grant_mode: none   # none | read | read_send
-#   # Agent-session lifecycle reconciler (session_reconciler.py). HARD RULE:
-#   # no indefinite retention. Provably complete agent sessions (clean+merged
-#   # worktree, or worktree gone) close at once. Any other idle agent session
-#   # with no verified owner (dirty, unmerged, no repo, UNKNOWN pane...) and
-#   # any service pane not listed healthy in required_services enters
-#   # RECOVERY_REQUIRED; if control is not regained within
-#   # recovery_grace_minutes it is CLEANUP_ELIGIBLE and closed after a git
-#   # checkpoint (refs/terminal-mcp/checkpoints/... + .patch). A failed
-#   # checkpoint or an open editor fails closed (BLOCKED). Protected,
-#   # attached, active-work and plain-shell sessions are never touched.
+#   # Agent-session lifecycle reconciler (session_reconciler.py). Only
+#   # provably complete agent sessions (clean+merged worktree, or worktree
+#   # gone) close automatically. Unproven Claude/Codex work stays open even
+#   # after the grace period: a git checkpoint preserves files, not task
+#   # completion. recovery_grace_minutes still bounds cleanup of unverified
+#   # non-agent service panes. Protected, attached, active-work and plain-shell
+#   # sessions are never touched.
 #   agent_cleanup:
 #     enabled: false
 #     dry_run: true                       # log candidates only
@@ -117,7 +114,7 @@ supervisor:
 #     agent_commands: [claude, codex]
 #     close_clean_primary_checkouts: false
 #     scrollback_dir: ~/tmux-reaped
-#     recovery_grace_minutes: 30           # 5..1440; keep 15-30
+#     recovery_grace_minutes: 30           # 5..1440; non-agent service cleanup grace
 #     checkpoint_dirty_work: true
 #     checkpoint_max_untracked_mb: 200     # larger untracked snapshot -> BLOCKED
 #     required_services:                   # exempt only while verified healthy

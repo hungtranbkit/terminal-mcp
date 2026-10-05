@@ -3753,18 +3753,19 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         Each row also carries lifecycle_state + lifecycle {state, reason,
         first_uncontrolled_at, grace_expires_at, recovery_attempts,
         recovered_at, closed_at, checkpoint}: CONTROLLED, RECOVERY_REQUIRED
-        (uncontrolled; recovery being attempted within the grace period),
-        CLEANUP_ELIGIBLE (closed on the next real pass after checkpointing
-        unique git work), BLOCKED (fail closed: unique work would be lost)."""
+        (uncontrolled; unproven development work remains open even after its
+        grace expires), CLEANUP_ELIGIBLE (provably complete or orphaned
+        worktree), BLOCKED (fail closed: unique work would be lost)."""
         return session_reconciler.inspect(session)
 
     @server.tool()
     def terminal_session_reconcile(dry_run: bool = True, confirm: bool = False) -> dict:
         """Drive the agent-session lifecycle rule on this host: provably
         complete sessions (merged clean tree, worktree gone) close at once;
-        uncontrolled ones enter RECOVERY_REQUIRED and close once the grace
-        period expires without regained control, after a verified git
-        checkpoint of any dirty/unmerged work. Defaults to a dry run. A real pass needs dry_run=false AND confirm=true; each close
+        unproven Claude/Codex work remains RECOVERY_REQUIRED after the grace
+        period because a checkpoint is not task completion. Unverified
+        non-agent service panes may close after grace. Defaults to a dry run.
+        A real pass needs dry_run=false AND confirm=true; each close
         re-classifies fresh, runs the delete preflight, saves scrollback and
         uses the ordinary guarded delete. Dirty/unmerged/active/protected/
         attached sessions, active work, plain shells and verified-healthy

@@ -304,6 +304,20 @@ def test_create_explicit_unknown_node_is_node_not_found(tmp_path):
     assert result["error"] == "NODE_NOT_FOUND"
 
 
+def test_create_legacy_local_node_alias_routes_to_canonical_local_node(tmp_path):
+    controller, _service = _controller(tmp_path, local_node_id="dell-test")
+    _heartbeat_local(controller)
+    result = controller.terminal_create_session(
+        "ctrl-create-local-alias", "shell", str(tmp_path), node="local")
+    try:
+        assert result.get("error") is None, result
+        assert result["node_id"] == "dell-test"
+    finally:
+        import subprocess
+        subprocess.run([*tmux_cmd(), "kill-session", "-t", "ctrl-create-local-alias"],
+                       check=False, capture_output=True)
+
+
 def test_create_auto_with_platform_requirement_no_match_is_no_eligible_node(tmp_path):
     controller, _service = _controller(tmp_path)
     _heartbeat_local(controller)  # local node is "linux"

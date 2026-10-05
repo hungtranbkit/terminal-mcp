@@ -654,14 +654,13 @@ class AgentCleanupConfig:
       * ORPHAN_WORKTREE_MISSING -- detached, idle for idle_hours, and its
         working directory demonstrably no longer exists.
 
-    HARD RULE (no indefinite retention): any other idle agent session with no
-    verified owner (dirty, unmerged, no repo, UNKNOWN pane, ...) and any
-    service pane that is not a verified-healthy entry of required_services
-    enters RECOVERY_REQUIRED; if control is not regained within
-    recovery_grace_minutes it becomes CLEANUP_ELIGIBLE and is closed after
-    unique git work is checkpointed (checkpoint_dirty_work). A failed
-    checkpoint fails closed (BLOCKED). Protected/attached sessions, active
-    work and plain shells are never touched. dry_run reports without closing.
+    Unproven agent work (dirty/unmerged branch, no repo, UNKNOWN pane, etc.)
+    enters RECOVERY_REQUIRED and stays open until the task becomes controlled
+    or completion is proven. A git checkpoint is a safety copy, not a task
+    completion signal. recovery_grace_minutes still bounds recovery before
+    cleanup of unverified non-agent service panes. Protected/attached sessions,
+    active work and plain shells are never touched. dry_run reports without
+    closing.
     """
     enabled: bool = False
     dry_run: bool = True

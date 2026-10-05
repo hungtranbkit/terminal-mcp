@@ -1564,7 +1564,12 @@ class ControllerService:
                         "excluded": list(placement.excluded)}
             node_id = placement.node_id
         else:
-            node_id = node
+            # Keep the historical explicit `node="local"` spelling working
+            # after this controller adopts its canonical host id. Session
+            # lookup already applies the same alias; create must resolve it
+            # before the exact NodeRegistry lookup too.
+            node_id = (self.local_node_id if node == LOCAL_NODE_ID
+                       and self.local_node_id != LOCAL_NODE_ID else node)
             explicit_node = self.node_status(node_id)
             if explicit_node is None:
                 return {"error": "NODE_NOT_FOUND", "node_id": node_id}
