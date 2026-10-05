@@ -319,6 +319,19 @@ class ControllerService:
         self.node_health.set_policy(node_id, NodeHealthPolicy(
             self_heal_enabled=self_heal_enabled, self_heal_action=self_heal_action))
 
+    def _note_transport_failure(self, node_id: str, client: Any, exc: NodeClientError) -> None:
+        """Feed a routed operation's network failure into node health so the
+        next list_nodes agrees with what create/send just saw. HTTP-level
+        answers (4xx/5xx) are the agent responding, not a reachability fact."""
+        if node_id == self.local_node_id or getattr(exc, "http_status", None) is not None:
+            return
+        try:
+            node = self.registry.get(node_id)
+            if node is not None:
+                self.node_health.record_operation_failure(node, client, exc)
+        except Exception:  # noqa: BLE001 -- bookkeeping must never mask the real error
+            _LOGGER.debug("controller: could not record transport failure for %s", node_id, exc_info=True)
+
     def client_for(self, node_id: str) -> NodeClient | None:
         return self._clients.get(node_id)
 
@@ -755,6 +768,7 @@ class ControllerService:
         try:
             result = call(client, bare)
         except NodeClientError as exc:
+            self._note_transport_failure(node_id, client, exc)
             return {"error": "NODE_UNREACHABLE", "node_id": node_id, "session": bare, "detail": str(exc),
                     **context}
         if op in ("delete", "kill") and isinstance(result, dict) and "error" not in result:
@@ -1674,7 +1688,14 @@ class ControllerService:
                        and self.local_node_id != LOCAL_NODE_ID else node)
             explicit_node = self.node_status(node_id)
             if explicit_node is None:
-                return {"error": "NODE_NOT_FOUND", "node_id": node_id}
+                # Name the answering controller and what it does know. Two
+                # controllers serving one ChatGPT tunnel made list_nodes
+                # (answered by one) and create_session (answered by the
+                # other) disagree; without this the split looked like a node
+                # flapping rather than a misrouted call.
+                return {"error": "NODE_NOT_FOUND", "node_id": node_id,
+                        "controller_node_id": self.local_node_id,
+                        "known_node_ids": [known.id for known in self.registry.list()]}
             if platform is not None and explicit_node.platform != platform:
                 # An explicit node_id that doesn't match an explicitly
                 # required platform is a caller error, never silently
@@ -1698,6 +1719,8 @@ class ControllerService:
                 # as move -- task item 5's own explicit "không silently
                 # fallback... Fail rõ ràng" requirement.
                 return {"error": "NODE_UNREACHABLE", "node_id": node_id,
+                        "controller_node_id": self.local_node_id,
+                        "health_state": explicit_node.health_state,
                         "detail": f"node status={explicit_node.status!r}, not online"}
             if agent_type != "shell" and agent_type not in explicit_node.agent_types:
                 # Keep explicit-node creation honest too.  The dashboard
@@ -1716,6 +1739,7 @@ class ControllerService:
                                            grant_mode=grant_mode, binding=binding, requested_by=requested_by,
                                            show_on_desktop=show_on_desktop)
         except NodeClientError as exc:
+            self._note_transport_failure(node_id, client, exc)
             return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": str(exc)}
         if isinstance(result, dict) and "error" not in result:
             node_row = self.registry.get(node_id)

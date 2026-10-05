@@ -1,0 +1,7 @@
+[Unit]
+Description=Terminal MCP fallback tunnel split-brain guard (stop duplicate when primary serves)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/terminal-mcp-tunnel-guard enforce

@@ -167,8 +167,21 @@ class NodeHealthService:
                        transport_state=HEALTH_TRANSPORT_ONLINE,
                        health_state=HEALTH_EXECUTION_OK, execution_state=HEALTH_EXECUTION_OK)
 
+    def record_operation_failure(self, node: Node, client: Any, exc: Exception) -> Node:
+        """A routed operation (create/send/status...) hit a transport failure.
+
+        That is the same evidence a failed probe is, and it is fresher than a
+        cached success: without recording it, list_nodes kept answering
+        "online" from the probe-interval cache while every create_session to
+        that node failed NODE_UNREACHABLE. Never self-heals -- one slow
+        operation must not restart an agent; the regular probe path decides.
+        """
+        if (node.transport_status or node.status) != NODE_ONLINE:
+            return node
+        return self._failure(node, client, exc, now=self.now(), generation=None, allow_self_heal=False)
+
     def _failure(self, node: Node, client: Any, exc: Exception, *, now: datetime,
-                 generation: str | None) -> Node:
+                 generation: str | None, allow_self_heal: bool = True) -> Node:
         failures = node.consecutive_failures + 1
         definitive_execution_down = (isinstance(exc, NodeClientError) and
                                      getattr(exc, "error_code", None) in {
@@ -185,7 +198,8 @@ class NodeHealthService:
         reconnect_status = "REPORT_ONLY" if unauthorized else "BACKOFF"
         heal_attempted = False
         policy = self.policies.get(node.id, NodeHealthPolicy())
-        if (not unauthorized and failures >= self.config.execution_down_after_failures and
+        if (allow_self_heal and not unauthorized and
+                failures >= self.config.execution_down_after_failures and
                 policy.self_heal_enabled and policy.self_heal_action != "none"):
             same_generation_already_requested = bool(
                 node.last_self_heal_at and

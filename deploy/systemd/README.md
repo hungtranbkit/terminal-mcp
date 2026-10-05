@@ -172,6 +172,23 @@ can create a restart storm every timer tick. On the Dell fallback deployment thi
 is a `terminal-mcp-tunnel-watchdog.service.d` drop-in that runs
 `%h/.local/bin/terminal-mcp-tunnel-guard condition`.
 
+The guard is versioned at `deploy/tunnel/terminal-mcp-tunnel-guard`. Its primary
+is required config (`~/.config/terminal-mcp/tunnel-guard.env`, see
+`deploy/tunnel/tunnel-guard.env.example`); the canonical controller is HP
+(`100.67.53.117:8766`). Without that file it fails closed and the fallback never
+joins. Install the `terminal-mcp-tunnel-guard.{service,timer}.example` pair on the
+fallback so `enforce` stops a duplicate within a minute. An `ExecCondition` alone
+runs only at start, and a stale primary of m910 left Dell joined to HP's tunnel
+for days (2026-10-06 split brain).
+
+```bash
+install -m 0755 deploy/tunnel/terminal-mcp-tunnel-guard ~/.local/bin/terminal-mcp-tunnel-guard
+cp deploy/tunnel/tunnel-guard.env.example ~/.config/terminal-mcp/tunnel-guard.env
+cp deploy/systemd/terminal-mcp-tunnel-guard.service.example ~/.config/systemd/user/terminal-mcp-tunnel-guard.service
+cp deploy/systemd/terminal-mcp-tunnel-guard.timer.example ~/.config/systemd/user/terminal-mcp-tunnel-guard.timer
+systemctl --user daemon-reload && systemctl --user enable --now terminal-mcp-tunnel-guard.timer
+```
+
 Install/update:
 
 ```bash

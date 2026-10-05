@@ -197,6 +197,15 @@ KillMode=process
 # hit the ceiling.
 MemoryMax=3G
 TasksMax=2048
+# Keep the agent answering while the HOST is under memory pressure.
+# m910 (2026-10-05): browser services pushed it into swap and a global OOM;
+# journald and snapd hit their watchdogs, the agent's memory.events showed
+# sock_throttled (socket buffers throttled under pressure), heartbeat pushes
+# timed out and the controller saw online/degraded/offline cycling. MemoryLow
+# keeps the agent's small working set (~80M) out of reclaim and CPUWeight
+# lets its heartbeat thread run ahead of batch work; neither raises a limit.
+MemoryLow=256M
+CPUWeight=500
 # IMPORTANT: do not use ProtectSystem/ProtectHome/ReadWritePaths here.
 # They create a user namespace under systemd --user; tmux children then see
 # root-owned SSH config as nobody and OpenSSH refuses to start.

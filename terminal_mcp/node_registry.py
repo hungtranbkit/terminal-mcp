@@ -412,6 +412,25 @@ class NodeRegistry:
             }
             capacity_status, reasons = classify_capacity(classify_input, thresholds)
 
+            # Reconnect: a heartbeat that ends a transport gap (no previous
+            # heartbeat, or the previous one was already past the fresh
+            # window) is new evidence the agent is back. The execution-probe
+            # backoff (up to backoff_max_seconds) was earned BEFORE the gap
+            # and, while the node was not transport-online, nothing probed it
+            # (NodeHealthService.evaluate never probes a non-online node), so
+            # keeping it held a recovered node DEGRADED for minutes after its
+            # heartbeats resumed -- seen live as m910 alternating
+            # online/degraded/offline. Only the retry gate is cleared: the
+            # failure count and execution state stay as evidence, and the next
+            # read must still earn ONLINE with a real probe. A heartbeat
+            # inside the fresh window leaves backoff alone, so frequent
+            # dashboard polls of a broken-but-pushing node stay rate-limited.
+            reconnected = (
+                not prev.get("last_heartbeat_at") or
+                _elapsed_seconds(prev["last_heartbeat_at"], now_iso)
+                > self.heartbeat_thresholds.degraded_after_seconds
+            )
+
             connection.execute(
                 """UPDATE nodes SET
                     last_heartbeat_at = ?, latency_ms = ?,
@@ -425,6 +444,7 @@ class NodeRegistry:
                     high_cpu_since = ?, high_load_since = ?, capacity_status = ?, overload_reasons = ?,
                     platform = ?, session_backend = ?, shell_capabilities = ?, wsl_available = ?,
                     contract_version = ?, contract_capabilities = ?,
+                    next_retry_at = CASE WHEN ? THEN NULL ELSE next_retry_at END,
                     updated_at = ?
                 WHERE id = ?""",
                 (now_iso, latency_ms,
@@ -438,7 +458,7 @@ class NodeRegistry:
                  high_cpu_since, high_load_since, capacity_status, json.dumps(reasons),
                  platform, session_backend, json.dumps(list(shell_capabilities)), int(wsl_available),
                  int(contract_version), json.dumps(sorted(contract_capabilities)),
-                 now_iso, node_id),
+                 int(reconnected), now_iso, node_id),
             )
         return self.get(node_id, now=now)
 

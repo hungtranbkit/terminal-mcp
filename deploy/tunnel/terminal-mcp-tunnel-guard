@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# Split-brain guard for a FALLBACK controller's terminal-mcp-tunnel.service.
+#
+# WHY THIS EXISTS
+# Two tunnel-clients serving one OpenAI tunnel id is a split brain: ChatGPT's
+# requests alternate between two controllers with different node registries.
+# Seen live 2026-10-06: HP (canonical) and Dell (fallback) both served
+# tunnel_6a95..., ~50/50. list_nodes answered by HP showed m910/hp-linux
+# online; the next create_session, answered by Dell, said NODE_UNREACHABLE
+# (Dell's registry had m910 offline since 09-10) or NODE_NOT_FOUND (Dell has
+# no hp-linux). It looked like node flapping; it was routing.
+#
+# The previous, unversioned copy of this script hard-coded m910 as the
+# primary. The controller moved to HP and m910 stopped serving 8766, so the
+# guard concluded "primary down" on every start and the fallback joined the
+# tunnel permanently. The primary is now REQUIRED configuration -- there is
+# no default host, so a stale default can never silently re-enable a split.
+#
+# Config: ${TERMINAL_MCP_GUARD_ENV:-~/.config/terminal-mcp/tunnel-guard.env}
+#   TERMINAL_MCP_PRIMARY_HOST=100.67.53.117   # canonical controller (required)
+#   TERMINAL_MCP_PRIMARY_PORT=8766
+#   TERMINAL_MCP_GUARD_UNITS="terminal-mcp-tunnel.service"
+# List in GUARD_UNITS only units whose tunnel the primary ALSO serves. A unit
+# only this host serves (e.g. a dashboard tunnel the primary does not run)
+# must not be listed, or enforce would take that hostname down.
+#
+# Modes:
+#   condition  ExecCondition= hook. Exit 1 -> systemd skips the start (unit
+#              not failed, Restart= does not fire). Exit 0 -> primary is gone,
+#              this host takes the tunnel over.
+#   enforce    Timer hook. Stops a running duplicate once the primary is
+#              demonstrably serving. Only ever STOPS; starting the fallback
+#              stays with the unit's own start paths.
+#   status     Print the decision without acting (for operators/tests).
+#
+# Reachability is a TCP connect via bash's /dev/tcp -- no curl dependency, so
+# a missing binary can never be mistaken for "primary is down".
+set -u
+
+ENV_FILE="${TERMINAL_MCP_GUARD_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/terminal-mcp/tunnel-guard.env}"
+# shellcheck disable=SC1090
+[ -r "$ENV_FILE" ] && . "$ENV_FILE"
+
+PEER_HOST="${TERMINAL_MCP_PRIMARY_HOST:-}"
+PEER_PORT="${TERMINAL_MCP_PRIMARY_PORT:-8766}"
+UNITS="${TERMINAL_MCP_GUARD_UNITS:-terminal-mcp-tunnel.service}"
+MODE="${1:-condition}"
+SYSTEMCTL="${TERMINAL_MCP_GUARD_SYSTEMCTL:-systemctl}"
+
+# Boot is the hostile case: Tailscale may need ~30s. Probing generously here
+# is cheap, and a false "primary is down" is what recreates the split brain.
+ATTEMPTS="${TERMINAL_MCP_GUARD_ATTEMPTS:-8}"
+GAP="${TERMINAL_MCP_GUARD_GAP:-3}"
+CONNECT_TIMEOUT="${TERMINAL_MCP_GUARD_TIMEOUT:-4}"
+
+if [ -z "$PEER_HOST" ]; then
+    # Fail closed: without knowing the primary we cannot prove we are alone.
+    echo "TERMINAL_MCP_PRIMARY_HOST is not set (looked in $ENV_FILE)" \
+         "-- refusing to join the tunnel" >&2
+    case "$MODE" in
+        condition) exit 1 ;;
+        *) exit 78 ;;
+    esac
+fi
+
+primary_is_serving() {
+    local attempt
+    for ((attempt = 1; attempt <= ATTEMPTS; attempt++)); do
+        if timeout "$CONNECT_TIMEOUT" \
+                bash -c "exec 3<>/dev/tcp/${PEER_HOST}/${PEER_PORT}" 2>/dev/null; then
+            return 0
+        fi
+        ((attempt < ATTEMPTS)) && sleep "$GAP"
+    done
+    return 1
+}
+
+case "$MODE" in
+    condition)
+        if primary_is_serving; then
+            echo "primary ${PEER_HOST}:${PEER_PORT} is serving -- not joining the tunnel" \
+                 "(a second client on one tunnel id would split-brain ChatGPT's requests)"
+            exit 1
+        fi
+        echo "primary ${PEER_HOST}:${PEER_PORT} unreachable after ${ATTEMPTS} attempts" \
+             "-- taking the tunnel over as fallback"
+        exit 0
+        ;;
+    enforce)
+        running=""
+        for unit in $UNITS; do
+            "$SYSTEMCTL" --user is-active --quiet "$unit" && running="$running $unit"
+        done
+        [ -n "$running" ] || exit 0
+        if primary_is_serving; then
+            for unit in $running; do
+                echo "primary ${PEER_HOST}:${PEER_PORT} is serving and this host is also" \
+                     "running ${unit} -- stopping the duplicate to end the split brain"
+                "$SYSTEMCTL" --user stop "$unit"
+            done
+        fi
+        exit 0
+        ;;
+    status)
+        if primary_is_serving; then
+            echo "primary=${PEER_HOST}:${PEER_PORT} serving=yes fallback_should_run=no units=${UNITS}"
+        else
+            echo "primary=${PEER_HOST}:${PEER_PORT} serving=no fallback_should_run=yes units=${UNITS}"
+        fi
+        exit 0
+        ;;
+    *)
+        echo "usage: $0 [condition|enforce|status]" >&2
+        exit 64
+        ;;
+esac
