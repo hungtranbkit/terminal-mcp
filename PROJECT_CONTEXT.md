@@ -1,5 +1,22 @@
 # PROJECT_CONTEXT.md
 
+## Open bug: menu guard deadlocks explicit numeric choices — 2026-10-05 (not fixed; owner = Terminal MCP lane)
+
+- Seen on Dell: Claude Code session `cdtm-runway-router-integration-1005` (Claude session `a92cfe50…`) waited on an AskUserQuestion
+  menu ("Temp space", options 1–4, `Enter to select · ↑/↓ to navigate · Esc to cancel`). The orchestrator explicitly submitted a safe
+  numeric selection. The pre-send menu/confirmation guard (`TARGET_AWAITING_APPROVAL`, the menu chrome patterns in
+  `terminal_mcp/adapters.py` `_WAITING_PATTERNS`) still blocks every send to a pane showing a menu, explicit choices included. The pane
+  stays stuck indefinitely: the orchestrator cannot answer it, and the agent cannot continue. The work was finished from another session.
+- **Do NOT disable or loosen the guard globally.** It correctly stops a free-text send from pressing Enter on whatever option is highlighted.
+- Proposed fix (this lane, later): a scoped, explicit `answer_prompt` / validated-choice action. It should:
+  1. re-read the pane and parse the visible menu (numbered options + highlighted line);
+  2. accept only a choice index (or exact label) that exists in that parsed menu, plus an expected-prompt fingerprint
+     (question text hash) so a stale or different menu is refused;
+  3. send only the navigation keys/digit + Enter for that option, then verify that the menu is gone or changed;
+  4. stay audited, idempotent (receipt key) and owner/lease-checked like other sends; never accept free text in this path.
+- Tests to add: a free-text send to a menu pane is still refused; a valid index is accepted exactly once; an out-of-range index or
+  fingerprint mismatch is refused; the "Type something"/"Chat about this" options are refused unless explicitly allowed.
+
 ## Legacy `node="local"` create-session alias — 2026-10-04
 
 After the Dell controller was assigned canonical ID `dell-linux`, explicit
