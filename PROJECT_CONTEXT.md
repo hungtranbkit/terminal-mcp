@@ -1,5 +1,14 @@
 # PROJECT_CONTEXT.md
 
+## HP dashboard cutover + m910 memory guardrails — 2026-10-06 (deployed)
+
+- Dashboard/Fleet Cloudflare tunnel  is now served from canonical controller HP.  on HP is enabled+active and uses  -> .
+- Dell copy of  is disabled+inactive. This removes the stale Dell Fleet view/split dashboard path. Public  still goes through Cloudflare Access;  still redirects to .
+- Rollback dashboard: on HP ; on Dell . Never leave both enabled except during a short cutover.
+- m910 memory guardrails were applied persistently with  to Chrome/OpenClaw cgroups. Current limits: chatgpt 900M/1200M, deepseek 700M/900M, facebook-radar 900M/1200M, fbpublisher 400M/600M, gemini 800M/1100M, grok 1400M/1800M, meta 600M/800M, muse 800M/1100M, openclaw 2200M/2800M ();  is 128-512M per service.
+-  on m910 remains protected with MemoryLow=256M, MemoryMax=512M and CPUWeight=500. At application time m910 had 15.4GB RAM, ~8.9GB available, 2.7GB swap still resident from the earlier OOM, and no new OOM event in the last 10 minutes. Existing swap was intentionally not force-cleared because passwordless sudo is unavailable; the new cgroup limits prevent renewed unbounded growth.
+- Rollback memory guardrails per service:  then .
+
 ## Node registry flapping / list_nodes vs create_session — 2026-10-06 (fixed, deployed)
 
 Symptom from ChatGPT: m910 kept alternating online/offline. `list_nodes` showed m910 online and healthy, and the very next
