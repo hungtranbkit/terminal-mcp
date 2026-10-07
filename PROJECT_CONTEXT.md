@@ -25,7 +25,18 @@
 
 ### Remaining follow-up
 - Codex's feature-settings menu is still not recognized by `terminal_send_text(prompt_response=true)`. Normal send correctly withholds Enter; this audit selected the exact visible option using the existing key-send path. A scoped, parsed-choice action remains the existing follow-up in “Open bug: menu guard deadlocks explicit numeric choices.”
-- The broad suite failures remain to be triaged separately; do not treat them as known baseline without a comparison run.
+
+## Full-suite failure triage — 2026-10-08
+- Compared the affected modules on a detached `main` worktree (`0ecb9ba`) and this branch. Both runs were **54 failed, 319 passed**. The exact 54 failing node IDs match; introduced regressions: **0**, resolved failures: **0**.
+- Root-cause groups for those 54 baseline failures:
+  - 3 knowledge-map completeness/provenance assertions: the index omits eight existing package modules (`direct_contract`, `direct_task`, `live_sessions`, `live_sessions_page`, `queue_policy`, `session_reconciler`, `shell_dispatch`, `task_labels`). No changed runtime file or new module caused this.
+  - 42 queue/task-start surface failures across start, project, route, observer, rename, migration, E2E, and requeue tests: tests expect retired-by-default queue tools and the old task-start contract. Default test app construction omits `terminal_enqueue_task` / `terminal_verify_requeue`, or returns `QUEUE_DISABLED_USE_DIRECT_SESSION`. The live HP/Dell controllers intentionally opt in via `TERMINAL_MCP_ENABLE_QUEUE=1`; per-lane dispatch stays off. This is existing source policy and not caused by this branch. The final E2E case also has a cleanup defect: when setup fails before assigning `new_name`, its `finally` masks the original queue-tool error with `UnboundLocalError`.
+  - 2 queue transition contract assertions: tests expect `QUEUED -> BLOCKED` and `DISPATCHING -> COMPLETED` to be invalid, while the baseline transition table allows them.
+  - 2 route latency tests: their `_StubController` lacks `_reconcile_ownership`, which the baseline controller invokes.
+  - 2 work UI tests: fixture transitions into `RUNNING` without the execution evidence required by the baseline queue store.
+  - 1 orchestration policy assertion and 2 transport assertions: tests assert older/missing policy phrases while generated server instructions use the current policy text.
+- The original full run had 56 failures. Its extra two—concurrent integration-loop merge and untagged tmux-squatter cleanup—both passed when rerun together on baseline and branch. They did not reproduce outside the full-suite run; classify as suite-order/flaky, not a regression.
+- Rerun on the final code: focused reliability suites **305 passed**; affected-module comparison **54 failed, 319 passed** on both baseline and branch; the two additional full-run failures passed on both. Full-suite release remains not green due the 54 existing failures and the two non-reproduced full-run failures. No source fix was warranted for this task's change set; triage these baseline failures in their respective workstreams before treating the repository-wide suite as green.
 
 ## Node registry flapping / list_nodes vs create_session — 2026-10-06 (fixed, deployed)
 
