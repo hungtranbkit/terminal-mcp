@@ -1,5 +1,11 @@
 # PROJECT_CONTEXT.md
 
+### Routed worker sweep recovery — 2026-10-08 (source fix pending deployment)
+- Audit found the canonical HP controller routes terminal operations to Dell's `terminal-node-agent`, whose `build_node_agent()` Starlette app had no lifespan hook. The controller's local HTTP app starts `TerminalService.start_submission_sweeper()`, but the routed Dell worker never did, so durable Codex submissions could remain `SUBMITTING` after an execution-evidence timeout or process restart.
+- `terminal_mcp/node_agent.py`: added a Starlette lifespan that starts the configured submission sweeper on worker startup and stops it on shutdown, only when `submit_watchdog.enabled` is true. `windows_agent.py` shares this app builder. `tests/test_node_agent.py::test_node_agent_runs_submission_sweeper_for_its_lifetime` checks both lifecycle calls. The test first failed with no calls, then passed after the fix.
+- The focused reliability group now passes **305 tests**. Full `pytest -q` completed with **9,438 passed, 56 failed, 13 skipped, 102 deselected** in 23:45. Failures include knowledge-map completeness, queue contracts/engine E2E, observer/transport, routing and project/task migration/rename, tmux ownership, and work UI; targeted submit/watchdog, composer, node-agent, queue engine, lifecycle and direct-task tests passed. Full suite is not green.
+- This source change is currently uncommitted and not yet deployed. Commit and push it, update both Dell `terminal-node-agent.service` and the HP controller worktree to the new commit, restart them, and verify `/v1/health`, `/health/ready`, and `/version`. The routed 20-cycle/Codex/restart checks documented below were run on commit `60c5cc8` before this worker fix and must be repeated against the new source.
+
 ## Terminal service reliability audit — 2026-10-08 (canary deployed)
 
 ### Source finding and fix

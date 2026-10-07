@@ -27,6 +27,7 @@ never blocks any session operation on the heartbeat loop's own success).
 from __future__ import annotations
 
 import argparse
+from contextlib import asynccontextmanager
 import hashlib
 import hmac
 import json
@@ -1157,7 +1158,19 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
         Route("/v1/internal/shutdown", internal_shutdown, methods=["POST"]),
         WebSocketRoute("/v1/ws/terminal", terminal_ws, name="node_agent_terminal_ws"),
     ]
-    app = Starlette(routes=routes)
+    watchdog_config = getattr(getattr(terminal, "config", None), "submit_watchdog", None)
+    watchdog_enabled = bool(getattr(watchdog_config, "enabled", False))
+    @asynccontextmanager
+    async def lifespan(_app):
+        try:
+            if watchdog_enabled:
+                terminal.start_submission_sweeper()
+            yield
+        finally:
+            if watchdog_enabled:
+                terminal.stop_submission_sweeper()
+
+    app = Starlette(routes=routes, lifespan=lifespan)
     # threading.Event, not anyio.Event -- safe to touch from a plain sync
     # context too (no event-loop affinity), and the only thing ever done
     # with it is a fast, non-blocking .set()/.is_set() from Starlette's
