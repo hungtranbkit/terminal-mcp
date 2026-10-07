@@ -2700,7 +2700,8 @@ class TerminalService:
                 "followup_queued_after_tab" if queue_followup_sent and state in (ACK_ACCEPTED, ACK_RUNNING)
                 else
                 (next((item for item in reversed(result["evidence"]) if "withheld" in item),
-                      result["evidence"][-1]) if state == ACK_STUCK and result["evidence"]
+                      result["evidence"][-1])
+                 if delivery == DELIVERY_UNKNOWN and result["evidence"]
                  else "verified-submit-watchdog")
                 if state != ACK_ACCEPTED or result["enter_count"] <= 1
                 else "verified-submit-watchdog recovery"

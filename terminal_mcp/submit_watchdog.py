@@ -418,8 +418,25 @@ class VerifiedSubmitWatchdog:
             self.store.update(submission_id, ack_state=ACK_SUBMITTING, evidence="watcher_cycle_timeout",
                               last_action="watcher_cycle_complete")
             return finish()
-        self.store.update(submission_id, ack_state=ACK_STUCK, evidence="recovery: submit_evidence_timeout",
-                          stop_reason="execution_evidence_timeout")
+        # Lack of evidence at the foreground deadline is not proof that the
+        # target is gone or that the submission failed. Keep the durable row
+        # eligible for the restart-safe sweeper; it can observe a settled
+        # composer and continue under the shared Enter cap, or age out under
+        # the sweeper TTL. Hard stops (approval, missing node, Enter cap)
+        # remain terminal above.
+        timed_out = self.store.get(submission_id)
+        assert timed_out is not None
+        exhausted_foreground_budget = (max_new_enters is None
+                                       and timed_out.enter_count >= max_enter_attempts)
+        if exhausted_foreground_budget:
+            self.store.update(submission_id, ack_state=ACK_STUCK,
+                              evidence="recovery: submit_evidence_timeout",
+                              last_action="foreground_evidence_timeout",
+                              stop_reason="execution_evidence_timeout")
+        else:
+            self.store.update(submission_id, ack_state=ACK_SUBMITTING,
+                              evidence="recovery: submit_evidence_timeout",
+                              last_action="foreground_evidence_timeout")
         return finish()
 
 

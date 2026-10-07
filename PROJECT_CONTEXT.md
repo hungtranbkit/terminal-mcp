@@ -1,5 +1,30 @@
 # PROJECT_CONTEXT.md
 
+## Terminal service reliability audit — 2026-10-08 (canary deployed)
+
+### Source finding and fix
+- Production `prompt_submissions.db` contained 128 Codex submissions finalized as `STUCK` with `execution_evidence_timeout`. `VerifiedSubmitWatchdog.run()` made an evidence timeout terminal even when foreground Enter budget remained, and `SubmissionStore.active()` consequently excluded the record from the restart-safe sweeper.
+- `terminal_mcp/submit_watchdog.py`: keep an evidence-timeout submission `SUBMITTING` while Enter budget remains so the sweeper can re-inspect it after a restart. Exhausted foreground Enter budgets remain terminal `STUCK`; approval/menu, missing-session, and hard-cap paths remain fail-closed.
+- `terminal_mcp/core.py`: for `DELIVERY_UNKNOWN`, expose the last concrete watchdog evidence in `submit_reason`. Before this, a recoverable timeout could hide `recovery withheld` behind the generic `verified-submit-watchdog` message.
+- Added `test_evidence_timeout_remains_recoverable_after_store_restart` in `tests/test_verified_submit_watchdog.py`; it proves RED (`STUCK`, absent from active records) then GREEN (durable row remains active and the restarted sweeper resolves it without Enter on an incomplete pane).
+- Other reported paths were audited against current source and live state. Durable owner/generation checks and owner-confirmed missing transitions are already in `terminal_mcp/session_ownership.py` / `terminal_mcp/controller.py`; live store state was 4 ACTIVE, 129 MISSING, 96 KILLED while tmux had exactly 4 sessions. Lifecycle cleanup is enabled (`dry_run=false`), with 176 CLOSED, 251 GONE, 1 CONTROLLED, 3 RECOVERY_REQUIRED records. Existing ownership/tombstone, queue completion-evidence, direct-task idle-not-complete, and lifecycle recovery tests passed in the full run. No new source change was made to those paths.
+
+### Verification
+- Focused reliability set: **278 passed** across submit/watchdog, real tmux/PTY composer, queue engine, lifecycle reaper, and direct-task suites.
+- Full `pytest -q`: **9,439 passed, 54 failed, 13 skipped, 102 deselected**. No focused watchdog or real-submit regression appeared in the failure list. The failures include stale knowledge-map coverage; retired queue/MCP contract expectations; observer/transport; routing, project/task migration, rename, verify queue, and live work UI tests. The full run was not green; investigate the broad-suite failures separately rather than treating them as baseline without a comparison run.
+- `git diff --check`: passed.
+
+### Local deployment and live acceptance
+- Branch `fix/terminal-mcp-source-reliability-20261008`, based on `main` at `0ecb9ba`. Dell `terminal-mcp-http.service` canary uses `/home/dell/workspace/terminal-mcp/.paperclip/worktrees/terminal-mcp-source-reliability` through the temporary systemd drop-in `~/.config/systemd/user/terminal-mcp-http.service.d/99-terminal-mcp-source-reliability.conf` (`WorkingDirectory` + `PYTHONPATH`). The same drop-in sets `TERMINAL_MCP_ENABLE_QUEUE=1`, the supported server-operator queue opt-in requested for this task. `/health/ready` is ready; `/version` reports `0ecb9ba` with dirty worktree source. To roll back, remove that drop-in, run `systemctl --user daemon-reload`, then restart `terminal-mcp-http.service`; the prior unit was saved at `/tmp/terminal-mcp-http.pre-source-reliability.unit`.
+- 20/20 real MCP shell cycles passed: create READY → `terminal_send_text` SUBMIT_CONFIRMED → observed unique output token → confirmed delete. No cycle sessions remained.
+- Real Codex `0.160.1` initially presented a Codex feature-settings menu. The send correctly withheld Enter and persisted the draft as SUBMITTING; after the explicit “run without daemon this time” choice, the sweeper observed the stable composer and sent exactly one Enter. Submission `71dc97145c4a45b182341a82bf2ba5f5` reached ACCEPTED and Codex emitted `TMCP_CODEX_LIVE_CYCLE_OK`; the session was deleted. No Codex shared settings were changed.
+- Restart recovery probe: a shell command printed `TMCP_RESTART_BEFORE_OK`, slept, then printed `TMCP_RESTART_AFTER_OK` across an HTTP service restart. `/health/ready` recovered, tmux PID stayed `2386811`, inspection showed both tokens, and the probe session was deleted. Final tmux list contains only the four pre-existing sessions.
+- Queue canary: after the server opt-in, `terminal_enqueue_task` became visible over MCP and accepted a harmless disposable task. Its lane reported `auto_dispatch_enabled=false`; after four seconds it was still QUEUED and the prompt had not reached the pane. The task was cancelled and its probe session deleted. This verifies the API opt-in without enabling any lane's auto-dispatch.
+
+### Remaining operational finding
+- Queue is intentionally retired by default in source (`terminal_mcp/queue_policy.py`); the Dell canary now opts in at the server level. The live queue DB has 65 lanes, zero `auto_dispatch_enabled` lanes, and no populated project fields. Per-lane auto-dispatch remains off; a specific lane/workflow policy is needed before opting a production lane in.
+- Live menu diagnosis also reproduced the known explicit-choice gap: `terminal_send_text(prompt_response=true)` did not recognize Codex’s feature-settings menu, while the normal send path safely withheld input. See the existing “Open bug: menu guard deadlocks explicit numeric choices” handoff below; a scoped parsed-choice action remains follow-up work.
+
 ## Node registry flapping / list_nodes vs create_session — 2026-10-06 (fixed, deployed)
 
 Symptom from ChatGPT: m910 kept alternating online/offline. `list_nodes` showed m910 online and healthy, and the very next
