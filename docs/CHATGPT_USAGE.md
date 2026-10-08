@@ -31,6 +31,16 @@ only, nothing to call yet. Never treat a PLANNED item as available.
 
 ## 1. Quick start
 
+For an **idle local Codex**, call `terminal_turn(action="start", target=...,
+text=..., request_key="<stable unique request>")`. This source version returns
+`TASK_STARTED` only after confirmed submission and a fresh `RUNNING` check.
+It never queues that Codex start, even with legacy queue opt-in. Failures are
+explicit: inspect the returned evidence; do not resend under a new key.
+Same-key retries return the durable receipt. `EXISTING_QUEUE_TASK` points to
+existing work that must not be duplicated. Remote guarded start is currently
+unsupported and fails closed. This change requires a service rollout; a source
+checkout alone does not change the running HP process.
+
 - The production control plane serves the MCP endpoint at
   `http://127.0.0.1:8766/mcp` and the dashboard at
   `http://127.0.0.1:8766/dashboard` (both loopback-only; a real

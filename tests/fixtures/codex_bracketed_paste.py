@@ -21,7 +21,7 @@ def render(body):
 try:
     tty.setraw(fd)
     sys.stdout.write("\x1b[?2004h")
-    render("› ")
+    render("› Ask Codex to do anything")
     while True:
         buffer += os.read(fd, 65536)
         if not in_paste:
