@@ -398,10 +398,23 @@ pure hardening). Tests: `tests/test_delivery_gate.py`.
 
 **Status: VERIFIED.**
 
-- **Press-enter semantics:** `SEND_TEXT_ENTER_SETTLE_SECONDS` settle
-  window between the literal-text `send-keys` and the Enter keystroke
-  (a real race found live: some CLIs swallow an Enter that arrives
-  before they've finished consuming the text).
+- **Press-enter semantics (2026-10-08):** the verified Codex path must
+  honor `submit.codex.settle_ms` (default 80 ms, bounded to 1–2000 ms)
+  after its text-only injection, before a separate Enter dispatch. tmux
+  payloads at least 1024 UTF-8 bytes use bracketed paste with unchanged line
+  endings and socket-local load/paste/delete operations. Every initial
+  activation requires the complete live draft (visible tail or exact
+  collapsed-paste character count); partial prefixes, historical markers,
+  and approval chrome do not authorize Enter. Acceptance still requires
+  post-Enter evidence. Recovery never retypes, stays within the persisted
+  Enter budget, and same-key replay returns the original receipt.
+  Explicit validated menu responses retain the single-Enter path.
+  `ACTIVATION_TEXT_ONLY` remains a truthful refusal when no activation
+  occurred; it must never be relabeled as accepted to hide a timeout.
+  Regression: `tests/test_codex_paste_settle.py`, watchdog/configuration
+  and send-reliability suites. Real Codex 0.154.0 verification uses only an
+  isolated disposable tmux socket; the running controller is not updated
+  by this source change. See `docs/prompt-submission.md` for evidence.
 - **SUBMIT_CONFIRMED/DELIVERY_UNKNOWN:** `_send_text_and_verify` (core.py)
   — a real before/after-Enter tmux-pane diff decides which; a raw
   `DELIVERY_UNKNOWN` NEVER silently retries — see §7 for how the queue

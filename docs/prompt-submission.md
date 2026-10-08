@@ -714,3 +714,83 @@ real.
 Audit metadata carried on every send: `submission_id`, `activation_attempts`,
 `enter_count`, `evidence`, `stage`, `submit_latency_ms`, `submit_reason`.
 None of them contain prompt text.
+
+
+## HP Codex paste investigation and fix (2026-10-08)
+
+Source inspection found the controller running from
+`~/.cache/terminal-mcp/source-reliability` at `d2370663`, while the clean
+working repository was `1b8e7a3`. The relevant submit paths matched.
+No service restart, session permission change, or live-session intervention
+is part of this source increment.
+
+Read-only receipt metadata identified zero-Enter submissions of 1096,
+1223, and 1719 characters. Their evidence was `text_injected_once`,
+`composer_buffer_not_fully_observed`, then
+`pre_activation_evidence_withheld` and timeout. This identifies the exact
+withholding branch: the watchdog never recognized an attributable complete
+composer and therefore never dispatched Enter. `ACTIVATION_TEXT_ONLY` is
+the correct downstream verdict for that receipt, not the transport error.
+The original incident pane was deliberately not captured, so its exact
+rendering cannot be reconstructed from those metadata alone.
+
+Two source defects compound this failure: the verified path injects with
+`press_enter=False`, bypassing the transport's existing settle delay; and
+the 4096-byte transport threshold sends a roughly 1 KiB payload as literal
+keystrokes rather than explicit bracketed paste. In isolated Codex 0.154.0
+probes, the immediate post-injection frame could still be empty, the first
+Enter could be swallowed, and a long literal draft's viewport omitted its
+tail. Polling for a hidden complete draft cannot fix that viewport limit.
+Explicit bracketed paste exposes Codex's `[Pasted Content N chars]`
+acknowledgment. The new threshold is 1024 UTF-8 bytes, and the verified path
+honors the bounded configured settle before its separate activation step.
+
+The completeness gate is now applied on every pre-Enter poll and scoped
+to the live composer. A prefix alone or a paste marker in scrollback is
+insufficient. Approval detection precedes activation; explicitly requested,
+prevalidated menu responses use the existing single-Enter path. Positive
+post-activation evidence is still mandatory. Durable Enter reservation,
+stable-draft bounded recovery, identity revalidation, and idempotency stay
+in force; no prompt is re-injected during recovery. A transport failure or
+missing evidence remains unconfirmed. Terminal `STUCK` records are not
+automatically retried by the sweeper.
+
+The isolated tests also exposed two transport defects: `load-buffer` used
+the default tmux socket while paste/delete used the selected socket, and
+`paste-buffer` rewrote LF to CR. All three operations now use the selected
+socket, with `paste-buffer -p -r` preserving line endings. A real raw-PTY
+fixture checks the SHA-256 of a long multilingual multiline prompt, one
+submission, and same-key replay. Unit regressions cover settle timing,
+delayed/collapsed drafts, partial/historical evidence, failed Enter,
+approval, and one bounded recovery after a swallowed Enter.
+
+Patched live verification: separate no-tool prompts of 1169 characters
+(single line) and 2805 characters (Vietnamese, CJK, emoji, multiline)
+each returned `SUBMIT_CONFIRMED`, one Enter, and no recovery. Same-key
+replays returned the original submission ID. A subsequent independent
+capture showed exactly one assistant reply for each requested marker.
+Only the owned `tmcp-paste-probe-*` socket/session was used and cleaned up.
+The protected recovery session and PropertyIQ/crawler worktrees were not
+accessed or modified. The CI submit-invariant job includes the new tests.
+
+Focused verification: 209 tests passed across paste/transport, send
+reliability, watchdog, configuration, delivery gates, compact tools, and
+submit acceptance. The independent review found no remaining blocking
+findings after explicit menu responses were excluded from both legacy retry
+paths. No production rollout was performed.
+
+The final CI-targeted command passed 155 tests after adding an inclusive
+1024-byte boundary regression. The broader diagnostic run, begun before the
+final revisions, finished with 9408 passed, 60 failed, 45 skipped, and 102
+deselected. Of its failures, 58 reproduced on an untouched `1b8e7a3`
+worktree (controller/registry wiring, package-map coverage, policy contracts,
+queue transitions, and related integrations). The remaining concurrency
+failure passed in isolation on both checkouts. The source-inspection failure
+was caused by editing core.py while that process was running; it passed in
+the final fresh-process checks. This is not a claim of a green full suite.
+
+Additional transport checks produced 78 passes plus one stale-session
+fixture recreation failure in each of two feature-branch runs, in different
+fixture tests; the untouched baseline passed all 79. These fixture paths
+are unchanged and do not call the modified paste method. No tests were
+skipped or security controls relaxed to obtain a passing result.
