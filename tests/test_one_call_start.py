@@ -37,8 +37,9 @@ from terminal_mcp.queue_task_follower import StartedTaskFollower
 @pytest.fixture(autouse=True)
 def _exercise_bounded_in_call_dispatch(monkeypatch):
     # These tests exercise the optional bounded synchronous transition path.
-    # Production defaults to enqueue + follower with no caller-thread ticks;
-    # test_compact_turn_actions pins that shipped zero-budget behavior.
+    # Opt-in queue mode uses enqueue + follower with no caller-thread ticks;
+    # test_compact_turn_actions pins that zero-budget behavior.
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "1")
     monkeypatch.setattr("terminal_mcp.compact_tools.START_WAIT_BUDGET_SECONDS", 5.0)
 
 
@@ -272,7 +273,8 @@ def test_the_start_receipt_states_the_no_polling_contract():
     assert "task_id" in result["guidance"]
 
 
-@pytest.mark.parametrize("phrase", ["GIVING A SESSION WORK IS ONE CALL", "After start, STOP"])
+@pytest.mark.parametrize("phrase", ["GIVING A SESSION WORK IS DIRECT SESSION SEND",
+                                    "After direct send, avoid polling unless the user asks for a check"])
 def test_the_server_policy_states_it_too(phrase: str):
     from terminal_mcp import orchestration_policy as op
     assert phrase in op.SERVER_INSTRUCTIONS

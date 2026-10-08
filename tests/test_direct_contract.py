@@ -41,3 +41,15 @@ def test_direct_contract_has_no_paperclip_runtime_dependency():
     source = inspect.getsource(direct_contract)
     assert "import paperclip" not in source
     assert "from paperclip" not in source
+
+
+def test_terminal_turn_schema_teaches_direct_compatibility(monkeypatch):
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "0")
+    server = build_mcp()
+    tool = next(t for t in server._tool_manager.list_tools() if t.name == "terminal_turn")
+    assert "direct-session-first" in tool.description
+    assert "existing target" in tool.description
+    assert "not a queued task_id" in tool.description
+    flag = tool.parameters["properties"]["long_task"]
+    assert flag["deprecated"] is True
+    assert "creates no queue task" in flag["description"]

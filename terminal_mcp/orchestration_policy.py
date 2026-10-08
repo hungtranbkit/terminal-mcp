@@ -37,7 +37,7 @@ Design commitments:
 
 from __future__ import annotations
 
-ORCHESTRATION_POLICY_VERSION = "1.4.1"
+ORCHESTRATION_POLICY_VERSION = "1.4.2"
 
 #: Where the expanded, human-readable form lives, relative to the repo root.
 POLICY_DOC_PATH = "docs/CHATGPT_ORCHESTRATION_POLICY.md"
@@ -58,7 +58,7 @@ PROMPT_RETRY_CAP = 6
 TOOL_EFFICIENCY = (
     "TOOL EFFICIENCY. Terminal MCP is the CONTROL PLANE. GIVING A SESSION WORK IS DIRECT SESSION SEND. "
     "The durable task queue is retired and disabled by default. For coding work, create a fresh session when needed, then use terminal_turn action=send or action=send_wait directly on that session. "
-    "Queue-producing actions start, enqueue_task, route_start, agent_start, project_start, aliases run/dispatch/enqueue, and send with long_task=true must not be used in normal operation. "
+    "Queue-producing actions enqueue_task, route_start, agent_start, project_start and alias enqueue must not be used in normal operation. When queue is disabled, cached start/run/dispatch/start_task calls use guarded direct send to an existing target; long_task=true on send/send_wait is a compatibility flag, with no queue writes or automatic continuation. These return direct delivery evidence, not a queued task_id. "
     "Use inspect only when the user explicitly asks for a status check. After direct send, avoid polling unless the user asks for a check. "
     "Read-only task history/status and cleanup remain available for historical tasks. Paperclip is a separate optional orchestration layer for project/issue assignment, heartbeats, budgets and managed workspaces; it is not a dependency of direct Terminal MCP inspection, remote execution, browser verification or break-glass recovery. When work is complete, verify it, merge to the intended branch, and clean up finished sessions/worktrees/branches."
 )
@@ -147,7 +147,7 @@ CRITICAL_INVARIANTS: tuple[str, ...] = (
     "PRODUCTION DEPLOYMENT AND RELEASE REMAIN A SEPARATE, EXPLICIT USER APPROVAL STEP",
     # Session task label: new chats only keep the live monitor accurate if
     # they are told to title task assignments.
-    "pass title=\"<short summary>\" on send/send_wait",
+    "pass BOTH title=\"<short summary>\" and metadata.task_summary=\"<same summary>\" on send/send_wait",
 )
 
 

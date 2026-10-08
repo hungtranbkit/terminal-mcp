@@ -569,14 +569,13 @@ def test_queue_submission_actions_are_disabled_by_default(monkeypatch):
     })
 
     attempts = [
-        tools.turn(action="start", target="worker", text="queued work"),
         tools.turn(action="enqueue_task", target="worker", text="queued work"),
         tools.turn(action="route_start", text="queued work"),
         tools.turn(action="agent_start", target="agent-1", text="queued work"),
         tools.turn(action="project_start", target="project-1", text="queued work"),
-        tools.turn(action="send", target="worker", text="queued work", long_task=True),
-        tools.turn(action="run", target="worker", text="queued work"),
         tools.turn(action="enqueue", target="worker", text="queued work"),
+        tools.turn(action="queue_resume", target="worker"),
+        tools.turn(action="queue_run_once", target="worker"),
     ]
 
     for result in attempts:
