@@ -318,6 +318,19 @@ Real return fields:
 - `correlation_id`/`submission_id`: use these to find the send later in
   audit/events, never invent your own id.
 
+For Codex, the server now waits the configured `submit.codex.settle_ms`
+(default 80 ms, bounded to 1–2000 ms) after injecting text, then sends
+Enter separately only when the complete live draft is observable. tmux
+uses bracketed paste for payloads at least 1024 UTF-8 bytes. A missing Enter
+is reported as `TEXT_SENT` / `ACTIVATION_TEXT_ONLY`, not acceptance.
+Reuse the same `idempotency_key` to retrieve the original receipt; do not
+paste again with a new key. Inspect the submission evidence and a separate
+post-submit observation. Bounded recovery sends only activation keys for
+an attributable stable draft; approval dialogs and uncertain drafts stop
+it. A terminal `STUCK` receipt is not automatically replayed by the sweeper.
+Use `prompt_response=True` only for an intentional short answer to an
+already-visible menu; that flow dispatches a single Enter.
+
 **Anti-pattern — never do this:** blindly resend on `DELIVERY_UNKNOWN`.
 A `DELIVERY_UNKNOWN` result does **not** mean the send failed — it
 means confirmation didn't arrive in time. A real, live-reproduced bug
