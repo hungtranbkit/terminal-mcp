@@ -892,9 +892,9 @@ class CompactTerminalTools:
         Pane actions, implemented here:
         - inspect: status+tail for one target or many targets (`targets`), each
           row carrying the `resource` context/quota health block.
-        - send: guarded/idempotent task submission. Set ``long_task=True``
-          to persist the prompt in the durable queue and return its receipt;
-          dispatch and progress observation stay server-side.
+        - send: guarded/idempotent direct submission. With queue disabled,
+          legacy start aliases and long_task=True use this same guarded path.
+          Queue-enabled operators retain the legacy durable receipt path.
         - send_wait: submit, then create one durable bounded wait in the same call.
         - wait: create one durable bounded wait.
         - resume: resume a previously PENDING wait.
@@ -934,6 +934,17 @@ class CompactTerminalTools:
                        if canonical not in QUEUE_SUBMISSION_ACTIONS}
             return {"status": "FAILED", "error": "INVALID_ACTION",
                     "allowed": allowed, "aliases": aliases}
+
+        # Cached clients may still say start or long_task. With queue off,
+        # translate those into the SAME guarded direct send, never a new
+        # session, queue row, dispatch tick or implicit supervision loop.
+        if not queue_submission_enabled():
+            if normalized == "start" or (normalized in {"send", "send_wait"} and long_task):
+                if normalized == "start":
+                    normalized = "send"
+                if idempotency_key is None:
+                    idempotency_key = request_key
+                long_task = False
 
         # Queue submission is retired for normal public use.  The legacy
         # engine remains for historical/running tasks, but no new queue row is

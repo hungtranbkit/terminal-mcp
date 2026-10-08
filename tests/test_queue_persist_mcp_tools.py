@@ -115,3 +115,52 @@ async def test_native_queue_submit_tools_fail_closed_without_server_opt_in(serve
 
     after = await _call(mcp_server, "terminal_queue_metrics", session="lane-a")
     assert after["queued_depth"] == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("delivery", ["SUBMIT_CONFIRMED", "BLOCKED"])
+async def test_queue_disabled_compatibility_and_history_do_not_write_queue_db(tmp_path, monkeypatch, delivery):
+    """Exercise real MCP wiring and compare every table, including queue events."""
+    import sqlite3
+    from terminal_mcp.controller import ControllerService
+
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "0")
+    path = tmp_path / "historical-queue.db"
+    store = QueueStore(path)
+    task_id = store.set_tasks("lane-a", [{"prompt": "historical work"}])[0]
+    queue = QueueService(store)
+    calls = []
+
+    def guarded_send(self, session, text, press_enter, dry_run, **kwargs):
+        calls.append((session, text, kwargs))
+        return {"session": session, "delivery_state": delivery,
+                "error": "TARGET_AWAITING_APPROVAL" if delivery == "BLOCKED" else None,
+                "enter_sent": delivery == "SUBMIT_CONFIRMED"}
+
+    monkeypatch.setattr(ControllerService, "terminal_send_text", guarded_send)
+    server = build_mcp(queue=queue)
+
+    def snapshot():
+        with sqlite3.connect(path) as conn:
+            return list(conn.iterdump())
+
+    before = snapshot()
+    for action, long_task in (("start", False), ("send", True), ("send_wait", True)):
+        result = await _call(server, "terminal_turn", action=action, target="lane-a",
+                             text="new work", long_task=long_task, request_key="retry", timeout=0.01)
+        if delivery == "BLOCKED":
+            assert result["status"] == "BLOCKED"
+        elif action != "send_wait":
+            assert result["status"] == "SUBMIT_CONFIRMED"
+        else:
+            assert result["send"]["status"] == "SUBMIT_CONFIRMED"
+    status = await _call(server, "terminal_turn", action="task_status", task_id=task_id)
+    assert status["result"]["task"]["prompt"] == "historical work"
+    batch = await _call(server, "terminal_turn", action="task_batch_status", task_ids=[task_id])
+    assert batch["status"] == "OK"
+    for name in ("terminal_queue_status", "terminal_queue_events", "terminal_queue_metrics"):
+        result = await _call(server, name, session="lane-a")
+        assert "error" not in result
+    assert len(calls) == 3
+    assert all(call[2]["idempotency_key"] == "retry" for call in calls)
+    assert snapshot() == before

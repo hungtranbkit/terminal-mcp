@@ -590,3 +590,98 @@ def test_stalled_reads_are_single_flight_and_capacity_bounded():
         assert len(calls) == 32
     finally:
         release.set()
+
+
+@pytest.mark.parametrize("queue_flag", [None, "0"])
+@pytest.mark.parametrize("action,long_task", [
+    ("start", False), ("run", False), ("dispatch", False),
+    ("start_task", False), ("send", True), ("send_wait", True),
+])
+def test_direct_compatibility_uses_guarded_send_without_queue(monkeypatch, queue_flag, action, long_task):
+    if queue_flag is None:
+        monkeypatch.delenv("TERMINAL_MCP_ENABLE_QUEUE", raising=False)
+    else:
+        monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", queue_flag)
+    compact, _terminal, controller = service()
+    controller.send_result = {"delivery_state": "SUBMIT_CONFIRMED", "enter_sent": True}
+    controller.statuses["node/worker"] = {"state": "IDLE"}
+    controller.tails["node/worker"] = "done"
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("direct compatibility must not touch queue handlers")
+
+    compact.handlers = dict.fromkeys(
+        ("enqueue_task", "dispatch_tick", "follow_task", "create_session", "task_status"), forbidden)
+    result = compact.turn(action=action, target="node/worker", text="do work",
+                          long_task=long_task, request_key="retry-1")
+    assert result["status"] in {"SUBMIT_CONFIRMED", "MATCHED"}
+    assert result["action"] == ("send_wait" if action == "send_wait" else "send")
+    assert controller.send_calls == [
+        ("node/worker", "do work", True, False, {"idempotency_key": "retry-1"})]
+    assert "task_id" not in result and "receipt" not in result
+
+
+@pytest.mark.parametrize("action,long_task", [("start", False), ("send", True), ("send_wait", True)])
+@pytest.mark.parametrize("error", ["TARGET_AWAITING_APPROVAL", "INPUT_RESTRICTED", "PROTECTED_SESSION", "IDENTITY_MISMATCH"])
+def test_direct_compatibility_preserves_guard_refusals(monkeypatch, action, long_task, error):
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "0")
+    compact, _terminal, controller = service()
+    controller.send_result = {"delivery_state": "BLOCKED", "error": error, "enter_sent": False}
+    result = compact.turn(action=action, target="worker", text="do work", long_task=long_task)
+    assert result["status"] == "BLOCKED"
+    assert (result.get("result") or result.get("send"))["reason"] == error
+    assert len(controller.send_calls) == 1
+    assert controller.status_calls == 0
+    assert result.get("wait") is None
+
+
+@pytest.mark.parametrize("target,text,error", [(None, "work", "TARGET_REQUIRED"), ("worker", None, "TEXT_REQUIRED")])
+def test_direct_start_requires_existing_target_and_text(monkeypatch, target, text, error):
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "0")
+    compact, _terminal, controller = service()
+    result = compact.turn(action="start", target=target, text=text)
+    assert result["error"] == error
+    assert controller.send_calls == []
+
+
+def test_direct_start_keeps_explicit_idempotency_key(monkeypatch):
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "0")
+    compact, _terminal, controller = service()
+    compact.turn(action="start", target="worker", text="work",
+                 request_key="legacy", idempotency_key="explicit")
+    assert controller.send_calls[0][-1] == {"idempotency_key": "explicit"}
+
+
+@pytest.mark.parametrize("action,long_task", [("start", False), ("send", True)])
+def test_direct_compatibility_keeps_binding_guard_and_task_label(monkeypatch, action, long_task):
+    from unittest.mock import Mock
+
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "0")
+    compact, terminal, controller = service()
+    terminal.bindings["primary"] = "worker"
+    terminal.send_result = {"delivery_state": "SUBMIT_CONFIRMED", "enter_sent": True}
+    compact.task_labels = Mock()
+    compact.task_labels.split_target.return_value = (None, "worker")
+    compact.task_labels.on_send.return_value = {"title": "Feature"}
+    compact.turn(action=action, target="binding:primary", text="implement feature",
+                 long_task=long_task, title="Feature", metadata={"task_summary": "Feature"})
+    assert len(terminal.send_calls) == 1
+    assert terminal.send_calls[0][:4] == ("primary", "implement feature", True, False)
+    assert controller.send_calls == []
+    assert compact.task_labels.on_send.call_args.kwargs["title"] == "Feature"
+    assert compact.task_labels.on_send.call_args.kwargs["metadata"] == {"task_summary": "Feature"}
+
+
+@pytest.mark.parametrize("action,long_task", [("start", False), ("send", True), ("send_wait", True)])
+def test_direct_compatibility_does_not_confirm_or_retry_unknown_delivery(monkeypatch, action, long_task):
+    from unittest.mock import Mock
+
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "0")
+    compact, _terminal, controller = service()
+    controller.send_result = {"delivery_state": "DELIVERY_UNKNOWN", "enter_sent": True}
+    compact.task_labels = Mock()
+    result = compact.turn(action=action, target="worker", text="work", long_task=long_task)
+    assert result["status"] == "FAILED"
+    assert len(controller.send_calls) == 1
+    assert controller.status_calls == 0
+    compact.task_labels.on_send.assert_not_called()
