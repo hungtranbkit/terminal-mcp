@@ -8,10 +8,11 @@ browser verification, and break-glass operations.
 
 from __future__ import annotations
 
-DIRECT_CONTRACT_VERSION = "1.0.0"
+DIRECT_CONTRACT_VERSION = "1.1.0"
 
 # Canonical terminal_turn actions that must remain usable without Paperclip.
 REQUIRED_DIRECT_TURN_ACTIONS = frozenset({
+    "start",
     "inspect",
     "send",
     "send_wait",
@@ -46,13 +47,10 @@ REQUIRED_DIRECT_TOOLS = frozenset({
 
 # Queue/orchestration entry points intentionally excluded from the direct contract.
 RETIRED_QUEUE_ACTIONS = frozenset({
-    "start",
     "enqueue_task",
     "route_start",
     "agent_start",
     "project_start",
-    "run",
-    "dispatch",
     "enqueue",
 })
 
@@ -81,6 +79,8 @@ def contract() -> dict[str, object]:
         "independentOfPaperclip": True,
         "requiredTurnActions": sorted(REQUIRED_DIRECT_TURN_ACTIONS),
         "requiredTools": sorted(REQUIRED_DIRECT_TOOLS),
+        "codexDirectStart": {"requiresIdle": True, "requiresRunning": True,
+                             "remoteIdleGuardSupported": False, "aliases": ["run", "dispatch"]},
         "retiredQueueActions": sorted(RETIRED_QUEUE_ACTIONS),
         "directUseCases": list(DIRECT_USE_CASES),
         "paperclipUseCases": list(PAPERCLIP_USE_CASES),

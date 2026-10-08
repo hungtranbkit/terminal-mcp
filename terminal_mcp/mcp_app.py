@@ -86,7 +86,7 @@ _RETIRED_PUBLIC_QUEUE_TOOLS = (
     "terminal_verify_requeue",
 )
 _DIRECT_ACTION_SCHEMA_HELP = (
-    "Direct Terminal MCP action. Normal public actions: inspect, send, send_wait, wait, resume, "
+    "Direct Terminal MCP action. Normal public actions: start (idle local Codex, confirmed RUNNING or error), inspect, send, send_wait, wait, resume, "
     "supervise (long task continued server-side until explicit DONE), supervise_status, "
     "supervise_complete, supervise_cancel, "
     "list_sessions, list_nodes, create_session, delete_session, task_status, task_batch_status, "
@@ -785,16 +785,18 @@ def build_mcp(service: TerminalService | None = None,
 
 NORMAL FLOW:
 1. `create_session` creates a fresh session for real work.
-2. `send` or `send_wait` sends work directly to that session.
+2. `start` submits directly to idle local Codex and requires confirmed RUNNING;
+   use a stable request_key. `send` or `send_wait` supports other direct input.
 3. `inspect` is used only when a user explicitly asks for a status check.
 4. When work is complete, merge/test as appropriate and clean up the finished
    session/worktree/branch.
 
 The durable task queue is RETIRED and disabled by default. Queue-producing
-actions (`start`, `enqueue_task`, `route_start`, `agent_start`,
-`project_start`, aliases such as `run`/`dispatch`, and `send` with
+actions (`enqueue_task`, `route_start`, `agent_start`,
+`project_start`, and `send` with
 `long_task=true`) return `QUEUE_DISABLED_USE_DIRECT_SESSION` and do not create
-a new queue row. Read-only task/task-batch/history/metrics and cleanup/cancel
+a new queue row. Codex `start` (aliases `run`/`dispatch`) bypasses the queue;
+non-Codex start retains the legacy queue gate. Read-only task/task-batch/history/metrics and cleanup/cancel
 operations remain available for historical or already-running tasks.
 
 A server operator can deliberately opt back in only by starting Terminal MCP
@@ -6427,6 +6429,10 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         harness_cancel=harness.cancel,
         harness_review=harness.review,
     ))
+
+    # Read-only compatibility lookup: a direct start may not duplicate a
+    # previously enqueued request, even when its lane is disabled.
+    compact_tools.handlers["legacy_task_by_request_key"] = queue.store.task_by_request_key
 
     if not queue_submission_enabled():
         for tool_name in _RETIRED_PUBLIC_QUEUE_TOOLS:

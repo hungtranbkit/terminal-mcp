@@ -1528,6 +1528,7 @@ class TerminalService:
                 "exists": True,
                 "allowed": True,
                 "state": state,
+                "agent_type": select_adapter(info.pane_current_command or "").name,
                 "input_required": input_required,
                 "reason": reason,
                 "last_activity_s": max(0, int(time.time()) - int(info.activity_epoch)),
@@ -1761,7 +1762,8 @@ class TerminalService:
 
     def _send_text_and_verify(self, session: str, text: str, press_enter: bool, *,
                               idempotency_key: str | None = None,
-                              prompt_response: bool = False) -> dict[str, Any]:
+                              prompt_response: bool = False,
+                              require_idle: bool = False) -> dict[str, Any]:
         """P0-3/P0-4/P0 Part B wrapper around _send_text_and_verify_locked:
         claims an idempotency key (if given) before anything else,
         acquires the durable cross-process pane lease (lease.py -- the
@@ -1808,9 +1810,20 @@ class TerminalService:
             return result
         try:
             with self._pane_locks.get(lock_key):
-                result = self._send_text_and_verify_locked(
-                    session, text, press_enter, correlation_id=correlation_id,
-                    prompt_response=prompt_response)
+                # Read while holding the same cross-process pane lease as the
+                # write. Concurrent immediate starts cannot turn into queued
+                # follow-ups merely because both saw IDLE before taking it.
+                state = self._status_payload(session) if require_idle else None
+                if state is not None and (state.get("error") or state.get("state") != "IDLE"
+                        or state.get("input_required") or state.get("exists") is False):
+                    result = {"session": session, "error": "DIRECT_TARGET_NOT_IDLE",
+                              "sent": False, "enter_sent": False,
+                              "delivery_state": DELIVERY_BLOCKED,
+                              "submit_status": to_legacy_submit_status(DELIVERY_BLOCKED)}
+                else:
+                    result = self._send_text_and_verify_locked(
+                        session, text, press_enter, correlation_id=correlation_id,
+                        prompt_response=prompt_response)
         finally:
             self.leases.release(lock_key, correlation_id)
         result = self._enrich_receipt(result)
@@ -2876,6 +2889,7 @@ class TerminalService:
     def terminal_send_text(self, session: str, text: str, press_enter: bool = False,
                            dry_run: bool = False, idempotency_key: str | None = None, *,
                            prompt_response: bool = False,
+                           require_idle: bool = False,
                            origin: str | None = None, trace_id: str | None = None,
                            parent_turn_id: str | None = None, depth: int = 0) -> dict[str, Any]:
         """idempotency_key (P0-4, optional): if provided, a repeat call
@@ -2921,7 +2935,8 @@ class TerminalService:
             response = {"session": session,
                         **self._send_text_and_verify(session, text, press_enter,
                                                      idempotency_key=idempotency_key,
-                                                     prompt_response=prompt_response)}
+                                                     prompt_response=prompt_response,
+                                                     require_idle=require_idle)}
             if prompt_response and "error" not in response:
                 response["prompt_response"] = True
         except TmuxError as exc:
@@ -3403,7 +3418,8 @@ class TerminalService:
         return None
 
     def terminal_send_bound(self, binding: str, text: str, press_enter: bool = False,
-                            dry_run: bool = False, idempotency_key: str | None = None) -> dict[str, Any]:
+                            dry_run: bool = False, idempotency_key: str | None = None, *,
+                            require_idle: bool = False) -> dict[str, Any]:
         action = "send_bound"
         stored, error = self._resolve_binding(binding)
         if error:
@@ -3436,7 +3452,8 @@ class TerminalService:
             try:
                 response = {"binding": binding, "session": stored.session,
                             **self._send_text_and_verify(stored.session, text, press_enter,
-                                                         idempotency_key=idempotency_key)}
+                                                         idempotency_key=idempotency_key,
+                                                         require_idle=require_idle)}
             except TmuxError as exc:
                 response = {"error": "SESSION_NOT_FOUND", "binding": binding,
                             "session": stored.session, "reason": str(exc)}

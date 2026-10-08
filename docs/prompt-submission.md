@@ -794,3 +794,34 @@ fixture recreation failure in each of two feature-branch runs, in different
 fixture tests; the untouched baseline passed all 79. These fixture paths
 are unchanged and do not call the modified paste method. No tests were
 skipped or security controls relaxed to obtain a passing result.
+
+
+## HP direct-start investigation (2026-10-08)
+
+Read-only audit of task `8f50a0ca598049d4b7cd09676191fcd2` found QUEUED,
+zero attempts, no submission ID, and disabled lane auto-dispatch. More
+specifically, legacy `start` has a zero synchronous start budget; its follower
+could not advance past the earlier BLOCKED lane head (`ACTIVATION_TEXT_ONLY`).
+Opting into the legacy queue did not guarantee immediate submission.
+
+During investigation the task was externally reconciled to RUNNING at
+08:11:39Z via `MANUAL_EXECUTION_RECONCILED`, explicitly recording direct user
+execution without automated dispatch. This is recorded task state, not a new
+pane acceptance claim. This investigation sent no input to that session.
+
+Local Codex start now bypasses enqueue/follower logic, reserves durable request
+identity, rechecks IDLE under the pane lease, uses the existing verified send
+and bounded Enter-only watchdog, then requires a fresh RUNNING observation.
+A blocked/unknown/busy target, failed acceptance or exhausted observation budget
+returns an explicit error. A timeout never authorizes another text injection.
+Pending receipts after a crash deliberately require inspection of the original
+submission rather than automatic replay; existing durable recovery safeguards
+remain responsible for any permitted Enter-only recovery. Non-Codex queue
+behavior and operator permissions are unchanged. Remote nodes do not yet expose
+an atomic idle guard and reject this guarded mutation before sending HTTP input.
+
+The caller's timeout bounds status observation (maximum 20 seconds), not hard
+cancellation of the guarded mutation. The mutation retains its existing bounded
+lease, transport and watchdog waits. Tests use a disposable tmux socket and an
+inert raw-PTY Codex fixture; they do not claim a production rollout or a fresh
+live-model acceptance test. The active HP service is deliberately not restarted.

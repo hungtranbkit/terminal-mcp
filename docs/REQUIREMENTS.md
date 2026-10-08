@@ -369,6 +369,23 @@ sessions bringing up dell-5530/m910/macbook — see `docs/multi-node.md`).
 
 ## 5. Reliable prompt submission
 
+- **Immediate local Codex start (2026-10-08): IMPLEMENTED, isolated PTY tested;
+  not promoted to the running HP service.** `terminal_turn(action="start")`
+  (also `run`/`dispatch`) checks IDLE and submits directly before the legacy
+  queue gate. IDLE is rechecked under the durable pane lease. Success requires
+  `SUBMIT_CONFIRMED` plus a separate fresh RUNNING observation; otherwise an
+  explicit FAILED receipt is returned, never a new QUEUED task. Enter retries
+  remain bounded by the existing durable watchdog; text is injected once.
+  Stable request keys reserve a durable pending receipt before input, cache
+  final receipts and reject changed prompts. Crash/retry cannot retype through
+  this entrypoint. Existing queue keys return `EXISTING_QUEUE_TASK` for manual
+  inspection, without migration. Remote idle guards fail closed as unsupported.
+  The 0–20-second observation budget does not cancel an in-flight mutation:
+  pane lease, transport and watchdog retain their separate existing bounds.
+  Tests: `tests/test_codex_direct_dispatch.py`, including concurrent starts,
+  failed Enter, non-running acceptance, crash replay and isolated tmux Unicode.
+  Non-Codex starts retain their legacy queue gate; queue policy is unchanged.
+
 **Generic-shell silent-command confirmation (2026-09-20): VERIFIED locally.**
 After the existing pre-Enter session identity, pane PID and foreground-command
 revalidation proves that the same interactive shell still owns the pane, a
