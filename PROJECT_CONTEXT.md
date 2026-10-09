@@ -546,3 +546,13 @@ Direct dispatch (`create_session` -> `send`/`send_wait`) leaves no queue row, so
 - Dell controller/node-agent/http services were restarted as part of live acceptance.
 - Canary runtimes were deleted/made missing as expected after the acceptance sequence.
 - Remaining task after this note: remove the merged hotfix worktree/branch and temporary maintenance inspection session; do not remove unrelated legacy worktrees/sessions.
+
+## 2026-10-09 ºw^~)Şt Dell Chrome DevTools MCP + Browser QA
+
+- Dell node: Chrome 151.0.7922.108 with valid CDP at 127.0.0.1:9222 (loopback only), Node 26.7, Codex CLI 0.162.0. Existing Chrome Harness / Browser Gateway was preserved.
+- Host-only Codex config: ~/.codex/config.toml now registers chrome-devtools MCP version 1.10.1 with --browser-url=http://127.0.0.1:9222, --no-usage-statistics, --no-performance-crux; original config backed up. ~/.codex/AGENTS.md now includes browser QA selection/security and fresh-pageId rule, also backed up. These are Dell host settings, not version-controlled deployment changes.
+- Shared code: scripts/chrome_devtools_mcp_smoke.py is a real stdio MCP protocol test (initialize, 30 tools, new tab, DOM/JS, console, network, image screenshot, cleanup). docs/browser-qa-chrome-devtools-mcp.md is the workflow/runbook.
+- Live validation: standalone MCP smoke PASS, including a 12-second held session; actual Codex exec using chrome-devtools MCP PASS after new_page -> list_pages -> take_snapshot -> evaluate_script -> close_page. Earlier Codex attempts reusing ID from new_page failed with No page found: always re-list and use current pageId. Gateway browser_verify against https://example.com PASS, HTTP 200, zero console/page/network errors.
+- No HP controller deployment needed for Dell-local Codex registration. Browser Gateway remains independently operational. A separate Terminal MCP direct interactive Codex submission issue (TEXT_SENT, Enter not delivered) was observed; work proceeded via the confirmed direct shell pathway; not part of this repository change.
+
+- Harness unit regression: python3 -m pytest -q tests/test_harness_core.py tests/test_harness_prerequisites.py -> 88 passed (2026-10-09).
