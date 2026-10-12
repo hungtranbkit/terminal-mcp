@@ -1,5 +1,32 @@
 # PROJECT_CONTEXT.md
 
+## Issue #52 supervised dispatch — 2026-10-12 (deployed on HP)
+
+- PR #53 (`fix/issue52-supervised-dispatch`). The persist-first supervised dispatch has these guarantees:
+  - a receipt ladder, with RUNNING only on observed execution
+  - honest non-running states: STUCK_COMPOSER, WAITING_INPUT, DISPATCH_UNCERTAIN
+  - no typing into boot dialogs (Codex "Hooks need review", Claude trust and auto-mode dialogs)
+  - an ack veto when the composer still holds the prompt
+  - idempotent `supervise` and `supervise_status` that work from any client
+  - queue-OFF guidance that points to supervise
+  - `tail_lines` clamped to 20
+  - details: `docs/CHATGPT_USAGE.md` §3a, `docs/REQUIREMENTS.md` TMCP-DISPATCH-001..010
+- Tests:
+  - Full suite on the branch: 98 failed / 9426 passed.
+  - Baseline main e39bdd1: 99 failed / 9389 passed.
+  - 0 regressions. Pre-existing failures are retired-queue contract tests, knowledge map and work UI.
+  - Deploy tree 5a27028 (branch + reliability d237066): no new non-flaky failures. Windows onboarding/session-host tests that failed in the full run passed on rerun (143 + 31).
+- Live evidence (`docs/evidence/`):
+  - 20/20 isolated Claude cycles DONE, with 0 lost tasks and 0 duplicate sends.
+  - On a real Codex hooks menu, the task went to WAITING_INPUT with `dispatches=0` and nothing typed.
+  - 6/6 production cycles through the HP compact sidecar, routed to dell-linux: DONE, dedup, sessions deleted. HP itself was at 10/10 sessions, so the probes did not run there and no user session was touched.
+- Deployment on HP:
+  - The controller and sidecar run `/home/kimex/.cache/terminal-mcp/issue52-deploy`, branch `deploy/issue52-on-reliability-20261012` @5a27028, via drop-ins `99-zz-terminal-mcp-issue52.conf` in `terminal-mcp-http.service.d/` and `terminal-mcp-chatgpt-v1.service.d/`.
+  - Queue stays `TERMINAL_MCP_ENABLE_QUEUE=0`.
+  - Backup: `~/.local/state/terminal-mcp/backup-issue52-20261012-205717/` holds the unit drop-ins tgz, a `direct_tasks.db` copy, and the tmux list and version before deploy.
+  - Rollback: delete both `99-zz-terminal-mcp-issue52.conf`, run `systemctl --user daemon-reload`, then restart `terminal-mcp-http` and `terminal-mcp-chatgpt-v1`. The direct_tasks migration is additive, so the old code reads the new columns fine. tmux sessions were preserved (KillMode=process); the session list was identical before and after.
+- Not deployed: Dell controller and node-agent are still on their previous build.
+
 ## HP dashboard cutover + m910 memory guardrails — 2026-10-06 (deployed)
 
 - Dashboard/Fleet Cloudflare tunnel  is now served from canonical controller HP.  on HP is enabled+active and uses  -> .
