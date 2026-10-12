@@ -118,7 +118,7 @@ BACKEND_UNAVAILABLE = "BACKEND_UNAVAILABLE"
 #: surface a connector is actually attached to. That is the whole diagnostic
 #: gap that made this bug recur: a stale legacy-six connector and a healthy
 #: one were indistinguishable from inside a chat.
-SURFACE_VERSION = "2.1.0"
+SURFACE_VERSION = "2.2.0"
 
 # CACHED-CALL TRANSLATION: every legacy name this surface used to advertise is
 # accepted at CALL time and rewritten into the equivalent terminal_turn action.
@@ -265,13 +265,27 @@ def compact_instructions() -> str:
         "USE terminal_turn FOR EVERYTHING. One logical orchestration step is one "
         "terminal_turn call. Its `action` covers inspect (one `target` or many "
         "`targets` -- this is batch inspect), send, send_wait, wait, resume, "
+        "supervise, supervise_status, supervise_complete, supervise_cancel, "
         "list_sessions, list_nodes, create_session, delete_session, task_status, "
         "task_batch_status, browser_verify, browser_screenshot, browser_status, "
         "browser_stop. `target` is the session for every action that names one; "
-        "`text` is the prompt for send/send_wait. Do not look for a separate "
+        "`text` is the prompt for send/send_wait/supervise. Do not look for a separate "
         "tool per verb -- there is "
         "none, and calling terminal_turn repeatedly for one step is the thing "
         "this surface exists to avoid.\n"
+        "GIVING A SESSION A TASK YOU WILL TRACK: the legacy queue is OFF -- any queue "
+        "action returns QUEUE_DISABLED_USE_DIRECT_SESSION and creates NO task. Use "
+        "create_session WITHOUT initial_prompt, then "
+        "action=supervise with `text`, `title` and a stable `idempotency_key` (reuse "
+        "it on any retry -- a retry never sends twice), and check with "
+        "action=supervise_status `task_id` (or the same idempotency_key; works from a "
+        "new chat). Only `state: RUNNING` / `running_confirmed: true` means the agent "
+        "was OBSERVED working; DISPATCHING, STUCK_COMPOSER, WAITING_INPUT (e.g. a Codex "
+        "'Hooks need review' menu -- a human must answer it) and DISPATCH_UNCERTAIN are "
+        "not running: follow the returned next_action, never resend blindly. "
+        "inspect/wait tail_lines is 1..20 (larger is clamped). A tool error with no "
+        "JSON result (client safety block, BACKEND_UNAVAILABLE, tunnel) is not agent "
+        "state: the task is durable, re-read supervise_status later.\n"
         "If the tool list you can see offers more than that one tool, you are "
         "attached to a STALE CACHED CATALOG. Those older names (terminal_batch_"
         "inspect, direct terminal_send_task/send_wait, terminal_wait_for_state, "

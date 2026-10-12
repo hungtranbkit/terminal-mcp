@@ -376,6 +376,9 @@ _WAITING_PATTERNS = tuple(
         # strings (never plausible inside the model's own conversational
         # text), not the y/n phrasing above.
         r"enter to select", r"tab/arrow keys to navigate", r"esc to cancel",
+        # Agent boot dialogs (issue #52; Codex hook-trust menu captured live
+        # 2026-10-12, Claude folder trust). A human must answer these.
+        r"hooks need review", r"trust this folder",
         # REMOVED (2026-09-07, real false positive found LIVE against a
         # real attended session, `window2`): this list used to also
         # include bare r"\bapprove\b" and r"\bpermission\b" word-boundary

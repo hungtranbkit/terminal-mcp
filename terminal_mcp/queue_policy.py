@@ -12,8 +12,19 @@ from typing import Any
 
 QUEUE_DISABLED_ERROR = "QUEUE_DISABLED_USE_DIRECT_SESSION"
 QUEUE_DISABLED_MESSAGE = (
-    "Terminal MCP queue submission is disabled. "
-    "Use create_session, then direct send/send_wait to that session."
+    "Terminal MCP queue submission is disabled, so this created NO task and dispatched "
+    "nothing. For tracked work use create_session (no initial_prompt), then "
+    "terminal_turn action=supervise with text and an idempotency_key; it returns a durable "
+    "task_id that action=supervise_status reads from any client."
+)
+#: The direct replacement for a queue `start`, as concrete call shapes (issue
+#: #52): a client told only "create_session_then_send" had no task_id to track.
+QUEUE_DISABLED_NEXT_CALLS = (
+    {"action": "create_session", "target": "<new session name>", "agent_type": "claude|codex",
+     "working_directory": "<repo>", "note": "omit initial_prompt; dispatch with supervise"},
+    {"action": "supervise", "target": "<session>", "text": "<task>",
+     "idempotency_key": "<stable key; reuse it when retrying>", "title": "<short summary>"},
+    {"action": "supervise_status", "task_id": "<dt_... from supervise>"},
 )
 
 QUEUE_SUBMISSION_ACTIONS = frozenset({
@@ -47,7 +58,9 @@ def queue_disabled_response(*, action: str | None = None) -> dict[str, Any]:
         "error": QUEUE_DISABLED_ERROR,
         "message": QUEUE_DISABLED_MESSAGE,
         "queue_submission_enabled": False,
-        "next_action": "create_session_then_send",
+        "next_action": "create_session_then_supervise",
+        "next_calls": [dict(call) for call in QUEUE_DISABLED_NEXT_CALLS],
+        "task_created": False,
     }
     if action:
         result["action"] = action

@@ -34,6 +34,11 @@ WAIT_PATTERNS = tuple(
         r"enter to select",
         r"tab/arrow keys to navigate",
         r"esc to cancel",
+        # Agent boot dialogs (issue #52), captured live on hp-linux
+        # 2026-10-12: Codex 0.154's hook-trust menu ("Hooks need review ...
+        # Press enter to confirm or esc to go back") and Claude's folder trust.
+        r"hooks need review",
+        r"trust this folder",
         # REMOVED (2026-09-07, real false positive found LIVE against a
         # real attended session, `window2`): this list used to also
         # include bare r"\bapprove\b" and r"\bpermission\b" word-boundary
@@ -53,6 +58,14 @@ WAIT_PATTERNS = tuple(
     )
 )
 _AGENT_COMMANDS = {"claude", "codex"}
+#: Key-hint lines agent CLIs draw only on a modal dialog/menu (Claude:
+#: "Enter to confirm · Esc to cancel"/"Enter to select"; Codex: "Press enter
+#: to confirm or esc to go back"), plus the hook/trust dialog titles.
+DIALOG_CHROME = re.compile(
+    r"enter to (?:confirm|select)\s*·\s*esc to (?:cancel|go back|exit)"
+    r"|press enter to confirm or esc"
+    r"|hooks need review",
+    re.IGNORECASE)
 
 ACTIVE_COMMANDS = {"claude", "codex", "python", "python3", "pytest", "node", "npm", "bash", "zsh"}
 
@@ -176,6 +189,15 @@ def detect_waiting_input(output: str) -> tuple[bool, str]:
     # examples in command output do not turn into false input requests.
     if recent and re.fullmatch(r"(?:--More--|\(END\))", recent[-1], re.IGNORECASE):
         return True, f"pager prompt {recent[-1]!r} is waiting for input"
+    # Agent CLI dialogs (issue #52, captured live 2026-10-12): Claude draws
+    # its own dialogs ABOVE the composer box and mode footer -- "Teach auto
+    # mode about your environment? ... ❯ 1. Yes ... Enter to confirm · Esc to
+    # cancel" ended 4 non-empty lines above the pane bottom, so the 4-line
+    # window below missed it and the pane read RUNNING. Only the dialog's own
+    # key-hint chrome is matched here (never prose), over the last 12 lines.
+    for offset, line in enumerate(reversed(recent)):
+        if DIALOG_CHROME.search(line):
+            return True, f"agent dialog chrome {line[:80]!r} at bottom offset {offset}"
     # A prompt must be very near the current pane bottom to avoid matching old logs.
     for offset, line in enumerate(reversed(recent[-4:])):
         for pattern in WAIT_PATTERNS:
@@ -185,13 +207,16 @@ def detect_waiting_input(output: str) -> tuple[bool, str]:
 
 
 def classify_status(session: SessionInfo, output: str, now: int | None = None) -> tuple[str, bool, str]:
+    command = normalize_command(session.pane_current_command)
     waiting, reason = detect_waiting_input(output)
     if waiting:
-        return "WAITING_INPUT", True, reason
+        # The command is restated so a caller can tell an agent's dialog
+        # (e.g. Codex's boot hooks menu) from a shell prompt (issue #52: a
+        # supervised task on a Codex pane was misfiled as mode=shell).
+        return "WAITING_INPUT", True, f"{reason}; current command is {command or 'unknown'!r}"
     if session.pane_dead:
         return "IDLE", False, "tmux reports the active pane is dead"
     age = max(0, (now if now is not None else int(time.time())) - session.activity_epoch)
-    command = normalize_command(session.pane_current_command)
     # Checked BEFORE the activity-age rules below, not after: the pane's own
     # footer is direct evidence of what the target is doing right now, while
     # activity_epoch is an unreliable proxy that is wrong in both directions

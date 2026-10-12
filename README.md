@@ -348,6 +348,14 @@ Restart the MCP child process after changing configuration. Enabling input lets 
 
 ## Tools
 
+- `terminal_turn` — the one tool the compact ChatGPT connector publishes. For
+  tracked work while the legacy queue is OFF: `create_session` (no
+  `initial_prompt`) → `supervise` (`text`, `title`, `idempotency_key`) →
+  `supervise_status` (`task_id` or the same key, from any client). A task is
+  `RUNNING` only after execution is observed; `DISPATCHING`, `STUCK_COMPOSER`,
+  `WAITING_INPUT` and `DISPATCH_UNCERTAIN` are honest non-running states and
+  are never blind-resent. See
+  [`docs/CHATGPT_USAGE.md` §3a](docs/CHATGPT_USAGE.md) (issue #52).
 - `terminal_list_sessions`
 - `terminal_tail`
 - `terminal_capture`

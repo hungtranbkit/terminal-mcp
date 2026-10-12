@@ -39,6 +39,15 @@
 - The original full run had 56 failures. Its extra two—concurrent integration-loop merge and untagged tmux-squatter cleanup—both passed when rerun together on baseline and branch. They did not reproduce outside the full-suite run; classify as suite-order/flaky, not a regression.
 - Rerun on the final code: focused reliability suites **305 passed**; affected-module comparison **54 failed, 319 passed** on both baseline and branch; the two additional full-run failures passed on both. Full-suite release remains not green due the 54 existing failures and the two non-reproduced full-run failures. No source fix was warranted for this task's change set; triage these baseline failures in their respective workstreams before treating the repository-wide suite as green.
 
+## HP dashboard cutover + m910 memory guardrails — 2026-10-06 (deployed)
+
+- Dashboard/Fleet Cloudflare tunnel  is now served from canonical controller HP.  on HP is enabled+active and uses  -> .
+- Dell copy of  is disabled+inactive. This removes the stale Dell Fleet view/split dashboard path. Public  still goes through Cloudflare Access;  still redirects to .
+- Rollback dashboard: on HP ; on Dell . Never leave both enabled except during a short cutover.
+- m910 memory guardrails were applied persistently with  to Chrome/OpenClaw cgroups. Current limits: chatgpt 900M/1200M, deepseek 700M/900M, facebook-radar 900M/1200M, fbpublisher 400M/600M, gemini 800M/1100M, grok 1400M/1800M, meta 600M/800M, muse 800M/1100M, openclaw 2200M/2800M ();  is 128-512M per service.
+-  on m910 remains protected with MemoryLow=256M, MemoryMax=512M and CPUWeight=500. At application time m910 had 15.4GB RAM, ~8.9GB available, 2.7GB swap still resident from the earlier OOM, and no new OOM event in the last 10 minutes. Existing swap was intentionally not force-cleared because passwordless sudo is unavailable; the new cgroup limits prevent renewed unbounded growth.
+- Rollback memory guardrails per service:  then .
+
 ## Node registry flapping / list_nodes vs create_session — 2026-10-06 (fixed, deployed)
 
 Symptom from ChatGPT: m910 kept alternating online/offline. `list_nodes` showed m910 online and healthy, and the very next
@@ -585,3 +594,13 @@ Direct dispatch (`create_session` -> `send`/`send_wait`) leaves no queue row, so
 - Dell controller/node-agent/http services were restarted as part of live acceptance.
 - Canary runtimes were deleted/made missing as expected after the acceptance sequence.
 - Remaining task after this note: remove the merged hotfix worktree/branch and temporary maintenance inspection session; do not remove unrelated legacy worktrees/sessions.
+
+## 2026-10-09 �w^~)�t Dell Chrome DevTools MCP + Browser QA
+
+- Dell node: Chrome 151.0.7922.108 with valid CDP at 127.0.0.1:9222 (loopback only), Node 26.7, Codex CLI 0.162.0. Existing Chrome Harness / Browser Gateway was preserved.
+- Host-only Codex config: ~/.codex/config.toml now registers chrome-devtools MCP version 1.10.1 with --browser-url=http://127.0.0.1:9222, --no-usage-statistics, --no-performance-crux; original config backed up. ~/.codex/AGENTS.md now includes browser QA selection/security and fresh-pageId rule, also backed up. These are Dell host settings, not version-controlled deployment changes.
+- Shared code: scripts/chrome_devtools_mcp_smoke.py is a real stdio MCP protocol test (initialize, 30 tools, new tab, DOM/JS, console, network, image screenshot, cleanup). docs/browser-qa-chrome-devtools-mcp.md is the workflow/runbook.
+- Live validation: standalone MCP smoke PASS, including a 12-second held session; actual Codex exec using chrome-devtools MCP PASS after new_page -> list_pages -> take_snapshot -> evaluate_script -> close_page. Earlier Codex attempts reusing ID from new_page failed with No page found: always re-list and use current pageId. Gateway browser_verify against https://example.com PASS, HTTP 200, zero console/page/network errors.
+- No HP controller deployment needed for Dell-local Codex registration. Browser Gateway remains independently operational. A separate Terminal MCP direct interactive Codex submission issue (TEXT_SENT, Enter not delivered) was observed; work proceeded via the confirmed direct shell pathway; not part of this repository change.
+
+- Harness unit regression: python3 -m pytest -q tests/test_harness_core.py tests/test_harness_prerequisites.py -> 88 passed (2026-10-09).

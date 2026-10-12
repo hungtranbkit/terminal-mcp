@@ -46,13 +46,34 @@ class FakePane:
         self.waiting_input = False
         self.exists = True
         self.send_status = "SUBMIT_CONFIRMED"
+        # Issue #52: when True the agent never receives the prompt -- it stays
+        # in the composer although the send reported SUBMIT_CONFIRMED.
+        self.swallow = False
+        self.draft = ""
+        self.activations: list[str] = []
+
+    @property
+    def is_agent(self):
+        return self.agent in ("claude", "codex")
 
     def send(self, target, text, key):
         if self.send_status != "SUBMIT_CONFIRMED":
             return {"status": self.send_status, "reason": "guard refused"}
         self.sent.append((text, key))
-        self.output.append(f"> {text}")  # the composer echoes the prompt
+        if self.swallow:
+            self.draft = text  # false ACK: still sitting in the composer
+            return {"status": "SUBMIT_CONFIRMED"}
+        # the transcript echoes the submitted prompt (shell: the command line)
+        self.output.append(f"> {text}" if self.is_agent else f"$ {text}")
         self.busy = self.busy_ticks
+        return {"status": "SUBMIT_CONFIRMED"}
+
+    def activate(self, target, key):
+        self.activations.append(key)
+        if self.draft and not self.swallow:
+            self.output.append(f"> {self.draft}")
+            self.draft = ""
+            self.busy = self.busy_ticks
         return {"status": "SUBMIT_CONFIRMED"}
 
     def status(self, target):
@@ -68,7 +89,10 @@ class FakePane:
         return {"state": "IDLE", "reason": f"{self.agent} is back at its composer; current command is {self.agent!r}"}
 
     def tail(self, target, lines):
-        return {"output": "\n".join(self.output[-lines:])}
+        rows = list(self.output)
+        if self.is_agent:
+            rows.append(f"❯ {self.draft}".rstrip())  # the live composer, bottom row
+        return {"output": "\n".join(rows[-lines:])}
 
 
 def _supervisor(tmp_path, pane, clock, **kwargs):
@@ -96,9 +120,14 @@ def test_idle_after_turn_is_not_done_and_controller_resumes_until_explicit_done(
 
     _run(sup, clock, 5)  # turn 1 ends -> pane IDLE, settle elapses
     task = sup.get(TASK["id"], refresh=False)["task"]
-    assert task["state"] == "RUNNING" and not task["business_complete"]
+    # Issue #52: a confirmed submit is DISPATCHING until execution is observed.
+    assert task["state"] == "DISPATCHING" and not task["business_complete"]
+    assert task["receipt"] == "SUBMIT_CONFIRMED" and task["running_confirmed"] is False
     assert len(pane.sent) == 2, "controller must re-dispatch after a normal turn end"
     assert "continuation 1/6" in pane.sent[1][0]
+    _run(sup, clock, 1)
+    task = sup.get(TASK["id"], refresh=False)["task"]
+    assert task["state"] == "RUNNING" and task["receipt"] == "EXECUTION_ACCEPTED"
 
     _run(sup, clock, 30)
     task = sup.get(TASK["id"], refresh=False)["task"]
@@ -321,8 +350,9 @@ def test_compact_wait_matching_idle_reports_task_not_complete(tmp_path):
     assert waited["business_complete"] is False
     assert waited["supervised_task"]["task_id"] == task_id
 
-    for action in ("supervise_status",):
-        assert tools.turn(action=action, task_id=task_id)["task"]["state"] == "RUNNING"
+    # The pane never started a turn: a confirmed submit alone is not RUNNING.
+    status = tools.turn(action="supervise_status", task_id=task_id)["task"]
+    assert status["state"] == "DISPATCHING" and status["running_confirmed"] is False
     cancelled = tools.turn(action="supervise_cancel", task_id=task_id)
     assert cancelled["task"]["state"] == "CANCELLED"
     assert "supervised_task" not in tools.turn(action="wait", target="pos", timeout=2)
