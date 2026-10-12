@@ -535,6 +535,16 @@ class CompactTerminalTools:
             return {"error": "INVALID_TAIL_LINES", "allowed": "1..20"}
         return None
 
+    @staticmethod
+    def _clamp_tail_lines(tail_lines: Any) -> tuple[Any, bool]:
+        """Issue #52: a client asking tail_lines=100 got INVALID_TAIL_LINES and
+        no status at all. An integer outside 1..20 is clamped (and reported);
+        a non-integer is still rejected by _validate_tail_lines."""
+        if isinstance(tail_lines, int) and not isinstance(tail_lines, bool):
+            clamped = min(MAX_TAIL_LINES, max(1, tail_lines))
+            return clamped, clamped != tail_lines
+        return tail_lines, False
+
     def batch_inspect(self, targets: list[str], tail_lines: int = 20,
                       compact: bool = True,
 
@@ -965,11 +975,17 @@ class CompactTerminalTools:
                 compact=compact, path=path, content_b64=content_b64,
                 overwrite=overwrite, mode=mode)
 
+        requested_tail_lines = tail_lines
+        tail_lines, tail_clamped = self._clamp_tail_lines(tail_lines)
+
         if normalized == "inspect":
             resolved_targets = list(targets or ([] if target is None else [target]))
             if not resolved_targets:
                 return {"status": "FAILED", "error": "TARGET_REQUIRED"}
             result = self.batch_inspect(resolved_targets, tail_lines=tail_lines, compact=compact)
+            if tail_clamped and isinstance(result, dict):
+                result["tail_lines_clamped"] = {"requested": requested_tail_lines,
+                                                "used": tail_lines, "max": MAX_TAIL_LINES}
             for row in result.get("targets", []) if isinstance(result, dict) else []:
                 note = self._supervised_note(row.get("target"))
                 if note is not None:
@@ -1188,18 +1204,23 @@ class CompactTerminalTools:
                     label = self.task_labels.on_task(
                         node_id=node_id, session=name,
                         text=text or (steps[0] if steps else None),
-                        title=title, task_id=result.get("task_id"),
+                        title=title, task_id=(result.get("task") or {}).get("task_id"),
                         source="supervised")
                 except Exception:  # noqa: BLE001
                     label = None
                 self._with_label(result, label)
         elif action == "supervise_status":
+            # Reads the durable task store: any client (a new ChatGPT chat, a
+            # reconnected connector) gets the same answer for the same id.
             if task_id:
                 result = self.direct_tasks.get(task_id)
+            elif idempotency_key and hasattr(self.direct_tasks, "get_by_key"):
+                result = self.direct_tasks.get_by_key(idempotency_key)
             elif target:
                 result = {"status": "OK", "tasks": self.direct_tasks.active_for(target.strip())}
             else:
-                return {"status": "FAILED", "error": "TASK_ID_REQUIRED", "action": action}
+                return {"status": "FAILED", "error": "TASK_ID_REQUIRED", "action": action,
+                        "accepted": ["task_id", "idempotency_key", "target"]}
         elif action == "supervise_complete":
             result = self.direct_tasks.complete(task_id or "", outcome=str(args.get("outcome") or "DONE"),
                                                 reason=args.get("reason"))

@@ -108,7 +108,7 @@ async def test_native_queue_submit_tools_fail_closed_without_server_opt_in(serve
         mcp_server, "terminal_enqueue_task", session="lane-a", prompt="must not persist"
     )
     assert enqueued["error"] == "QUEUE_DISABLED_USE_DIRECT_SESSION"
-    assert enqueued["next_action"] == "create_session_then_send"
+    assert enqueued["next_action"] == "create_session_then_supervise"
 
     routed = await _call(mcp_server, "terminal_route_start", prompt="must not route")
     assert routed["error"] == "QUEUE_DISABLED_USE_DIRECT_SESSION"

@@ -91,6 +91,9 @@ _DIRECT_ACTION_SCHEMA_HELP = (
     "supervise_complete, supervise_cancel, "
     "list_sessions, list_nodes, create_session, delete_session, task_status, task_batch_status, "
     "browser_verify, browser_screenshot, browser_status, browser_stop. "
+    "Tracked work: create_session (no initial_prompt) -> supervise(text, title, idempotency_key) "
+    "-> supervise_status(task_id or idempotency_key). start/run/dispatch are retired queue actions "
+    "(QUEUE_DISABLED_USE_DIRECT_SESSION, no task created). RUNNING only after observed execution. "
     "When assigning or changing a session's task (send/send_wait/supervise/create_session), "
     "pass title=\"<short task summary>\" so the live monitor shows it; omit title for "
     "continuations (y, continue, approvals, follow-ups)."
@@ -355,6 +358,13 @@ def build_mcp(service: TerminalService | None = None,
             tail=lambda target, lines: compact_tools._bounded_read(
                 ("direct-task-tail", target, lines),
                 lambda: compact_tools._tail(target, lines), 10),
+            # Stuck-composer recovery: the guarded activate-only send (empty
+            # text + Enter) submits the composer's OWN content and refuses on
+            # an empty composer -- it can never retype or duplicate a prompt.
+            activate=lambda target, key: compact_tools.send_task(target, "", idempotency_key=key),
+            # In-call look for execution evidence so a fast start can say
+            # RUNNING honestly; the loop carries the rest.
+            accept_wait_seconds=float(os.environ.get("TERMINAL_MCP_SUPERVISE_ACCEPT_WAIT", "6")),
         )
     except Exception:  # noqa: BLE001 -- never block startup; supervise* reports unavailable
         direct_tasks = None
@@ -766,9 +776,13 @@ def build_mcp(service: TerminalService | None = None,
                       targets: list[str] | None = None, text: str | None = None,
                       desired_states: list[str] | None = None,
                       resume_token: str | None = None, timeout: float = 20,
-                      poll_interval: float = 1, tail_lines: int = 20,
+                      poll_interval: float = 1,
+                      tail_lines: Annotated[int, Field(description=(
+                          "inspect/wait tail rows, 1..20; larger values are clamped to 20"))] = 20,
                       compact: bool = True,
-                      idempotency_key: str | None = None,
+                      idempotency_key: Annotated[str | None, Field(description=(
+                          "send/supervise: stable key; a retry with the same key returns the same "
+                          "task/receipt and never sends twice. supervise_status also accepts it."))] = None,
                       agent_type: str = "shell", working_directory: str | None = None,
                       initial_prompt: str | None = None, grant_mode: str = "none",
                       binding: str | None = None, node: str = "auto",
@@ -784,8 +798,13 @@ def build_mcp(service: TerminalService | None = None,
         """THE terminal surface: direct session control only.
 
 NORMAL FLOW:
-1. `create_session` creates a fresh session for real work.
-2. `send` or `send_wait` sends work directly to that session.
+1. `create_session` creates a fresh session for real work (omit initial_prompt
+   for tracked work: an initial prompt is only typed once the agent shows a
+   settled composer, never into a boot dialog such as Codex "Hooks need review").
+2. `supervise` (text + title + idempotency_key) dispatches tracked work and
+   returns a durable task_id; `supervise_status` (task_id or the same
+   idempotency_key) reads it from any client. `send`/`send_wait` remain for
+   short one-off prompts.
 3. `inspect` is used only when a user explicitly asks for a status check.
 4. When work is complete, merge/test as appropriate and clean up the finished
    session/worktree/branch.
@@ -811,7 +830,14 @@ Direct actions:
                 target printing `TMCP-DONE:<task_id>` / `TMCP-BLOCKED:<task_id>
                 reason`, WAITING_INPUT, supervise_complete/supervise_cancel, or
                 args.max_continuations (default 6). Do not resend.
-  supervise_status/supervise_complete/supervise_cancel  (task_id)
+                States: DISPATCHING (persisted/submitted, execution not yet
+                observed) -> RUNNING (observed: busy footer or an answer after
+                the echoed prompt). STUCK_COMPOSER (prompt still in composer;
+                bounded Enter-only recovery), WAITING_INPUT (dialog/menu needs
+                a human -- never auto-answered), DISPATCH_UNCERTAIN (no evidence;
+                not resent). Each task carries next_action and receipts.
+  supervise_status/supervise_complete/supervise_cancel  (task_id; status also
+                takes idempotency_key or target)
   list_sessions/list, list_nodes/nodes
   create_session/create, delete_session/delete (confirm=true, or args={"confirm": true})
   session_lifecycle (read-only classification), session_reconcile (dry run by default)

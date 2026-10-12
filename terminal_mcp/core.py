@@ -17,8 +17,8 @@ from . import composer, submit_flow
 from .composer import (COMPOSER_DRAFT, COMPOSER_EMPTY, COMPOSER_UNKNOWN,
                        ComposerSnapshot, draft_contains, read_composer)
 from .adapters import (DELIVERY_NOT_ACTIVATED, DELIVERY_ACTIVATION_UNCERTAIN, DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_STALLED, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_TEXT_SENT,
-                       DELIVERY_UNKNOWN, TARGET_WAITING, SHELL_COMMANDS, _sent_text_echoed,
-                       enter_is_safe_after_command_change, select_adapter,
+                       DELIVERY_UNKNOWN, TARGET_COMPOSER, TARGET_WAITING, SHELL_COMMANDS, _sent_text_echoed,
+                       enter_is_safe_after_command_change, normalize_command, select_adapter,
                        to_legacy_submit_status)
 from .audit import AuditStore
 from .bindings import Binding, BindingStore, valid_binding_name
@@ -39,7 +39,7 @@ from .session_knowledge import SessionKnowledgeStore, make_instance_id
 from .session_registry import SessionRegistryStore, instance_identity, linked_worktree_root
 from .session_resource import (ContextPolicy, build_resource_block,
                               parse_session_resources, probe_git_state)
-from .status import classify_status
+from .status import classify_status, detect_waiting_input
 from .submit_watchdog import (ACK_ACCEPTED, ACK_NODE_UNAVAILABLE, ACK_RUNNING, ACK_STUCK, Submission,
                                SubmissionStore, SubmissionSweeper, VerifiedSubmitWatchdog, WatchdogConfig)
 from .tmux import SEND_TEXT_ENTER_SETTLE_SECONDS, TmuxClient, TmuxError, iso_timestamp
@@ -125,6 +125,16 @@ SEND_VERIFY_POLL_INTERVAL_SECONDS = 0.05
 # _verify_resume_or_fail, see that method's own docstring for why.
 RESUME_FAILURE_PATTERN = re.compile(r"No conversation found with session ID", re.IGNORECASE)
 TRUST_DIALOG_PATTERN = re.compile(r"trust this folder|Accessing workspace", re.IGNORECASE)
+# Boot screens an agent CLI can show before its composer is usable (issue
+# #52). "Hooks need review" is Codex 0.154's hook-trust menu, captured live on
+# hp-linux 2026-10-12; folder trust is Claude's. Both need a human decision.
+BOOT_DIALOG_PATTERN = re.compile(
+    r"hooks need review|trust this folder|do you trust the files", re.IGNORECASE)
+# Codex's banner while it is still starting ("model: loading").
+BOOT_LOADING_PATTERN = re.compile(r"^\W*(?:model|directory):\s+loading\b",
+                                  re.IGNORECASE | re.MULTILINE)
+AGENT_BOOT_READY_TIMEOUT_SECONDS = float(os.environ.get("TERMINAL_MCP_AGENT_BOOT_TIMEOUT", "20"))
+AGENT_BOOT_READY_POLL_SECONDS = 1.0
 # 15s, not a shorter value: live-reproduced false negative during this
 # feature's own disposable E2E test (2026-09-07) -- a real resume that
 # HAD succeeded (full prior conversation correctly loaded, confirmed by
@@ -294,6 +304,25 @@ def _has_embedded_newline(text: str) -> bool:
     "\\n" is, so a caller that normalised its script to CRLF -- or to bare
     CR -- must not slip past the guard that rejects "\\n"."""
     return "\n" in text or "\r" in text
+
+
+_CLAUDE_PASTE_PLACEHOLDER = re.compile(r"\[Pasted text #\d+")
+
+
+def _composer_still_holds_prompt(before: ComposerSnapshot, after: ComposerSnapshot,
+                                 text: str) -> bool:
+    """True when the composer read AFTER Enter is a real draft that is still
+    our prompt: its prefix, the draft seen before Enter, or Claude's
+    ``[Pasted text #N ...]`` placeholder for a long paste. UNKNOWN/EMPTY
+    composers never veto -- only positive evidence of a pending draft does.
+    """
+    if not after.has_draft:
+        return False
+    if text and draft_contains(after, text):
+        return True
+    if before.has_draft and draft_contains(after, before.draft_text):
+        return True
+    return bool(_CLAUDE_PASTE_PLACEHOLDER.search(after.draft_text))
 
 
 def _codex_draft_in_composer(snapshot: list[str], text: str) -> bool:
@@ -2382,6 +2411,18 @@ class TerminalService:
                                                        deadline=time.monotonic() + verify_timeout)
         composer_after = self._read_composer(session) if adapter.submit_policy.uses_composer_evidence else ComposerSnapshot(COMPOSER_UNKNOWN)
         result.update(self._composer_fields(composer_before, composer_after))
+        if confirmed and _composer_still_holds_prompt(composer_before, composer_after, text):
+            # Issue #52: ADAPTER_ACK is a pane-diff rule, and a booting TUI, a
+            # dialog or a wrapped draft all move rows above the last line. A
+            # composer that STILL holds the prompt after the Enter is direct
+            # evidence the agent never received it, so it vetoes the ack.
+            # One Enter was already delivered: report it, never resend text.
+            result.update(delivery_state=DELIVERY_ACTIVATION_UNCERTAIN,
+                          submit_status=to_legacy_submit_status(DELIVERY_ACTIVATION_UNCERTAIN),
+                          evidence=["ADAPTER_ACK", "COMPOSER_STILL_HOLDS_DRAFT"],
+                          submit_reason=("adapter ack vetoed: the composer still holds the prompt "
+                                         "after Enter (STUCK_COMPOSER); do not resend text"))
+            return result
         if confirmed:
             result["delivery_state"] = DELIVERY_SUBMIT_CONFIRMED
             result["submit_status"] = to_legacy_submit_status(DELIVERY_SUBMIT_CONFIRMED)
@@ -2827,6 +2868,10 @@ class TerminalService:
             if adapter.name != "codex" and adapter.submit_policy.uses_composer_evidence:
                 if draft_contains(self._read_composer(session), text):
                     return False
+            if adapter.name == "codex" and text and _codex_draft_in_composer(lines, text):
+                # Issue #52: pane progress elsewhere (a modal, a boot redraw)
+                # must not confirm while Codex's composer still holds the draft.
+                return False
             return True
 
         after = first_after
@@ -4555,13 +4600,75 @@ class TerminalService:
         result["binding"] = binding_result
 
         if initial_prompt:
-            if result.get("state") == "READY":
-                result["initial_prompt_result"] = self.terminal_send_text(name, initial_prompt, press_enter=True)
+            boot = (self._await_agent_composer_ready(name) if result.get("state") == "READY"
+                    else None)
+            if boot is not None and boot.get("error"):
+                # Issue #52: never type into a booting TUI or a boot dialog
+                # (Codex "Hooks need review", Claude folder trust). The hooks
+                # menu is a security prompt for a human; answering it with the
+                # prompt's Enter would bypass it. Nothing was typed.
+                result["initial_prompt_result"] = {**boot, "session": name, "sent": False}
+            elif result.get("state") == "READY":
+                sent = self.terminal_send_text(name, initial_prompt, press_enter=True)
+                if isinstance(sent, dict):
+                    # A submit receipt is not proof the agent started work.
+                    sent.setdefault("execution_confirmed", False)
+                result["initial_prompt_result"] = sent
             else:
                 result["initial_prompt_result"] = {
                     "error": "SESSION_NOT_READY", "session": name, "state": result.get("state"),
                 }
         return result
+
+    def _await_agent_composer_ready(self, name: str) -> dict[str, Any] | None:
+        """Bounded wait until a freshly created AGENT pane shows a settled,
+        idle composer, before an initial prompt is typed into it.
+
+        lifecycle READY only means the launcher process exec'd; Claude/Codex
+        then draw a banner, may show a boot dialog, and only then a composer.
+        Typing earlier is how a create_session receipt said ADAPTER_ACK while
+        the prompt sat unsent with context 0% (issue #52). Returns None for
+        non-agent panes or once ready, else an error dict -- nothing typed.
+        """
+        try:
+            info = self.tmux.get_session(name)
+        except TmuxError:
+            return None
+        command = normalize_command((info.pane_current_command or "") if info else "")
+        if command not in {"claude", "codex"}:
+            return None
+        adapter = select_adapter(command)
+        deadline = time.monotonic() + AGENT_BOOT_READY_TIMEOUT_SECONDS
+        streak = 0
+        last_state = "unknown"
+        while True:
+            try:
+                lines = self.tmux.capture_lines(name, SEND_VERIFY_LINES)
+            except TmuxError:
+                lines = []
+            text = "\n".join(lines)
+            last_state = adapter.identify_target_state(lines)
+            waiting, waiting_reason = detect_waiting_input(text)
+            if BOOT_DIALOG_PATTERN.search(text) or waiting or last_state == TARGET_WAITING:
+                return {"status": "NOT_SENT", "error": "BOOT_DIALOG_WAITING_INPUT",
+                        "state": "WAITING_INPUT", "agent": command,
+                        "reason": (f"{command} is showing a boot dialog that needs a human "
+                                   f"({waiting_reason}); the initial prompt was not typed"),
+                        "next_action": ("answer the dialog in the session (hooks review is a "
+                                        "security prompt -- never auto-trust), then use "
+                                        "terminal_turn action=supervise to dispatch the task")}
+            booting = BOOT_LOADING_PATTERN.search(text) is not None
+            streak = streak + 1 if (last_state == TARGET_COMPOSER and not booting) else 0
+            if streak >= 2:
+                return None
+            if time.monotonic() >= deadline:
+                return {"status": "NOT_SENT", "error": "AGENT_NOT_READY", "state": "UNKNOWN",
+                        "agent": command,
+                        "reason": (f"{command} did not show a settled idle composer within "
+                                   f"{AGENT_BOOT_READY_TIMEOUT_SECONDS:.0f}s (last adapter state "
+                                   f"{last_state!r}); the initial prompt was not typed"),
+                        "next_action": "inspect the session, then terminal_turn action=supervise"}
+            time.sleep(AGENT_BOOT_READY_POLL_SECONDS)
 
     def terminal_detach_session(self, name: str) -> dict[str, Any]:
         """Detach any attached tmux client from `name` -- never kills the

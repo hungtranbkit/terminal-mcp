@@ -34,6 +34,11 @@ WAIT_PATTERNS = tuple(
         r"enter to select",
         r"tab/arrow keys to navigate",
         r"esc to cancel",
+        # Agent boot dialogs (issue #52), captured live on hp-linux
+        # 2026-10-12: Codex 0.154's hook-trust menu ("Hooks need review ...
+        # Press enter to confirm or esc to go back") and Claude's folder trust.
+        r"hooks need review",
+        r"trust this folder",
         # REMOVED (2026-09-07, real false positive found LIVE against a
         # real attended session, `window2`): this list used to also
         # include bare r"\bapprove\b" and r"\bpermission\b" word-boundary
@@ -185,13 +190,16 @@ def detect_waiting_input(output: str) -> tuple[bool, str]:
 
 
 def classify_status(session: SessionInfo, output: str, now: int | None = None) -> tuple[str, bool, str]:
+    command = normalize_command(session.pane_current_command)
     waiting, reason = detect_waiting_input(output)
     if waiting:
-        return "WAITING_INPUT", True, reason
+        # The command is restated so a caller can tell an agent's dialog
+        # (e.g. Codex's boot hooks menu) from a shell prompt (issue #52: a
+        # supervised task on a Codex pane was misfiled as mode=shell).
+        return "WAITING_INPUT", True, f"{reason}; current command is {command or 'unknown'!r}"
     if session.pane_dead:
         return "IDLE", False, "tmux reports the active pane is dead"
     age = max(0, (now if now is not None else int(time.time())) - session.activity_epoch)
-    command = normalize_command(session.pane_current_command)
     # Checked BEFORE the activity-age rules below, not after: the pane's own
     # footer is direct evidence of what the target is doing right now, while
     # activity_epoch is an unreliable proxy that is wrong in both directions

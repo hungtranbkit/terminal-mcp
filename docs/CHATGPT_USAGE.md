@@ -295,10 +295,83 @@ invalid, unknown, and expired tokens fail deterministically. The journal stores
 only bounded, redacted state/reason metadata, never terminal output or
 credentials.
 
-The durable task queue remains the canonical persist-before-dispatch path for
-work. A wait continuation observes that already-running work; it is not another
-queue and does not change session, permission, node-affinity, or dispatch
-semantics.
+The legacy durable task queue is retired and OFF by default (see §3a for the
+canonical tracked path). A wait continuation observes already-running work; it
+is not another queue and does not change session, permission, node-affinity,
+or dispatch semantics.
+
+## 3a. Supervised dispatch (canonical for tracked work while the queue is OFF)
+
+Issue #52 (2026-10-12). On the compact connector (`terminal_turn`, one tool)
+this is THE way to give a session a task you or the user will check later:
+
+```text
+1. terminal_turn action=create_session target=<name> agent_type=claude|codex
+       working_directory=<repo>            # NO initial_prompt for tracked work
+2. terminal_turn action=supervise target=<name> text=<task> title=<summary>
+       idempotency_key=<stable key>        # reuse the SAME key on any retry
+   -> {"task": {"task_id": "dt_...", "state": "DISPATCHING", "receipt": ...}}
+3. terminal_turn action=supervise_status task_id=dt_...   # or idempotency_key=
+```
+
+`action=start`/`run`/`dispatch`/`enqueue_task` are retired queue actions:
+with the queue OFF they return `QUEUE_DISABLED_USE_DIRECT_SESSION`,
+`task_created: false` and `next_calls` naming exactly the three calls above.
+They never create or dispatch anything; do not turn the queue on to make them
+work (`TERMINAL_MCP_ENABLE_QUEUE` is an operator-only rollback switch).
+
+**Persist first, stable id.** `supervise` writes the task to the WAL SQLite
+store (`$XDG_STATE_HOME/terminal-mcp/direct_tasks.db`) before anything is
+observed or sent, so the response always carries a `task_id`. The same
+`idempotency_key` always returns the same task (`deduplicated: true`), even
+after it finished, a controller restart, or from a new chat -- a retry never
+sends twice. `supervise_status` reads the store, so a new ChatGPT client gets
+the same answer for the same `task_id` or key.
+
+**Receipts are separate rungs, and only the last one is execution:**
+
+| `receipt` | meaning |
+|---|---|
+| `PERSISTED` | stored; nothing sent yet |
+| `INPUT_SENT` | intent persisted immediately before the guarded send call |
+| `SUBMIT_CONFIRMED` | text typed + Enter + adapter ack. **Not** proof the agent started |
+| `EXECUTION_ACCEPTED` | independently observed: busy footer, or an agent answer after the echoed prompt, or the marker |
+| `NOT_SENT` | a guard refused before typing (bounded retry) |
+| `DISPATCH_UNCERTAIN` | typed but outcome unknown; settled by observation only |
+
+**Task states** (`task.state`, with `next_action` on every response):
+
+| state | what it means / what to do |
+|---|---|
+| `DISPATCHING` | persisted/submitted, execution not observed yet. Wait; do not resend. |
+| `RUNNING` | execution observed (`running_confirmed: true`). The server continues the task after each turn end. |
+| `WAITING_INPUT` | a dialog/menu needs a human. `wait_reason=SESSION_INPUT_BEFORE_DISPATCH` means nothing was typed yet (e.g. Codex "Hooks need review" -- a security prompt, never auto-trusted). Supervision resumes by itself once answered. |
+| `STUCK_COMPOSER` | the prompt sits unsent in the composer. The server presses Enter (guarded activate-only, never retypes) at most 2 times, 10s apart, only while the pane is not busy. Then a human presses Enter or `supervise_cancel`. |
+| `DISPATCH_UNCERTAIN` | 45s after submit with no evidence (e.g. a clone whose context stayed 0%). Not resent. Inspect; if truly not received, `supervise_cancel` and `supervise` again with a NEW key. |
+| `DONE` / `BLOCKED` | explicit outcome: `TMCP-DONE:<task_id>` / `TMCP-BLOCKED:<task_id> reason` printed by the agent, or `supervise_complete`. IDLE alone never completes a task. |
+| `FAILED` / `CANCELLED` | continuation limit, session gone, long node outage; or cancelled. A marker printed later still upgrades a limit failure (`late_completion: true`). |
+
+**Hops are classified, not guessed.** An observation failure records
+`last_error_hop` (`node`, `controller->node`, `session`, `controller`) and
+backs off (max 60s). A node/tunnel outage keeps the task for 30 minutes
+without failing or resending; a missing session fails after ~5 checks.
+`task.watcher` reports the server-side loop heartbeat (`alive`,
+`last_tick_age_s`).
+
+**Tool errors are not agent state.** A tool call that comes back without a
+JSON result -- a ChatGPT safety block, `BACKEND_UNAVAILABLE`, a tunnel
+timeout -- tells you nothing about the agent. The task is durable: read
+`supervise_status` again later (same `task_id`/key) instead of resending.
+
+**`tail_lines`** on inspect/wait is 1..20. Larger integers are clamped to 20
+and reported in `result.tail_lines_clamped`; non-integers are rejected.
+
+**create_session with `initial_prompt`** (one-off convenience) now waits up to
+20s (`TERMINAL_MCP_AGENT_BOOT_TIMEOUT`) for a settled idle Claude/Codex
+composer and never types into a boot dialog: `initial_prompt_result` is then
+`NOT_SENT` with `BOOT_DIALOG_WAITING_INPUT` or `AGENT_NOT_READY`. A sent
+initial prompt carries `execution_confirmed: false`; use `supervise` when you
+need tracking.
 
 ## 3. Direct-send flow (canonical for a single, immediate prompt)
 
@@ -334,8 +407,11 @@ whether the prompt actually landed before ever sending again.
 dismissing a dialog/prompt (e.g. `["Down", "Enter"]` for a Claude Code
 workspace-trust confirmation), not as a substitute for `terminal_send_text`.
 
-## 4. Queue flow (canonical for anything that needs orchestration —
-multiple steps, retries, verification, or running unattended)
+## 4. Queue flow (LEGACY -- retired and OFF by default; use §3a)
+
+> Historical reference. With the queue OFF every queue-producing action
+> returns `QUEUE_DISABLED_USE_DIRECT_SESSION`. Supervised dispatch (§3a) is
+> the canonical persist-before-dispatch path.
 
 **Status: VERIFIED** (local/Linux, 2026-09-07 live test — see
 REQUIREMENTS.md's own Feature Details entry for the full evidence).

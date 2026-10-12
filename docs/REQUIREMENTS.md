@@ -6637,3 +6637,59 @@ operator-visible rather than being silently retried. Retries are allowed only
 after a transport change can make the payload deliverable. A valid task/attempt/nonce-bound completion marker found
 for stale QUEUED or DISPATCHING work is verified and settled as COMPLETED once;
 completed tasks never have a queue position.
+
+# 2026-10-12 P0 Supervised dispatch contract (issue #52)
+
+Observed on hp-linux 2026-10-12: `create_session(initial_prompt)` returned
+SUBMIT_CONFIRMED/ADAPTER_ACK while the prompt still sat in the composer with
+context 0%; the compact connector steered clients to `action=start` although
+the legacy queue is OFF (no task_id came back); a supervised task on a Codex
+pane stuck at "Hooks need review" read RUNNING with `dispatches=0` and
+`mode=shell`; `inspect tail_lines=100` was rejected outright.
+
+Requirements (status: IMPLEMENTED, unit/regression VERIFIED; live evidence in
+the PR for issue #52):
+
+- **TMCP-DISPATCH-001 Persist first, stable id.** `supervise` writes the task
+  (WAL SQLite `direct_tasks.db`) before any observation or send and always
+  returns its `task_id`. An `idempotency_key` maps to exactly one task forever
+  (also after completion or restart); a retry never sends again.
+- **TMCP-DISPATCH-002 Receipt ladder.** PERSISTED → INPUT_SENT (persisted before
+  the send call) → SUBMIT_CONFIRMED → EXECUTION_ACCEPTED, plus NOT_SENT and
+  DISPATCH_UNCERTAIN. SUBMIT_CONFIRMED/ADAPTER_ACK never means RUNNING.
+- **TMCP-DISPATCH-003 RUNNING needs independent evidence.** Busy footer after
+  dispatch, an agent answer after the echoed prompt, or the completion marker.
+  A composer still holding the prompt vetoes acceptance — in the supervisor and
+  in the core send path (`_composer_still_holds_prompt`, Codex
+  `_codex_draft_in_composer`), which then reports ACTIVATION_UNCERTAIN.
+- **TMCP-DISPATCH-004 Honest non-running states.** STUCK_COMPOSER (bounded
+  Enter-only recovery: guarded activate-only send, ≤2 attempts, 10s cooldown,
+  never while the pane is busy, never retypes text), WAITING_INPUT (a dialog;
+  `SESSION_INPUT_BEFORE_DISPATCH` when nothing was typed), DISPATCH_UNCERTAIN
+  (no evidence 45s after submit; not resent). Every task view carries
+  `next_action`.
+- **TMCP-DISPATCH-005 Prompt hooks are never bypassed.** Nothing is typed while
+  a pane shows a boot/approval dialog (Codex "Hooks need review", Claude folder
+  trust); the classifier reports WAITING_INPUT naming the agent CLI, and
+  `create_session(initial_prompt)` waits (≤20s) for a settled composer or
+  returns `NOT_SENT` (`BOOT_DIALOG_WAITING_INPUT` / `AGENT_NOT_READY`).
+- **TMCP-DISPATCH-006 Mode from the pane's CLI.** `mode=auto` resolves from
+  structured agent fields or "current command is '<cli>'", never from free
+  text alone; unresolved stays DISPATCHING with `MODE_UNRESOLVED`.
+- **TMCP-DISPATCH-007 IDLE is not DONE.** Completion needs `TMCP-DONE:<id>` /
+  `TMCP-BLOCKED:<id>` or `supervise_complete`; a marker after a limit failure
+  upgrades it (`late_completion`).
+- **TMCP-DISPATCH-008 Survives restart, any client.** Supervision state and the
+  watcher heartbeat live in SQLite; `supervise_status` accepts `task_id`,
+  `idempotency_key` or `target`. Observation failures record `last_error_hop`
+  (node / controller->node / session / controller) with backoff ≤60s; a node
+  outage keeps the task 30 min, a missing session fails after ~5 checks.
+- **TMCP-DISPATCH-009 Queue stays off; guidance is truthful.** Queue actions
+  return QUEUE_DISABLED_USE_DIRECT_SESSION with `task_created: false` and
+  `next_calls` (create_session → supervise → supervise_status). Sidecar
+  instructions (surface v2.2.0), tool schema and orchestration policy v1.5.0
+  steer to supervise; nothing enables the queue.
+- **TMCP-DISPATCH-010 tail_lines.** inspect/wait accept 1..20; larger integers
+  are clamped and reported (`tail_lines_clamped`), schema text says so.
+
+Regression suite: `tests/test_issue52_supervised_dispatch.py`.
