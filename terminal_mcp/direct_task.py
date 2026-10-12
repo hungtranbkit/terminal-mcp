@@ -88,6 +88,13 @@ ACCEPT_TIMEOUT_SECONDS = 45.0
 #: upgraded to the explicit outcome (late completion).
 LATE_COMPLETION_WINDOW_SECONDS = 86_400.0
 MARKER_TAIL_LINES = 60
+#: mode=auto that cannot see which CLI runs fails (nothing sent) after this.
+MODE_RESOLVE_TIMEOUT_SECONDS = 60.0
+#: An INPUT_SENT row younger than this may be a send in flight in ANOTHER
+#: process sharing the store (stdio + HTTP servers); only older is "lost".
+MAX_SEND_SECONDS = 90.0
+#: Bottom rows searched for a boot dialog title (not prose higher up).
+DIALOG_TAIL_LINES = 12
 LOOP_INTERVAL_SECONDS = 3.0
 TASK_ID_PLACEHOLDER = "{TMCP_TASK_ID}"
 _TASK_ID = re.compile(r"^dt_[0-9a-f]{16}$")
@@ -196,17 +203,26 @@ def composer_holds(output: str, needle: str) -> bool:
 
 def echoed_then_answered(output: str, needle: str) -> bool:
     """The prompt was echoed into the transcript AND the agent wrote output
-    after it -- independent evidence the agent took the prompt."""
+    after it -- independent evidence the agent took the prompt. The needle
+    is matched across wrapped rows; it is per-dispatch (see _needle), so an
+    earlier prompt's echo can never vouch for a later one."""
     lines = [line for line in str(output or "").splitlines() if line.strip()]
     region = _composer_region(lines)
     history = lines[:len(lines) - len(region)] if region else lines
     wanted = _collapse(needle)
-    last = None
-    for index, line in enumerate(history):
-        if wanted and wanted in _collapse(line):
-            last = index
-    if last is None:
+    if not wanted:
         return False
+    starts, parts, position = [], [], 0
+    for line in history:
+        part = _collapse(line.strip(" │┃║"))
+        starts.append(position)
+        parts.append(part)
+        position += len(part) + 1
+    found = " ".join(parts).rfind(wanted)
+    if found < 0:
+        return False
+    end = found + len(wanted)
+    last = max(index for index, start in enumerate(starts) if start <= end)
     return any(_AGENT_OUTPUT_LINE.match(line) for line in history[last + 1:])
 
 
@@ -228,6 +244,9 @@ def agent_of(observed: dict[str, Any]) -> str | None:
     for agent in _AGENT_HINTS:
         if agent in lowered:
             return agent
+    # classify_status's shell-only rules do not restate the command.
+    if "shell prompt is back" in lowered or "shell pane has no tmux activity" in lowered:
+        return "shell"
     return None
 
 
@@ -294,11 +313,18 @@ class DirectTaskStore:
                 "ON direct_tasks(completed_at, target)")
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS direct_task_meta (key TEXT PRIMARY KEY, value TEXT)")
+        with self._connection() as connection:
+            # Serialized: two servers (stdio + HTTP) may open the store at once.
+            connection.execute("BEGIN IMMEDIATE")
             existing = {row["name"] for row in connection.execute(
                 "PRAGMA table_info(direct_tasks)").fetchall()}
             for name, kind in self._ADDED_COLUMNS:
                 if name not in existing:
-                    connection.execute(f"ALTER TABLE direct_tasks ADD COLUMN {name} {kind}")
+                    try:
+                        connection.execute(f"ALTER TABLE direct_tasks ADD COLUMN {name} {kind}")
+                    except sqlite3.OperationalError as exc:
+                        if "duplicate column" not in str(exc).lower():
+                            raise
         with contextlib.suppress(OSError):
             self.path.chmod(0o600)
 
@@ -320,7 +346,7 @@ class DirectTaskStore:
         result["steps"] = json.loads(result["steps"])
         return result
 
-    def insert(self, task: dict[str, Any]) -> dict[str, Any]:
+    def insert(self, task: dict[str, Any], *, exclusive_target: bool = False) -> dict[str, Any]:
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             if task.get("idempotency_key"):
@@ -329,6 +355,13 @@ class DirectTaskStore:
                     (task["idempotency_key"],)).fetchone()
                 if existing is not None:
                     return {**self._row(existing), "deduplicated": True}
+            if exclusive_target:
+                bare = task["target"].split("/", 1)[-1]
+                active = connection.execute(
+                    "SELECT * FROM direct_tasks WHERE completed_at IS NULL AND target IN (?, ?) "
+                    "ORDER BY created_at LIMIT 1", (task["target"], bare)).fetchone()
+                if active is not None:
+                    return {**self._row(active), "conflict": True}
             values = {**task, "steps": json.dumps(task["steps"])}
             columns = ", ".join(values)
             marks = ", ".join("?" for _ in values)
@@ -371,6 +404,24 @@ class DirectTaskStore:
                     "SELECT * FROM direct_tasks WHERE completed_at IS NULL AND target IN (?, ?) "
                     "ORDER BY created_at", (target, bare)).fetchall()
         return [self._row(row) for row in rows]
+
+    def claim_dispatch(self, task_id: str, expected_dispatches: int, expected_receipt: str | None,
+                       **fields: Any) -> dict[str, Any] | None:
+        """Compare-and-swap the pre-send INPUT_SENT write. Returns None when
+        another writer (a second process on the same store) already moved the
+        task, so exactly one process ever sends a given dispatch."""
+        fields["updated_at"] = _now()
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                f"UPDATE direct_tasks SET {assignments} WHERE task_id = ? AND completed_at IS NULL "
+                "AND dispatches = ? AND receipt IS ? AND receipt IS NOT 'INPUT_SENT'",
+                (*fields.values(), task_id, expected_dispatches, expected_receipt))
+            if cursor.rowcount != 1:
+                return None
+            return self._row(connection.execute(
+                "SELECT * FROM direct_tasks WHERE task_id = ?", (task_id,)).fetchone())
 
     def set_meta(self, key: str, value: str) -> None:
         with self._connection() as connection:
@@ -491,7 +542,11 @@ class DirectTaskSupervisor:
             "receipt": RECEIPT_PERSISTED, "steps": items, "continue_text": continue_text,
             "max_continuations": max_continuations, "idempotency_key": idempotency_key,
             "created_at": now, "updated_at": now,
-        })
+        }, exclusive_target=True)
+        if task.get("conflict"):
+            return {"status": "FAILED", "error": "TARGET_HAS_ACTIVE_SUPERVISED_TASK",
+                    "task": self._view(task),
+                    "next_action": "complete or cancel that task first (supervise_complete / supervise_cancel)"}
         if task.get("deduplicated"):
             return {"status": "OK", "deduplicated": True, "task": self._view(task)}
         with self._lock:
@@ -584,7 +639,7 @@ class DirectTaskSupervisor:
             "state": state, "wait_reason": task.get("wait_reason"),
             "business_complete": state == "DONE",
             "running_confirmed": task.get("accepted_at") is not None,
-            "receipt": task.get("receipt") or (RECEIPT_EXECUTION_ACCEPTED if task["dispatches"] else None),
+            "receipt": task.get("receipt") or ("LEGACY_UNVERIFIED" if task["dispatches"] else None),
             "receipts": {
                 "persisted_at": task["created_at"],
                 "input_sent_at": task.get("input_sent_at"),
@@ -650,9 +705,13 @@ class DirectTaskSupervisor:
             reason=_clip(f"late completion after {task.get('reason')}: "
                          f"{detail or 'target printed TMCP-' + outcome}"))
 
-    def _needle(self, task: dict[str, Any], text: str) -> str:
-        if task["mode"] == "agent" and task["task_id"] in text:
-            return task["task_id"]
+    def _needle(self, task: dict[str, Any], text: str, advance: dict[str, Any]) -> str:
+        """A string unique to THIS dispatch, for composer/echo checks."""
+        task_id = task["task_id"]
+        if task["mode"] == "agent" and "continuations" in advance and not task.get("continue_text"):
+            return f"{task_id}, continuation {advance['continuations']}/"
+        if task["mode"] == "agent" and f"supervised task {task_id}]" in text:
+            return f"supervised task {task_id}]"
         return _collapse(text)[:40]
 
     def _next_text(self, task: dict[str, Any], now: float) -> tuple[str | None, dict[str, Any], dict[str, Any] | None]:
@@ -682,19 +741,24 @@ class DirectTaskSupervisor:
 
     def _dispatch(self, task: dict[str, Any], now: float) -> dict[str, Any]:
         """Send the next step or continuation; stop at an explicit limit."""
+        task_id = task["task_id"]
         text, advance, terminal = self._next_text(task, now)
         if terminal is not None:
             return self.store.update(task["task_id"], **terminal)
         key = f"direct-task:{task['task_id']}:{task['dispatches'] + 1}:{task['send_failures']}"
-        needle = self._needle(task, text)
+        needle = self._needle(task, text, advance)
         # Persist the intent BEFORE the send: after a crash between here and
         # the result, the task is verified by observation, never re-typed.
-        task = self.store.update(
-            task["task_id"], receipt=RECEIPT_INPUT_SENT, dispatch_key=key, dispatch_needle=needle,
+        task = self.store.claim_dispatch(
+            task["task_id"], task["dispatches"], task.get("receipt"),
+            receipt=RECEIPT_INPUT_SENT, dispatch_key=key, dispatch_needle=needle,
             pending_advance=json.dumps(advance), input_sent_at=now, submit_confirmed_at=None,
             accepted_at=None,
             recovery_attempts=0, last_recovery_at=None, state="DISPATCHING", wait_reason=None,
             idle_since=None)
+        if task is None:
+            # Another process claimed this dispatch first: never send twice.
+            return self.store.get(task_id)
         try:
             sent = self._send(task["target"], text, key)
         except Exception as exc:  # noqa: BLE001 -- outcome unknown, verified below
@@ -767,6 +831,11 @@ class DirectTaskSupervisor:
         if task["mode"] == "auto":
             agent = agent_of(observed)
             if agent is None:
+                if now - task["created_at"] >= MODE_RESOLVE_TIMEOUT_SECONDS:
+                    return self.store.update(
+                        task["task_id"], **base, state="FAILED", completed_at=now,
+                        reason=("MODE_UNRESOLVED: could not identify the pane's CLI; nothing was "
+                                "sent. Retry supervise with args.mode=agent or shell."))
                 return self.store.update(task["task_id"], **base,
                                          reason="MODE_UNRESOLVED: waiting to identify the pane's CLI")
             task = self.store.update(task["task_id"], mode="shell" if agent == "shell" else "agent",
@@ -793,7 +862,9 @@ class DirectTaskSupervisor:
         return self._supervise_running(task, base, turn_state, observed, now)
 
     def _first_dispatch(self, task, base, turn_state, observed, output, now):
-        if turn_state == "WAITING_INPUT" or (output and _BOOT_DIALOG.search(output)):
+        bottom = "\n".join([line for line in (output or "").splitlines()
+                             if line.strip()][-DIALOG_TAIL_LINES:])
+        if turn_state == "WAITING_INPUT" or _BOOT_DIALOG.search(bottom):
             # Never type into a dialog -- in particular never let our Enter
             # answer a hooks-review/trust menu. Nothing was sent.
             return self.store.update(task["task_id"], **base, state="WAITING_INPUT",
@@ -812,9 +883,11 @@ class DirectTaskSupervisor:
         needle = task.get("dispatch_needle") or ""
         sent_at = task.get("input_sent_at") or task.get("last_dispatch_at") or now
         if task.get("receipt") == RECEIPT_INPUT_SENT:
-            # Intent persisted but no recorded result. Sends run under the
-            # same lock as ticks, so this is never an in-flight send: a crash
-            # hit it. Apply the step (it may be in the pane) and verify.
+            if now - sent_at < MAX_SEND_SECONDS:
+                # Possibly a send still in flight in another process.
+                return self.store.update(task["task_id"], **base)
+            # Intent persisted, no result, and far older than any send: a
+            # crash hit it. Apply the step (it may be in the pane) and verify.
             advance = json.loads(task.get("pending_advance") or "{}")
             task = self.store.update(task["task_id"], **advance, pending_advance=None,
                                      dispatches=task["dispatches"] + 1, last_dispatch_at=sent_at,
@@ -825,7 +898,8 @@ class DirectTaskSupervisor:
         # execution evidence (a dialog redraw reads the same); only the CLI's
         # own busy footer/adapter signal counts.
         accepted = (turn_state == "RUNNING" and not holds
-                    and not _WEAK_RUNNING.search(str(observed.get("reason") or "")))
+                    and not (task["mode"] == "agent"
+                             and _WEAK_RUNNING.search(str(observed.get("reason") or ""))))
         if not accepted and output is not None and not holds:
             if task["mode"] == "shell":
                 accepted = bool(needle) and needle in _collapse(output) and turn_state == "IDLE"
@@ -844,7 +918,8 @@ class DirectTaskSupervisor:
             if now - sent_at < STUCK_GRACE_SECONDS:
                 return self.store.update(task["task_id"], **base, state="DISPATCHING")
             return self._recover_stuck(task, base, now)
-        if now - sent_at >= ACCEPT_TIMEOUT_SECONDS:
+        since = max(sent_at, task.get("last_recovery_at") or 0)
+        if now - since >= ACCEPT_TIMEOUT_SECONDS:
             return self.store.update(
                 task["task_id"], **base, state="DISPATCH_UNCERTAIN",
                 wait_reason="NO_EXECUTION_EVIDENCE",

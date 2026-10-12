@@ -227,7 +227,7 @@ def test_restart_with_only_the_persisted_intent_verifies_by_observation(tmp_path
     task_id = sup.start("s", text="goal")["task"]["task_id"]
     # Emulate a process killed after the INPUT_SENT write, before the result.
     store.update(task_id, receipt="INPUT_SENT", dispatches=0, next_step=0,
-                 pending_advance='{"next_step": 1}', input_sent_at=clock.now)
+                 pending_advance='{"next_step": 1}', input_sent_at=clock.now - 600)
     restarted = _sup(tmp_path, pane, clock)
     _run(restarted, clock, 2)
     task = _task(restarted, task_id)
@@ -444,3 +444,153 @@ def test_claude_dialog_above_the_composer_is_waiting_input():
     session = SimpleNamespace(pane_dead=False, activity_epoch=0, pane_current_command="claude")
     state, waiting, reason = classify_status(session, pane, now=5)
     assert state == "WAITING_INPUT" and waiting and "claude" in reason
+
+
+# -- review follow-ups ---------------------------------------------------------
+
+def test_auto_mode_resolves_an_idle_shell_without_a_command_in_the_reason(tmp_path):
+    clock = Clock()
+    pane = FakePane(agent="bash", busy_ticks=1)
+    original = pane.status
+
+    def status(target):
+        observed = original(target)
+        if observed.get("state") == "IDLE":
+            observed["reason"] = "shell prompt is back at the bottom of the pane; the command has finished"
+        return observed
+
+    sup = DirectTaskSupervisor(DirectTaskStore(tmp_path / "direct.db"), send=pane.send, status=status,
+                               tail=pane.tail, clock=clock, settle_seconds=5)
+    task = sup.start("sh", steps=["echo hi"])["task"]
+    assert task["mode"] == "shell" and len(pane.sent) == 1
+
+
+def test_unresolvable_mode_fails_without_sending(tmp_path):
+    clock = Clock()
+    pane = FakePane()
+    sup = DirectTaskSupervisor(DirectTaskStore(tmp_path / "direct.db"), send=pane.send,
+                               status=lambda t: {"state": "UNKNOWN", "reason": "no signal"},
+                               tail=pane.tail, clock=clock, settle_seconds=5)
+    task_id = sup.start("s", text="goal")["task"]["task_id"]
+    _run(sup, clock, 30)
+    task = _task(sup, task_id)
+    assert task["state"] == "FAILED" and "MODE_UNRESOLVED" in task["reason"] and pane.sent == []
+
+
+def test_an_earlier_prompt_echo_never_vouches_for_a_lost_continuation(tmp_path):
+    clock = Clock()
+    pane = FakePane(busy_ticks=1)
+    sup = _sup(tmp_path, pane, clock, activate=None)
+    task_id = sup.start("s", text="goal")["task"]["task_id"]
+    _run(sup, clock, 2)
+    assert _task(sup, task_id)["state"] == "RUNNING"
+    original = pane.send
+
+    def lost(target, text, key):
+        result = original(target, text, key)
+        pane.output.pop()  # the continuation never reached the transcript
+        pane.busy = 0
+        return result
+
+    sup._send = lost
+    _run(sup, clock, 6)
+    task = _task(sup, task_id)
+    assert task["continuations"] == 1 and task["state"] == "DISPATCHING"
+    assert task["running_confirmed"] is False
+
+
+def test_shell_step_with_timer_running_is_accepted(tmp_path):
+    clock = Clock()
+    pane = FakePane(agent="bash", busy_ticks=3)
+    original = pane.status
+    pane.status = lambda t: ({**original(t), "reason": "current command is 'pytest'; tmux activity age is 1s"}
+                             if pane.busy else original(t))
+    sup = DirectTaskSupervisor(DirectTaskStore(tmp_path / "direct.db"), send=pane.send,
+                               status=pane.status, tail=pane.tail, clock=clock, settle_seconds=5)
+    task_id = sup.start("sh", steps=["pytest -q"], mode="shell")["task"]["task_id"]
+    _run(sup, clock, 1)
+    assert _task(sup, task_id)["state"] == "RUNNING"
+
+
+def test_prose_about_hooks_higher_up_does_not_block_dispatch(tmp_path):
+    clock = Clock()
+    pane = FakePane()
+    pane.output.extend(["● I fixed the Hooks need review detection."] + [f"● line {i}" for i in range(20)])
+    sup = _sup(tmp_path, pane, clock)
+    task = sup.start("s", text="goal")["task"]
+    assert len(pane.sent) == 1 and task["state"] in ("DISPATCHING", "RUNNING")
+
+
+def test_a_second_process_cannot_claim_the_same_dispatch(tmp_path):
+    clock = Clock()
+    pane = FakePane()
+    store = DirectTaskStore(tmp_path / "direct.db")
+    sup = DirectTaskSupervisor(store, send=pane.send, status=pane.status, tail=pane.tail,
+                               clock=clock, settle_seconds=5)
+    task_id = sup.start("s", text="goal")["task"]["task_id"]
+    row = store.get(task_id)
+    assert store.claim_dispatch(task_id, row["dispatches"] - 1, row["receipt"], receipt="INPUT_SENT") is None
+    assert store.claim_dispatch(task_id, row["dispatches"], row["receipt"], receipt="INPUT_SENT") is not None
+    assert store.claim_dispatch(task_id, row["dispatches"], "INPUT_SENT", receipt="INPUT_SENT") is None
+
+
+def test_in_flight_send_in_another_process_is_not_treated_as_lost(tmp_path):
+    clock = Clock()
+    pane = FakePane(busy_ticks=0)
+    store = DirectTaskStore(tmp_path / "direct.db")
+    sup = DirectTaskSupervisor(store, send=pane.send, status=pane.status, tail=pane.tail,
+                               clock=clock, settle_seconds=5)
+    task_id = sup.start("s", text="goal")["task"]["task_id"]
+    store.update(task_id, receipt="INPUT_SENT", input_sent_at=clock.now)
+    _run(sup, clock, 2)
+    assert _task(sup, task_id)["receipt"] == "INPUT_SENT"
+
+
+def test_two_supervises_on_one_target_cannot_both_insert(tmp_path):
+    store = DirectTaskStore(tmp_path / "direct.db")
+    base = {"target": "s", "mode": "agent", "state": "DISPATCHING", "steps": ["x"],
+            "max_continuations": 1, "created_at": 1.0, "updated_at": 1.0}
+    first = store.insert({**base, "task_id": "dt_0000000000000001"}, exclusive_target=True)
+    second = store.insert({**base, "task_id": "dt_0000000000000002"}, exclusive_target=True)
+    assert "conflict" not in first and second["conflict"] and second["task_id"] == first["task_id"]
+
+
+def test_migration_from_the_old_schema_keeps_legacy_rows(tmp_path):
+    import sqlite3
+    path = tmp_path / "direct.db"
+    connection = sqlite3.connect(path)
+    connection.execute("""CREATE TABLE direct_tasks (task_id TEXT PRIMARY KEY, target TEXT NOT NULL,
+        mode TEXT NOT NULL, state TEXT NOT NULL, wait_reason TEXT, steps TEXT NOT NULL,
+        next_step INTEGER NOT NULL DEFAULT 0, continue_text TEXT, continuations INTEGER NOT NULL DEFAULT 0,
+        max_continuations INTEGER NOT NULL, dispatches INTEGER NOT NULL DEFAULT 0,
+        send_failures INTEGER NOT NULL DEFAULT 0, observe_failures INTEGER NOT NULL DEFAULT 0,
+        last_dispatch_at REAL, idle_since REAL, last_turn_state TEXT, reason TEXT,
+        idempotency_key TEXT UNIQUE, created_at REAL NOT NULL, updated_at REAL NOT NULL, completed_at REAL)""")
+    connection.execute("INSERT INTO direct_tasks (task_id, target, mode, state, steps, next_step, "
+                       "max_continuations, dispatches, created_at, updated_at) VALUES "
+                       "('dt_00000000000000aa', 's', 'agent', 'RUNNING', '[\"x\"]', 1, 6, 1, 1.0, 1.0)")
+    connection.commit()
+    connection.close()
+    DirectTaskStore(path)
+    DirectTaskStore(path)  # idempotent
+    clock = Clock()
+    pane = FakePane(busy_ticks=5)
+    sup = DirectTaskSupervisor(DirectTaskStore(path), send=pane.send, status=pane.status,
+                               tail=pane.tail, clock=clock, settle_seconds=5)
+    view = sup.get("dt_00000000000000aa", refresh=False)["task"]
+    assert view["receipt"] == "LEGACY_UNVERIFIED" and view["state"] == "RUNNING"
+    _run(sup, clock, 2)
+    assert pane.sent == []  # a legacy RUNNING task is supervised, not re-sent
+
+
+def test_recovery_enter_restarts_the_acceptance_clock(tmp_path):
+    clock = Clock()
+    pane = FakePane()
+    pane.swallow = True
+    sup = _sup(tmp_path, pane, clock, activate=None)
+    task_id = sup.start("s", text="goal")["task"]["task_id"]
+    _run(sup, clock, 20)  # stuck well past ACCEPT_TIMEOUT_SECONDS
+    sup._activate = lambda target, key: (pane.draft and pane.output.append("> draft"),
+                                         setattr(pane, "draft", ""), {"status": "SUBMIT_CONFIRMED"})[-1]
+    _run(sup, clock, 1)
+    assert _task(sup, task_id)["state"] != "DISPATCH_UNCERTAIN"

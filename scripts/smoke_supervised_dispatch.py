@@ -115,7 +115,7 @@ def main() -> int:
             task_id = task.get("task_id")
             row.update(task_id=task_id, start_status=first.get("status"),
                        start_error=first.get("error"), start_state=task.get("state"),
-                       start_receipt=task.get("receipt"),
+                       start_receipt=task.get("receipt"), start_reason=task.get("reason"),
                        start_running_confirmed=task.get("running_confirmed"))
             dup = sup.start(name, text=text, idempotency_key=key)
             row["duplicate_same_task"] = (dup.get("deduplicated") is True
