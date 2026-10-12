@@ -131,10 +131,10 @@ TRUST_DIALOG_PATTERN = re.compile(r"trust this folder|Accessing workspace", re.I
 BOOT_DIALOG_PATTERN = re.compile(
     r"hooks need review|trust this folder|do you trust the files", re.IGNORECASE)
 # Codex's banner while it is still starting ("model: loading").
-BOOT_LOADING_PATTERN = re.compile(r"^\W*(?:model|directory):\s+loading\b",
-                                  re.IGNORECASE | re.MULTILINE)
+BOOT_HEADER_PATTERN = re.compile(r"^\W*model:\s+(\S+)", re.IGNORECASE | re.MULTILINE)
 AGENT_BOOT_READY_TIMEOUT_SECONDS = float(os.environ.get("TERMINAL_MCP_AGENT_BOOT_TIMEOUT", "20"))
 AGENT_BOOT_READY_POLL_SECONDS = 1.0
+COMPOSER_VETO_RECHECK_SECONDS = 3.0
 # 15s, not a shorter value: live-reproduced false negative during this
 # feature's own disposable E2E test (2026-09-07) -- a real resume that
 # HAD succeeded (full prior conversation correctly loaded, confirmed by
@@ -2412,6 +2412,17 @@ class TerminalService:
         composer_after = self._read_composer(session) if adapter.submit_policy.uses_composer_evidence else ComposerSnapshot(COMPOSER_UNKNOWN)
         result.update(self._composer_fields(composer_before, composer_after))
         if confirmed and _composer_still_holds_prompt(composer_before, composer_after, text):
+            # A just-booted Claude can take ~1s to act on the Enter. Re-read
+            # briefly before calling it stuck, so a late-but-real submit is
+            # not reported as uncertain.
+            recheck_deadline = time.monotonic() + COMPOSER_VETO_RECHECK_SECONDS
+            while time.monotonic() < recheck_deadline:
+                time.sleep(SEND_VERIFY_POLL_INTERVAL_SECONDS)
+                composer_after = self._read_composer(session)
+                if not _composer_still_holds_prompt(composer_before, composer_after, text):
+                    result.update(self._composer_fields(composer_before, composer_after))
+                    break
+        if confirmed and _composer_still_holds_prompt(composer_before, composer_after, text):
             # Issue #52: ADAPTER_ACK is a pane-diff rule, and a booting TUI, a
             # dialog or a wrapped draft all move rows above the last line. A
             # composer that STILL holds the prompt after the Enter is direct
@@ -4642,15 +4653,17 @@ class TerminalService:
         deadline = time.monotonic() + AGENT_BOOT_READY_TIMEOUT_SECONDS
         streak = 0
         last_state = "unknown"
+        previous: str | None = None
         while True:
             try:
                 lines = self.tmux.capture_lines(name, SEND_VERIFY_LINES)
             except TmuxError:
                 lines = []
             text = "\n".join(lines)
+            bottom = "\n".join([line for line in lines if line.strip()][-15:])
             last_state = adapter.identify_target_state(lines)
             waiting, waiting_reason = detect_waiting_input(text)
-            if BOOT_DIALOG_PATTERN.search(text) or waiting or last_state == TARGET_WAITING:
+            if BOOT_DIALOG_PATTERN.search(bottom) or waiting or last_state == TARGET_WAITING:
                 return {"status": "NOT_SENT", "error": "BOOT_DIALOG_WAITING_INPUT",
                         "state": "WAITING_INPUT", "agent": command,
                         "reason": (f"{command} is showing a boot dialog that needs a human "
@@ -4658,8 +4671,15 @@ class TerminalService:
                         "next_action": ("answer the dialog in the session (hooks review is a "
                                         "security prompt -- never auto-trust), then use "
                                         "terminal_turn action=supervise to dispatch the task")}
-            booting = BOOT_LOADING_PATTERN.search(text) is not None
-            streak = streak + 1 if (last_state == TARGET_COMPOSER and not booting) else 0
+            # Codex may leave an early "model: loading" header in scrollback
+            # and draw a fresh one; only the LAST header line decides.
+            headers = BOOT_HEADER_PATTERN.findall(text)
+            booting = bool(headers) and headers[-1].lower() == "loading"
+            # Ready = an idle composer on a pane that has stopped redrawing
+            # (identical consecutive captures), seen on 3 polls in a row.
+            settled = last_state == TARGET_COMPOSER and not booting and text == previous
+            streak = streak + 1 if settled else 0
+            previous = text
             if streak >= 2:
                 return None
             if time.monotonic() >= deadline:

@@ -1204,7 +1204,8 @@ class CompactTerminalTools:
                     label = self.task_labels.on_task(
                         node_id=node_id, session=name,
                         text=text or (steps[0] if steps else None),
-                        title=title, task_id=(result.get("task") or {}).get("task_id"),
+                        title=title, task_id=(result.get("task_id")
+                                              or (result.get("task") or {}).get("task_id")),
                         source="supervised")
                 except Exception:  # noqa: BLE001
                     label = None
