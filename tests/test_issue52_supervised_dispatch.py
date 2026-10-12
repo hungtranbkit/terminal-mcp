@@ -414,3 +414,33 @@ def test_inspect_tail_lines_over_max_is_clamped_not_rejected(tmp_path):
     assert result["status"] == "OK"
     assert result["result"]["tail_lines_clamped"] == {"requested": 100, "used": 20, "max": 20}
     assert tools.turn(action="inspect", target="s", tail_lines="x")["status"] == "FAILED"
+
+
+def test_activity_age_running_is_not_execution_evidence(tmp_path):
+    clock = Clock()
+    pane = FakePane(busy_ticks=0)
+    original = pane.status
+    pane.status = lambda t: {**original(t), "state": "RUNNING",
+                             "reason": "current command is 'claude'; tmux activity age is 2s"}
+    sup = DirectTaskSupervisor(DirectTaskStore(tmp_path / "direct.db"), send=pane.send,
+                               status=pane.status, tail=pane.tail, clock=clock, settle_seconds=5)
+    task_id = sup.start("s", text="goal")["task"]["task_id"]
+    _run(sup, clock, 3)
+    assert _task(sup, task_id)["state"] == "DISPATCHING"
+
+
+def test_claude_dialog_above_the_composer_is_waiting_input():
+    pane = """❯ Smoke cycle 1 of an automated test.
+────────────────────────────────────────
+  Teach auto mode about your environment?
+  ❯ 1. Yes
+    2. Not now
+    3. Don't show again
+  Enter to confirm · Esc to cancel
+────────────────────────────────────────
+❯
+────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents"""
+    session = SimpleNamespace(pane_dead=False, activity_epoch=0, pane_current_command="claude")
+    state, waiting, reason = classify_status(session, pane, now=5)
+    assert state == "WAITING_INPUT" and waiting and "claude" in reason

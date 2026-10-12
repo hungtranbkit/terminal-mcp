@@ -58,6 +58,14 @@ WAIT_PATTERNS = tuple(
     )
 )
 _AGENT_COMMANDS = {"claude", "codex"}
+#: Key-hint lines agent CLIs draw only on a modal dialog/menu (Claude:
+#: "Enter to confirm · Esc to cancel"/"Enter to select"; Codex: "Press enter
+#: to confirm or esc to go back"), plus the hook/trust dialog titles.
+DIALOG_CHROME = re.compile(
+    r"enter to (?:confirm|select)\s*·\s*esc to (?:cancel|go back|exit)"
+    r"|press enter to confirm or esc"
+    r"|hooks need review",
+    re.IGNORECASE)
 
 ACTIVE_COMMANDS = {"claude", "codex", "python", "python3", "pytest", "node", "npm", "bash", "zsh"}
 
@@ -181,6 +189,15 @@ def detect_waiting_input(output: str) -> tuple[bool, str]:
     # examples in command output do not turn into false input requests.
     if recent and re.fullmatch(r"(?:--More--|\(END\))", recent[-1], re.IGNORECASE):
         return True, f"pager prompt {recent[-1]!r} is waiting for input"
+    # Agent CLI dialogs (issue #52, captured live 2026-10-12): Claude draws
+    # its own dialogs ABOVE the composer box and mode footer -- "Teach auto
+    # mode about your environment? ... ❯ 1. Yes ... Enter to confirm · Esc to
+    # cancel" ended 4 non-empty lines above the pane bottom, so the 4-line
+    # window below missed it and the pane read RUNNING. Only the dialog's own
+    # key-hint chrome is matched here (never prose), over the last 12 lines.
+    for offset, line in enumerate(reversed(recent)):
+        if DIALOG_CHROME.search(line):
+            return True, f"agent dialog chrome {line[:80]!r} at bottom offset {offset}"
     # A prompt must be very near the current pane bottom to avoid matching old logs.
     for offset, line in enumerate(reversed(recent[-4:])):
         for pattern in WAIT_PATTERNS:

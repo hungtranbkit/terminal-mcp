@@ -105,6 +105,9 @@ _AGENT_OUTPUT_LINE = re.compile(r"^\s*(?:[●⏺•]\s+\S|─+\s*Worked for\b)")
 _BOOT_DIALOG = re.compile(r"hooks need review|trust this folder|do you trust the files",
                           re.IGNORECASE)
 _DEFINITELY_NOT_TYPED = {"BLOCKED", "ERROR", None}
+# classify_status's timer fallback ("current command is 'claude'; tmux
+# activity age is 3s") -- weak evidence, see _verify_acceptance.
+_WEAK_RUNNING = re.compile(r"tmux activity age is \d+s")
 _NODE_ERRORS = ("NODE", "REMOTE", "UNREACHABLE", "OFFLINE", "TUNNEL", "CONNECT", "TIMEOUT")
 
 
@@ -818,7 +821,11 @@ class DirectTaskSupervisor:
                                      receipt=RECEIPT_UNCERTAIN,
                                      reason="send outcome lost (restart/timeout); verifying by observation")
         holds = output is not None and composer_holds(output, needle)
-        accepted = turn_state == "RUNNING" and not holds
+        # A RUNNING read from the tmux activity-age fallback is a redraw, not
+        # execution evidence (a dialog redraw reads the same); only the CLI's
+        # own busy footer/adapter signal counts.
+        accepted = (turn_state == "RUNNING" and not holds
+                    and not _WEAK_RUNNING.search(str(observed.get("reason") or "")))
         if not accepted and output is not None and not holds:
             if task["mode"] == "shell":
                 accepted = bool(needle) and needle in _collapse(output) and turn_state == "IDLE"
