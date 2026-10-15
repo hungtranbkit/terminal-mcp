@@ -67,7 +67,7 @@ def test_every_new_session_requires_safe_precreate_audit():
         "call list_sessions",
         "batch inspect when useful",
         "reuse",
-        "no active",
+        "active tasks/runs",
         "UNKNOWN status is NEVER proof",
         "WAITING_INPUT",
         "dirty/unmerged or unsaved-input",
