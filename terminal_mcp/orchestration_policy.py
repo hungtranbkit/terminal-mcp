@@ -37,7 +37,7 @@ Design commitments:
 
 from __future__ import annotations
 
-ORCHESTRATION_POLICY_VERSION = "1.4.1"
+ORCHESTRATION_POLICY_VERSION = "1.4.2"
 
 #: Where the expanded, human-readable form lives, relative to the repo root.
 POLICY_DOC_PATH = "docs/CHATGPT_ORCHESTRATION_POLICY.md"
@@ -59,7 +59,7 @@ TOOL_EFFICIENCY = (
     "TOOL EFFICIENCY. Terminal MCP is the CONTROL PLANE. GIVING A SESSION WORK IS DIRECT SESSION SEND. "
     "The durable task queue is retired and disabled by default. For coding work, create a fresh session when needed, then use terminal_turn action=send or action=send_wait directly on that session. "
     "Queue-producing actions start, enqueue_task, route_start, agent_start, project_start, aliases run/dispatch/enqueue, and send with long_task=true must not be used in normal operation. "
-    "Use inspect only when the user explicitly asks for a status check. After direct send, avoid polling unless the user asks for a check. "
+    "Use inspect only for user-requested checks or the mandatory pre-create session audit. After direct send, avoid polling unless the user asks for a check. "
     "Read-only task history/status and cleanup remain available for historical tasks. Paperclip is a separate optional orchestration layer for project/issue assignment, heartbeats, budgets and managed workspaces; it is not a dependency of direct Terminal MCP inspection, remote execution, browser verification or break-glass recovery. When work is complete, verify it, merge to the intended branch, and clean up finished sessions/worktrees/branches."
 )
 
@@ -74,9 +74,16 @@ ROLES = (
     "and never replaces Terminal MCP status as the source of truth."
 )
 
+SESSION_PRECREATE_AUDIT = (
+    "SESSION PRE-CREATE AUDIT (MANDATORY). Before EVERY terminal_turn action=create_session, even if the destination node has spare capacity, call list_sessions and inspect the old/idle candidate sessions on that node (batch inspect when useful). "
+    "Reuse a suitable existing unclaimed session for the same task when safe. Close only PROVEN UNUSED sessions after checking pane state/output, owner and registry references, active tasks/runs, bindings, leases and grants, attachment, and git/worktree state. "
+    "A quiet timestamp or UNKNOWN status is NEVER proof of completion; do not delete RUNNING, WAITING_INPUT, UNKNOWN, protected, attached, actively owned, dirty/unmerged or unsaved-input sessions on age alone. "
+    "For genuinely finished and safe candidates call delete_session with confirm=true, verify tmux kill and registry receipt, then create the new session. If no safe candidate exists and capacity is full, report NODE_AT_SESSION_CAPACITY rather than forcing deletion."
+)
+
 EXECUTION_FLOW = (
     "DEFAULT FLOW. 1) Inspect project and current session state only as needed. 2) Default to one primary Claude executor for substantial repository work. "
-    "3) If a new task needs a runtime and resources are available, create a fresh session/worktree/branch from the correct updated base. "
+    "3) Follow SESSION PRE-CREATE AUDIT before any new session, then create a fresh session/worktree/branch from the correct updated base only when appropriate. "
     "4) Send the implementation contract to that session with direct terminal_turn action=send or action=send_wait; do not enqueue it. "
     f"5) VERIFY the prompt actually landed AND that execution started using the guarded send result; if delivery is unconfirmed, retry safely up to {PROMPT_RETRY_CAP} attempts without creating duplicate sessions or duplicate work. "
     "6) Keep the same primary runner through implementation, targeted tests, review and routine fixes. 7) For NovaRetail UI work, explicitly instruct Claude to use the UI-UX-Pro-Max skill and to PRESERVE UI V3; do not redesign business logic unless asked. "
@@ -114,7 +121,7 @@ _REFERENCE = (
 #: The exact string handed to `MCPServer(instructions=...)`, and therefore the
 #: exact string a ChatGPT client receives in its `initialize` response.
 SERVER_INSTRUCTIONS = "\n\n".join(
-    (TOOL_EFFICIENCY, ROLES, EXECUTION_FLOW, PARALLELISM, FAILURE_RECOVERY, EFFICIENCY, _REFERENCE)
+    (TOOL_EFFICIENCY, ROLES, SESSION_PRECREATE_AUDIT, EXECUTION_FLOW, PARALLELISM, FAILURE_RECOVERY, EFFICIENCY, _REFERENCE)
 )
 
 
@@ -143,6 +150,9 @@ CRITICAL_INVARIANTS: tuple[str, ...] = (
     # TMCP-CALLED-TOOL-SPAM-002: the one-call rule is load-bearing too -- a
     # policy that quietly loses it puts the "Called tool" wall straight back.
     "GIVING A SESSION WORK IS DIRECT SESSION SEND",
+    "Before EVERY terminal_turn action=create_session",
+    "A quiet timestamp or UNKNOWN status is NEVER proof of completion",
+    "delete_session with confirm=true",
     "After direct send, avoid polling unless the user asks for a check",
     "PRODUCTION DEPLOYMENT AND RELEASE REMAIN A SEPARATE, EXPLICIT USER APPROVAL STEP",
     # Session task label: new chats only keep the live monitor accurate if
