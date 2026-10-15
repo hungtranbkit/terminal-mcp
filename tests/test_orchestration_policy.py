@@ -49,8 +49,34 @@ def test_invariants_cover_each_required_area():
     for required in ("ORCHESTRATOR", "CONTROL PLANE", "PRIMARY CODING EXECUTOR",
                      "execution started", "6 attempts", "UI-UX-Pro-Max", "UI V3",
                      "/codex:review", "/codex:rescue", "review gate stays DISABLED",
-                     "one primary Claude executor", "EXPLICIT USER APPROVAL"):
+                     "one primary Claude executor", "EXPLICIT USER APPROVAL",
+                     "Before EVERY terminal_turn action=create_session",
+                     "UNKNOWN status is NEVER proof of completion"):
         assert required in joined, f"CRITICAL_INVARIANTS no longer covers {required!r}"
+
+
+def test_every_new_session_requires_safe_precreate_audit():
+    """No capacity check or age-only reap can bypass the mandatory safety review."""
+    instructions = mcp.instructions or ""
+    assert "SESSION PRE-CREATE AUDIT (MANDATORY)" in instructions
+    assert instructions.index("SESSION PRE-CREATE AUDIT (MANDATORY)") < instructions.index("DEFAULT FLOW.")
+    for phrase in (
+        "Before EVERY terminal_turn action=create_session",
+        "even if the destination node has spare capacity",
+        "call list_sessions",
+        "batch inspect when useful",
+        "reuse",
+        "active tasks/runs",
+        "UNKNOWN status is NEVER proof",
+        "WAITING_INPUT",
+        "dirty/unmerged or unsaved-input",
+        "delete_session with confirm=true",
+        "registry receipt",
+        "report NODE_AT_SESSION_CAPACITY rather than forcing deletion",
+    ):
+        # Reuse wording is deliberately implementation-independent. Other
+        # phrases encode non-negotiable safety/ordering semantics.
+        assert phrase.lower() in instructions.lower(), phrase
 
 
 def test_instructions_stay_within_the_client_context_budget():
