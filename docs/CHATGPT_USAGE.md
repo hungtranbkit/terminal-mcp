@@ -128,6 +128,17 @@ not only after it. None of these checkpoint calls dispatches or changes project 
    if false, you have no access; ask a human to grant it (dashboard) or
    use a session already in `allowed_session_patterns`.
 
+## 2a. Mandatory pre-create session audit (fleet-wide)
+
+**Applies before every new session, not just when a node is at capacity.** This is an operator-requested workflow rule, declared in `terminal_mcp/orchestration_policy.py` and delivered to ChatGPT/other connected agents through MCP `instructions`. It does not silently enable the automatic reaper or weaken its safeguards.
+
+1. **Discover:** call `terminal_turn(action="list_sessions")`, and `list_nodes` if choosing where to create. Prefer reusing a suitable, unclaimed existing session for the **same** task; don't send an unrelated task to an active agent.
+2. **Audit:** use one `terminal_turn(action="inspect", targets=[...], tail_lines=6)` on possible old/idle sessions on the intended node. When useful, `cleanup_candidates` is a **report only**, and `session_reconcile(dry_run=true)` is a node-local, conservative view: neither is proof that a task has finished and neither covers every fleet node. Check ownership, bindings, active tasks/runs, leases, grants, protected/attached state, pending input, current process, and Git/worktree status before deciding.
+3. **Close only provably unused:** a confirmed completed/abandoned session with no owner/activity and no uncommitted, unmerged or unsaved work may be removed using `terminal_turn(action="delete_session", target="...", confirm=true)`. Check the receipt for `deleted:true`, `tmux_absent_verified:true`, no active references and a registry tombstone. A quiet timestamp, plain IDLE badge or UNKNOWN state **alone is not proof**. Never delete RUNNING, WAITING_INPUT, UNKNOWN, protected, attached, task-owned or dirty/unmerged sessions merely to free capacity; stop and request clarification if needed. Do not kill a background service when only its interactive control session appears old.
+4. **Then create:** `terminal_turn(action="create_session", ...)` only after the audit and safe cleanup. When nothing can be safely reclaimed, try another eligible node or report `NODE_AT_SESSION_CAPACITY` with the blockers; never force-kill or raise the limit blindly.
+
+At task completion, verify results, keep a recoverable checkpoint/commit and close its obsolete session. Audit again before the next create. Existing server-side `reap_idle_sessions` reclaims only a narrow category of idle shell/dead panes at capacity; it is **not a substitute** for this pre-create fleet audit. Config `session_lifecycle.agent_cleanup` is off by default and keeps unverified coding sessions open; do not flip it on as part of this rule.
+
 ## 2b. Reading a repository directly (`repo_*` — READ-ONLY)
 
 **Use these instead of asking a session to read a file for you.** Before
