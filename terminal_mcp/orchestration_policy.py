@@ -157,7 +157,7 @@ CRITICAL_INVARIANTS: tuple[str, ...] = (
     "PRODUCTION DEPLOYMENT AND RELEASE REMAIN A SEPARATE, EXPLICIT USER APPROVAL STEP",
     # Session task label: new chats only keep the live monitor accurate if
     # they are told to title task assignments.
-    "pass title=\"<short summary>\" on send/send_wait",
+    "pass BOTH title=\"<short summary>\" and metadata.task_summary=\"<same summary>\" on send/send_wait",
 )
 
 
