@@ -56,7 +56,7 @@ PROMPT_RETRY_CAP = 6
 # tests assert on it by phrase.
 # ---------------------------------------------------------------------------
 TOOL_EFFICIENCY = (
-    "TOOL EFFICIENCY. Terminal MCP is the CONTROL PLANE. GIVING A SESSION WORK IS DIRECT SESSION SEND. "
+    "TOOL EFFICIENCY. Terminal MCP is the CONTROL PLANE. GIVING A SESSION WORK IS DIRECT SESSION SEND. Prefer one compact tool per logical terminal operation. "
     "The durable task queue is retired and disabled by default. For coding work, create a fresh session when needed, then use terminal_turn action=send or action=send_wait directly on that session. "
     "Queue-producing actions start, enqueue_task, route_start, agent_start, project_start, aliases run/dispatch/enqueue, and send with long_task=true must not be used in normal operation. "
     "Use inspect only for user-requested checks or the mandatory pre-create session audit. After direct send, avoid polling unless the user asks for a check. "
