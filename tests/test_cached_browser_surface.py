@@ -62,3 +62,46 @@ def test_unmodified_canonical_args_remain_identical():
  from terminal_mcp.browser_compat import normalize_cached_browser_args
  canonical={"assertions":["text contains: Ready"],"viewport_width":390}
  assert normalize_cached_browser_args("browser_verify",canonical) is canonical
+
+
+@pytest.mark.browser_smoke
+def test_cached_arguments_drive_real_chromium(tmp_path):
+    """A local page reports the actual inner viewport, not echoed job metadata."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+
+    class Page(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = (b"<title>Cached browser proof</title><body>Ready<script>"
+                    b"document.body.append(' viewport='+innerWidth+'x'+innerHeight)"
+                    b"</script></body>")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    http = ThreadingHTTPServer(("127.0.0.1", 0), Page)
+    thread = Thread(target=http.serve_forever, daemon=True)
+    thread.start()
+    gateway = BrowserGateway(BrowserGatewayConfig(
+        enabled=True, allow_loopback=True, artifact_dir=str(tmp_path)))
+    server = build_mcp(browser=gateway)
+    try:
+        for text, verdict in [("viewport=390x844", "PASS"), ("Must not exist", "FAIL")]:
+            result = structured(asyncio.run(server.call_tool("terminal_turn", {
+                "action": "browser_verify", "url": f"http://127.0.0.1:{http.server_port}/",
+                "steps": [{"action": "assert_text", "text": text},
+                          {"action": "assert_title", "text": "Cached browser proof"},
+                          {"action": "assert_status", "status": 200}],
+                "viewport": {"width": 390, "height": 844}, "screenshot": "never",
+            })))
+            assert result["status"] == verdict, result
+            assert result["result"]["summary"]["total"] == 3
+            assert result["result"]["viewport"] == {"width": 390, "height": 844}
+    finally:
+        http.shutdown()
+        http.server_close()
+        thread.join(timeout=5)

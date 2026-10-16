@@ -7,7 +7,7 @@ import threading
 import time
 from typing import Annotated, Any
 
-from pydantic import Field
+from pydantic import Field, StrictBool
 from mcp.server.mcpserver import MCPServer
 
 from . import tool_metrics
@@ -805,7 +805,7 @@ def build_mcp(service: TerminalService | None = None,
                       url: str | None = None, args: dict | None = None,
                       path: str | None = None, content_b64: str | None = None,
                       overwrite: bool = False, mode: str | None = None,
-                      confirm: bool | None = None,
+                      confirm: StrictBool | None = None,
                       steps: list[dict[str, Any]] | None = None,
                       viewport: dict[str, Any] | None = None,
                       screenshot: str | None = None,

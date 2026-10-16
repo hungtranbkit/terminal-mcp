@@ -37,3 +37,33 @@ def test_confirm_true_is_forwarded_without_coercion(action):
     result = tools.turn(action=action, target=" test-compact-delete ", args={"confirm": True})
     assert result["status"] == "OK"
     assert calls == [("test-compact-delete", True)]
+
+
+@pytest.mark.parametrize("confirm", ["true", "false", 1, 0, True, False, None])
+def test_mcp_delete_confirmation_does_not_coerce(confirm):
+    """Exercise schema validation, which runs before CompactTerminalTools."""
+    import asyncio
+    from terminal_mcp.mcp_app import build_mcp
+
+    server = build_mcp()
+    calls = []
+    server.compact_tools.handlers["delete_session"] = (
+        lambda name, **kwargs: calls.append((name, kwargs)) or {"deleted": True}
+    )
+    def call():
+        return asyncio.run(server.call_tool("terminal_turn", {
+            "action": "delete_session", "target": "test-confirm-boundary",
+            "confirm": confirm, "screenshot": "on_failure",
+        }))
+    if type(confirm) is not bool and confirm is not None:
+        from mcp.server.mcpserver.exceptions import ToolError
+        with pytest.raises(ToolError, match="valid boolean"):
+            call()
+    else:
+        call()
+    if confirm is True:
+        assert calls == [("test-confirm-boundary", {"confirm": True})]
+    elif type(confirm) is not bool and confirm is not None:
+        assert calls == []
+    else:
+        assert all(kwargs.get("confirm") is not True for _, kwargs in calls)
