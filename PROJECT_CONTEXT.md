@@ -78,6 +78,42 @@
 - Verification: regression tests were observed failing before their corresponding fixes. Focused run `.venv/bin/python -m pytest -q tests/test_direct_task_lifecycle.py tests/test_session_lifecycle.py tests/test_adapters.py tests/test_verified_submit_watchdog.py` passed **156 tests**; broader lifecycle/dispatch/adapter/compact/MCP/reconciler run passed **328 tests**, with 5 deselected and 7 existing MCP metadata deprecation warnings. `git diff --check` passed. No full suite, headless `codex exec` task integration, HP deployment, or ChatGPT-to-Codex E2E was performed.
 - Not accepted/deployed. Implementation commit `9db06c06f9a99e7f91c17792e269a618aaa92eb2` on `fix/codex-session-readiness-20261016`. Remaining required work: implement and test a durable, permission-preserving `codex exec` execution/receipt path; complete progress watchdog and safe checkpoint/cleanup/restart reconciliation; obtain authorized HP access and prepare rollback; deploy HP first; then run 10 real ChatGPT-to-Codex create/dispatch/execute/cleanup rounds. Do not report DONE until those steps pass.
 
+## Direct-session-first compatibility — 2026-10-08 (branch only, NOT deployed)
+
+- With `TERMINAL_MCP_ENABLE_QUEUE=0` (or unset), `terminal_turn(action="start")`
+  and its `run`/`dispatch`/`start_task` aliases now normalize to the existing guarded
+  `send` path for an **existing** target. No automatic session creation, enqueue,
+  dispatch tick, queue follower, or implicit direct supervisor is started.
+- `long_task=true` is accepted for compatibility on `send`/`send_wait` in this mode;
+  it does not create queue work or enable automatic continuation. New clients should
+  use `create_session` then `send`/`send_wait`; explicit `supervise` remains separate.
+- Compatibility calls preserve explicit `idempotency_key`, or use legacy `request_key`
+  when it is absent. They return canonical direct `action="send"` / `"send_wait"`
+  and guarded delivery evidence, **not** a queue receipt/task ID. Missing target/text,
+  binding resolution, authorization/menu/identity refusals, uncertain delivery and
+  task labels still use the existing direct path. No retry or guard bypass was added.
+- Actual queue producers and manual dispatch remain disabled; server-side opt-in
+  (`TERMINAL_MCP_ENABLE_QUEUE=1`) retains the old queue behavior. Historical task/batch
+  status, queue status/events/metrics remain readable without changing queue data.
+- Updated `terminal_turn` description and deprecated `long_task` schema help, policy
+  v1.4.2 and its generated document. Aligned stale queue-first policy assertions and
+  the title+metadata invariant with the existing guidance. Legacy engine tests now
+  explicitly opt into queue mode. Compact-turn CI includes these regression suites.
+
+Validation evidence:
+- RED before implementation: 23 failures / 4 passes in the 27 new compatibility
+  cases; GREEN after implementation: 27/27. Additional tests cover bound sends,
+  labels and uncertain delivery.
+- Real MCP wiring tests compare a complete SQLite `iterdump()` before/after both
+  confirmed and blocked compatibility sends plus historical reads; all tables and
+  events remain identical. The terminal transport is stubbed, never production.
+- Final targeted run: **540 passed**, 17 MCP deprecated-field warnings, 109.57s.
+  Covers compact routing, policy/schema/sidecar wiring, queue persistence/config,
+  legacy one-call start, delivery guards, direct lifecycle, session resources and
+  send reliability; exact command is in the PR. Full suite/live production tests
+  were not run. Tests use isolated state and tmux sockets. No production controller restart,
+  deployment, API Gateway queue operation, or production queue DB mutation performed.
+
 ## HP dashboard cutover + m910 memory guardrails — 2026-10-06 (deployed)
 
 - Dashboard/Fleet Cloudflare tunnel  is now served from canonical controller HP.  on HP is enabled+active and uses  -> .

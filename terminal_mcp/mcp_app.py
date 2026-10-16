@@ -102,8 +102,9 @@ _DIRECT_ACTION_SCHEMA_HELP = (
     "continuations (y, continue, approvals, follow-ups)."
 )
 _LONG_TASK_SCHEMA_HELP = (
-    "Legacy operator-only queue switch. Deprecated for normal direct execution and rejected "
-    "unless the server operator explicitly enables the retired queue."
+    "Deprecated compatibility flag. With queue disabled, send/send_wait stay guarded direct "
+    "sends; this flag creates no queue task and enables no automatic continuation. "
+    "Only queue-enabled operators retain legacy queued send behavior."
 )
 from .queue_service import QueueService
 from .queue_policy import queue_disabled_response, queue_submission_enabled
@@ -834,13 +835,17 @@ INTERACTIVE FLOW (existing tmux sessions / remote nodes):
 4. When work is complete, merge/test as appropriate and clean up the finished
    session/worktree/branch.
 
-The durable task queue is RETIRED and disabled by default. Queue-producing
-actions (`enqueue_task`, `route_start`, `agent_start`,
-`project_start`, and `send` with
-`long_task=true`) return `QUEUE_DISABLED_USE_DIRECT_SESSION` and do not create
-a new queue row. Codex `start` (aliases `run`/`dispatch`) bypasses the queue;
-non-Codex start retains the legacy queue gate. Read-only task/task-batch/history/metrics and cleanup/cancel
-operations remain available for historical or already-running tasks.
+The durable task queue is RETIRED and disabled by default. With queue disabled,
+legacy `start` (including `run`/`dispatch`/`start_task`) is a guarded `send` to
+an existing target; it never creates a session. `long_task=true` on send or
+send_wait is accepted for compatibility and does not enable queueing or automatic
+continuation. These calls return direct delivery evidence, not a queued task_id;
+request_key is used as idempotency_key when no explicit idempotency_key is given.
+Idle Codex start additionally requires fresh RUNNING evidence. For tracked work, prefer create_session then supervise in new clients.
+Queue-producing actions (`enqueue_task`, `route_start`, `agent_start`,
+`project_start`) and queue dispatch return `QUEUE_DISABLED_USE_DIRECT_SESSION`.
+Read-only task/task-batch/history/metrics and cleanup/cancel operations remain
+available for historical or already-running tasks.
 
 A server operator can deliberately opt back in only by starting Terminal MCP
 with `TERMINAL_MCP_ENABLE_QUEUE=1`; client arguments cannot enable the queue.

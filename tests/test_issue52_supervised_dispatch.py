@@ -386,10 +386,10 @@ def _tools(tmp_path, pane, clock):
     return tools
 
 
-def test_queue_start_is_refused_with_supervise_next_calls(tmp_path, monkeypatch):
+def test_queue_enqueue_is_refused_with_supervise_next_calls(tmp_path, monkeypatch):
     monkeypatch.delenv("TERMINAL_MCP_ENABLE_QUEUE", raising=False)
     tools = _tools(tmp_path, FakePane(), Clock())
-    result = tools.turn(action="start", target="s", text="do it")
+    result = tools.turn(action="enqueue_task", target="s", text="do it")
     assert result["error"] == "QUEUE_DISABLED_USE_DIRECT_SESSION"
     assert result["task_created"] is False
     assert [call["action"] for call in result["next_calls"]] == [

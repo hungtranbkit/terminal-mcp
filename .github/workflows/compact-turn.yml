@@ -13,6 +13,13 @@ on:
       - "tests/test_cached_browser_surface.py"
       - "tests/test_browser_gateway.py"
       - "tests/test_mcp_app_wiring.py"
+
+      - "terminal_mcp/orchestration_policy.py"
+      - "tests/test_direct_contract.py"
+      - "tests/test_queue_persist_mcp_tools.py"
+      - "tests/test_one_call_start.py"
+      - "tests/test_orchestration_policy.py"
+      - "docs/CHATGPT_ORCHESTRATION_POLICY.md"
       - ".github/workflows/compact-turn.yml"
   workflow_dispatch:
 
@@ -33,3 +40,6 @@ jobs:
           tests/test_compact_turn_actions.py tests/test_compact_delete_confirmation.py
           tests/test_cached_browser_surface.py tests/test_browser_gateway.py
           tests/test_mcp_app_wiring.py
+          tests/test_direct_contract.py
+          tests/test_queue_persist_mcp_tools.py tests/test_one_call_start.py
+          tests/test_orchestration_policy.py
