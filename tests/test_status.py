@@ -31,6 +31,24 @@ def test_running_and_idle_classification():
     assert classify_status(info("bash", 1), "$", now=100)[0] == "IDLE"
 
 
+def test_stale_shell_activity_without_a_returned_prompt_is_unknown():
+    # A running command may be quiet longer than the activity threshold.
+    # Stale tmux activity is not evidence that it returned to the shell.
+    state, input_required, reason = classify_status(
+        info("bash", activity=0), "command started\nwaiting for output", now=10_000)
+    assert state == "UNKNOWN"
+    assert input_required is False
+    assert "activity age" in reason
+
+
+def test_stale_shell_error_output_is_not_reported_as_a_live_failure():
+    state, reason = classify_supervisor_state(
+        "UNKNOWN", "current command is 'bash'; activity age is 10000s",
+        "Traceback (most recent call last):\n  File x")
+    assert state == "UNKNOWN"
+    assert "Traceback" not in reason
+
+
 def test_ordinary_composer_mentioning_permission_is_not_waiting_input():
     # Real false positive, found LIVE against a real attended session
     # (`window2`, 2026-09-07): status.py's own WAIT_PATTERNS used to

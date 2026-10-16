@@ -11,6 +11,8 @@ nothing. So it gets a test that asks what the built objects actually hold.
 """
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from terminal_mcp.controller import ControllerService
@@ -76,6 +78,14 @@ def test_the_supervisor_gets_the_fleets_view_on_the_stdio_surface():
     assert supervisor.fleet_status is not None, "fleet_status was never wired"
     assert supervisor.fleet_sessions is not None, "fleet_sessions was never wired"
     assert callable(supervisor.fleet_status)
+
+
+def test_compact_terminal_turn_schema_exposes_strict_delete_confirmation():
+    server = build_mcp()
+    tool = next(tool for tool in asyncio.run(server.list_tools())
+                if tool.name == "terminal_turn")
+    confirm = tool.input_schema["properties"]["confirm"]
+    assert {row.get("type") for row in confirm["anyOf"]} == {"boolean", "null"}
 
 
 def test_an_explicitly_passed_controller_is_still_the_one_used(built):

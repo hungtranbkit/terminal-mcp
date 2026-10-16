@@ -444,6 +444,8 @@ class BrowserGateway:
 
         result: dict[str, Any] = {
             "status": verdict,
+            "verification_scope": ("incomplete" if parse_errors or errored else
+                                   "assertions" if checks else "navigation_only"),
             "url": scrub(target, 300),
             "engine": ENGINE,
             "viewport": viewport,

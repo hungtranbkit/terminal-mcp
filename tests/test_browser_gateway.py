@@ -64,6 +64,44 @@ def gateway(runner=None, **kwargs):
     return BrowserGateway(BrowserGatewayConfig(enabled=True, **kwargs), runner=runner)
 
 
+def test_browser_verify_executes_assertions_and_forwards_inner_viewport():
+    jobs = []
+    service = gateway(lambda job, *_: jobs.append(job) or {
+        "ok": True, "observation": {"status": 200, "text": "Task Center"}})
+
+    result = service.verify("https://8.8.8.8", ["text contains: Task Center"],
+                            viewport_width=390, viewport_height=844)
+
+    assert result["status"] == "PASS"
+    assert result["checks"] == [{"assertion": "text contains: Task Center", "status": "PASS"}]
+    assert result["summary"] == {"total": 1, "passed": 1, "failed": 0, "errors": 0}
+    assert jobs[0]["viewport"] == {"width": 390, "height": 844}
+
+
+def test_browser_verify_fails_when_requested_assertion_is_false():
+    service = gateway(lambda *_: {
+        "ok": True, "observation": {"status": 200, "text": "Other page"}})
+
+    result = service.verify("https://8.8.8.8", ["text contains: Task Center"])
+
+    assert result["status"] == "FAIL"
+    assert result["summary"]["total"] == 1
+    assert result["checks"][0]["status"] == "FAIL"
+
+
+def test_browser_verify_labels_navigation_only_and_invalid_assertions_incomplete():
+    service = gateway(lambda *_: {"ok": True, "observation": {"status": 200, "text": "Ready"}})
+
+    navigation = service.verify("https://8.8.8.8")
+    unsupported = service.verify("https://8.8.8.8", ["status is: not-a-status"])
+
+    assert navigation["status"] == "PASS"
+    assert navigation["verification_scope"] == "navigation_only"
+    assert navigation["summary"]["total"] == 0
+    assert unsupported["status"] == "ERROR"
+    assert unsupported["verification_scope"] == "incomplete"
+
+
 def test_scrub_before_truncation_and_url_secrets():
     for text in ['token=very-secret', 'https://user:very-secret@example.org',
                  'https://example.org/?%74oken=very-secret', 'Authorization: Bearer very-secret']:
