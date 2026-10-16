@@ -1,5 +1,15 @@
 # PROJECT_CONTEXT.md
 
+## 2026-10-16 — Cached browser arguments acceptance fix (HP isolated, not deployed)
+
+- Continued existing `fix/p0-terminal-regressions-20261016` from `3045f3b`; no shared service restart or live state changes. Live ChatGPT `browser_verify` was given an intentionally false assert_text and viewport 390x844, but returned PASS, zero checks and 1348x768.
+- Added bounded read-only cached-argument normalization at the actual MCP terminal_turn entrypoint: assert_text/assert_title/assert_status, viewport, screenshot policy. Unsupported/mutating steps and conflicting canonical args fail before backend execution. No auth/confirmation bypass. The cached wrapper default screenshot=on_failure remains harmless for unrelated actions.
+- Failing-first proof: 8 original regression tests failed (including PASS vs FAIL, zero checks); 5 cached-default regressions also failed before their fix. Final `pytest -q tests/test_cached_browser_surface.py tests/test_browser_gateway.py tests/test_compact_delete_confirmation.py tests/test_status.py`: 143 passed, 7 existing MCP deprecation warnings (21.71s). Tests call the real MCP entry and BrowserGateway evaluator with a fixture worker; no real-browser acceptance is claimed.
+- Full repository test attempt used isolated HOME/state and 2GB/150% CPU cap; timeout 300 exited 124 at approximately 30%. No completed full-suite result, no final pass/failure totals, no CI or release acceptance claimed. The full attempt preceded the final cached-default fix.
+- Evidence on HP: /home/kimex/.local/state/portfolio-audit/20261016/{tmcp-cached-red.log,tmcp-default-red.log,tmcp-focused-final.log,tmcp-full-suite.log,tmcp-full-suite.exit}. Private worktree: terminal-client-compat under the same directory.
+- Still open: obtain current-SHA CI/review, full integration testing and narrow managed rollout/rollback; verify true and false assertions from the actual connected client after rollout. The conversation tool schema still lacks confirm: closing sessions cannot be marked fixed from these changes. No delete workaround or relaxed permissions added.
+
+
 ## P0-A stale shell completion and browser verification scope — 2026-10-16 (code fixed locally; rollout blocked)
 
 - Audited `/home/dell/workspace/terminal-mcp` without changing its active checkout: branch `fix/codex-session-readiness-20261016` is used by the live `dell-tmcp-readiness-audit-20261016` Codex session, so implementation was isolated in `/tmp/terminal-mcp-p0-regressions` on branch `fix/p0-terminal-regressions-20261016`, based on `origin/main` `28e6450d6211b4fa07ea7d2af35893ad0fc0a710`.

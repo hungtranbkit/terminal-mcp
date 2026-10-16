@@ -5,7 +5,7 @@ from pathlib import Path
 import os
 import threading
 import time
-from typing import Annotated
+from typing import Annotated, Any
 
 from pydantic import Field
 from mcp.server.mcpserver import MCPServer
@@ -805,7 +805,11 @@ def build_mcp(service: TerminalService | None = None,
                       url: str | None = None, args: dict | None = None,
                       path: str | None = None, content_b64: str | None = None,
                       overwrite: bool = False, mode: str | None = None,
-                      confirm: bool | None = None) -> dict:
+                      confirm: bool | None = None,
+                      steps: list[dict[str, Any]] | None = None,
+                      viewport: dict[str, Any] | None = None,
+                      screenshot: str | None = None,
+                      allow_mutations: bool = False) -> dict:
         """THE terminal surface: direct session control only.
 
 HEADLESS FLOW (preferred for new local Codex/Claude work when enabled):
@@ -878,6 +882,13 @@ TASK LABEL (shown as "Task hiện tại" on /dashboard/live and /app/live):
 For direct work, prefer one useful session per task and avoid stale duplicates.
         """
         _refresh_local_heartbeat()
+        from .browser_compat import normalize_cached_browser_args
+        try:
+            args = normalize_cached_browser_args(action, args, steps=steps, viewport=viewport,
+                                                 screenshot=screenshot, allow_mutations=allow_mutations)
+        except ValueError as exc:
+            return {"status": "ERROR", "action": action, "error": "INVALID_BROWSER_ARGUMENT",
+                    "reason": str(exc), "verification_scope": "incomplete"}
         return compact_tools.turn(
             action=action, target=target, targets=targets, text=text,
             desired_states=desired_states, resume_token=resume_token,
