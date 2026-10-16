@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 import os
 import threading
 import time
@@ -369,6 +370,14 @@ def build_mcp(service: TerminalService | None = None,
     except Exception:  # noqa: BLE001 -- never block startup; supervise* reports unavailable
         direct_tasks = None
     compact_tools.direct_tasks = direct_tasks
+    compact_tools.headless = None
+    if os.name == "posix":
+        from .headless import HeadlessManager
+        compact_tools.headless = HeadlessManager(
+            terminal, Path(os.environ.get("TERMINAL_MCP_HEADLESS_STATE_DIR",
+                                         str(Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "terminal-mcp/headless"))),
+            direct=direct_tasks,
+            enabled=os.environ.get("TERMINAL_MCP_HEADLESS_ENABLED") == "1")
     # Per-session "current task" label (task_labels.py) in the audit DB,
     # mirrored best-effort to the node that owns the session (node_sync) so
     # that host's own Live Monitor sees work assigned through this controller.
@@ -3763,6 +3772,9 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
             refs.append("active run")
         return refs
 
+    terminal.durable_deletion_guard = lambda name: deletion_preflight(
+        name, queue=queue, run_journal=run_journal, supervisor=supervisor, direct_tasks=direct_tasks)
+
     from .session_reconciler import SessionReconciler
     session_reconciler = SessionReconciler(
         terminal, active_refs=_reconcile_active_refs,
@@ -4075,7 +4087,9 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         """Direct by-id lookup for one task -- lets a caller track a
         specific task (e.g. one just returned by terminal_enqueue_task)
         without needing to already know which session's lane it's in."""
-        return queue.task_status(task_id)
+        from .task_lookup import task_status
+        return task_status(task_id, direct=direct_tasks, queue=queue,
+                           headless=getattr(compact_tools, "headless", None))
 
     @server.tool()
     def terminal_task_batch_status(task_ids: list[str]) -> dict:
@@ -4085,11 +4099,13 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
             return {"error": "INVALID_TASK_IDS", "max_task_ids": 100}
         tasks = []
         for task_id in task_ids:
-            result = queue.task_status(task_id)
+            result = terminal_task_status(task_id)
             if "task" in result:
                 task = result["task"]
-                tasks.append({"task_id": task["id"], "state": task["status"],
-                              "status": task["status"], "session": task["session"],
+                tasks.append({"task_id": task.get("task_id", task.get("id")),
+                              "state": task.get("state", task.get("status")),
+                              "status": task.get("state", task.get("status")),
+                              "session": task.get("target", task.get("session")),
                               "queue_position": result.get("queue_position")})
             else:
                 tasks.append({"task_id": task_id, **result})
@@ -6459,6 +6475,7 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
             server.remove_tool(tool_name)
 
     # server_http starts the background ticker; import-time builds do not.
+    server.headless_manager = compact_tools.headless
     server.direct_task_supervisor = direct_tasks
     server.task_labels = task_labels
     server.compact_tools = compact_tools

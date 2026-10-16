@@ -84,6 +84,7 @@ MAX_RECOVERY_ATTEMPTS = 2
 RECOVERY_COOLDOWN_SECONDS = 10.0
 #: No independent execution evidence this long after a submit -> UNCERTAIN.
 ACCEPT_TIMEOUT_SECONDS = 45.0
+DISPATCH_ACK_DEADLINE_SECONDS = 300.0
 #: A finished-by-limit task whose marker shows up within this window is
 #: upgraded to the explicit outcome (late completion).
 LATE_COMPLETION_WINDOW_SECONDS = 86_400.0
@@ -358,8 +359,9 @@ class DirectTaskStore:
             if exclusive_target:
                 bare = task["target"].split("/", 1)[-1]
                 active = connection.execute(
-                    "SELECT * FROM direct_tasks WHERE completed_at IS NULL AND target IN (?, ?) "
-                    "ORDER BY created_at LIMIT 1", (task["target"], bare)).fetchone()
+                    "SELECT * FROM direct_tasks WHERE completed_at IS NULL AND "
+                    "(target IN (?, ?) OR (? = ? AND substr(target, instr(target, '/') + 1) = ?)) "
+                    "ORDER BY created_at LIMIT 1", (task["target"], bare, task["target"], bare, bare)).fetchone()
                 if active is not None:
                     return {**self._row(active), "conflict": True}
             values = {**task, "steps": json.dumps(task["steps"])}
@@ -401,8 +403,9 @@ class DirectTaskStore:
             else:
                 bare = target.split("/", 1)[-1]
                 rows = connection.execute(
-                    "SELECT * FROM direct_tasks WHERE completed_at IS NULL AND target IN (?, ?) "
-                    "ORDER BY created_at", (target, bare)).fetchall()
+                    "SELECT * FROM direct_tasks WHERE completed_at IS NULL AND "
+                    "(target IN (?, ?) OR (? = ? AND substr(target, instr(target, '/') + 1) = ?)) "
+                    "ORDER BY created_at", (target, bare, target, bare, bare)).fetchall()
         return [self._row(row) for row in rows]
 
     def claim_dispatch(self, task_id: str, expected_dispatches: int, expected_receipt: str | None,
@@ -697,7 +700,10 @@ class DirectTaskSupervisor:
             return task
         tail = self._tail(task["target"], MARKER_TAIL_LINES)
         marker = find_marker(str(tail.get("output") or ""), task["task_id"]) if "error" not in tail else None
-        if marker is None:
+        if marker is None or not task.get("accepted_at"):
+            return task
+        observed = self._status(task["target"])
+        if str(observed.get("state") or "UNKNOWN").upper() != "IDLE":
             return task
         outcome, detail = marker
         return self.store.update(
@@ -848,7 +854,8 @@ class DirectTaskSupervisor:
             tail = self._tail(task["target"], MARKER_TAIL_LINES)
             output = str(tail.get("output") or "") if "error" not in tail else None
             marker = find_marker(output or "", task["task_id"])
-            if marker is not None:
+            if (marker is not None and task.get("accepted_at")
+                    and turn_state == "IDLE"):
                 outcome, detail = marker
                 return self.store.update(
                     task["task_id"], **base, state=outcome, completed_at=now, wait_reason=None,
@@ -914,6 +921,14 @@ class DirectTaskSupervisor:
             return self.store.update(task["task_id"], **base, state="WAITING_INPUT",
                                      wait_reason="SESSION_INPUT", idle_since=None,
                                      reason=_clip(observed.get("reason")))
+        if now - sent_at >= DISPATCH_ACK_DEADLINE_SECONDS:
+            # Hold ownership: an uncertain dispatch may have executed. A timeout
+            # must neither free the target nor authorize a duplicate send/cleanup.
+            return self.store.update(
+                task["task_id"], **base, state="BLOCKED", completed_at=None,
+                wait_reason="DISPATCH_ACK_TIMEOUT",
+                reason="Dispatch acknowledgment deadline exceeded; execution remains unknown. "
+                       "Target retained; inspect/checkpoint before any retry or cleanup.")
         if holds:
             if now - sent_at < STUCK_GRACE_SECONDS:
                 return self.store.update(task["task_id"], **base, state="DISPATCHING")
@@ -924,7 +939,7 @@ class DirectTaskSupervisor:
                 task["task_id"], **base, state="DISPATCH_UNCERTAIN",
                 wait_reason="NO_EXECUTION_EVIDENCE",
                 reason=_clip(f"no execution evidence {now - sent_at:.0f}s after dispatch "
-                             f"(turn {turn_state}, composer empty); not resending"))
+                             f"(turn {turn_state}, submitted prompt not identifiable in composer); not resending"))
         return self.store.update(task["task_id"], **base,
                                  state="DISPATCHING" if task["state"] != "DISPATCH_UNCERTAIN"
                                  else "DISPATCH_UNCERTAIN")

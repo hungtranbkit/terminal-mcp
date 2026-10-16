@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .session_admission import serialized_admission
 from . import composer, submit_flow
 from .composer import (COMPOSER_DRAFT, COMPOSER_EMPTY, COMPOSER_UNKNOWN,
                        ComposerSnapshot, draft_contains, read_composer)
@@ -4285,6 +4286,9 @@ class TerminalService:
         lifecycle = self.config.session_lifecycle
         try:
             current = len(self.tmux.list_sessions())
+            headless = getattr(self, "headless_store", None)
+            if headless is not None:
+                current += sum(row["state"] != "RELEASED" for row in headless.rows())
         except TmuxError:
             # Cannot count -> cannot honestly enforce. Allow, rather than
             # refuse real work on a number we do not have.
@@ -4427,6 +4431,7 @@ class TerminalService:
         return {"path": str(target), "bytes": len(blob), "sha256": digest,
                 "overwritten": existed, "node_id": self.REGISTRY_LOCAL_NODE_ID}
 
+    @serialized_admission
     def terminal_create_session(self, name: str, agent_type: str = "shell", cwd: str | None = None, *,
                                 initial_prompt: str | None = None, grant_mode: str = "none",
                                 binding: str | None = None, requested_by: str | None = None,
@@ -4473,6 +4478,10 @@ class TerminalService:
         workspace-write resume <id>`, and recovery must not use the normal
         new-session YOLO flag."""
         action = "create_session"
+        headless = getattr(self, "headless_store", None)
+        if headless is not None and any(row["target"] == name and row["state"] != "RELEASED"
+                                        for row in headless.rows()):
+            return {"error": "SESSION_HAS_HEADLESS_WORK", "session": name}
         if (error := require_session_lifecycle(self.config)) is not None:
             self.audit.record(action=action, session=name, result="BLOCKED", reason=error)
             return {"error": error, "session": name}
@@ -4717,6 +4726,14 @@ class TerminalService:
         beside the actual backend kill so direct node-agent callers cannot
         bypass attachment, pane-lease, or recovery protection.
         """
+        guard = getattr(self, "durable_deletion_guard", None)
+        if guard is not None:
+            try:
+                result = guard(name)
+            except Exception:
+                return "TASK_OWNERSHIP_UNAVAILABLE"
+            if result.get("error"):
+                return result["error"]
         if info.attached:
             return "SESSION_ATTACHED"
         record = self.session_registry.get(self.REGISTRY_LOCAL_NODE_ID, name)

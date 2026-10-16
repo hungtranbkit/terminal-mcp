@@ -594,3 +594,44 @@ def test_recovery_enter_restarts_the_acceptance_clock(tmp_path):
                                          setattr(pane, "draft", ""), {"status": "SUBMIT_CONFIRMED"})[-1]
     _run(sup, clock, 1)
     assert _task(sup, task_id)["state"] != "DISPATCH_UNCERTAIN"
+
+
+def test_scrolled_unattributed_composer_eventually_blocks_without_blind_enter(tmp_path):
+    """Live Dell pane retained only a clipped suffix, not the dispatch nonce."""
+    clock = Clock()
+    pane = FakePane()
+    pane.swallow = True
+    sup = _sup(tmp_path, pane, clock)
+    task_id = sup.start('s', text='fix the bug')['task']['task_id']
+    pane.status = lambda target: {'state': 'UNKNOWN', 'agent': 'codex'}
+    sup._status = pane.status
+    sup._tail = lambda target, lines: {'output': '› 57] Work autonomously until the WHOLE task is complete; ending a turn does\n  not end the task and yo\n  GPT-6-Luna medium · ~/workspace'}
+    clock.now += 301
+    sup.tick()
+    task = _task(sup, task_id)
+    assert task['state'] == 'BLOCKED'
+    assert task['wait_reason'] == 'DISPATCH_ACK_TIMEOUT'
+    assert task['completed_at'] is None, 'ambiguous work must retain target ownership'
+    assert len(pane.sent) == 1 and not pane.activations
+
+
+def test_bare_target_cannot_replace_qualified_active_work(tmp_path):
+    clock = Clock()
+    pane = FakePane()
+    sup = _sup(tmp_path, pane, clock)
+    task = sup.start('hp-linux/shared', text='work')['task']
+    assert sup.active_for('shared')[0]['task_id'] == task['task_id']
+    result = sup.start('shared', text='another task')
+    assert result['error'] == 'TARGET_HAS_ACTIVE_SUPERVISED_TASK'
+    # Fully-qualified other nodes are distinct; a bare lookup is conservative.
+    assert not sup.active_for('dell-linux/shared')
+
+
+def test_marker_without_execution_evidence_cannot_complete(tmp_path):
+    clock = Clock()
+    pane = FakePane()
+    pane.swallow = True
+    sup = _sup(tmp_path, pane, clock, activate=None)
+    tid = sup.start('s', text='work')['task']['task_id']
+    pane.output.append(f'● TMCP-DONE:{tid}')
+    assert sup.get(tid)['task']['state'] != 'DONE'

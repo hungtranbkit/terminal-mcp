@@ -317,7 +317,8 @@ TURN_ACTION_ALIASES: dict[str, str] = {
     "dispatch": "start",
     "run": "start",
 }
-TURN_ACTIONS = (*TURN_PANE_ACTIONS, *TURN_HANDLER_ACTIONS)
+HEADLESS_ACTIONS = ("headless_start", "headless_status", "headless_checkpoint", "headless_cleanup", "headless_cancel")
+TURN_ACTIONS = (*TURN_PANE_ACTIONS, *TURN_HANDLER_ACTIONS, *HEADLESS_ACTIONS)
 
 BROWSER_ARGS: dict[str, frozenset[str]] = {
     "browser_verify": frozenset({"url", "assertions", "viewport_width", "viewport_height",
@@ -964,6 +965,16 @@ class CompactTerminalTools:
                 return {"status": "FAILED", "error": "INVALID_ARGUMENT", "action": normalized,
                         "detail": "confirm and args.confirm disagree"}
             args = {**(args if isinstance(args, dict) else {}), "confirm": confirm}
+
+        if normalized in HEADLESS_ACTIONS:
+            manager = getattr(self, "headless", None)
+            if manager is None:
+                return {"error": "HEADLESS_UNAVAILABLE"}
+            if node not in ("auto", "local"):
+                return {"error": "HEADLESS_REMOTE_NODE_UNSUPPORTED", "node": node}
+            return manager.turn(normalized, target=target, text=text or initial_prompt,
+                                cwd=working_directory, key=idempotency_key or request_key,
+                                task_id=task_id, agent=agent_type)
 
         if normalized in TURN_HANDLER_ACTIONS:
             return self._handler_turn(

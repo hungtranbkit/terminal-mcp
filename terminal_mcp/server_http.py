@@ -647,6 +647,9 @@ def main() -> None:
 
             def tick(self) -> None:
                 direct_tasks.tick()
+                manager = getattr(server, "headless_manager", None)
+                if manager is not None:
+                    manager.reconcile()
                 now = time.monotonic()
                 if now - self._last_reap >= 60:
                     self._last_reap = now
