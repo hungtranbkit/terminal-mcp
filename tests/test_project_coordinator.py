@@ -485,3 +485,22 @@ class TestBackwardCompatibility:
         assert "import queue_engine" not in source
         assert "from .queue_engine" not in source
         assert "from .queue_loop" not in source
+
+
+def test_cursor_advance_between_batch_read_and_decision_does_not_fire_second_sink(tmp_path, monkeypatch):
+    bus = EventBus(tmp_path / "events.db")
+    bus.publish("TASK_CREATED", project_id=P1, entity_id="t1", payload={"prompt": "a" * 80})
+    fired = []
+    first = _coordinator(bus, action_sink=fired.append)
+    second = _coordinator(EventBus(bus.path), action_sink=fired.append)
+    read = bus.read_since
+
+    def interleaved(*args, **kwargs):
+        batch = read(*args, **kwargs)
+        second.drain(P1)
+        return batch
+
+    monkeypatch.setattr(bus, "read_since", interleaved)
+    first.drain(P1)
+    assert len(fired) == 1
+    assert len(bus.list_events(project_id=P1, types=[PRIORITISE, HOLD])) == 1

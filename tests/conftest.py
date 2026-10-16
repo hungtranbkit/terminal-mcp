@@ -297,6 +297,19 @@ def _is_test_owned(name: str) -> bool:
     return _session_owner(name) is not None
 
 
+def _new_test_session(name: str, command: str) -> None:
+    # Killing the last owned session can leave its private server exiting.
+    # Only retry that transport failure; duplicate names remain a hard error.
+    for attempt in range(3):
+        try:
+            tmux("new-session", "-d", "-s", name, command)
+            return
+        except subprocess.CalledProcessError as exc:
+            if "server exited unexpectedly" not in (exc.stderr or "") or attempt == 2:
+                raise
+            time.sleep(0.05)
+
+
 @pytest.fixture
 def tmux_session_factory():
     """Creates a real tmux session for the duration of one test, then kills
@@ -365,7 +378,7 @@ def tmux_session_factory():
             )
         if exists:
             tmux("kill-session", "-t", name, check=False)
-        tmux("new-session", "-d", "-s", name, command)
+        _new_test_session(name, command)
         tmux("set-option", "-t", name, OWNER_OPTION, _RUN_OWNER, check=False)
         _remember_created(name)
         created.add(name)

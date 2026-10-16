@@ -358,12 +358,15 @@ class ProjectCoordinator:
 
         limit = self.batch_size if max_events is None else max(1, int(max_events))
         consumer = consumer_name(project_id)
+        # Snapshot the cursor before reading the batch. A concurrent drain may
+        # commit after that read; using its newer cursor would turn an already
+        # decided event into a different HOLD action and fire the sink twice.
+        acted_seq = self.cursor(project_id)
         events = self.bus.read_since(consumer, project_id=project_id, limit=limit)
         project_state = self._resolve_project(project_id) if events else None
 
         actions: list[dict[str, Any]] = []
         highest_seq = 0
-        acted_seq = self.cursor(project_id)
         for event in events:
             action = decide(event, project_id=project_id, project_state=project_state,
                             scope_reasoner=self.scope_reasoner, last_acted_seq=acted_seq)

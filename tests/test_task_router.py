@@ -800,7 +800,8 @@ def test_cleanup_report_never_proposes_a_protected_admin_session(store, queue, t
 # terminal_turn mapping and the queue-loop rescue step.
 # ---------------------------------------------------------------------------
 
-def test_turn_route_start_maps_to_the_router_and_needs_no_target():
+def test_turn_route_start_maps_to_the_router_and_needs_no_target(monkeypatch):
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "1")
     from terminal_mcp.compact_tools import CompactTerminalTools
 
     calls: list[dict] = []
@@ -835,7 +836,8 @@ def test_turn_route_start_aliases_resolve(alias):
     assert tools.turn(action=alias, text="x")["action"] == "route_start"
 
 
-def test_turn_route_start_requires_text_but_not_target():
+def test_turn_route_start_requires_text_but_not_target(monkeypatch):
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "1")
     from terminal_mcp.compact_tools import CompactTerminalTools
 
     tools = CompactTerminalTools(terminal=None, controller=None,
@@ -843,7 +845,8 @@ def test_turn_route_start_requires_text_but_not_target():
     assert tools.turn(action="route_start")["error"] == "TEXT_REQUIRED"
 
 
-def test_turn_route_start_forwards_an_explicit_target_unchanged():
+def test_turn_route_start_forwards_an_explicit_target_unchanged(monkeypatch):
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "1")
     from terminal_mcp.compact_tools import CompactTerminalTools
 
     seen: dict = {}
@@ -858,7 +861,8 @@ def test_turn_route_start_forwards_an_explicit_target_unchanged():
     assert seen["target"] == "named"
 
 
-def test_turn_start_still_requires_a_target_and_never_routes():
+def test_turn_start_still_requires_a_target_and_never_routes(monkeypatch):
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "1")
     """The legacy action must keep its exact contract: naming no session is an
     error, not an invitation to pick one."""
     from terminal_mcp.compact_tools import CompactTerminalTools

@@ -4,6 +4,10 @@ on:
   pull_request:
     paths:
       - "terminal_mcp/core.py"
+      - "terminal_mcp/lifecycle.py"
+      - "terminal_mcp/project_coordinator.py"
+      - "tests/test_codex_startup_navigation.py"
+      - "tests/test_project_coordinator.py"
       - "terminal_mcp/tmux.py"
       - "tests/test_codex_direct_dispatch.py"
       - "tests/test_codex_paste_settle.py"
@@ -29,4 +33,4 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y tmux
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[test]"
-      - run: python -m pytest -q tests/test_delivery_gate.py tests/test_compact_tools.py tests/test_submit_acceptance_p1.py tests/test_codex_paste_settle.py tests/test_verified_submit_watchdog.py tests/test_submit_config_wiring.py tests/test_codex_direct_dispatch.py tests/test_direct_contract.py tests/test_node_client_permissions.py
+      - run: python -m pytest -q tests/test_delivery_gate.py tests/test_compact_tools.py tests/test_submit_acceptance_p1.py tests/test_codex_paste_settle.py tests/test_verified_submit_watchdog.py tests/test_submit_config_wiring.py tests/test_codex_direct_dispatch.py tests/test_direct_contract.py tests/test_node_client_permissions.py tests/test_codex_startup_navigation.py tests/test_project_coordinator.py tests/test_session_access_no_whitelist.py

@@ -566,7 +566,8 @@ class TerminalService:
         # docstring for why this is composed here rather than folded into
         # this already-large class: one small, independently-testable
         # object, shared by both the dashboard routes and the MCP tools.
-        self.lifecycle = SessionLifecycleService(config, self.tmux)
+        self.lifecycle = SessionLifecycleService(
+            config, self.tmux, input_authorized=lambda name: self._input_authorized(name)[0])
         # Durable Codex submission FSM. It is deliberately separate from
         # input_audit: audit rows redact prompt text, while recovery needs a
         # private, 0600 local record to prove that a retry must never

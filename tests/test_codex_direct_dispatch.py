@@ -202,3 +202,12 @@ def test_remote_guard_refuses_before_any_http_request(monkeypatch):
     result = client.send_text('codex', 'inert', True, require_idle=True)
     assert result['error'] == 'IDLE_GUARD_UNSUPPORTED'
     assert result['sent'] is False
+
+
+def test_explicit_idempotency_key_takes_precedence_over_legacy_request_key(rig):
+    tools, _, controller = rig
+    first = start(tools, idempotency_key='explicit')
+    replay = tools.turn(action='start', target='codex', text='inert task', timeout=1,
+                        request_key='changed-legacy', idempotency_key='explicit')
+    assert replay == first
+    assert len(controller.send_calls) == 1

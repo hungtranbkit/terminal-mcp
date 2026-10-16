@@ -35,6 +35,7 @@ def _make_one_task(store, session="lane-a", **overrides):
 
 
 @pytest.mark.parametrize("from_status,to_status", [
+    (QUEUED, BLOCKED), (DISPATCHING, COMPLETED),
     (QUEUED, DISPATCHING), (QUEUED, SKIPPED), (QUEUED, CANCELLED), (QUEUED, PAUSED),
     (DISPATCHING, RUNNING), (DISPATCHING, QUEUED), (DISPATCHING, BLOCKED), (DISPATCHING, CANCELLED), (DISPATCHING, PAUSED),
     (RUNNING, VERIFYING), (RUNNING, BLOCKED), (RUNNING, CANCELLED), (RUNNING, PAUSED),
@@ -78,7 +79,7 @@ def _drive_to_status(store, task_id, status):
 
 
 @pytest.mark.parametrize("from_status,to_status", [
-    (QUEUED, RUNNING), (QUEUED, VERIFYING), (QUEUED, BLOCKED),
+    (QUEUED, RUNNING), (QUEUED, VERIFYING),
     # (QUEUED, COMPLETED) and (PAUSED, COMPLETED) deliberately removed from
     # this "must be rejected" list, same reasoning as (BLOCKED, COMPLETED)
     # below: a task the engine never dispatched -- work driven in by hand --
@@ -99,7 +100,7 @@ def _drive_to_status(store, task_id, status):
     # below for the guarded, real coverage of this one specific edge.
     (BLOCKED, RUNNING), (BLOCKED, VERIFYING), (BLOCKED, DISPATCHING),
     (RUNNING, QUEUED), (RUNNING, COMPLETED), (RUNNING, DISPATCHING),
-    (DISPATCHING, VERIFYING), (DISPATCHING, COMPLETED),
+    (DISPATCHING, VERIFYING),
     (PAUSED, BLOCKED), (PAUSED, SKIPPED),
 ])
 def test_every_undocumented_transition_is_rejected(from_status, to_status):

@@ -137,6 +137,10 @@ class _StubController:
         self._clients = clients
         self._nodes = nodes
 
+    def _reconcile_ownership(self, node_id, listing):
+        # This fan-out fixture has no ownership store.
+        pass
+
     def list_nodes(self, *, budget_seconds=None):
         return list(self._nodes)
 

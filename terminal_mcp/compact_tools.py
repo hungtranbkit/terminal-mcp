@@ -954,7 +954,7 @@ class CompactTerminalTools:
         # historical queue opt-in. Never enqueue an idle Codex as a fallback.
         if normalized == "start" and target and text:
             direct = self._codex_direct_start(target, text, timeout=timeout,
-                                               request_key=request_key or idempotency_key)
+                                               request_key=idempotency_key if idempotency_key is not None else request_key)
             if direct is not None:
                 if direct.get("status") == "TASK_STARTED":
                     return self._with_label(direct, self._label_send(
