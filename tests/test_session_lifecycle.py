@@ -323,6 +323,7 @@ def test_create_launch_fail_cleans_up_disposable_session(tmp_path, lifecycle_ses
 def test_codex_startup_menu_is_blocked_instead_of_ready(tmp_path, lifecycle_session_factory, monkeypatch):
     """A live Codex process can still be waiting on its first-run menu."""
     from types import SimpleNamespace
+    monkeypatch.setattr("terminal_mcp.lifecycle.resolve_launcher", lambda command: command)
 
     config = _lifecycle_config(tmp_path, timeout=0.01)
     service = TerminalService(config)
@@ -366,6 +367,7 @@ def test_codex_startup_menu_is_blocked_instead_of_ready(tmp_path, lifecycle_sess
 def test_codex_selects_only_visible_authorized_non_granting_startup_choice(
         tmp_path, lifecycle_session_factory, monkeypatch, menu):
     from types import SimpleNamespace
+    monkeypatch.setattr("terminal_mcp.lifecycle.resolve_launcher", lambda command: command)
 
     service = TerminalService(_lifecycle_config(tmp_path, timeout=0.4))
     name = lifecycle_session_factory("codex-safe-menu")
@@ -394,7 +396,9 @@ def test_codex_selects_only_visible_authorized_non_granting_startup_choice(
 
     result = service.lifecycle.create(name, "codex", str(tmp_path))
 
-    assert result["state"] == "READY"
+    assert result["state"] == "CREATED"
+    assert result["composer_ready"] is True
+    assert result["tool_ready"] is False
     assert state["keys"] == ["Enter"]
 
 
@@ -421,6 +425,7 @@ def test_codex_only_becomes_ready_at_its_composer():
 
 def test_codex_readiness_deadline_returns_structured_blocker(tmp_path, lifecycle_session_factory, monkeypatch):
     from types import SimpleNamespace
+    monkeypatch.setattr("terminal_mcp.lifecycle.resolve_launcher", lambda command: command)
 
     service = TerminalService(_lifecycle_config(tmp_path, timeout=0.01))
     name = lifecycle_session_factory("codex-timeout")
@@ -872,3 +877,29 @@ def test_a_session_merely_observed_records_neither(tmp_path, tmux_session_factor
 def test_codex_yolo_defaults_to_least_privilege(tmp_path):
     config = _lifecycle_config(tmp_path)
     assert config.session_lifecycle.codex_yolo is False
+
+
+def test_permission_during_initial_preflight_overrides_create_readiness(tmp_path, monkeypatch):
+    service = TerminalService(_lifecycle_config(tmp_path))
+    monkeypatch.setattr(service.lifecycle, 'create', lambda *a, **kw: {
+        'session': 'test-codex-preflight', 'agent_type': 'codex', 'state': 'CREATED',
+        'composer_ready': True, 'tool_ready': False})
+    monkeypatch.setattr(service, '_await_agent_composer_ready', lambda name: {
+        'error': 'BOOT_DIALOG_WAITING_INPUT', 'state': 'WAITING_INPUT'})
+    monkeypatch.setattr(service, 'terminal_send_text', lambda *a, **kw: pytest.fail('must not accept permission'))
+    result = service.terminal_create_session('test-codex-preflight', 'codex', str(tmp_path), initial_prompt='inert probe')
+    assert result['state'] == 'WAITING_INPUT'
+    assert result['input_required'] is True
+    assert result['tool_ready'] is False
+    assert result['initial_prompt_result']['sent'] is False
+
+
+def test_created_agent_without_live_process_cannot_send_task_into_shell(tmp_path, monkeypatch):
+    service = TerminalService(_lifecycle_config(tmp_path))
+    monkeypatch.setattr(service.lifecycle, 'create', lambda *a, **kw: {
+        'session': 'test-agent-still-booting', 'agent_type': 'claude', 'state': 'CREATED',
+        'composer_ready': False, 'tool_ready': False, 'agent_process_ready': False})
+    monkeypatch.setattr(service, '_await_agent_composer_ready', lambda name: None)
+    monkeypatch.setattr(service, 'terminal_send_text', lambda *a, **kw: pytest.fail('agent not running'))
+    result = service.terminal_create_session('test-agent-still-booting', 'claude', str(tmp_path), initial_prompt='inert probe')
+    assert result['initial_prompt_result']['error'] == 'SESSION_NOT_READY'

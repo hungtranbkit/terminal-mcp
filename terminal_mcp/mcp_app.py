@@ -1214,10 +1214,9 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         server-side-only command from config, never anything this caller
         supplies as text). working_directory is optional and must resolve
         inside config.session_lifecycle.allowed_cwd_roots. Returns a
-        receipt with state: READY (the expected process is confirmed and,
-        for Codex, its task composer is visible), CREATED (a non-Codex
-        session exists but is still starting), BLOCKED (Codex is at a
-        startup/trust/hook/config prompt or failed its readiness deadline),
+        receipt with state: READY (shell ready), CREATED (agent launched;
+        tool readiness is unverified), BLOCKED_PERMISSION (owner approval
+        is required), BLOCKED (startup/trust/config prompt or deadline),
         or FAILED (nothing usable was created; any disposable
         session this call itself made is already cleaned up). Duplicate
         names fail explicitly (SESSION_ALREADY_EXISTS) -- this never
@@ -1238,7 +1237,7 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         grant grant_session_read/_input would give, subject to the exact
         same rules (refused for a sensitive-worded name, a denied input
         pattern, etc). initial_prompt, if given, is sent only once the
-        session reaches state=READY, through the same verified terminal_
+        agent composer settles (agent creation alone does not prove tool permissions), through the same verified terminal_
         send_text path every other prompt in this project uses -- if your
         effective permission doesn't cover this session yet, that send
         comes back ACCESS_DENIED, exactly like any other ungranted

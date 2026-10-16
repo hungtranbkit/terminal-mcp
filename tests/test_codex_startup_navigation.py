@@ -46,7 +46,7 @@ def launch(tmp_path, monkeypatch, backend, config=None):
 def test_navigate_only_known_non_granting_choices(tmp_path, monkeypatch, kind, selected, expected):
     backend = MenuBackend(kind, selected)
     result = launch(tmp_path, monkeypatch, backend)
-    assert result["state"] == "READY"
+    assert result["state"] == "CREATED"
     assert backend.keys == expected
 
 @pytest.mark.parametrize("denial",["terminal_input","allow_send_keys","pattern","key"])
@@ -81,7 +81,7 @@ class LateMenuBackend(MenuBackend):
 def test_boot_composer_must_settle_before_ready(tmp_path,monkeypatch):
     backend=LateMenuBackend("daemon",2)
     result=launch(tmp_path,monkeypatch,backend)
-    assert result["state"]=="READY"
+    assert result["state"]=="CREATED"
     assert backend.keys==["Up","Up","Enter"]
 
 class UpdateBackend(MenuBackend):
@@ -96,7 +96,7 @@ class UpdateBackend(MenuBackend):
 def test_skip_exact_update_menu_without_running_installer(tmp_path,monkeypatch):
     backend=UpdateBackend("update",0)
     result=launch(tmp_path,monkeypatch,backend)
-    assert result["state"]=="READY"
+    assert result["state"]=="CREATED"
     assert backend.keys==["Escape"]
 
 
@@ -114,7 +114,7 @@ def test_startup_open_default_does_not_require_retired_whitelist(tmp_path, monke
     config = replace(config, allowed_session_patterns=("other-*",),
                      input_policy=replace(config.input_policy, allowed_session_patterns=("other-*",)))
     backend = MenuBackend("daemon", 0)
-    assert launch(tmp_path, monkeypatch, backend, config)["state"] == "READY"
+    assert launch(tmp_path, monkeypatch, backend, config)["state"] == "CREATED"
     assert backend.keys == ["Enter"]
 
 
@@ -126,3 +126,81 @@ def test_startup_rechecks_canonical_permission_before_input(tmp_path, monkeypatc
     monkeypatch.setattr(svc, "launch_command_for", lambda agent: "codex")
     assert svc.create("codex-nav-check", "codex", str(tmp_path))["state"] == "BLOCKED"
     assert backend.keys == []
+
+
+TOOL_PERMISSION = [
+    'Allow terminal.start_process (osascript Safari)?',
+    '› 1. Allow once',
+    '  2. Always allow',
+    '  3. Cancel',
+    'enter to submit | esc to cancel',
+    'model: gpt-5',
+    'context: 90% left',
+    'workspace: /Users/mac17',
+    '› Ask Codex to do anything',
+    '? for shortcuts',
+]
+
+
+@pytest.mark.parametrize('platform', ['darwin', 'linux'])
+@pytest.mark.parametrize('argument_lines', [0, 17, 100])
+def test_tool_permission_dominates_visible_composer(tmp_path, monkeypatch, platform, argument_lines):
+    from terminal_mcp.adapters import CodexAdapter, TARGET_WAITING
+    from terminal_mcp.lifecycle import _codex_readiness
+    from terminal_mcp.status import detect_waiting_input
+    monkeypatch.setattr('sys.platform', platform)
+    lines = TOOL_PERMISSION[:1] + ['tell application Safari -- wrapped argument'] * argument_lines + TOOL_PERMISSION[1:]
+    assert CodexAdapter().identify_target_state(lines) == TARGET_WAITING
+    assert detect_waiting_input('\n'.join(lines))[0] is True
+    assert _codex_readiness(lines) == ('BLOCKED_PERMISSION', 'CODEX_TOOL_PERMISSION_REQUIRED')
+    backend = MenuBackend('daemon', 0)
+    monkeypatch.setattr(backend, 'capture_lines', lambda *a, **kw: lines)
+    result = launch(tmp_path, monkeypatch, backend)
+    assert result['state'] == 'BLOCKED_PERMISSION'
+    assert result['input_required'] is True
+    assert backend.keys == []  # input permission cannot grant external tool/OS rights
+
+
+def test_composer_alone_does_not_claim_tool_readiness(tmp_path, monkeypatch):
+    backend = MenuBackend('daemon', 0)
+    backend.ready = True
+    result = launch(tmp_path, monkeypatch, backend)
+    assert result['state'] == 'CREATED'
+    assert result['composer_ready'] is True
+    assert result['tool_ready'] is False
+    assert result['readiness_stage'] == 'TOOL_PREFLIGHT_REQUIRED'
+    assert result['readiness_status'] == 'WAITING_INPUT'
+
+
+def test_permission_example_in_old_scrollback_does_not_block_composer():
+    from terminal_mcp.adapters import CodexAdapter, TARGET_COMPOSER
+    from terminal_mcp.status import detect_waiting_input
+    lines = TOOL_PERMISSION + ['ordinary output'] * 30 + ['› Ask Codex to do anything']
+    assert CodexAdapter().identify_target_state(lines) == TARGET_COMPOSER
+    assert detect_waiting_input('\n'.join(lines))[0] is False
+
+
+def test_old_non_granting_menu_cannot_authorize_keys_in_tool_dialog(tmp_path, monkeypatch):
+    from terminal_mcp.lifecycle import _authorized_startup_step
+    lines = ['Background server has incompatible feature settings',
+             '› 1. Run without daemon this time', '2. Restart with these settings', '3. Cancel'] + TOOL_PERMISSION
+    assert _authorized_startup_step(lines) is None
+    backend = MenuBackend('daemon', 0)
+    monkeypatch.setattr(backend, 'capture_lines', lambda *a, **kw: lines)
+    assert launch(tmp_path, monkeypatch, backend)['state'] == 'BLOCKED_PERMISSION'
+    assert backend.keys == []
+
+
+def test_old_update_menu_cannot_dismiss_current_tool_permission():
+    from terminal_mcp.lifecycle import _authorized_startup_step
+    lines = ['Update now', '2. Skip', '3. Skip until next version', 'esc skip'] + TOOL_PERMISSION
+    assert _authorized_startup_step(lines) is None
+
+
+def test_tool_permission_header_clipped_by_capture_still_blocks():
+    from terminal_mcp.adapters import CodexAdapter, TARGET_WAITING
+    from terminal_mcp.lifecycle import _codex_readiness, _authorized_startup_step
+    lines = TOOL_PERMISSION[1:]
+    assert CodexAdapter().identify_target_state(lines) == TARGET_WAITING
+    assert _codex_readiness(lines)[0] == "BLOCKED_PERMISSION"
+    assert _authorized_startup_step(lines) is None

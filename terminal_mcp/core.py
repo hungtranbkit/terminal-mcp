@@ -4467,7 +4467,7 @@ class TerminalService:
         read/grant_session_input this class always used, so a grant here
         is refused exactly when a manual dashboard grant would be, e.g. a
         sensitive-worded name or a denied input pattern). initial_prompt,
-        when given, is sent ONLY after the session reaches state=READY,
+        when given, is sent ONLY after the agent composer passes preflight,
         through terminal_send_text -- the same pane-locked, idempotency-
         aware, adapter-verified submission path every other prompt in
         this project goes through, never a raw send-keys shortcut; if the
@@ -4641,15 +4641,21 @@ class TerminalService:
         result["binding"] = binding_result
 
         if initial_prompt:
-            boot = (self._await_agent_composer_ready(name) if result.get("state") == "READY"
-                    else None)
+            may_preflight = (result.get("state") == "READY" or
+                             (agent_type in {"codex", "claude"} and result.get("state") == "CREATED"
+                              and (result.get("agent_process_ready") is True or
+                                   result.get("composer_ready") is True)))
+            boot = self._await_agent_composer_ready(name) if may_preflight else None
             if boot is not None and boot.get("error"):
                 # Issue #52: never type into a booting TUI or a boot dialog
                 # (Codex "Hooks need review", Claude folder trust). The hooks
                 # menu is a security prompt for a human; answering it with the
                 # prompt's Enter would bypass it. Nothing was typed.
+                result.update(state=boot.get("state", "UNKNOWN"),
+                              input_required=boot.get("state") == "WAITING_INPUT",
+                              composer_ready=False, tool_ready=False)
                 result["initial_prompt_result"] = {**boot, "session": name, "sent": False}
-            elif result.get("state") == "READY":
+            elif may_preflight:
                 sent = self.terminal_send_text(name, initial_prompt, press_enter=True)
                 if isinstance(sent, dict):
                     # A submit receipt is not proof the agent started work.

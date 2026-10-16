@@ -135,12 +135,7 @@ def test_failed_create_on_target_never_touches_real_source(controller_with_fake_
     controller.terminal_create_session("move-src", "shell", str(tmp_path), node="local")
     assert _tmux_has_session("move-src")
 
-    # agent_type="claude" -- node-b's own reported agent_types includes
-    # "claude" (see the fixture's heartbeat call), so this passes the
-    # controller's own local AGENT_TYPE_NOT_AVAILABLE_ON_TARGET pre-check
-    # and reaches the target's real create_session call, whose error this
-    # test is actually about.
-    result = controller.terminal_move_session("move-src", "node-b", agent_type="claude")
+    result = controller.terminal_move_session("move-src", "node-b", agent_type="shell")
     assert result["error"] == "LAUNCHER_NOT_CONFIGURED"
     assert result["phase"] == "create_on_target"
 
@@ -246,3 +241,18 @@ def test_move_when_target_already_has_that_name_leaves_source_untouched(controll
     assert result["error"] == "SESSION_ALREADY_EXISTS"
     assert result["phase"] == "create_on_target"
     assert _tmux_has_session("move-src")
+
+
+@pytest.mark.parametrize("agent_type", ["codex", "claude"])
+def test_agent_move_requires_verified_tools_before_creating_destination(controller_with_fake_target, tmp_path, agent_type):
+    controller, service = controller_with_fake_target
+    controller.registry.heartbeat("node-b", metrics=_bare_metrics(), tmux_session_count=0, agent_counts={},
+                                  agent_types=("shell", "codex", "claude"), agent_version=None, labels=())
+    target = FakeTargetClient(create_response={"state": "CREATED", "tool_ready": False})
+    controller._clients["node-b"] = target
+    controller.terminal_create_session("move-src", "shell", str(tmp_path), node="local")
+    result = controller.terminal_move_session("move-src", "node-b", agent_type=agent_type)
+    assert result["error"] == "MOVE_REQUIRES_TOOL_PREFLIGHT"
+    assert target.create_calls == []
+    assert _tmux_has_session("move-src")
+    assert controller.resolve_session("move-src")["node_id"] == "local"
