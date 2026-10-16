@@ -1,0 +1,66 @@
+{
+  "deployed_code_sha": "7ce39a61892c10dc4664a757e65be7873eaef218",
+  "base_sha": "8249c35ef298d539fbaf1e3eff0952c4eacb7bd3",
+  "targeted_tests": {
+    "passed": 178,
+    "failed": 0
+  },
+  "broad_tests": {
+    "passed": 693,
+    "failed": 5,
+    "stopped_after_failures": 5,
+    "baseline_backlog_file": {
+      "failed": 9,
+      "passed": 1
+    }
+  },
+  "codex_real_cycles": {
+    "passed": 10,
+    "total": 10
+  },
+  "claude_real_read": {
+    "passed": true
+  },
+  "mcp_restart_test": {
+    "task_id": "hd_9ce08a4348ac4108bd870e98fd7c0b0d",
+    "started_via": "ChatGPT Terminal MCP connector",
+    "controller_restart_state": "RUNNING",
+    "final_state": "RELEASED",
+    "artifact_exact_bytes": "MCP_RESTART_OK\\n",
+    "artifact_verified": true,
+    "worker_claims": 1,
+    "cli_spawns": 1,
+    "checkpoint_sha256": "e23757a5854329c5b16e458a51fbfadfb97b14505ef8927c3e9c22bbc6280ca5"
+  },
+  "tmux_before": 9,
+  "tmux_after": 9,
+  "existing_session_ids_preserved": true,
+  "services": [
+    "terminal-mcp-http.service",
+    "terminal-mcp-chatgpt-v1.service"
+  ],
+  "safe_periodic_cleanup": "session-guard.service override installed and executed",
+  "legacy_dell_task": {
+    "task_id": "dt_9d78e880cad54157",
+    "state": "BLOCKED",
+    "reason": "DISPATCH_ACK_TIMEOUT",
+    "completed_at": null,
+    "dispatches": 1,
+    "resubmitted": false
+  },
+  "limitations": [
+    "New headless transport currently local to HP; it does not silently route remote Dell work to HP.",
+    "Existing Dell uncertain task is held for explicit inspect/checkpoint/cancel decisions, not replayed.",
+    "Repository-wide tests are not all green; baseline backlog failures were reproduced."
+  ],
+  "overall_acceptance": "BLOCKED_ON_DELL_INCIDENT_EVIDENCE",
+  "remaining_blocker": {
+    "node": "dell-linux",
+    "missing_evidence": "Original remote prompt submission receipt and node audit for 17e92858a5714398b39ab11df2bfbbeb",
+    "hp_store_has_remote_submission": false,
+    "ssh_attempts": "Configured Dell hostname and registered node address, BatchMode, existing SSH agent",
+    "ssh_result": "Permission denied (publickey,password)",
+    "required_access": "Authenticated SSH as dell, or an authorized read-only export of the submission metadata and node input audit; never raw prompt/key export",
+    "not_claimed": "Whether the original Enter event was sent/received; remote headless rollout"
+  }
+}

@@ -18,17 +18,84 @@ class is trivially unit-testable in isolation.
 from __future__ import annotations
 
 import time
+import re
 from pathlib import Path
 from typing import Any
 
 from .config import AppConfig
 from .launcher_resolution import resolve_launcher
-from .permissions import SENSITIVE_SESSION_WORDS, valid_new_session_name
+from .permissions import SENSITIVE_SESSION_WORDS, valid_new_session_name, input_session_allowed
 from .session_backend import SessionBackend
 from .tmux import TmuxError
 
 AGENT_TYPES = ("shell", "claude", "codex")
 CREATE_POLL_INTERVAL_SECONDS = 0.2
+
+
+def _codex_readiness(lines: list[str]) -> tuple[str, str | None]:
+    """Classify Codex's visible startup surface without accepting prompts.
+
+    The process name alone is not a readiness signal. Only Codex's stable
+    composer footer admits task input; setup, trust, hook, and config prompts
+    are returned as structured blockers and are never answered here.
+    """
+    text = "\n".join(lines).casefold()
+    if ("run without daemon this time" in text
+            and "restart with these settings" in text
+            and "cancel" in text):
+        return "BLOCKED", "CODEX_STARTUP_MENU"
+    if ("trust this folder" in text or "do you trust" in text
+            or "workspace trust" in text):
+        return "BLOCKED", "CODEX_TRUST_PROMPT"
+    if any(marker in text for marker in (
+            "sign in to codex", "log in to codex", "authentication required",
+            "api key required", "could not authenticate")):
+        return "BLOCKED", "CODEX_AUTH_REQUIRED"
+    if "hook" in text and any(word in text for word in ("allow", "approve", "trust", "run this")):
+        return "BLOCKED", "CODEX_HOOK_PROMPT"
+    if ("permission" in text and any(marker in text for marker in
+            ("enter to select", "press enter", "tab/arrow keys to navigate"))):
+        return "BLOCKED", "CODEX_PERMISSION_PROMPT"
+    if "warning" in text and any(word in text for word in ("config", "configuration", "hook")):
+        return "BLOCKED", "CODEX_CONFIG_WARNING"
+    if "ask codex to do anything" in text and any(marker in text for marker in ("›", ">")):
+        return "READY", None
+    return "STARTUP_CHECK", None
+
+
+def _authorized_startup_step(lines: list[str]) -> tuple[str, str] | None:
+    """One key toward a known non-granting option, never a shared config change."""
+    recent = lines[-30:]
+    text = "\n".join(recent).casefold()
+    options = {}
+    selected = []
+    for line in recent:
+        match = re.match(r"^\s*([›❯>])?\s*([1-3])\.\s+(.+?)\s*$", line)
+        if not match:
+            continue
+        mark, number, label = match.groups()
+        number = int(number)
+        if number in options:
+            return None
+        options[number] = label.casefold()
+        if mark:
+            selected.append(number)
+    if set(options) != {1, 2, 3} or len(selected) != 1:
+        return None
+    if options == {1: "run without daemon this time", 2: "restart with these settings", 3: "cancel"}:
+        safe, reason = 1, "CODEX_STARTUP_MENU"
+    elif ("hooks need review" in text and options[1] == "review hooks"
+          and options[2] == "trust all and continue"
+          and re.fullmatch(r"continue without trusting(?: \(hooks won.t run\))?", options[3])):
+        safe, reason = 3, "CODEX_HOOK_REVIEW_MENU"
+    else:
+        return None
+    current = selected[0]
+    return reason, ("Enter" if current == safe else "Up" if current > safe else "Down")
+
+def _authorized_startup_choice(lines: list[str]) -> str | None:
+    step = _authorized_startup_step(lines)
+    return step[0] if step and step[1] == "Enter" else None
 
 
 def resolve_cwd(requested: str | None, config: AppConfig) -> tuple[Path | None, dict[str, Any] | None]:
@@ -94,8 +161,8 @@ class SessionLifecycleService:
         """Create one new detached session, then poll (bounded by
         config.session_lifecycle.create_ready_timeout_seconds) for
         evidence the launched process actually started. Returns a receipt
-        with `state` in {"READY", "CREATED", "FAILED"}: READY means the
-        pane's current command already matches the expected launcher (or,
+        with `state` in {"READY", "CREATED", "BLOCKED", "FAILED"}: READY means the
+        pane's current command and CLI-specific prompt state are ready (or,
         for agent_type="shell", the pane has drawn its own first real
         output -- at minimum its prompt; see the loop's own comment
         below for the real, reproducing race this closes: reporting
@@ -142,6 +209,9 @@ class SessionLifecycleService:
         deadline = time.monotonic() + self.config.session_lifecycle.create_ready_timeout_seconds
         state = "CREATED"
         info = None
+        startup_choices: set[str] = set()
+        startup_key_count = 0
+        startup_actions: list[dict[str, str]] = []
         while True:
             try:
                 info = self.tmux.get_session(name)
@@ -162,8 +232,56 @@ class SessionLifecycleService:
                         "reason": "launched process exited"}
             if expected_command is not None:
                 if info.pane_current_command.casefold() == expected_command:
-                    state = "READY"
-                    break
+                    if agent_type == "codex":
+                        try:
+                            lines = self.tmux.capture_lines(name, 80)
+                        except TmuxError:
+                            lines = []
+                        readiness, blocked_reason = _codex_readiness(lines)
+                        step = _authorized_startup_step(lines)
+                        if step:
+                            reason, key = step
+                            permitted = (self.config.permissions.terminal_input
+                                and self.config.permissions.allow_send_keys
+                                and input_session_allowed(name, self.config)
+                                and key in self.config.input_policy.allow_keys
+                                and key not in self.config.input_policy.sensitive_keys_require_confirmation)
+                            if (permitted and reason not in startup_choices
+                                    and startup_key_count < 8 and time.monotonic() < deadline):
+                                try:
+                                    fresh = self.tmux.get_session(name)
+                                    fresh_lines = self.tmux.capture_lines(name, 80)
+                                    same = (fresh is not None and not fresh.pane_dead
+                                        and fresh.session_id == info.session_id
+                                        and fresh.pane_id == info.pane_id
+                                        and fresh.created_epoch == info.created_epoch
+                                        and fresh.pane_current_command.casefold() == expected_command
+                                        and _authorized_startup_step(fresh_lines) == step)
+                                    if same:
+                                        self.tmux.send_keys(name, [key])
+                                        startup_key_count += 1
+                                        startup_actions.append({"menu": reason, "key": key})
+                                        if key == "Enter":
+                                            startup_choices.add(reason)
+                                        time.sleep(CREATE_POLL_INTERVAL_SECONDS)
+                                        continue
+                                except TmuxError:
+                                    pass
+                        if readiness == "BLOCKED":
+                            return {
+                                "session": name, "agent_type": agent_type,
+                                "cwd": str(resolved_cwd), "state": "BLOCKED",
+                                "readiness_stage": "STARTUP_CHECK",
+                                "blocked_reason": blocked_reason,
+                                "session_id": info.session_id, "pane_id": info.pane_id,
+                                "pane_current_command": info.pane_current_command,
+                            }
+                        if readiness == "READY":
+                            state = "READY"
+                            break
+                    else:
+                        state = "READY"
+                        break
             else:
                 # agent_type == "shell": no specific launcher command to
                 # poll for, but the pane's own shell (rc-file sourcing,
@@ -198,6 +316,15 @@ class SessionLifecycleService:
                     state = "READY"
                     break
             if time.monotonic() >= deadline:
+                if agent_type == "codex" and expected_command is not None:
+                    return {
+                        "session": name, "agent_type": agent_type,
+                        "cwd": str(resolved_cwd), "state": "BLOCKED",
+                        "readiness_stage": "STARTUP_CHECK",
+                        "blocked_reason": "CODEX_READINESS_TIMEOUT",
+                        "session_id": info.session_id, "pane_id": info.pane_id,
+                        "pane_current_command": info.pane_current_command,
+                    }
                 break
             time.sleep(CREATE_POLL_INTERVAL_SECONDS)
 
@@ -206,6 +333,8 @@ class SessionLifecycleService:
             "session_id": info.session_id, "pane_id": info.pane_id,
             "pane_current_command": info.pane_current_command, "created_epoch": info.created_epoch,
         }
+        if startup_actions:
+            result["startup_actions"] = startup_actions
         # Only surfaced when actually requested -- never a new, always-
         # present field an existing (tmux-only, or headless-by-default
         # Windows) caller would need to start ignoring.

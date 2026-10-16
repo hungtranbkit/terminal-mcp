@@ -1,0 +1,1 @@
+{"type":"object","properties":{"outcome":{"type":"string","enum":["completed","blocked"]},"summary":{"type":"string"}},"required":["outcome","summary"],"additionalProperties":false}

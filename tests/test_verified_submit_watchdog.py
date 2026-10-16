@@ -273,6 +273,40 @@ def test_submission_idempotency_survives_store_reopen(tmp_path: Path):
     assert same.enter_count == 1
 
 
+def test_evidence_timeout_remains_recoverable_after_store_restart(tmp_path: Path):
+    """A transiently incomplete pane must not turn a durable submission
+    into a terminal failure before the background sweeper can inspect it."""
+    path = tmp_path / "evidence-timeout-recovery.db"
+    store = SubmissionStore(path)
+    record, _ = store.create(idempotency_key="timeout-recovery", session="codex",
+                             agent_type="codex", prompt="recover this draft")
+    watchdog = VerifiedSubmitWatchdog(store, WatchdogConfig(
+        poll_interval_seconds=.01, timeout_seconds=.025, max_enter_attempts=6,
+    ))
+    result = watchdog.run(
+        record.submission_id,
+        capture=lambda: ["loading pane snapshot"],
+        inject=lambda _text: None,
+        send_enter=lambda: pytest.fail("an incomplete pane must never receive Enter"),
+        evidence=lambda _lines, _record: ("INCOMPLETE", "pane_snapshot_not_ready"),
+    )
+
+    assert result["ack_state"] == "SUBMITTING"
+    reopened = SubmissionStore(path)
+    recovered_record = reopened.get(record.submission_id)
+    assert recovered_record is not None
+    assert recovered_record in reopened.active()
+    assert "recovery: submit_evidence_timeout" in recovered_record.evidence
+
+    def recover(active_record):
+        reopened.update(active_record.submission_id, ack_state=ACK_RUNNING,
+                        execution_started=True, evidence="execution_seen_after_restart")
+
+    sweeper = SubmissionSweeper(reopened, recover, backoff_seconds=(0,))
+    sweeper.run_once()
+    assert reopened.get(record.submission_id).ack_state == ACK_RUNNING  # type: ignore[union-attr]
+
+
 def test_different_prompt_cannot_reuse_submission_key(tmp_path: Path):
     store = SubmissionStore(tmp_path / "collision.db")
     store.create(idempotency_key="same", session="codex", agent_type="codex", prompt="one")

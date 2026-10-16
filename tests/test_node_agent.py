@@ -81,6 +81,24 @@ def test_health_needs_no_auth(agent_client):
     assert response.json()["node_id"] == "test-node"
 
 
+def test_node_agent_runs_submission_sweeper_for_its_lifetime(tmp_path, monkeypatch):
+    """The remote execution surface must recover durable Codex submissions
+    just like the full local HTTP service does."""
+    from terminal_mcp.grants import SessionGrantStore
+
+    terminal = TerminalService(_config(tmp_path), grants=SessionGrantStore(tmp_path / "sweeper-grants.db"))
+    calls: list[str] = []
+    monkeypatch.setattr(terminal, "start_submission_sweeper", lambda: calls.append("start"))
+    monkeypatch.setattr(terminal, "stop_submission_sweeper", lambda: calls.append("stop"))
+    app = build_node_agent(node_id="test-node", terminal=terminal, token=TOKEN,
+                           workspace_root=str(tmp_path))
+
+    with TestClient(app):
+        assert calls == ["start"]
+
+    assert calls == ["start", "stop"]
+
+
 def test_health_reports_this_process_own_generation_id(agent_client):
     # Phase 0 node-agent restart-safety audit (2026-09-06): a fresh id
     # per process, so a caller (deploy tooling, dashboard) can tell "this

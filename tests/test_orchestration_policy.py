@@ -55,7 +55,6 @@ def test_invariants_cover_each_required_area():
         assert required in joined, f"CRITICAL_INVARIANTS no longer covers {required!r}"
 
 
-
 def test_every_new_session_requires_safe_precreate_audit():
     """No capacity check or age-only reap can bypass the mandatory safety review."""
     instructions = mcp.instructions or ""

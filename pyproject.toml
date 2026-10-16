@@ -77,7 +77,7 @@ terminal-windows-node-agent = "terminal_mcp.windows_agent:main"
 include = ["terminal_mcp*"]
 
 [tool.setuptools.package-data]
-terminal_mcp = ["vendor/xterm/*"]
+terminal_mcp = ["vendor/xterm/*", "headless_outcome.schema.json"]
 
 [tool.setuptools.dynamic]
 version = {attr = "terminal_mcp.__version__"}

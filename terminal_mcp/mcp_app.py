@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 import os
 import threading
 import time
@@ -86,11 +87,16 @@ _RETIRED_PUBLIC_QUEUE_TOOLS = (
     "terminal_verify_requeue",
 )
 _DIRECT_ACTION_SCHEMA_HELP = (
+    "For new local headless work: headless_start (agent_type=codex|claude, text, working_directory, "
+    "idempotency_key), headless_status/list/checkpoint/cancel/cleanup. "
     "Direct Terminal MCP action. Normal public actions: inspect, send, send_wait, wait, resume, "
     "supervise (long task continued server-side until explicit DONE), supervise_status, "
     "supervise_complete, supervise_cancel, "
     "list_sessions, list_nodes, create_session, delete_session, task_status, task_batch_status, "
     "browser_verify, browser_screenshot, browser_status, browser_stop. "
+    "Tracked work: create_session (no initial_prompt) -> supervise(text, title, idempotency_key) "
+    "-> supervise_status(task_id or idempotency_key). Retired queue actions return "
+    "QUEUE_DISABLED_USE_DIRECT_SESSION and create no task. RUNNING only after observed execution. "
     "When assigning or changing a session's task (send/send_wait/supervise/create_session), "
     "pass title=\"<short task summary>\" so the live monitor shows it; omit title for "
     "continuations (y, continue, approvals, follow-ups)."
@@ -355,10 +361,25 @@ def build_mcp(service: TerminalService | None = None,
             tail=lambda target, lines: compact_tools._bounded_read(
                 ("direct-task-tail", target, lines),
                 lambda: compact_tools._tail(target, lines), 10),
+            # Stuck-composer recovery: the guarded activate-only send (empty
+            # text + Enter) submits the composer's OWN content and refuses on
+            # an empty composer -- it can never retype or duplicate a prompt.
+            activate=lambda target, key: compact_tools.send_task(target, "", idempotency_key=key),
+            # In-call look for execution evidence so a fast start can say
+            # RUNNING honestly; the loop carries the rest.
+            accept_wait_seconds=float(os.environ.get("TERMINAL_MCP_SUPERVISE_ACCEPT_WAIT", "6")),
         )
     except Exception:  # noqa: BLE001 -- never block startup; supervise* reports unavailable
         direct_tasks = None
     compact_tools.direct_tasks = direct_tasks
+    compact_tools.headless = None
+    if os.name == "posix":
+        from .headless import HeadlessManager
+        compact_tools.headless = HeadlessManager(
+            terminal, Path(os.environ.get("TERMINAL_MCP_HEADLESS_STATE_DIR",
+                                         str(Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "terminal-mcp/headless"))),
+            direct=direct_tasks,
+            enabled=os.environ.get("TERMINAL_MCP_HEADLESS_ENABLED") == "1")
     # Per-session "current task" label (task_labels.py) in the audit DB,
     # mirrored best-effort to the node that owns the session (node_sync) so
     # that host's own Live Monitor sees work assigned through this controller.
@@ -766,9 +787,13 @@ def build_mcp(service: TerminalService | None = None,
                       targets: list[str] | None = None, text: str | None = None,
                       desired_states: list[str] | None = None,
                       resume_token: str | None = None, timeout: float = 20,
-                      poll_interval: float = 1, tail_lines: int = 20,
+                      poll_interval: float = 1,
+                      tail_lines: Annotated[int, Field(description=(
+                          "inspect/wait tail rows, 1..20; larger values are clamped to 20"))] = 20,
                       compact: bool = True,
-                      idempotency_key: str | None = None,
+                      idempotency_key: Annotated[str | None, Field(description=(
+                          "send/supervise: stable key; a retry with the same key returns the same "
+                          "task/receipt and never sends twice. supervise_status also accepts it."))] = None,
                       agent_type: str = "shell", working_directory: str | None = None,
                       initial_prompt: str | None = None, grant_mode: str = "none",
                       binding: str | None = None, node: str = "auto",
@@ -783,9 +808,24 @@ def build_mcp(service: TerminalService | None = None,
                       confirm: bool | None = None) -> dict:
         """THE terminal surface: direct session control only.
 
-NORMAL FLOW:
-1. `create_session` creates a fresh session for real work.
-2. `send` or `send_wait` sends work directly to that session.
+HEADLESS FLOW (preferred for new local Codex/Claude work when enabled):
+`headless_start` atomically creates a session and dispatches text using the
+noninteractive CLI. Supply target, agent_type=codex|claude, working_directory,
+and an idempotency_key. Save hd_ task_id. Use headless_status or task_status;
+headless_list discovers durable sessions. headless_checkpoint then
+headless_cleanup releases completed work. headless_cancel explicitly cancels.
+Structured delivery/execution ACKs and successful business outcome plus process
+exit are required; workers survive controller restarts. No hooks are approved.
+Never create replacement work for an existing blocked/uncertain target.
+
+INTERACTIVE FLOW (existing tmux sessions / remote nodes):
+1. `create_session` creates a fresh session for real work (omit initial_prompt
+   for tracked work: an initial prompt is only typed once the agent shows a
+   settled composer, never into a boot dialog such as Codex "Hooks need review").
+2. `supervise` (text + title + idempotency_key) dispatches tracked work and
+   returns a durable task_id; `supervise_status` (task_id or the same
+   idempotency_key) reads it from any client. `send`/`send_wait` remain for
+   short one-off prompts.
 3. `inspect` is used only when a user explicitly asks for a status check.
 4. When work is complete, merge/test as appropriate and clean up the finished
    session/worktree/branch.
@@ -811,7 +851,14 @@ Direct actions:
                 target printing `TMCP-DONE:<task_id>` / `TMCP-BLOCKED:<task_id>
                 reason`, WAITING_INPUT, supervise_complete/supervise_cancel, or
                 args.max_continuations (default 6). Do not resend.
-  supervise_status/supervise_complete/supervise_cancel  (task_id)
+                States: DISPATCHING (persisted/submitted, execution not yet
+                observed) -> RUNNING (observed: busy footer or an answer after
+                the echoed prompt). STUCK_COMPOSER (prompt still in composer;
+                bounded Enter-only recovery), WAITING_INPUT (dialog/menu needs
+                a human -- never auto-answered), DISPATCH_UNCERTAIN (no evidence;
+                not resent). Each task carries next_action and receipts.
+  supervise_status/supervise_complete/supervise_cancel  (task_id; status also
+                takes idempotency_key or target)
   list_sessions/list, list_nodes/nodes
   create_session/create, delete_session/delete (confirm=true, or args={"confirm": true})
   session_lifecycle (read-only classification), session_reconcile (dry run by default)
@@ -1150,9 +1197,11 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         server-side-only command from config, never anything this caller
         supplies as text). working_directory is optional and must resolve
         inside config.session_lifecycle.allowed_cwd_roots. Returns a
-        receipt with state: READY (the expected process is confirmed
-        running), CREATED (session exists, still starting -- not a
-        failure), or FAILED (nothing usable was created; any disposable
+        receipt with state: READY (the expected process is confirmed and,
+        for Codex, its task composer is visible), CREATED (a non-Codex
+        session exists but is still starting), BLOCKED (Codex is at a
+        startup/trust/hook/config prompt or failed its readiness deadline),
+        or FAILED (nothing usable was created; any disposable
         session this call itself made is already cleaned up). Duplicate
         names fail explicitly (SESSION_ALREADY_EXISTS) -- this never
         attaches to or overwrites an existing session.
@@ -3737,6 +3786,9 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
             refs.append("active run")
         return refs
 
+    terminal.durable_deletion_guard = lambda name: deletion_preflight(
+        name, queue=queue, run_journal=run_journal, supervisor=supervisor, direct_tasks=direct_tasks)
+
     from .session_reconciler import SessionReconciler
     session_reconciler = SessionReconciler(
         terminal, active_refs=_reconcile_active_refs,
@@ -4049,7 +4101,9 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         """Direct by-id lookup for one task -- lets a caller track a
         specific task (e.g. one just returned by terminal_enqueue_task)
         without needing to already know which session's lane it's in."""
-        return queue.task_status(task_id)
+        from .task_lookup import task_status
+        return task_status(task_id, direct=direct_tasks, queue=queue,
+                           headless=getattr(compact_tools, "headless", None))
 
     @server.tool()
     def terminal_task_batch_status(task_ids: list[str]) -> dict:
@@ -4059,11 +4113,13 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
             return {"error": "INVALID_TASK_IDS", "max_task_ids": 100}
         tasks = []
         for task_id in task_ids:
-            result = queue.task_status(task_id)
+            result = terminal_task_status(task_id)
             if "task" in result:
                 task = result["task"]
-                tasks.append({"task_id": task["id"], "state": task["status"],
-                              "status": task["status"], "session": task["session"],
+                tasks.append({"task_id": task.get("task_id", task.get("id")),
+                              "state": task.get("state", task.get("status")),
+                              "status": task.get("state", task.get("status")),
+                              "session": task.get("target", task.get("session")),
                               "queue_position": result.get("queue_position")})
             else:
                 tasks.append({"task_id": task_id, **result})
@@ -6433,6 +6489,7 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
             server.remove_tool(tool_name)
 
     # server_http starts the background ticker; import-time builds do not.
+    server.headless_manager = compact_tools.headless
     server.direct_task_supervisor = direct_tasks
     server.task_labels = task_labels
     server.compact_tools = compact_tools

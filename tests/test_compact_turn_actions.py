@@ -582,7 +582,7 @@ def test_queue_submission_actions_are_disabled_by_default(monkeypatch):
     for result in attempts:
         assert result["status"] == "FAILED"
         assert result["error"] == "QUEUE_DISABLED_USE_DIRECT_SESSION"
-        assert result["next_action"] == "create_session_then_send"
+        assert result["next_action"] == "create_session_then_supervise"
     assert recorder.calls == []
 
 

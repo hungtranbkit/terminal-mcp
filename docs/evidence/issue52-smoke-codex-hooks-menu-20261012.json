@@ -1,0 +1,43 @@
+{
+  "summary": {
+    "run": "09b2b1",
+    "cycles": 1,
+    "done": 0,
+    "lost_tasks": 0,
+    "duplicate_ok": 1,
+    "duplicate_sends": 0,
+    "false_running_at_start": 0
+  },
+  "results": [
+    {
+      "cycle": 1,
+      "session": "tmcp52-smoke-09b2b1-01",
+      "agent": "codex",
+      "create_state": "READY",
+      "boot": {
+        "error": "BOOT_DIALOG_WAITING_INPUT",
+        "state": "WAITING_INPUT",
+        "reason": "codex is showing a boot dialog that needs a human (agent dialog chrome 'Press enter to confirm or esc to go back' at bottom offset 0); the initial prompt was not typed"
+      },
+      "task_id": "dt_a16bf25d401d42d6",
+      "start_status": "OK",
+      "start_error": null,
+      "start_state": "WAITING_INPUT",
+      "start_receipt": "PERSISTED",
+      "start_running_confirmed": false,
+      "duplicate_same_task": true,
+      "final_state": "WAITING_INPUT",
+      "final_receipt": "PERSISTED",
+      "trace": [
+        "WAITING_INPUT"
+      ],
+      "dispatches": 0,
+      "continuations": 0,
+      "recovery_attempts": 0,
+      "reason": "agent dialog chrome 'Press enter to confirm or esc to go back' at bottom offset 0; current command is 'codex'",
+      "prompt_occurrences_in_pane": 0,
+      "seconds": 46.8,
+      "started_at": "2026-10-12T17:04:51+0700"
+    }
+  ]
+}
