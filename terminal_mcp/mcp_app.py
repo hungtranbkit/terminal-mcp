@@ -87,6 +87,8 @@ _RETIRED_PUBLIC_QUEUE_TOOLS = (
     "terminal_verify_requeue",
 )
 _DIRECT_ACTION_SCHEMA_HELP = (
+    "For new local headless work: headless_start (agent_type=codex|claude, text, working_directory, "
+    "idempotency_key), headless_status/list/checkpoint/cancel/cleanup. "
     "Direct Terminal MCP action. Normal public actions: inspect, send, send_wait, wait, resume, "
     "supervise (long task continued server-side until explicit DONE), supervise_status, "
     "supervise_complete, supervise_cancel, "
@@ -806,7 +808,17 @@ def build_mcp(service: TerminalService | None = None,
                       confirm: bool | None = None) -> dict:
         """THE terminal surface: direct session control only.
 
-NORMAL FLOW:
+HEADLESS FLOW (preferred for new local Codex/Claude work when enabled):
+`headless_start` atomically creates a session and dispatches text using the
+noninteractive CLI. Supply target, agent_type=codex|claude, working_directory,
+and an idempotency_key. Save hd_ task_id. Use headless_status or task_status;
+headless_list discovers durable sessions. headless_checkpoint then
+headless_cleanup releases completed work. headless_cancel explicitly cancels.
+Structured delivery/execution ACKs and successful business outcome plus process
+exit are required; workers survive controller restarts. No hooks are approved.
+Never create replacement work for an existing blocked/uncertain target.
+
+INTERACTIVE FLOW (existing tmux sessions / remote nodes):
 1. `create_session` creates a fresh session for real work (omit initial_prompt
    for tracked work: an initial prompt is only typed once the agent shows a
    settled composer, never into a boot dialog such as Codex "Hooks need review").

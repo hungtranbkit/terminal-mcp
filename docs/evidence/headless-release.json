@@ -1,0 +1,56 @@
+{
+  "deployed_code_sha": "59fecd9",
+  "base_sha": "8249c35ef298d539fbaf1e3eff0952c4eacb7bd3",
+  "targeted_tests": {
+    "passed": 178,
+    "failed": 0
+  },
+  "broad_tests": {
+    "passed": 693,
+    "failed": 5,
+    "stopped_after_failures": 5,
+    "baseline_backlog_file": {
+      "failed": 9,
+      "passed": 1
+    }
+  },
+  "codex_real_cycles": {
+    "passed": 10,
+    "total": 10
+  },
+  "claude_real_read": {
+    "passed": true
+  },
+  "mcp_restart_test": {
+    "task_id": "hd_9ce08a4348ac4108bd870e98fd7c0b0d",
+    "started_via": "ChatGPT Terminal MCP connector",
+    "controller_restart_state": "RUNNING",
+    "final_state": "RELEASED",
+    "artifact_exact_bytes": "MCP_RESTART_OK\\n",
+    "artifact_verified": true,
+    "worker_claims": 1,
+    "cli_spawns": 1,
+    "checkpoint_sha256": "e23757a5854329c5b16e458a51fbfadfb97b14505ef8927c3e9c22bbc6280ca5"
+  },
+  "tmux_before": 9,
+  "tmux_after": 9,
+  "existing_session_ids_preserved": true,
+  "services": [
+    "terminal-mcp-http.service",
+    "terminal-mcp-chatgpt-v1.service"
+  ],
+  "safe_periodic_cleanup": "session-guard.service override installed and executed",
+  "legacy_dell_task": {
+    "task_id": "dt_9d78e880cad54157",
+    "state": "BLOCKED",
+    "reason": "DISPATCH_ACK_TIMEOUT",
+    "completed_at": null,
+    "dispatches": 1,
+    "resubmitted": false
+  },
+  "limitations": [
+    "New headless transport currently local to HP; it does not silently route remote Dell work to HP.",
+    "Existing Dell uncertain task is held for explicit inspect/checkpoint/cancel decisions, not replayed.",
+    "Repository-wide tests are not all green; baseline backlog failures were reproduced."
+  ]
+}

@@ -317,7 +317,7 @@ TURN_ACTION_ALIASES: dict[str, str] = {
     "dispatch": "start",
     "run": "start",
 }
-HEADLESS_ACTIONS = ("headless_start", "headless_status", "headless_checkpoint", "headless_cleanup", "headless_cancel")
+HEADLESS_ACTIONS = ("headless_start", "headless_status", "headless_checkpoint", "headless_cleanup", "headless_cancel", "headless_list")
 TURN_ACTIONS = (*TURN_PANE_ACTIONS, *TURN_HANDLER_ACTIONS, *HEADLESS_ACTIONS)
 
 BROWSER_ARGS: dict[str, frozenset[str]] = {

@@ -444,6 +444,10 @@ class HeadlessManager:
     def turn(self, action, *, target=None, text=None, cwd=None, key=None, task_id=None, agent='codex'):
         if action == 'headless_start':
             return self.start(target, text, cwd, key, agent=agent)
+        if action == 'headless_list':
+            return {'status': 'OK', 'enabled': self.enabled, 'sessions': [
+                {key: row.get(key) for key in ('task_id', 'session_id', 'target', 'agent_type', 'state', 'reason', 'checkpoint_sha256')}
+                for row in self.store.rows() if not self.guard(row['target'])]}
         row = self.store.get(task_id)
         if not row:
             return {'error': 'TASK_NOT_FOUND'}

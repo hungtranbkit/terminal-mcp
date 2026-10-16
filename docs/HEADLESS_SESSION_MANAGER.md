@@ -150,3 +150,32 @@ live MCP receipts must accompany the final release report.
 
 References: https://developers.openai.com/codex/noninteractive and
 https://code.claude.com/docs/en/headless and https://code.claude.com/docs/en/hooks.
+
+## HP release verification
+
+Initial code deployment: `59fecd9`, pinned at
+`/home/kimex/.cache/terminal-mcp/headless-59fecd9`. Targeted release suite:
+178 passed. Both controller services are active. All original 9 tmux session
+identities survived deployment and the subsequent restart test.
+
+ChatGPT's actual Terminal MCP connector created
+`hd_9ce08a4348ac4108bd870e98fd7c0b0d`. Both controllers restarted while this
+worker was RUNNING. The worker completed and wrote exact verified artifact
+bytes. Repeating the same request returned the same ID. Durable audit has
+one WORKER_CLAIM and one CLI_SPAWNED. Checkpoint and cleanup were then called
+through the connector and returned RELEASED. See
+`docs/evidence/headless-release.json` for sanitized receipts/counts.
+
+The periodic safe cleanup override is installed and its oneshot was tested.
+The old Dell task is now truthfully BLOCKED/DISPATCH_ACK_TIMEOUT with ownership
+retained, one dispatch and no replay. New headless workers are local to HP;
+remote Dell headless deployment was not silently implied or performed.
+
+Changed implementation files: `headless.py`, `headless_cleanup.py`,
+`headless_outcome.schema.json`, `session_admission.py`, `task_lookup.py`,
+`direct_task.py`, `core.py`, `compact_tools.py`, `mcp_app.py`, `server_http.py`
+(all under `terminal_mcp/`), and `pyproject.toml`. Tests:
+`tests/test_headless.py`, `tests/test_task_lookup.py`,
+`tests/test_issue52_supervised_dispatch.py`. Operator assets:
+`scripts/headless_acceptance.py`, `deploy/headless/session-guard-override.conf`,
+this guide and the JSON evidence files.
