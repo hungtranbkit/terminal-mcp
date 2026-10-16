@@ -40,6 +40,9 @@ def _codex_readiness(lines: list[str]) -> tuple[str, str | None]:
     are returned as structured blockers and are never answered here.
     """
     text = "\n".join(lines).casefold()
+    if ("update now" in text and "2. skip" in text
+            and "3. skip until next version" in text and "esc skip" in text):
+        return "BLOCKED", "CODEX_UPDATE_MENU"
     if ("run without daemon this time" in text
             and "restart with these settings" in text
             and "cancel" in text):
@@ -67,6 +70,9 @@ def _authorized_startup_step(lines: list[str]) -> tuple[str, str] | None:
     """One key toward a known non-granting option, never a shared config change."""
     recent = lines[-30:]
     text = "\n".join(recent).casefold()
+    if ("update now" in text and "2. skip" in text
+            and "3. skip until next version" in text and "esc skip" in text):
+        return "CODEX_UPDATE_MENU", "Escape"
     options = {}
     selected = []
     for line in recent:
@@ -211,6 +217,9 @@ class SessionLifecycleService:
         info = None
         startup_choices: set[str] = set()
         startup_key_count = 0
+        composer_since = None
+        composer_snapshot = None
+        settle_seconds = min(2.0, max(0.05, self.config.session_lifecycle.create_ready_timeout_seconds / 4.0))
         startup_actions: list[dict[str, str]] = []
         while True:
             try:
@@ -238,6 +247,9 @@ class SessionLifecycleService:
                         except TmuxError:
                             lines = []
                         readiness, blocked_reason = _codex_readiness(lines)
+                        if readiness != "READY":
+                            composer_since = None
+                            composer_snapshot = None
                         step = _authorized_startup_step(lines)
                         if step:
                             reason, key = step
@@ -277,8 +289,13 @@ class SessionLifecycleService:
                                 "pane_current_command": info.pane_current_command,
                             }
                         if readiness == "READY":
-                            state = "READY"
-                            break
+                            snapshot = tuple(line.strip() for line in lines[-12:])
+                            if composer_since is None or composer_snapshot != snapshot:
+                                composer_since = time.monotonic()
+                                composer_snapshot = snapshot
+                            elif time.monotonic() - composer_since >= settle_seconds:
+                                state = "READY"
+                                break
                     else:
                         state = "READY"
                         break

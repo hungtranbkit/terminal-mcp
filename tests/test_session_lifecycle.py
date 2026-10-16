@@ -221,7 +221,15 @@ def test_create_claude_and_codex_use_server_side_allowlisted_launcher(
     name = lifecycle_session_factory("1", prefix=session_prefix.rstrip("-"))
     result = service.terminal_create_session(name, agent_type)
     assert "error" not in result
-    assert result["state"] in ("READY", "CREATED")
+    # This test checks launcher selection, not authorization of a fresh tmp cwd.
+    # A real installed Codex can correctly stop at a startup/auth/trust gate.
+    assert result["state"] in ("READY", "CREATED", "BLOCKED")
+    if result["state"] == "BLOCKED":
+        assert agent_type == "codex"
+        assert result["readiness_stage"] == "STARTUP_CHECK"
+        assert result["blocked_reason"] in {"CODEX_TRUST_PROMPT", "CODEX_AUTH_REQUIRED",
+            "CODEX_HOOK_PROMPT", "CODEX_PERMISSION_PROMPT", "CODEX_CONFIG_WARNING",
+            "CODEX_STARTUP_MENU", "CODEX_UPDATE_MENU", "CODEX_READINESS_TIMEOUT"}
     info = service.tmux.get_session(name)
     assert info is not None
 
