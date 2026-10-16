@@ -179,3 +179,27 @@ Changed implementation files: `headless.py`, `headless_cleanup.py`,
 `tests/test_issue52_supervised_dispatch.py`. Operator assets:
 `scripts/headless_acceptance.py`, `deploy/headless/session-guard-override.conf`,
 this guide and the JSON evidence files.
+
+
+## Final acceptance boundary
+
+Final HP code SHA: `7ce39a61892c10dc4664a757e65be7873eaef218`, deployed
+from `/home/kimex/.cache/terminal-mcp/headless-7ce39a6` on both services.
+Headless discovery was additionally verified through the live ChatGPT MCP
+connector after that deployment. The worktree is clean and branch is pushed.
+
+**Overall incident investigation remains BLOCKED on Dell evidence.** The
+original submission receipt `17e92858a5714398b39ab11df2bfbbeb` is not in HP's
+prompt-submission store; it belongs to the remote node. Read-only SSH attempts
+using both the configured Dell hostname and registered node address, including
+the existing SSH agent, returned `Permission denied (publickey,password)`.
+No account, SSH config, trust policy or credentials were changed to bypass this.
+
+Required next access: SSH as `dell` using an authorized HP identity, or an
+operator-provided read-only export of that submission's metadata (ack_state,
+enter_count, attempts, execution_started, terminal_state, stop_reason) and
+corresponding input audit (timestamps, keys, press_enter, result, reason).
+Do not export prompt text, API keys or unrelated logs. With that evidence,
+finish the Enter-path root-cause audit and determine a checkpointed recovery
+for the existing Dell session. Headless deployment to Dell is not claimed.
+HP headless acceptance and its 10/10 results remain valid independently.
