@@ -89,7 +89,7 @@ _RETIRED_PUBLIC_QUEUE_TOOLS = (
 _DIRECT_ACTION_SCHEMA_HELP = (
     "For new local headless work: headless_start (agent_type=codex|claude, text, working_directory, "
     "idempotency_key), headless_status/list/checkpoint/cancel/cleanup. "
-    "Direct Terminal MCP action. Normal public actions: inspect, send, send_wait, wait, resume, "
+    "Direct Terminal MCP action. Normal public actions: start (idle local Codex, confirmed RUNNING or error), inspect, send, send_wait, wait, resume, "
     "supervise (long task continued server-side until explicit DONE), supervise_status, "
     "supervise_complete, supervise_cancel, "
     "list_sessions, list_nodes, create_session, delete_session, task_status, task_batch_status, "
@@ -835,10 +835,11 @@ INTERACTIVE FLOW (existing tmux sessions / remote nodes):
    session/worktree/branch.
 
 The durable task queue is RETIRED and disabled by default. Queue-producing
-actions (`start`, `enqueue_task`, `route_start`, `agent_start`,
-`project_start`, aliases such as `run`/`dispatch`, and `send` with
+actions (`enqueue_task`, `route_start`, `agent_start`,
+`project_start`, and `send` with
 `long_task=true`) return `QUEUE_DISABLED_USE_DIRECT_SESSION` and do not create
-a new queue row. Read-only task/task-batch/history/metrics and cleanup/cancel
+a new queue row. Codex `start` (aliases `run`/`dispatch`) bypasses the queue;
+non-Codex start retains the legacy queue gate. Read-only task/task-batch/history/metrics and cleanup/cancel
 operations remain available for historical or already-running tasks.
 
 A server operator can deliberately opt back in only by starting Terminal MCP
@@ -6494,6 +6495,10 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         harness_cancel=harness.cancel,
         harness_review=harness.review,
     ))
+
+    # Read-only compatibility lookup: a direct start may not duplicate a
+    # previously enqueued request, even when its lane is disabled.
+    compact_tools.handlers["legacy_task_by_request_key"] = queue.store.task_by_request_key
 
     if not queue_submission_enabled():
         for tool_name in _RETIRED_PUBLIC_QUEUE_TOOLS:

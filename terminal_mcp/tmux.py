@@ -32,7 +32,10 @@ disposable-tmux-pane reproduction of this exact race, and
 TerminalService._send_text_and_verify (core.py) for the best-effort
 post-send confirmation layered on top of this."""
 
-PASTE_BUFFER_THRESHOLD = 4096
+# A ~1 KiB Codex draft can exceed the visible composer while literal
+# send-keys is still rendered as ordinary typing. Explicit bracketed paste
+# gives the TUI a complete-buffer boundary and its collapsed paste receipt.
+PASTE_BUFFER_THRESHOLD = 1024
 
 TMUX_SOCKET_ENV = "TERMINAL_MCP_TMUX_SOCKET"
 """Env var naming the tmux server socket (`tmux -L <name>`) this process
@@ -183,16 +186,18 @@ class TmuxClient:
         return captured[-lines:]
 
     def send_text(self, session: str, text: str, press_enter: bool) -> None:
-        if len(text.encode("utf-8")) > PASTE_BUFFER_THRESHOLD:
+        if len(text.encode("utf-8")) >= PASTE_BUFFER_THRESHOLD:
             buffer_name = "terminal-mcp-paste-" + uuid.uuid4().hex
             try:
                 result = subprocess.run(
-                    [self.binary, "load-buffer", "-b", buffer_name, "-"],
+                    self._argv(["load-buffer", "-b", buffer_name, "-"]),
                     input=text, check=False, capture_output=True, text=True, timeout=10,
                 )
                 if result.returncode != 0:
                     raise TmuxError(result.stderr.strip() or "tmux load-buffer failed")
-                self._run(["paste-buffer", "-p", "-b", buffer_name, "-t", session])
+                # -r preserves LF inside bracketed paste instead of tmux
+                # silently rewriting it to CR. Enter is dispatched separately.
+                self._run(["paste-buffer", "-p", "-r", "-b", buffer_name, "-t", session])
             finally:
                 self._run(["delete-buffer", "-b", buffer_name], check=False)
         else:
