@@ -11,13 +11,16 @@ re-sent them.
 A supervised task separates the two:
 
 * ``turn_state``  -- what the pane is doing (RUNNING / IDLE / WAITING_INPUT),
-* ``task state``  -- RUNNING until an EXPLICIT outcome: DONE, BLOCKED,
-  WAITING_INPUT, CANCELLED, or FAILED (continuation limit / target lost).
+* ``task state``  -- DISPATCHING -> EXECUTION_ACCEPTED -> RUNNING after an
+  observed running signal, until an
+  EXPLICIT outcome: DONE, BLOCKED, DISPATCH_UNCERTAIN, WAITING_INPUT,
+  CANCELLED, or FAILED (continuation limit / target lost).
 
 When the pane settles IDLE and no explicit outcome has been seen, the
 supervisor dispatches the next queued step or a bounded continuation prompt.
 It never spins: continuations are capped, dispatches need a settled IDLE, and
-send failures are capped too.
+unconfirmed dispatches stop as DISPATCH_UNCERTAIN and are never resent
+automatically, because the target may have accepted the first submission.
 
 Explicit completion is either a client call (``supervise_complete``) or a
 marker line printed by the target: ``TMCP-DONE:<task_id>`` or
@@ -49,8 +52,9 @@ from .redaction import redact_text
 
 _log = logging.getLogger(__name__)
 
-ACTIVE_STATES = ("RUNNING", "WAITING_INPUT")
-TERMINAL_STATES = ("DONE", "BLOCKED", "CANCELLED", "FAILED")
+ACTIVE_STATES = ("DISPATCHING", "EXECUTION_ACCEPTED", "RUNNING", "WAITING_INPUT")
+EXECUTION_START_TIMEOUT_SECONDS = 300.0
+TERMINAL_STATES = ("DONE", "BLOCKED", "DISPATCH_UNCERTAIN", "CANCELLED", "FAILED")
 DEFAULT_MAX_CONTINUATIONS = 6
 MAX_CONTINUATIONS_CAP = 30
 MAX_STEPS = 20
@@ -298,17 +302,21 @@ class DirectTaskSupervisor:
             items[0] = f"{items[0]} {completion_instruction(task_id)}"
         now = self.clock()
         task = self.store.insert({
-            "task_id": task_id, "target": target, "mode": mode, "state": "RUNNING",
+            "task_id": task_id, "target": target, "mode": mode, "state": "DISPATCHING",
             "steps": items, "continue_text": continue_text,
             "max_continuations": max_continuations, "idempotency_key": idempotency_key,
             "created_at": now, "updated_at": now,
         })
         if task.get("deduplicated"):
-            return {"status": "OK", "deduplicated": True, "task": self._view(task)}
+            status = "BLOCKED" if task["state"] == "DISPATCH_UNCERTAIN" else "OK"
+            return {"status": status, "deduplicated": True, "task": self._view(task)}
         with self._lock:
             task = self._dispatch(task, now)
-        return {"status": "OK" if task["state"] in ACTIVE_STATES or task["state"] == "DONE" else "FAILED",
-                "task": self._view(task)}
+        if task["state"] == "DISPATCH_UNCERTAIN":
+            start_status = "BLOCKED"
+        else:
+            start_status = "OK" if task["state"] in ACTIVE_STATES or task["state"] == "DONE" else "FAILED"
+        return {"status": start_status, "task": self._view(task)}
 
     def get(self, task_id: str, *, refresh: bool = True) -> dict[str, Any]:
         if not isinstance(task_id, str) or not _TASK_ID.fullmatch(task_id):
@@ -418,17 +426,23 @@ class DirectTaskSupervisor:
             sent = {"status": "FAILED", "reason": type(exc).__name__}
         if sent.get("status") != "SUBMIT_CONFIRMED":
             failures = task["send_failures"] + 1
-            reason = _clip(f"dispatch not confirmed: {sent.get('status')}: "
-                           f"{sent.get('reason') or sent.get('error') or ''}")
-            if failures >= MAX_SEND_FAILURES:
-                return self.store.update(task["task_id"], state="BLOCKED", send_failures=failures,
-                                         completed_at=now, reason=reason)
-            return self.store.update(task["task_id"], send_failures=failures, reason=reason,
-                                     idle_since=None)
+            reason = _clip(
+                f"DISPATCH_UNCERTAIN: submit not confirmed ({sent.get('status')}): "
+                f"{sent.get('reason') or sent.get('error') or ''}; automatic retry withheld"
+            )
+            # The prompt may have reached an active composer even though
+            # Enter/acceptance was not proved. Re-sending here can execute a
+            # duplicate, while the initial RUNNING row would falsely claim
+            # that execution started. Persist an explicit terminal uncertainty
+            # and require inspection/reconciliation before any new dispatch.
+            return self.store.update(
+                task["task_id"], state="DISPATCH_UNCERTAIN", send_failures=failures,
+                completed_at=now, reason=reason,
+            )
         return self.store.update(
             task["task_id"], **advance, dispatches=task["dispatches"] + 1, send_failures=0,
-            last_dispatch_at=now, idle_since=None, state="RUNNING", wait_reason=None,
-            last_turn_state="DISPATCHED", reason=None)
+            last_dispatch_at=now, idle_since=None, state="EXECUTION_ACCEPTED", wait_reason=None,
+            last_turn_state="SUBMIT_CONFIRMED", reason=None)
 
     def _tick_task(self, task: dict[str, Any]) -> dict[str, Any]:
         task = self.store.get(task["task_id"]) or task
@@ -452,7 +466,31 @@ class DirectTaskSupervisor:
                                      reason=_clip(observed.get("reason")))
         if task["state"] == "WAITING_INPUT" and task.get("wait_reason") == "SESSION_INPUT":
             # A human answered the prompt; supervision resumes.
-            task = self.store.update(task["task_id"], state="RUNNING", wait_reason=None, reason=None)
+            task = self.store.update(task["task_id"], state="EXECUTION_ACCEPTED",
+                                     wait_reason=None, reason=None)
+        if task["state"] == "EXECUTION_ACCEPTED":
+            if turn_state == "RUNNING":
+                return self.store.update(task["task_id"], **base, state="RUNNING",
+                                         idle_since=None, reason=None)
+            if turn_state == "IDLE":
+                tail = self._tail(task["target"], MARKER_TAIL_LINES)
+                marker = (find_marker(str(tail.get("output") or ""), task["task_id"])
+                          if "error" not in tail else None)
+                if marker is not None:
+                    outcome, detail = marker
+                    return self.store.update(
+                        task["task_id"], **base, state=outcome, completed_at=now,
+                        wait_reason=None,
+                        reason=_clip(detail or f"target printed TMCP-{outcome}"),
+                    )
+                if (task["last_dispatch_at"] is not None
+                        and now - task["last_dispatch_at"] >= EXECUTION_START_TIMEOUT_SECONDS):
+                    return self.store.update(
+                        task["task_id"], **base, state="FAILED", completed_at=now,
+                        reason="EXECUTION_ACCEPTANCE_TIMEOUT: no running signal or completion marker within 300 seconds",
+                    )
+                return self.store.update(task["task_id"], **base, idle_since=None,
+                                         reason="awaiting execution evidence")
         if turn_state != "IDLE":
             return self.store.update(task["task_id"], **base, idle_since=None)
 

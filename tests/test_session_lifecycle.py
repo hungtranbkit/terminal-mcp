@@ -312,6 +312,109 @@ def test_create_launch_fail_cleans_up_disposable_session(tmp_path, lifecycle_ses
     assert service.tmux.get_session(name) is None
 
 
+def test_codex_startup_menu_is_blocked_instead_of_ready(tmp_path, lifecycle_session_factory, monkeypatch):
+    """A live Codex process can still be waiting on its first-run menu."""
+    from types import SimpleNamespace
+
+    config = _lifecycle_config(tmp_path, timeout=0.01)
+    service = TerminalService(config)
+    name = lifecycle_session_factory("codex-menu")
+    info = SimpleNamespace(
+        pane_dead=False, pane_current_command="codex", session_id="$1",
+        pane_id="%1", created_epoch=1,
+    )
+    session_exists = False
+
+    def get_session(_name):
+        nonlocal session_exists
+        if not session_exists:
+            return None
+        return info
+
+    def new_session(*_args, **_kwargs):
+        nonlocal session_exists
+        session_exists = True
+        return False, None
+
+    monkeypatch.setattr(service.tmux, "get_session", get_session)
+    monkeypatch.setattr(service.tmux, "new_session", new_session)
+    monkeypatch.setattr(service.tmux, "capture_lines", lambda *a, **k: [
+        "1. Run without daemon this time",
+        "2. Restart with these settings",
+        "3. Cancel",
+    ])
+
+    result = service.lifecycle.create(name, "codex", str(tmp_path))
+
+    assert result["state"] == "BLOCKED"
+    assert result["blocked_reason"] == "CODEX_STARTUP_MENU"
+    assert result["readiness_stage"] == "STARTUP_CHECK"
+
+
+@pytest.mark.parametrize(("lines", "expected"), [
+    (["Do you trust this folder?"], "CODEX_TRUST_PROMPT"),
+    (["Run hook? Allow this command"], "CODEX_HOOK_PROMPT"),
+    (["Warning: config value is invalid"], "CODEX_CONFIG_WARNING"),
+])
+def test_codex_startup_prompts_are_structured_blockers(lines, expected):
+    from terminal_mcp.lifecycle import _codex_readiness
+
+    assert _codex_readiness(lines) == ("BLOCKED", expected)
+
+
+def test_codex_only_becomes_ready_at_its_composer():
+    from terminal_mcp.lifecycle import _codex_readiness
+
+    assert _codex_readiness(["› Ask Codex to do anything"]) == ("READY", None)
+    assert _codex_readiness(["Codex is starting"]) == ("STARTUP_CHECK", None)
+
+
+def test_codex_readiness_deadline_returns_structured_blocker(tmp_path, lifecycle_session_factory, monkeypatch):
+    from types import SimpleNamespace
+
+    service = TerminalService(_lifecycle_config(tmp_path, timeout=0.01))
+    name = lifecycle_session_factory("codex-timeout")
+    info = SimpleNamespace(
+        pane_dead=False, pane_current_command="codex", session_id="$1",
+        pane_id="%1", created_epoch=1,
+    )
+    exists = False
+
+    def get_session(_name):
+        return info if exists else None
+
+    def new_session(*_args, **_kwargs):
+        nonlocal exists
+        exists = True
+        return False, None
+
+    monkeypatch.setattr(service.tmux, "get_session", get_session)
+    monkeypatch.setattr(service.tmux, "new_session", new_session)
+    monkeypatch.setattr(service.tmux, "capture_lines", lambda *_a, **_k: ["Codex is starting"])
+
+    result = service.lifecycle.create(name, "codex", str(tmp_path))
+
+    assert result["state"] == "BLOCKED"
+    assert result["readiness_stage"] == "STARTUP_CHECK"
+    assert result["blocked_reason"] == "CODEX_READINESS_TIMEOUT"
+
+
+def test_blocked_codex_create_never_sends_initial_prompt(tmp_path, lifecycle_session_factory, monkeypatch):
+    service = TerminalService(_lifecycle_config(tmp_path))
+    name = lifecycle_session_factory("codex-initial-blocked")
+    monkeypatch.setattr(service.lifecycle, "create", lambda *_a, **_k: {
+        "session": name, "agent_type": "codex", "cwd": str(tmp_path),
+        "state": "BLOCKED", "readiness_stage": "STARTUP_CHECK",
+        "blocked_reason": "CODEX_STARTUP_MENU",
+    })
+    monkeypatch.setattr(service, "terminal_send_text", lambda *_a, **_k: pytest.fail("prompt must not be sent"))
+
+    result = service.terminal_create_session(name, "codex", initial_prompt="do work")
+
+    assert result["state"] == "BLOCKED"
+    assert result["initial_prompt_result"]["error"] == "SESSION_NOT_READY"
+
+
 def test_create_grant_mode_none_never_grants(tmp_path, lifecycle_session_factory):
     config = _lifecycle_config(tmp_path)
     service = TerminalService(config)

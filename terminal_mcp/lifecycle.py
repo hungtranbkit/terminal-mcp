@@ -31,6 +31,30 @@ AGENT_TYPES = ("shell", "claude", "codex")
 CREATE_POLL_INTERVAL_SECONDS = 0.2
 
 
+def _codex_readiness(lines: list[str]) -> tuple[str, str | None]:
+    """Classify Codex's visible startup surface without accepting prompts.
+
+    The process name alone is not a readiness signal. Only Codex's stable
+    composer footer admits task input; setup, trust, hook, and config prompts
+    are returned as structured blockers and are never answered here.
+    """
+    text = "\n".join(lines).casefold()
+    if ("run without daemon this time" in text
+            and "restart with these settings" in text
+            and "cancel" in text):
+        return "BLOCKED", "CODEX_STARTUP_MENU"
+    if ("trust this folder" in text or "do you trust" in text
+            or "workspace trust" in text):
+        return "BLOCKED", "CODEX_TRUST_PROMPT"
+    if "hook" in text and any(word in text for word in ("allow", "approve", "trust", "run this")):
+        return "BLOCKED", "CODEX_HOOK_PROMPT"
+    if "warning" in text and any(word in text for word in ("config", "configuration", "hook")):
+        return "BLOCKED", "CODEX_CONFIG_WARNING"
+    if "ask codex to do anything" in text and any(marker in text for marker in ("›", ">")):
+        return "READY", None
+    return "STARTUP_CHECK", None
+
+
 def resolve_cwd(requested: str | None, config: AppConfig) -> tuple[Path | None, dict[str, Any] | None]:
     """Resolve an optional caller-supplied working directory against
     config.session_lifecycle.allowed_cwd_roots (falling back to the
@@ -94,8 +118,8 @@ class SessionLifecycleService:
         """Create one new detached session, then poll (bounded by
         config.session_lifecycle.create_ready_timeout_seconds) for
         evidence the launched process actually started. Returns a receipt
-        with `state` in {"READY", "CREATED", "FAILED"}: READY means the
-        pane's current command already matches the expected launcher (or,
+        with `state` in {"READY", "CREATED", "BLOCKED", "FAILED"}: READY means the
+        pane's current command and CLI-specific prompt state are ready (or,
         for agent_type="shell", the pane has drawn its own first real
         output -- at minimum its prompt; see the loop's own comment
         below for the real, reproducing race this closes: reporting
@@ -162,8 +186,27 @@ class SessionLifecycleService:
                         "reason": "launched process exited"}
             if expected_command is not None:
                 if info.pane_current_command.casefold() == expected_command:
-                    state = "READY"
-                    break
+                    if agent_type == "codex":
+                        try:
+                            lines = self.tmux.capture_lines(name, 80)
+                        except TmuxError:
+                            lines = []
+                        readiness, blocked_reason = _codex_readiness(lines)
+                        if readiness == "BLOCKED":
+                            return {
+                                "session": name, "agent_type": agent_type,
+                                "cwd": str(resolved_cwd), "state": "BLOCKED",
+                                "readiness_stage": "STARTUP_CHECK",
+                                "blocked_reason": blocked_reason,
+                                "session_id": info.session_id, "pane_id": info.pane_id,
+                                "pane_current_command": info.pane_current_command,
+                            }
+                        if readiness == "READY":
+                            state = "READY"
+                            break
+                    else:
+                        state = "READY"
+                        break
             else:
                 # agent_type == "shell": no specific launcher command to
                 # poll for, but the pane's own shell (rc-file sourcing,
@@ -198,6 +241,15 @@ class SessionLifecycleService:
                     state = "READY"
                     break
             if time.monotonic() >= deadline:
+                if agent_type == "codex" and expected_command is not None:
+                    return {
+                        "session": name, "agent_type": agent_type,
+                        "cwd": str(resolved_cwd), "state": "BLOCKED",
+                        "readiness_stage": "STARTUP_CHECK",
+                        "blocked_reason": "CODEX_READINESS_TIMEOUT",
+                        "session_id": info.session_id, "pane_id": info.pane_id,
+                        "pane_current_command": info.pane_current_command,
+                    }
                 break
             time.sleep(CREATE_POLL_INTERVAL_SECONDS)
 

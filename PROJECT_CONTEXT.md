@@ -1,5 +1,14 @@
 # PROJECT_CONTEXT.md
 
+## Codex readiness and dispatch safety â€” 2026-10-16 (local fix; not deployed)
+
+- Verified repository: `/home/dell/workspace/terminal-mcp`, branch `main` at start (`e39bdd1`), initially clean; current patch branch is `fix/codex-session-readiness-20261016`. Dell has Codex CLI `0.162.0`; `codex exec --help` confirms stdin prompt (`-`), `--cd`, `--sandbox`, `--json`, and `--output-last-message`. HP SSH from Dell failed with `Permission denied (publickey)`, so HP version/service state and rollback cannot be inspected from this host.
+- Root cause evidence: `SessionLifecycleService.create()` considered a Codex session `READY` from `pane_current_command == codex` alone. A new regression with a live-process-shaped pane showing `Run without daemon this time / Restart with these settings / Cancel` failed before the fix because it returned `READY`. `DirectTaskSupervisor.start()` also inserted a task as `RUNNING` before dispatch, and `_dispatch()` retained that state when a send was unconfirmed; polling could retry the same unconfirmed prompt.
+- Local code changes: `terminal_mcp/lifecycle.py` now recognizes the Codex composer as ready, returns structured `BLOCKED` for startup menu, workspace trust, hook and configuration warning prompts, and returns `CODEX_READINESS_TIMEOUT` after the configured create deadline. It never answers those prompts. `terminal_mcp/adapters.py` recognizes the specific first-launch menu as `TARGET_WAITING`, so send's existing guard refuses both text and Enter there. `terminal_mcp/direct_task.py` now uses `DISPATCHING -> EXECUTION_ACCEPTED -> RUNNING` (RUNNING only after observed execution), `DISPATCH_UNCERTAIN` for unconfirmed submits, no automatic resend across uncertainty, and `EXECUTION_ACCEPTANCE_TIMEOUT` after 300 seconds without execution/completion evidence. `tests/test_session_lifecycle.py`, `tests/test_adapters.py`, and `tests/test_direct_task_lifecycle.py` cover these cases.
+- Security posture: no sandbox/approval bypass flag or auto-accept path was added; existing `codex_yolo` behavior was not changed. CWD validation remains before process creation.
+- Verification: regression tests were observed failing before their corresponding fixes. Focused run `.venv/bin/python -m pytest -q tests/test_direct_task_lifecycle.py tests/test_session_lifecycle.py tests/test_adapters.py tests/test_verified_submit_watchdog.py` passed **156 tests**; broader lifecycle/dispatch/adapter/compact/MCP/reconciler run passed **328 tests**, with 5 deselected and 7 existing MCP metadata deprecation warnings. `git diff --check` passed. No full suite, headless `codex exec` task integration, HP deployment, or ChatGPT-to-Codex E2E was performed.
+- Not accepted/deployed. Commit `b79ee63d2e013bdb215f5bcf47deaf59516b4a09` on `fix/codex-session-readiness-20261016`. Remaining required work: implement and test a durable, permission-preserving `codex exec` execution/receipt path; complete progress watchdog and safe checkpoint/cleanup/restart reconciliation; obtain authorized HP access and prepare rollback; deploy HP first; then run 10 real ChatGPT-to-Codex create/dispatch/execute/cleanup rounds. Do not report DONE until those steps pass.
+
 ## HP dashboard cutover + m910 memory guardrails â€” 2026-10-06 (deployed)
 
 - Dashboard/Fleet Cloudflare tunnel  is now served from canonical controller HP.  on HP is enabled+active and uses  -> .
@@ -556,7 +565,7 @@ Direct dispatch (`create_session` -> `send`/`send_wait`) leaves no queue row, so
 - Canary runtimes were deleted/made missing as expected after the acceptance sequence.
 - Remaining task after this note: remove the merged hotfix worktree/branch and temporary maintenance inspection session; do not remove unrelated legacy worktrees/sessions.
 
-## 2026-10-09 ºw^~)Þt Dell Chrome DevTools MCP + Browser QA
+## Dell Chrome DevTools MCP + Browser QA â€” 2026-10-09
 
 - Dell node: Chrome 151.0.7922.108 with valid CDP at 127.0.0.1:9222 (loopback only), Node 26.7, Codex CLI 0.162.0. Existing Chrome Harness / Browser Gateway was preserved.
 - Host-only Codex config: ~/.codex/config.toml now registers chrome-devtools MCP version 1.10.1 with --browser-url=http://127.0.0.1:9222, --no-usage-statistics, --no-performance-crux; original config backed up. ~/.codex/AGENTS.md now includes browser QA selection/security and fresh-pageId rule, also backed up. These are Dell host settings, not version-controlled deployment changes.
