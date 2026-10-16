@@ -69,3 +69,32 @@ def test_recheck_identity_and_menu_before_startup_key(tmp_path,monkeypatch,mode)
     result = launch(tmp_path,monkeypatch,backend)
     assert result["state"] == "BLOCKED"
     assert backend.keys == []
+
+
+class LateMenuBackend(MenuBackend):
+    def capture_lines(self, *args, **kwargs):
+        if self.captures == 0:
+            self.captures += 1
+            return ["› Ask Codex to do anything", "? for shortcuts"]
+        return super().capture_lines(*args, **kwargs)
+
+def test_boot_composer_must_settle_before_ready(tmp_path,monkeypatch):
+    backend=LateMenuBackend("daemon",2)
+    result=launch(tmp_path,monkeypatch,backend)
+    assert result["state"]=="READY"
+    assert backend.keys==["Up","Up","Enter"]
+
+class UpdateBackend(MenuBackend):
+    def capture_lines(self,*args,**kwargs):
+        if self.ready: return ["› Ask Codex to do anything", "codex default"]
+        return ["Update available", "› 1. Update now (runs installer)", "2. Skip", "3. Skip until next version", "enter continue · esc skip"]
+    def send_keys(self,name,keys):
+        assert keys==["Escape"]
+        self.keys.extend(keys)
+        self.ready=True
+
+def test_skip_exact_update_menu_without_running_installer(tmp_path,monkeypatch):
+    backend=UpdateBackend("update",0)
+    result=launch(tmp_path,monkeypatch,backend)
+    assert result["state"]=="READY"
+    assert backend.keys==["Escape"]
