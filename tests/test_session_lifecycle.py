@@ -353,7 +353,7 @@ def test_codex_startup_menu_is_blocked_instead_of_ready(tmp_path, lifecycle_sess
 
 @pytest.mark.parametrize("menu", [
     ["› 1. Run without daemon this time", "2. Restart with these settings", "3. Cancel"],
-    ["Hooks need review", "› Continue without trusting", "Trust hooks and continue", "Cancel"],
+    ["Hooks need review", "1. Review hooks", "2. Trust all and continue", "› 3. Continue without trusting"],
 ])
 def test_codex_selects_only_visible_authorized_non_granting_startup_choice(
         tmp_path, lifecycle_session_factory, monkeypatch, menu):

@@ -24,7 +24,7 @@ from typing import Any
 
 from .config import AppConfig
 from .launcher_resolution import resolve_launcher
-from .permissions import SENSITIVE_SESSION_WORDS, valid_new_session_name
+from .permissions import SENSITIVE_SESSION_WORDS, valid_new_session_name, input_session_allowed
 from .session_backend import SessionBackend
 from .tmux import TmuxError
 
@@ -63,27 +63,39 @@ def _codex_readiness(lines: list[str]) -> tuple[str, str | None]:
     return "STARTUP_CHECK", None
 
 
-def _authorized_startup_choice(lines: list[str]) -> str | None:
-    """Return the one authorized non-granting menu choice only when selected.
-
-    We never navigate an unknown menu. The visible selection marker must be
-    directly attached to the exact option, so Enter cannot accept a neighbor.
-    """
-    text = "\n".join(lines[-30:]).casefold()
-    exact_menu = None
-    if ("run without daemon this time" in text
-            and "restart with these settings" in text and "cancel" in text):
-        exact_menu = ("run without daemon this time", "CODEX_STARTUP_MENU")
-    elif ("hooks need review" in text and "continue without trusting" in text):
-        exact_menu = ("continue without trusting", "CODEX_HOOK_REVIEW_MENU")
-    if exact_menu is None:
+def _authorized_startup_step(lines: list[str]) -> tuple[str, str] | None:
+    """One key toward a known non-granting option, never a shared config change."""
+    recent = lines[-30:]
+    text = "\n".join(recent).casefold()
+    options = {}
+    selected = []
+    for line in recent:
+        match = re.match(r"^\s*([›❯>])?\s*([1-3])\.\s+(.+?)\s*$", line)
+        if not match:
+            continue
+        mark, number, label = match.groups()
+        number = int(number)
+        if number in options:
+            return None
+        options[number] = label.casefold()
+        if mark:
+            selected.append(number)
+    if set(options) != {1, 2, 3} or len(selected) != 1:
         return None
-    label, reason = exact_menu
-    for line in lines[-30:]:
-        folded = line.casefold()
-        if label in folded and re.match(r"^\s*[›❯>]", line):
-            return reason
-    return None
+    if options == {1: "run without daemon this time", 2: "restart with these settings", 3: "cancel"}:
+        safe, reason = 1, "CODEX_STARTUP_MENU"
+    elif ("hooks need review" in text and options[1] == "review hooks"
+          and options[2] == "trust all and continue"
+          and re.fullmatch(r"continue without trusting(?: \(hooks won.t run\))?", options[3])):
+        safe, reason = 3, "CODEX_HOOK_REVIEW_MENU"
+    else:
+        return None
+    current = selected[0]
+    return reason, ("Enter" if current == safe else "Up" if current > safe else "Down")
+
+def _authorized_startup_choice(lines: list[str]) -> str | None:
+    step = _authorized_startup_step(lines)
+    return step[0] if step and step[1] == "Enter" else None
 
 
 def resolve_cwd(requested: str | None, config: AppConfig) -> tuple[Path | None, dict[str, Any] | None]:
@@ -198,6 +210,8 @@ class SessionLifecycleService:
         state = "CREATED"
         info = None
         startup_choices: set[str] = set()
+        startup_key_count = 0
+        startup_actions: list[dict[str, str]] = []
         while True:
             try:
                 info = self.tmux.get_session(name)
@@ -224,20 +238,35 @@ class SessionLifecycleService:
                         except TmuxError:
                             lines = []
                         readiness, blocked_reason = _codex_readiness(lines)
-                        choice = _authorized_startup_choice(lines)
-                        if choice and choice not in startup_choices:
-                            # Pin the target again immediately before the
-                            # startup key. A replaced pane must never receive it.
-                            fresh = self.tmux.get_session(name)
-                            if (fresh is not None and not fresh.pane_dead
-                                    and fresh.session_id == info.session_id
-                                    and fresh.pane_id == info.pane_id
-                                    and fresh.created_epoch == info.created_epoch
-                                    and fresh.pane_current_command.casefold() == expected_command):
-                                self.tmux.send_keys(name, ["Enter"])
-                                startup_choices.add(choice)
-                                time.sleep(CREATE_POLL_INTERVAL_SECONDS)
-                                continue
+                        step = _authorized_startup_step(lines)
+                        if step:
+                            reason, key = step
+                            permitted = (self.config.permissions.terminal_input
+                                and self.config.permissions.allow_send_keys
+                                and input_session_allowed(name, self.config)
+                                and key in self.config.input_policy.allow_keys
+                                and key not in self.config.input_policy.sensitive_keys_require_confirmation)
+                            if (permitted and reason not in startup_choices
+                                    and startup_key_count < 8 and time.monotonic() < deadline):
+                                try:
+                                    fresh = self.tmux.get_session(name)
+                                    fresh_lines = self.tmux.capture_lines(name, 80)
+                                    same = (fresh is not None and not fresh.pane_dead
+                                        and fresh.session_id == info.session_id
+                                        and fresh.pane_id == info.pane_id
+                                        and fresh.created_epoch == info.created_epoch
+                                        and fresh.pane_current_command.casefold() == expected_command
+                                        and _authorized_startup_step(fresh_lines) == step)
+                                    if same:
+                                        self.tmux.send_keys(name, [key])
+                                        startup_key_count += 1
+                                        startup_actions.append({"menu": reason, "key": key})
+                                        if key == "Enter":
+                                            startup_choices.add(reason)
+                                        time.sleep(CREATE_POLL_INTERVAL_SECONDS)
+                                        continue
+                                except TmuxError:
+                                    pass
                         if readiness == "BLOCKED":
                             return {
                                 "session": name, "agent_type": agent_type,
@@ -304,6 +333,8 @@ class SessionLifecycleService:
             "session_id": info.session_id, "pane_id": info.pane_id,
             "pane_current_command": info.pane_current_command, "created_epoch": info.created_epoch,
         }
+        if startup_actions:
+            result["startup_actions"] = startup_actions
         # Only surfaced when actually requested -- never a new, always-
         # present field an existing (tmux-only, or headless-by-default
         # Windows) caller would need to start ignoring.

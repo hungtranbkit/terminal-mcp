@@ -1,0 +1,71 @@
+from dataclasses import replace
+from types import SimpleNamespace
+import pytest
+from terminal_mcp.config import AppConfig, PermissionsConfig, InputPolicyConfig, SessionLifecycleConfig
+from terminal_mcp.lifecycle import SessionLifecycleService
+
+class MenuBackend:
+    def __init__(self, kind, selected, replace_pane=False, drift=False):
+        self.kind, self.selected = kind, selected
+        self.exists = self.ready = False
+        self.keys = []
+        self.captures = 0
+        self.replace_pane, self.drift = replace_pane, drift
+    def get_session(self, name):
+        if not self.exists: return None
+        pane = "%2" if self.replace_pane and self.captures else "%1"
+        return SimpleNamespace(session_id="$1", pane_id=pane, created_epoch=1, pane_dead=False, pane_current_command="codex")
+    def new_session(self, *args, **kwargs):
+        self.exists = True
+        return False, None
+    def capture_lines(self, *args, **kwargs):
+        self.captures += 1
+        if self.drift and self.captures >= 2:
+            return ["Unexpected security confirmation", "1. Proceed", "› 2. Cancel"]
+        if self.ready: return ["› Ask Codex to do anything", "codex default"]
+        labels = (["Run without daemon this time", "Restart with these settings", "Cancel"] if self.kind == "daemon" else ["Review hooks", "Trust all and continue", "Continue without trusting (hooks won’t run)"])
+        return (["Background server has incompatible feature settings"] if self.kind == "daemon" else ["Hooks need review"]) + [("› " if n == self.selected else "  ") + str(n+1) + ". " + label for n, label in enumerate(labels)]
+    def send_keys(self, name, keys):
+        self.keys.extend(keys)
+        for key in keys:
+            if key == "Up": self.selected -= 1
+            elif key == "Down": self.selected += 1
+            elif key == "Enter":
+                assert self.selected == (0 if self.kind == "daemon" else 2), "unsafe menu selection"
+                self.ready = True
+
+def configured(tmp_path):
+    return AppConfig(permissions=PermissionsConfig(True, True), allowed_session_patterns=("codex-nav-*",), input_policy=InputPolicyConfig(allowed_session_patterns=("codex-nav-*",)), session_lifecycle=SessionLifecycleConfig(enabled=True, allowed_cwd_roots=(str(tmp_path),), launch_commands=(("codex", "codex"),), create_ready_timeout_seconds=2.0))
+
+def launch(tmp_path, monkeypatch, backend, config=None):
+    svc = SessionLifecycleService(config or configured(tmp_path), backend)
+    monkeypatch.setattr(svc, "launch_command_for", lambda agent: "codex")
+    return svc.create("codex-nav-check", "codex", str(tmp_path))
+
+@pytest.mark.parametrize("kind,selected,expected", [("daemon",2,["Up","Up","Enter"]),("daemon",1,["Up","Enter"]),("hooks",0,["Down","Down","Enter"]),("hooks",1,["Down","Enter"])])
+def test_navigate_only_known_non_granting_choices(tmp_path, monkeypatch, kind, selected, expected):
+    backend = MenuBackend(kind, selected)
+    result = launch(tmp_path, monkeypatch, backend)
+    assert result["state"] == "READY"
+    assert backend.keys == expected
+
+@pytest.mark.parametrize("denial",["terminal_input","allow_send_keys","pattern","key"])
+def test_no_startup_input_without_existing_permission(tmp_path, monkeypatch, denial):
+    config = configured(tmp_path)
+    if denial in ("terminal_input","allow_send_keys"):
+        config = replace(config, permissions=replace(config.permissions, **{denial:False}))
+    elif denial == "pattern":
+        config = replace(config, input_policy=replace(config.input_policy, denied_session_patterns=("codex-nav-*",)))
+    else:
+        config = replace(config, input_policy=replace(config.input_policy, allow_keys=("Up","Down")))
+    backend = MenuBackend("daemon",0)
+    result = launch(tmp_path,monkeypatch,backend,config)
+    assert result["state"] == "BLOCKED"
+    assert backend.keys == []
+
+@pytest.mark.parametrize("mode",["replace_pane","drift"])
+def test_recheck_identity_and_menu_before_startup_key(tmp_path,monkeypatch,mode):
+    backend = MenuBackend("daemon",0,**{mode:True})
+    result = launch(tmp_path,monkeypatch,backend)
+    assert result["state"] == "BLOCKED"
+    assert backend.keys == []

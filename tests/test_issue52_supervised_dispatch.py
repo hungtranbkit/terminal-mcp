@@ -62,7 +62,7 @@ def test_submit_confirmed_with_prompt_still_in_composer_is_never_running(tmp_pat
     sup = _sup(tmp_path, pane, clock, activate=None)
     started = sup.start("s", text="fix the bug")
     task = started["task"]
-    assert started["status"] == "OK" and task["state"] == "DISPATCHING"
+    assert started["status"] == "OK" and task["state"] == "EXECUTION_ACCEPTED"
     assert task["receipt"] == "SUBMIT_CONFIRMED" and task["running_confirmed"] is False
     _run(sup, clock, 10)
     task = _task(sup, task["task_id"])
@@ -168,7 +168,7 @@ def test_boot_hooks_menu_blocks_dispatch_and_mode_is_agent(tmp_path):
     pane.waiting_input = False  # a human answered the menu
     _run(sup, clock, 2)
     task = _task(sup, task["task_id"])
-    assert len(pane.sent) == 1 and task["state"] in ("DISPATCHING", "RUNNING")
+    assert len(pane.sent) == 1 and task["state"] in ("DISPATCHING", "EXECUTION_ACCEPTED", "RUNNING")
 
 
 def test_classifier_names_the_agent_on_waiting_input_and_sees_hooks_menu():
@@ -495,7 +495,7 @@ def test_an_earlier_prompt_echo_never_vouches_for_a_lost_continuation(tmp_path):
     sup._send = lost
     _run(sup, clock, 6)
     task = _task(sup, task_id)
-    assert task["continuations"] == 1 and task["state"] == "DISPATCHING"
+    assert task["continuations"] == 1 and task["state"] == "EXECUTION_ACCEPTED"
     assert task["running_confirmed"] is False
 
 
@@ -518,7 +518,7 @@ def test_prose_about_hooks_higher_up_does_not_block_dispatch(tmp_path):
     pane.output.extend(["● I fixed the Hooks need review detection."] + [f"● line {i}" for i in range(20)])
     sup = _sup(tmp_path, pane, clock)
     task = sup.start("s", text="goal")["task"]
-    assert len(pane.sent) == 1 and task["state"] in ("DISPATCHING", "RUNNING")
+    assert len(pane.sent) == 1 and task["state"] in ("DISPATCHING", "EXECUTION_ACCEPTED", "RUNNING")
 
 
 def test_a_second_process_cannot_claim_the_same_dispatch(tmp_path):
