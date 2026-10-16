@@ -1238,7 +1238,7 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         grant grant_session_read/_input would give, subject to the exact
         same rules (refused for a sensitive-worded name, a denied input
         pattern, etc). initial_prompt, if given, is sent only once the
-        session reaches state=READY, through the same verified terminal_
+        agent composer settles (agent creation alone does not prove tool permissions), through the same verified terminal_
         send_text path every other prompt in this project uses -- if your
         effective permission doesn't cover this session yet, that send
         comes back ACCESS_DENIED, exactly like any other ungranted

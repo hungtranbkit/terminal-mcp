@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import AppConfig
+from .adapters import tool_permission_prompt
 from .launcher_resolution import resolve_launcher
 from .permissions import SENSITIVE_SESSION_WORDS, valid_new_session_name, session_input_denied_by_pattern
 from .session_backend import SessionBackend
@@ -39,6 +40,8 @@ def _codex_readiness(lines: list[str]) -> tuple[str, str | None]:
     composer footer admits task input; setup, trust, hook, and config prompts
     are returned as structured blockers and are never answered here.
     """
+    if tool_permission_prompt(lines):
+        return "BLOCKED_PERMISSION", "CODEX_TOOL_PERMISSION_REQUIRED"
     text = "\n".join(lines).casefold()
     if ("update now" in text and "2. skip" in text
             and "3. skip until next version" in text and "esc skip" in text):
@@ -68,6 +71,8 @@ def _codex_readiness(lines: list[str]) -> tuple[str, str | None]:
 
 def _authorized_startup_step(lines: list[str]) -> tuple[str, str] | None:
     """One key toward a known non-granting option, never a shared config change."""
+    if tool_permission_prompt(lines):
+        return None
     recent = lines[-30:]
     text = "\n".join(recent).casefold()
     if ("update now" in text and "2. skip" in text
@@ -179,11 +184,10 @@ class SessionLifecycleService:
         """Create one new detached session, then poll (bounded by
         config.session_lifecycle.create_ready_timeout_seconds) for
         evidence the launched process actually started. Returns a receipt
-        with `state` in {"READY", "CREATED", "BLOCKED", "FAILED"}: READY means the
-        pane's current command and CLI-specific prompt state are ready (or,
-        for agent_type="shell", the pane has drawn its own first real
-        output -- at minimum its prompt; see the loop's own comment
-        below for the real, reproducing race this closes: reporting
+        with separate process/composer and tool-readiness evidence. Agents
+        return CREATED with TOOL_PREFLIGHT_REQUIRED: a visible composer is
+        not proof of external tool/OS permission. READY is retained for a
+        shell after its own first output (normally its prompt), rather than
         READY the instant the tmux session merely EXISTS, before the
         shell has actually attached its line editor, used to let
         terminal_create_session's initial_prompt send race the shell's
@@ -291,10 +295,12 @@ class SessionLifecycleService:
                                         continue
                                 except TmuxError:
                                     pass
-                        if readiness == "BLOCKED":
+                        if readiness in {"BLOCKED", "BLOCKED_PERMISSION"}:
                             return {
                                 "session": name, "agent_type": agent_type,
-                                "cwd": str(resolved_cwd), "state": "BLOCKED",
+                                "cwd": str(resolved_cwd), "state": readiness,
+                                "input_required": True, "tool_ready": False,
+                                "next_action": "Owner must review the exact tool and OS permission; never select Always allow automatically.",
                                 "readiness_stage": "STARTUP_CHECK",
                                 "blocked_reason": blocked_reason,
                                 "session_id": info.session_id, "pane_id": info.pane_id,
@@ -362,6 +368,14 @@ class SessionLifecycleService:
             "session_id": info.session_id, "pane_id": info.pane_id,
             "pane_current_command": info.pane_current_command, "created_epoch": info.created_epoch,
         }
+        if agent_type in {"codex", "claude"}:
+            result.update(
+                state="CREATED", agent_process_ready=state == "READY",
+                composer_ready=state == "READY" and agent_type == "codex",
+                tool_ready=False, readiness_stage="TOOL_PREFLIGHT_REQUIRED",
+                readiness_status="WAITING_INPUT",
+                next_action="Dispatch an explicitly authorized task or harmless tool preflight; composer visibility does not prove tool or OS permissions.",
+            )
         if startup_actions:
             result["startup_actions"] = startup_actions
         # Only surfaced when actually requested -- never a new, always-

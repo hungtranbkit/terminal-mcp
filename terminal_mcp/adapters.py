@@ -358,6 +358,22 @@ _WORKING_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (r"esc to interrupt", r"\bworking\b", r"\bthinking\b")
 )
+def tool_permission_prompt(lines: list[str]) -> bool:
+    """Recognize a live tool approval menu, never a permission word in prose.
+
+    A composer may remain painted below the modal. Require its selected
+    numbered approval choice and cancellation chrome together near the bottom.
+    This evidence does not authorize accepting any of its choices.
+    """
+    recent = "\n".join(line.strip() for line in lines if line.strip())
+    recent = "\n".join(recent.splitlines()[-16:])
+    return bool(
+        re.search(r"(?im)^allow .*?(?:terminal\.[a-z_]+|run tool)\b", recent)
+        and re.search(r"(?im)^[›❯>]\s*\d+[.)]\s*(?:allow|always allow|cancel)\b", recent)
+        and re.search(r"(?i)esc to cancel", recent)
+    )
+
+
 _WAITING_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -494,6 +510,8 @@ class CodexAdapter(AgentAdapter):
     _IDLE_COMPOSER = re.compile(r"^\s*[›>]\s*Ask Codex to do anything\s*$", re.IGNORECASE)
 
     def identify_target_state(self, lines: list[str]) -> str:
+        if tool_permission_prompt(lines):
+            return TARGET_WAITING
         tail = _tail(lines, 6)
         if any(self._IDLE_COMPOSER.search(line) for line in tail.splitlines()):
             return TARGET_COMPOSER
