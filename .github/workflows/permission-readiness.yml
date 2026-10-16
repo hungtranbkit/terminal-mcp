@@ -7,6 +7,8 @@ on:
       - 'terminal_mcp/status.py'
       - 'terminal_mcp/lifecycle.py'
       - 'terminal_mcp/core.py'
+      - 'terminal_mcp/controller.py'
+      - 'tests/test_move_session.py'
       - 'tests/test_codex_startup_navigation.py'
       - 'tests/test_session_lifecycle.py'
       - '.github/workflows/permission-readiness.yml'
@@ -34,4 +36,4 @@ jobs:
       - run: >-
           python -m pytest -q tests/test_codex_startup_navigation.py
           tests/test_session_lifecycle.py tests/test_status.py tests/test_adapters.py
-          tests/test_issue52_supervised_dispatch.py
+          tests/test_issue52_supervised_dispatch.py tests/test_move_session.py

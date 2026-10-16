@@ -1214,10 +1214,9 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         server-side-only command from config, never anything this caller
         supplies as text). working_directory is optional and must resolve
         inside config.session_lifecycle.allowed_cwd_roots. Returns a
-        receipt with state: READY (the expected process is confirmed and,
-        for Codex, its task composer is visible), CREATED (a non-Codex
-        session exists but is still starting), BLOCKED (Codex is at a
-        startup/trust/hook/config prompt or failed its readiness deadline),
+        receipt with state: READY (shell ready), CREATED (agent launched;
+        tool readiness is unverified), BLOCKED_PERMISSION (owner approval
+        is required), BLOCKED (startup/trust/config prompt or deadline),
         or FAILED (nothing usable was created; any disposable
         session this call itself made is already cleaned up). Duplicate
         names fail explicitly (SESSION_ALREADY_EXISTS) -- this never

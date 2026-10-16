@@ -1576,6 +1576,16 @@ class ControllerService:
             return {"error": "AGENT_TYPE_NOT_AVAILABLE_ON_TARGET", "node_id": target_node_id,
                     "detail": f"agent_type={agent_type!r} not available on {target_node_id!r} "
                               f"(has {target_node.agent_types!r}) -- move refused, source untouched"}
+        if agent_type in ("codex", "claude"):
+            # A fresh composer cannot prove tool permissions. This one-shot
+            # move has no verified-tool continuation: refuse before creating
+            # a duplicate destination or stopping the working source.
+            return {"error": "MOVE_REQUIRES_TOOL_PREFLIGHT", "node_id": target_node_id,
+                    "phase": "preflight", "input_required": True,
+                    "detail": "Agent moves require owner-verified tool readiness on the destination; "
+                              "source and destination were left untouched.",
+                    "next_action": "Create a separately named destination, verify an authorized tool "
+                                   "there, then explicitly decide whether to stop the source."}
         target_client = self._clients.get(target_node_id)
         if target_client is None:
             return {"error": "NODE_UNREACHABLE", "node_id": target_node_id, "detail": "no client configured for this node"}

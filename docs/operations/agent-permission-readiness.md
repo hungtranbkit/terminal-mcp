@@ -6,6 +6,8 @@ An active Codex tool approval menu takes precedence over a visible composer. Sta
 
 No code in this fix selects Allow, Allow for session, or Always allow. Terminal input grants do not grant Codex MCP-tool approval, Apple Events Automation, or Safari JavaScript permissions. Already configured owner grants remain the CLI/OS's responsibility; absent verifiable scope, stop for an owner decision. Existing startup navigation only handles known non-granting choices under current input authorization, and never dismisses a tool permission dialog using an old update menu.
 
+Agent moves for Codex/Claude now fail before touching either node with `MOVE_REQUIRES_TOOL_PREFLIGHT`. The one-shot move cannot verify tool readiness. Create a separately named destination, verify an authorized tool there, and explicitly decide whether to stop the source. Shell moves retain their existing readiness gate.
+
 ## Unblocking affiliate-chon-tech-mac
 
 Observed on 2026-10-16: session is on `mac17-macbook-pro`; its latest output says Safari requires **Allow JavaScript from Apple Events** in Developer settings. The agent has returned to its composer. This is an unresolved operation permission, not proof of a currently displayed approval menu.

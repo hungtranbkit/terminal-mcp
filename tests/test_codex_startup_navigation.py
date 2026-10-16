@@ -143,16 +143,18 @@ TOOL_PERMISSION = [
 
 
 @pytest.mark.parametrize('platform', ['darwin', 'linux'])
-def test_tool_permission_dominates_visible_composer(tmp_path, monkeypatch, platform):
+@pytest.mark.parametrize('argument_lines', [0, 17, 100])
+def test_tool_permission_dominates_visible_composer(tmp_path, monkeypatch, platform, argument_lines):
     from terminal_mcp.adapters import CodexAdapter, TARGET_WAITING
     from terminal_mcp.lifecycle import _codex_readiness
     from terminal_mcp.status import detect_waiting_input
     monkeypatch.setattr('sys.platform', platform)
-    assert CodexAdapter().identify_target_state(TOOL_PERMISSION) == TARGET_WAITING
-    assert detect_waiting_input('\n'.join(TOOL_PERMISSION))[0] is True
-    assert _codex_readiness(TOOL_PERMISSION) == ('BLOCKED_PERMISSION', 'CODEX_TOOL_PERMISSION_REQUIRED')
+    lines = TOOL_PERMISSION[:1] + ['tell application Safari -- wrapped argument'] * argument_lines + TOOL_PERMISSION[1:]
+    assert CodexAdapter().identify_target_state(lines) == TARGET_WAITING
+    assert detect_waiting_input('\n'.join(lines))[0] is True
+    assert _codex_readiness(lines) == ('BLOCKED_PERMISSION', 'CODEX_TOOL_PERMISSION_REQUIRED')
     backend = MenuBackend('daemon', 0)
-    monkeypatch.setattr(backend, 'capture_lines', lambda *a, **kw: TOOL_PERMISSION)
+    monkeypatch.setattr(backend, 'capture_lines', lambda *a, **kw: lines)
     result = launch(tmp_path, monkeypatch, backend)
     assert result['state'] == 'BLOCKED_PERMISSION'
     assert result['input_required'] is True
@@ -192,4 +194,13 @@ def test_old_non_granting_menu_cannot_authorize_keys_in_tool_dialog(tmp_path, mo
 def test_old_update_menu_cannot_dismiss_current_tool_permission():
     from terminal_mcp.lifecycle import _authorized_startup_step
     lines = ['Update now', '2. Skip', '3. Skip until next version', 'esc skip'] + TOOL_PERMISSION
+    assert _authorized_startup_step(lines) is None
+
+
+def test_tool_permission_header_clipped_by_capture_still_blocks():
+    from terminal_mcp.adapters import CodexAdapter, TARGET_WAITING
+    from terminal_mcp.lifecycle import _codex_readiness, _authorized_startup_step
+    lines = TOOL_PERMISSION[1:]
+    assert CodexAdapter().identify_target_state(lines) == TARGET_WAITING
+    assert _codex_readiness(lines)[0] == "BLOCKED_PERMISSION"
     assert _authorized_startup_step(lines) is None

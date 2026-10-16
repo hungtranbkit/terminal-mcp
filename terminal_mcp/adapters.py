@@ -365,10 +365,13 @@ def tool_permission_prompt(lines: list[str]) -> bool:
     numbered approval choice and cancellation chrome together near the bottom.
     This evidence does not authorize accepting any of its choices.
     """
-    recent = "\n".join(line.strip() for line in lines if line.strip())
-    recent = "\n".join(recent.splitlines()[-16:])
+    capture = "\n".join(line.strip() for line in lines if line.strip())
+    recent = "\n".join(capture.splitlines()[-16:])
     return bool(
-        re.search(r"(?im)^allow .*?(?:terminal\.[a-z_]+|run tool)\b", recent)
+        (re.search(r"(?im)^allow .*?(?:terminal\.[a-z_]+|run tool)\b", capture)
+         or (re.search(r"(?im)^(?:[›❯>]\s*)?\d+[.)]\s*allow once\b", recent)
+             and re.search(r"(?im)^(?:[›❯>]\s*)?\d+[.)]\s*always allow\b", recent)
+             and re.search(r"(?im)^(?:[›❯>]\s*)?\d+[.)]\s*cancel\b", recent)))
         and re.search(r"(?im)^[›❯>]\s*\d+[.)]\s*(?:allow|always allow|cancel)\b", recent)
         and re.search(r"(?i)esc to cancel", recent)
     )

@@ -323,6 +323,7 @@ def test_create_launch_fail_cleans_up_disposable_session(tmp_path, lifecycle_ses
 def test_codex_startup_menu_is_blocked_instead_of_ready(tmp_path, lifecycle_session_factory, monkeypatch):
     """A live Codex process can still be waiting on its first-run menu."""
     from types import SimpleNamespace
+    monkeypatch.setattr("terminal_mcp.lifecycle.resolve_launcher", lambda command: command)
 
     config = _lifecycle_config(tmp_path, timeout=0.01)
     service = TerminalService(config)
@@ -366,6 +367,7 @@ def test_codex_startup_menu_is_blocked_instead_of_ready(tmp_path, lifecycle_sess
 def test_codex_selects_only_visible_authorized_non_granting_startup_choice(
         tmp_path, lifecycle_session_factory, monkeypatch, menu):
     from types import SimpleNamespace
+    monkeypatch.setattr("terminal_mcp.lifecycle.resolve_launcher", lambda command: command)
 
     service = TerminalService(_lifecycle_config(tmp_path, timeout=0.4))
     name = lifecycle_session_factory("codex-safe-menu")
@@ -423,6 +425,7 @@ def test_codex_only_becomes_ready_at_its_composer():
 
 def test_codex_readiness_deadline_returns_structured_blocker(tmp_path, lifecycle_session_factory, monkeypatch):
     from types import SimpleNamespace
+    monkeypatch.setattr("terminal_mcp.lifecycle.resolve_launcher", lambda command: command)
 
     service = TerminalService(_lifecycle_config(tmp_path, timeout=0.01))
     name = lifecycle_session_factory("codex-timeout")
