@@ -67,9 +67,10 @@
       "summary": "ask_chatgpt bridge -- Phase A (docs/ask-chatgpt-bridge.md)"
     },
     "browser": {
-      "last_verified_at": "2026-09-24T06:59:12.302161+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-16T12:22:15.017297+00:00",
+      "last_verified_commit": "ca5b89fa80bc0366524e1d7852d9e1cf560b0aeb",
       "paths": [
+        "terminal_mcp/browser_compat.py",
         "terminal_mcp/browser_gateway.py",
         "terminal_mcp/browser_network.py",
         "terminal_mcp/browser_safety.py",
@@ -123,6 +124,18 @@
       ],
       "summary": "Connection reliability for the OpenAI Secure MCP Tunnel (terminal-mcp- tunnel.service) -- diagnostics + the self-healing decision logic, shared by `terminal-mcp-doctor` (read-only, human/machine output) and `terminal-mcp-tunnel-watchdog` (the same checks, acting on them)"
     },
+    "direct_tasks": {
+      "last_verified_at": "2026-10-16T12:22:15.043454+00:00",
+      "last_verified_commit": "ca5b89fa80bc0366524e1d7852d9e1cf560b0aeb",
+      "paths": [
+        "terminal_mcp/direct_contract.py",
+        "terminal_mcp/direct_task.py",
+        "terminal_mcp/shell_dispatch.py",
+        "terminal_mcp/task_labels.py",
+        "terminal_mcp/task_lookup.py"
+      ],
+      "summary": "Supervised direct-session tasks: an agent turn ending is not the task ending"
+    },
     "fleet": {
       "last_verified_at": "2026-09-24T06:59:12.437876+00:00",
       "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
@@ -162,6 +175,15 @@
         "terminal_mcp/harness_trust.py"
       ],
       "summary": "Durable persistence for the Harness engine, inside the canonical queue db"
+    },
+    "headless": {
+      "last_verified_at": "2026-10-16T12:22:15.059091+00:00",
+      "last_verified_commit": "ca5b89fa80bc0366524e1d7852d9e1cf560b0aeb",
+      "paths": [
+        "terminal_mcp/headless.py",
+        "terminal_mcp/headless_cleanup.py"
+      ],
+      "summary": "Durable noninteractive agent runs"
     },
     "http_api": {
       "last_verified_at": "2026-09-24T06:59:12.543208+00:00",
@@ -347,8 +369,8 @@
       "summary": "Durable, evidence-driven prompt submission for interactive agents"
     },
     "queue": {
-      "last_verified_at": "2026-09-24T06:59:13.033269+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-16T12:22:15.122967+00:00",
+      "last_verified_commit": "ca5b89fa80bc0366524e1d7852d9e1cf560b0aeb",
       "paths": [
         "terminal_mcp/queue_engine.py",
         "terminal_mcp/queue_store.py",
@@ -360,7 +382,8 @@
         "terminal_mcp/task_migration.py",
         "terminal_mcp/dor_gate.py",
         "terminal_mcp/analysis_gate.py",
-        "terminal_mcp/queue_event_drain.py"
+        "terminal_mcp/queue_event_drain.py",
+        "terminal_mcp/queue_policy.py"
       ],
       "summary": "Supervisor Queue v2 -- persistence + state machine (task: \"Supervisor Queue v2 cho Terminal MCP\")"
     },
@@ -389,8 +412,8 @@
       "summary": ""
     },
     "session_ops": {
-      "last_verified_at": "2026-09-24T06:59:13.185101+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-16T12:22:15.179953+00:00",
+      "last_verified_commit": "ca5b89fa80bc0366524e1d7852d9e1cf560b0aeb",
       "paths": [
         "terminal_mcp/core.py",
         "terminal_mcp/tmux.py",
@@ -403,19 +426,22 @@
         "terminal_mcp/lifecycle_store.py",
         "terminal_mcp/session_deletion.py",
         "terminal_mcp/session_matcher.py",
-        "terminal_mcp/session_resource.py"
+        "terminal_mcp/session_resource.py",
+        "terminal_mcp/session_admission.py"
       ],
       "summary": ""
     },
     "session_registry": {
-      "last_verified_at": "2026-09-24T06:59:13.211227+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-16T12:22:15.216409+00:00",
+      "last_verified_commit": "ca5b89fa80bc0366524e1d7852d9e1cf560b0aeb",
       "paths": [
         "terminal_mcp/session_registry.py",
         "terminal_mcp/session_knowledge.py",
         "terminal_mcp/ephemeral_state.py",
         "terminal_mcp/registry_cleanup.py",
-        "terminal_mcp/stale_sessions.py"
+        "terminal_mcp/stale_sessions.py",
+        "terminal_mcp/session_ownership.py",
+        "terminal_mcp/session_reconciler.py"
       ],
       "summary": "Persistent Session Registry -- a durable SQLite record of every session this project has ever discovered/created, independent of whether the underlying tmux/Windows-backend process is still alive"
     },
@@ -507,8 +533,8 @@
       "summary": "Work Efficiency Telemetry -- durable storage + schema (TASK A: \"add additive telemetry needed to measure whether Analysis Gate + implementation contracts reduce model turns/token cost\")"
     },
     "work_ui": {
-      "last_verified_at": "2026-09-24T06:59:13.540407+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-16T12:22:15.328905+00:00",
+      "last_verified_commit": "ca5b89fa80bc0366524e1d7852d9e1cf560b0aeb",
       "paths": [
         "terminal_mcp/dashboard.py",
         "terminal_mcp/dashboard_nav.py",
@@ -517,7 +543,9 @@
         "terminal_mcp/windows_webterm.py",
         "terminal_mcp/dispatch_settings_dashboard.py",
         "terminal_mcp/novaretail_dispatch_dashboard.py",
-        "terminal_mcp/ui_workflow.py"
+        "terminal_mcp/ui_workflow.py",
+        "terminal_mcp/live_sessions.py",
+        "terminal_mcp/live_sessions_page.py"
       ],
       "summary": ""
     }

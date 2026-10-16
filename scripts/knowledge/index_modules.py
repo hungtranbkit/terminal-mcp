@@ -123,7 +123,7 @@ GROUPS: dict[str, list[str]] = {
 # Files recovered from the fleet branch consolidation, indexed by subsystem.
 GROUPS.setdefault('auth', []).extend(['auth_throttle.py'])
 GROUPS.setdefault('backlog', []).extend(['notes_service.py', 'notes_store.py', 'project_analyzer.py', 'project_coordinator.py', 'project_dispatch_bridge.py', 'project_runtime.py', 'project_task_feeder.py', 'project_workflows.py'])
-GROUPS.setdefault('browser', []).extend(['browser_gateway.py', 'browser_network.py', 'browser_safety.py', 'browser_script.py', 'browser_tools.py', 'browser_worker.py'])
+GROUPS.setdefault('browser', []).extend(['browser_compat.py', 'browser_gateway.py', 'browser_network.py', 'browser_safety.py', 'browser_script.py', 'browser_tools.py', 'browser_worker.py'])
 GROUPS.setdefault('capabilities', []).extend(['agent_bundle.py', 'agent_registry.py', 'agent_service.py', 'ai_context_window.py', 'capability_profile.py'])
 GROUPS.setdefault('deployment', []).extend(['effective_bind.py', 'endpoint_policy.py', 'listen_evidence.py', 'release_manifest.py', 'system_report.py'])
 GROUPS.setdefault('fleet', []).extend(['fleet_audit.py', 'fleet_registry_read.py', 'scheduler_health.py'])
@@ -145,6 +145,15 @@ GROUPS.setdefault('windows', []).extend(['windows_detached.py', 'windows_session
 GROUPS.setdefault('work_runtime', []).extend(['run_journal.py', 'work_microtask.py', 'work_recovery.py', 'work_runtime.py'])
 GROUPS.setdefault('work_telemetry', []).extend(['tool_metrics.py', 'work_telemetry_service.py', 'work_telemetry_store.py'])
 GROUPS.setdefault('work_ui', []).extend(['dispatch_settings_dashboard.py', 'novaretail_dispatch_dashboard.py', 'ui_workflow.py'])
+
+# Keep the package completeness gate current with the direct-session runtime.
+GROUPS['direct_tasks'] = ['direct_contract.py', 'direct_task.py', 'shell_dispatch.py',
+                         'task_labels.py', 'task_lookup.py']
+GROUPS['headless'] = ['headless.py', 'headless_cleanup.py']
+GROUPS['queue'].append('queue_policy.py')
+GROUPS['session_ops'].append('session_admission.py')
+GROUPS['session_registry'].append('session_reconciler.py')
+GROUPS['work_ui'].extend(['live_sessions.py', 'live_sessions_page.py'])
 
 # Operational artifacts that are part of the system but are not Python. Kept
 # separate from GROUPS so the completeness check over the package stays
