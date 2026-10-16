@@ -31,6 +31,16 @@ only, nothing to call yet. Never treat a PLANNED item as available.
 
 ## 1. Quick start
 
+For an **idle local Codex**, call `terminal_turn(action="start", target=...,
+text=..., request_key="<stable unique request>")`. This source version returns
+`TASK_STARTED` only after confirmed submission and a fresh `RUNNING` check.
+It never queues that Codex start, even with legacy queue opt-in. Failures are
+explicit: inspect the returned evidence; do not resend under a new key.
+Same-key retries return the durable receipt. `EXISTING_QUEUE_TASK` points to
+existing work that must not be duplicated. Remote guarded start is currently
+unsupported and fails closed. This change requires a service rollout; a source
+checkout alone does not change the running HP process.
+
 - The production control plane serves the MCP endpoint at
   `http://127.0.0.1:8766/mcp` and the dashboard at
   `http://127.0.0.1:8766/dashboard` (both loopback-only; a real
@@ -401,6 +411,19 @@ Real return fields:
   `["OUTPUT_CHANGED"]`).
 - `correlation_id`/`submission_id`: use these to find the send later in
   audit/events, never invent your own id.
+
+For Codex, the server now waits the configured `submit.codex.settle_ms`
+(default 80 ms, bounded to 1–2000 ms) after injecting text, then sends
+Enter separately only when the complete live draft is observable. tmux
+uses bracketed paste for payloads at least 1024 UTF-8 bytes. A missing Enter
+is reported as `TEXT_SENT` / `ACTIVATION_TEXT_ONLY`, not acceptance.
+Reuse the same `idempotency_key` to retrieve the original receipt; do not
+paste again with a new key. Inspect the submission evidence and a separate
+post-submit observation. Bounded recovery sends only activation keys for
+an attributable stable draft; approval dialogs and uncertain drafts stop
+it. A terminal `STUCK` receipt is not automatically replayed by the sweeper.
+Use `prompt_response=True` only for an intentional short answer to an
+already-visible menu; that flow dispatches a single Enter.
 
 **Anti-pattern — never do this:** blindly resend on `DELIVERY_UNKNOWN`.
 A `DELIVERY_UNKNOWN` result does **not** mean the send failed — it

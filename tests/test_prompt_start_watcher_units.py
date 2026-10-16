@@ -31,6 +31,16 @@ INSTALLER = REPO / "deploy/install-prompt-start-watcher.sh"
 SERVICE, TIMER = UNIT_NAMES
 
 
+@pytest.fixture(autouse=True)
+def isolated_template_repo(tmp_path, monkeypatch):
+    # Render local fixtures independently of the runner's HOME and checkout.
+    import shutil
+    repo = tmp_path / "repo"
+    shutil.copytree(REPO / "deploy", repo / "deploy")
+    shutil.copy2(REPO / "pyproject.toml", repo / "pyproject.toml")
+    monkeypatch.setattr(__import__(__name__, fromlist=["REPO"]), "REPO", repo)
+
+
 def _uncommented(text: str) -> str:
     """The file with its comment lines dropped -- these units and this
     installer are heavily commented, and a word in a comment is not a

@@ -239,13 +239,14 @@ def _codex_composer_buffer_complete(snapshot: list[str], text: str) -> bool:
     shortcut accepted by the verified-submit path; pager/unknown output does
     not qualify.
     """
-    if _sent_text_echoed(snapshot, text):
-        return True
+    rows = _codex_live_composer_rows(snapshot)
+    if rows is None:
+        return False
     if _codex_draft_tail_in_live_composer(snapshot, text):
         return True
-    visible = " ".join(snapshot)
+    visible = " ".join(rows)
     match = re.search(r"\[Pasted Content\s+(\d+)\s+chars\]", visible, re.IGNORECASE)
-    return bool(match and int(match.group(1)) >= len(text))
+    return bool(match and int(match.group(1)) == len(text))
 
 
 # How much of the draft's END must be visible to prove the whole injection
@@ -565,7 +566,8 @@ class TerminalService:
         # docstring for why this is composed here rather than folded into
         # this already-large class: one small, independently-testable
         # object, shared by both the dashboard routes and the MCP tools.
-        self.lifecycle = SessionLifecycleService(config, self.tmux)
+        self.lifecycle = SessionLifecycleService(
+            config, self.tmux, input_authorized=lambda name: self._input_authorized(name)[0])
         # Durable Codex submission FSM. It is deliberately separate from
         # input_audit: audit rows redact prompt text, while recovery needs a
         # private, 0600 local record to prove that a retry must never
@@ -1557,6 +1559,7 @@ class TerminalService:
                 "exists": True,
                 "allowed": True,
                 "state": state,
+                "agent_type": select_adapter(info.pane_current_command or "").name,
                 "input_required": input_required,
                 "reason": reason,
                 "last_activity_s": max(0, int(time.time()) - int(info.activity_epoch)),
@@ -1790,7 +1793,8 @@ class TerminalService:
 
     def _send_text_and_verify(self, session: str, text: str, press_enter: bool, *,
                               idempotency_key: str | None = None,
-                              prompt_response: bool = False) -> dict[str, Any]:
+                              prompt_response: bool = False,
+                              require_idle: bool = False) -> dict[str, Any]:
         """P0-3/P0-4/P0 Part B wrapper around _send_text_and_verify_locked:
         claims an idempotency key (if given) before anything else,
         acquires the durable cross-process pane lease (lease.py -- the
@@ -1837,9 +1841,20 @@ class TerminalService:
             return result
         try:
             with self._pane_locks.get(lock_key):
-                result = self._send_text_and_verify_locked(
-                    session, text, press_enter, correlation_id=correlation_id,
-                    prompt_response=prompt_response)
+                # Read while holding the same cross-process pane lease as the
+                # write. Concurrent immediate starts cannot turn into queued
+                # follow-ups merely because both saw IDLE before taking it.
+                state = self._status_payload(session) if require_idle else None
+                if state is not None and (state.get("error") or state.get("state") != "IDLE"
+                        or state.get("input_required") or state.get("exists") is False):
+                    result = {"session": session, "error": "DIRECT_TARGET_NOT_IDLE",
+                              "sent": False, "enter_sent": False,
+                              "delivery_state": DELIVERY_BLOCKED,
+                              "submit_status": to_legacy_submit_status(DELIVERY_BLOCKED)}
+                else:
+                    result = self._send_text_and_verify_locked(
+                        session, text, press_enter, correlation_id=correlation_id,
+                        prompt_response=prompt_response)
         finally:
             self.leases.release(lock_key, correlation_id)
         result = self._enrich_receipt(result)
@@ -2048,7 +2063,8 @@ class TerminalService:
         # still identifies our complete draft as pending.  It is intentionally
         # before the legacy one-Enter path and is backend-neutral: tmux and
         # Windows ConPTY both implement capture_lines/send_text/send_keys.
-        if press_enter and adapter.name == "codex" and self.config.submit_watchdog.enabled:
+        if (press_enter and not prompt_response and adapter.name == "codex"
+                and self.config.submit_watchdog.enabled):
             verified = self._verified_codex_submit_locked(
                 session, text, correlation_id, identity_before, command_before, adapter,
             )
@@ -2210,7 +2226,8 @@ class TerminalService:
         # the moment this legacy path ran, since SubmitWatchdogConfig has no
         # enter_interval_ms/verify_after_each_enter/fixed_enter_count.
         profile = _submit_profile_for(self.config, adapter.name)
-        if adapter.name == "codex" and (profile.max_enter_attempts > 1 or profile.fixed_enter_count > 0):
+        if (not prompt_response and adapter.name == "codex"
+                and (profile.max_enter_attempts > 1 or profile.fixed_enter_count > 0)):
             confirmed, latest = self._poll_for_ack_evidence(
                 session, typed_snapshot, after, adapter, text,
                 deadline=time.monotonic() + profile.enter_interval_ms / 1000.0,
@@ -2279,7 +2296,8 @@ class TerminalService:
         # specific stuck-composer signature overrides that bare diff,
         # rather than only kicking in when the bare check already failed.
         needs_recovery = (
-            after is not None
+            not prompt_response
+            and after is not None
             and adapter.stuck_composer_evidence(typed_snapshot, after)
             and adapter.safe_recovery_allowed(after)
         )
@@ -2574,12 +2592,23 @@ class TerminalService:
         queue_followup_requested = False
         queue_followup_sent = False
         activation_key = ""
+        settle_pending = False
 
         def capture() -> list[str]:
+            nonlocal settle_pending
+            if settle_pending:
+                # The watchdog has persisted INJECTED before this callback.
+                # Keep the settle out of the injection-to-persistence window.
+                settle_pending = False
+                time.sleep(min(2.0, max(0.001, _settle_seconds(self.config, adapter.name))))
             return self.tmux.capture_lines(session, CODEX_SEND_VERIFY_LINES)
 
         def inject(prompt: str) -> None:
+            nonlocal settle_pending
             self.tmux.send_text(session, prompt, press_enter=False)
+            # Text-only injection bypasses the transport's settle. Restore
+            # that bounded delay before observing the draft or sending Enter.
+            settle_pending = True
 
         def send_enter() -> None:
             nonlocal has_submitted_enter, enter_calls, queue_followup_requested
@@ -2609,13 +2638,6 @@ class TerminalService:
 
         def evidence(lines: list[str], current: Submission) -> tuple[str, str]:
             nonlocal baseline, queue_followup_requested
-            if baseline is None or (not has_submitted_enter
-                                    and _codex_draft_in_composer(lines, text)
-                                    and not _codex_draft_in_composer(baseline, text)):
-                baseline = list(lines)
-                if not _codex_composer_buffer_complete(lines, text):
-                    return "INCOMPLETE", "composer_buffer_not_fully_observed"
-                return "COMPOSER", "draft_still_in_composer"
             if adapter.identify_target_state(lines) == "waiting":
                 return "PAGER", "approval_or_pager_visible"
             if (queue_followup_sent and _codex_followup_queued(lines)
@@ -2629,26 +2651,24 @@ class TerminalService:
             if (adapter.identify_target_state(lines) == "running"
                     and _codex_followup_queue_prompt_present(lines)
                     and _codex_composer_buffer_complete(lines, text)):
+                baseline = list(lines)
                 queue_followup_requested = True
                 return "COMPOSER", "working_followup_requires_tab"
+            if not has_submitted_enter:
+                # Every pre-activation frame must prove the complete live
+                # draft. A prefix, historical paste marker, or stale working
+                # footer cannot authorize Enter, even after a redraw.
+                if not _codex_composer_buffer_complete(lines, text):
+                    return "INCOMPLETE", "composer_buffer_not_fully_observed"
+                baseline = list(lines)
+                return "COMPOSER", "draft_still_in_composer"
             if _codex_draft_in_composer(lines, text):
                 return "COMPOSER", "draft_still_in_composer"
-            if not has_submitted_enter:
-                # A stale working footer or adapter diff before this attempt's
-                # Enter cannot prove that this prompt executed. Wait for the
-                # composer to settle; never report SUBMIT_CONFIRMED yet.
-                return "INCOMPLETE", "pre_activation_evidence_withheld"
             if (has_submitted_enter and baseline is not None
                     and _codex_draft_in_composer(baseline, text)
                     and not _codex_composer_marker_present(lines)):
                 return (ACK_RUNNING if adapter.identify_target_state(lines) == "running" else ACK_ACCEPTED,
                         "composer_cleared_after_enter")
-            # A working footer before this submission has sent its first
-            # Enter is not acceptance evidence: it may belong to the prior
-            # turn. Require the complete draft to be observed before the
-            # first Enter; otherwise keep polling without any keypress.
-            if not has_submitted_enter and not _codex_composer_buffer_complete(lines, text):
-                return "INCOMPLETE", "composer_buffer_not_fully_observed"
             # A working footer or adapter delta is only attributable to
             # THIS submission after at least one Enter was actually sent.
             # Before that it may be stale activity from a previous turn.
@@ -2658,12 +2678,8 @@ class TerminalService:
                     and adapter.submit_ack_evidence(baseline, lines, text)):
                 state = ACK_RUNNING if adapter.identify_target_state(lines) == "running" else ACK_ACCEPTED
                 return state, "adapter_execution_evidence_after_enter"
-            # Before the first Enter, a complete echo is the safety gate.
-            # After an Enter, the composer is expected to disappear, so its
-            # absence is evidence of either acceptance or a stuck/changed
-            # draft, not a reason to send the prompt again.
-            if not has_submitted_enter and not _codex_composer_buffer_complete(lines, text):
-                return "INCOMPLETE", "composer_buffer_not_fully_observed"
+            # No re-injection or recovery Enter without attributable draft
+            # evidence after the first activation attempt.
             if has_submitted_enter and not _codex_composer_buffer_complete(lines, text):
                 return "INCOMPLETE", "recovery withheld: composer_cleared_without_execution_evidence"
             return "COMPOSER", "draft_still_in_composer"
@@ -2932,6 +2948,7 @@ class TerminalService:
     def terminal_send_text(self, session: str, text: str, press_enter: bool = False,
                            dry_run: bool = False, idempotency_key: str | None = None, *,
                            prompt_response: bool = False,
+                           require_idle: bool = False,
                            origin: str | None = None, trace_id: str | None = None,
                            parent_turn_id: str | None = None, depth: int = 0) -> dict[str, Any]:
         """idempotency_key (P0-4, optional): if provided, a repeat call
@@ -2977,7 +2994,8 @@ class TerminalService:
             response = {"session": session,
                         **self._send_text_and_verify(session, text, press_enter,
                                                      idempotency_key=idempotency_key,
-                                                     prompt_response=prompt_response)}
+                                                     prompt_response=prompt_response,
+                                                     require_idle=require_idle)}
             if prompt_response and "error" not in response:
                 response["prompt_response"] = True
         except TmuxError as exc:
@@ -3459,7 +3477,8 @@ class TerminalService:
         return None
 
     def terminal_send_bound(self, binding: str, text: str, press_enter: bool = False,
-                            dry_run: bool = False, idempotency_key: str | None = None) -> dict[str, Any]:
+                            dry_run: bool = False, idempotency_key: str | None = None, *,
+                            require_idle: bool = False) -> dict[str, Any]:
         action = "send_bound"
         stored, error = self._resolve_binding(binding)
         if error:
@@ -3492,7 +3511,8 @@ class TerminalService:
             try:
                 response = {"binding": binding, "session": stored.session,
                             **self._send_text_and_verify(stored.session, text, press_enter,
-                                                         idempotency_key=idempotency_key)}
+                                                         idempotency_key=idempotency_key,
+                                                         require_idle=require_idle)}
             except TmuxError as exc:
                 response = {"error": "SESSION_NOT_FOUND", "binding": binding,
                             "session": stored.session, "reason": str(exc)}

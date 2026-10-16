@@ -44,7 +44,8 @@ async def _call(server, name, **kwargs):
 
 
 @pytest.fixture
-def rig(tmp_path, tmux_session_factory):
+def rig(tmp_path, tmux_session_factory, monkeypatch):
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "1")
     service = _service(tmp_path)
     controller = build_default_controller(service)
     controller.refresh_local_heartbeat(tmux_session_count=0, agent_counts={}, agent_types=(), agent_version=None)

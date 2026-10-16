@@ -47,7 +47,10 @@ async def _call(server, tool_name, **kwargs):
 
 
 @pytest.mark.anyio
-async def test_final_e2e_burst_enqueue_task_manager_rename_migrate_restart(tmp_path, tmux_session_factory):
+async def test_final_e2e_burst_enqueue_task_manager_rename_migrate_restart(tmp_path, tmux_session_factory, monkeypatch):
+    # This scenario exercises the operator-opted-in legacy queue, not the
+    # default direct-session catalog where enqueue is intentionally absent.
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "1")
     config = AppConfig(
         PermissionsConfig(True, True), ("e2e-*",), 200, 100,
         InputPolicyConfig(allowed_session_patterns=("e2e-*",), max_text_length=2000),
@@ -66,6 +69,7 @@ async def test_final_e2e_burst_enqueue_task_manager_rename_migrate_restart(tmp_p
 
     session_a = _unique("e2e-a")
     session_b = _unique("e2e-b")
+    new_name = _unique("e2e-a-renamed")
     tmux_session_factory(session_a, "bash -lc 'sleep 600'")
     tmux_session_factory(session_b, "bash -lc 'sleep 600'")
     service.grants.set_read(session_a, True, granted_by="e2e")
@@ -89,7 +93,6 @@ async def test_final_e2e_burst_enqueue_task_manager_rename_migrate_restart(tmp_p
         assert {t["id"] for t in board["queued"]} == set(task_ids)
 
         # 3) Rename session_a WHILE it still has 12 QUEUED tasks.
-        new_name = _unique("e2e-a-renamed")
         rename_result = await _call(server, "terminal_rename_session", name=session_a, new_name=new_name)
         assert "error" not in rename_result, rename_result
         assert rename_result["queue_tasks_updated"] == 12

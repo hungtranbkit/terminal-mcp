@@ -24,7 +24,7 @@ def _enable_legacy_queue_for_existing_engine_tests(monkeypatch):
 
 
 from terminal_mcp.compact_tools import (TURN_ACTION_ALIASES, TURN_ACTIONS,
-                                        TURN_HANDLER_ACTIONS, TURN_PANE_ACTIONS,
+                                        HEADLESS_ACTIONS, TURN_HANDLER_ACTIONS, TURN_PANE_ACTIONS,
                                         CompactTerminalTools)
 from terminal_mcp.config import load_config
 from terminal_mcp.run_journal import RunJournalStore
@@ -80,7 +80,8 @@ def test_the_action_vocabulary_covers_every_retired_tool():
                    "delete_session", "enqueue_task", "task_status",
                    "task_batch_status"):
         assert action in TURN_ACTIONS, action
-    assert set(TURN_ACTIONS) == set(TURN_PANE_ACTIONS) | set(TURN_HANDLER_ACTIONS)
+    assert set(TURN_ACTIONS) == (set(TURN_PANE_ACTIONS) | set(TURN_HANDLER_ACTIONS)
+                                 | set(HEADLESS_ACTIONS))
 
 
 def test_an_unknown_action_is_refused_and_names_what_is_allowed():
@@ -569,14 +570,13 @@ def test_queue_submission_actions_are_disabled_by_default(monkeypatch):
     })
 
     attempts = [
-        tools.turn(action="start", target="worker", text="queued work"),
         tools.turn(action="enqueue_task", target="worker", text="queued work"),
         tools.turn(action="route_start", text="queued work"),
         tools.turn(action="agent_start", target="agent-1", text="queued work"),
         tools.turn(action="project_start", target="project-1", text="queued work"),
-        tools.turn(action="send", target="worker", text="queued work", long_task=True),
-        tools.turn(action="run", target="worker", text="queued work"),
         tools.turn(action="enqueue", target="worker", text="queued work"),
+        tools.turn(action="queue_resume", target="worker"),
+        tools.turn(action="queue_run_once", target="worker"),
     ]
 
     for result in attempts:

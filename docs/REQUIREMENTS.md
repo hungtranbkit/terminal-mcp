@@ -369,6 +369,23 @@ sessions bringing up dell-5530/m910/macbook — see `docs/multi-node.md`).
 
 ## 5. Reliable prompt submission
 
+- **Immediate local Codex start (2026-10-08): IMPLEMENTED, isolated PTY tested;
+  not promoted to the running HP service.** `terminal_turn(action="start")`
+  (also `run`/`dispatch`) checks IDLE and submits directly before the legacy
+  queue gate. IDLE is rechecked under the durable pane lease. Success requires
+  `SUBMIT_CONFIRMED` plus a separate fresh RUNNING observation; otherwise an
+  explicit FAILED receipt is returned, never a new QUEUED task. Enter retries
+  remain bounded by the existing durable watchdog; text is injected once.
+  Stable request keys reserve a durable pending receipt before input, cache
+  final receipts and reject changed prompts. Crash/retry cannot retype through
+  this entrypoint. Existing queue keys return `EXISTING_QUEUE_TASK` for manual
+  inspection, without migration. Remote idle guards fail closed as unsupported.
+  The 0–20-second observation budget does not cancel an in-flight mutation:
+  pane lease, transport and watchdog retain their separate existing bounds.
+  Tests: `tests/test_codex_direct_dispatch.py`, including concurrent starts,
+  failed Enter, non-running acceptance, crash replay and isolated tmux Unicode.
+  Non-Codex starts retain their legacy queue gate; queue policy is unchanged.
+
 **Generic-shell silent-command confirmation (2026-09-20): VERIFIED locally.**
 After the existing pre-Enter session identity, pane PID and foreground-command
 revalidation proves that the same interactive shell still owns the pane, a
@@ -398,10 +415,23 @@ pure hardening). Tests: `tests/test_delivery_gate.py`.
 
 **Status: VERIFIED.**
 
-- **Press-enter semantics:** `SEND_TEXT_ENTER_SETTLE_SECONDS` settle
-  window between the literal-text `send-keys` and the Enter keystroke
-  (a real race found live: some CLIs swallow an Enter that arrives
-  before they've finished consuming the text).
+- **Press-enter semantics (2026-10-08):** the verified Codex path must
+  honor `submit.codex.settle_ms` (default 80 ms, bounded to 1–2000 ms)
+  after its text-only injection, before a separate Enter dispatch. tmux
+  payloads at least 1024 UTF-8 bytes use bracketed paste with unchanged line
+  endings and socket-local load/paste/delete operations. Every initial
+  activation requires the complete live draft (visible tail or exact
+  collapsed-paste character count); partial prefixes, historical markers,
+  and approval chrome do not authorize Enter. Acceptance still requires
+  post-Enter evidence. Recovery never retypes, stays within the persisted
+  Enter budget, and same-key replay returns the original receipt.
+  Explicit validated menu responses retain the single-Enter path.
+  `ACTIVATION_TEXT_ONLY` remains a truthful refusal when no activation
+  occurred; it must never be relabeled as accepted to hide a timeout.
+  Regression: `tests/test_codex_paste_settle.py`, watchdog/configuration
+  and send-reliability suites. Real Codex 0.154.0 verification uses only an
+  isolated disposable tmux socket; the running controller is not updated
+  by this source change. See `docs/prompt-submission.md` for evidence.
 - **SUBMIT_CONFIRMED/DELIVERY_UNKNOWN:** `_send_text_and_verify` (core.py)
   — a real before/after-Enter tmux-pane diff decides which; a raw
   `DELIVERY_UNKNOWN` NEVER silently retries — see §7 for how the queue

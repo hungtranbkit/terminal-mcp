@@ -27,7 +27,8 @@ async def _call(server, name, **kwargs):
 
 
 @pytest.fixture
-def rig(tmp_path):
+def rig(tmp_path, monkeypatch):
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "1")
     queue = QueueService(QueueStore(tmp_path / "queue.db"))
     return build_mcp(queue=queue), queue
 

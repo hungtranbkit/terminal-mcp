@@ -179,7 +179,10 @@ def test_the_browser_sees_the_dom_change_as_state_moves(live):
 
             # Move the task for real, in the database the page is reading.
             for state in ("READY", "DISPATCHING", "RUNNING"):
-                queue.store.transition_task(task_id, state, event_type=state)
+                if state == "RUNNING":
+                    queue.store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
+                else:
+                    queue.store.transition_task(task_id, state, event_type=state)
 
             # The page polls every 6s; wait for the change rather than sleeping
             # a fixed amount, so a slow box does not fail a working page.
@@ -210,7 +213,10 @@ def test_a_waiting_task_shows_its_age_and_that_age_advances(live):
     work_id = created["work"]["work_id"]
     task_id = created["tasks"][0]["queue_task_id"]
     for state in ("PRECHECK", "READY", "DISPATCHING", "RUNNING", "VERIFYING"):
-        queue.store.transition_task(task_id, state, event_type=state)
+        if state == "RUNNING":
+            queue.store.mark_running_with_evidence(task_id, evidence={"accepted": True, "signal": "explicit_running_signal"})
+        else:
+            queue.store.transition_task(task_id, state, event_type=state)
 
     with sync_playwright() as pw:
         try:

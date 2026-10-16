@@ -476,14 +476,14 @@ async def test_terminal_turn_schema_guides_clients_to_direct_actions_only():
                    "delete_session", "browser_verify", "browser_screenshot",
                    "browser_status", "browser_stop"):
         assert action in action_help
-    for retired in ("start", "enqueue_task", "route_start", "agent_start",
+    for retired in ("enqueue_task", "route_start", "agent_start",
                     "project_start", "queue_resume", "queue_run_once"):
         assert retired not in action_help, retired
 
     assert schema["long_task"]["default"] is False
     assert schema["long_task"]["deprecated"] is True
-    assert "operator" in schema["long_task"]["description"].lower()
-    assert "normal direct execution" in schema["long_task"]["description"].lower()
+    assert "creates no queue task" in schema["long_task"]["description"].lower()
+    assert "compatibility" in schema["long_task"]["description"].lower()
 
 
 @pytest.fixture

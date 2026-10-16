@@ -114,7 +114,7 @@ async def test_observer_exposes_exactly_the_declared_tools(observer_server):
 
 
 @pytest.mark.anyio
-async def test_observer_exposes_no_tool_that_can_change_anything(observer_server):
+async def test_observer_exposes_no_tool_that_can_change_anything(observer_server, monkeypatch):
     """An explicit denylist, not a prefix rule.
 
     Named tools rather than a heuristic because the failure this catches is
@@ -137,6 +137,7 @@ async def test_observer_exposes_no_tool_that_can_change_anything(observer_server
     # ...and the denylist is not stale: every name in it is a tool that
     # really does exist on the full surface. A typo here would silently
     # assert nothing.
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "1")
     full = {tool.name for tool in await build_mcp(TerminalService(
         AppConfig(PermissionsConfig(True, False), ("test-*",), 50, 20))).list_tools()}
     assert forbidden <= full

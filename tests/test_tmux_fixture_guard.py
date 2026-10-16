@@ -51,3 +51,26 @@ def test_a_tagged_leftover_from_an_earlier_run_is_reaped_and_reused(tmux_session
         assert _is_test_owned(name)
     finally:
         _kill(name)
+
+
+@pytest.mark.parametrize("error,retry", [("server exited unexpectedly", True), ("duplicate session: owned", False)])
+def test_session_creation_retries_only_server_shutdown_race(monkeypatch, error, retry):
+    import subprocess
+    from tests import conftest
+    calls = []
+
+    def fake(*args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            raise subprocess.CalledProcessError(1, args, stderr=error)
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(conftest, "tmux", fake)
+    monkeypatch.setattr(conftest.time, "sleep", lambda _: None)
+    if retry:
+        conftest._new_test_session("owned", "sleep 30")
+        assert len(calls) == 2
+    else:
+        with pytest.raises(subprocess.CalledProcessError):
+            conftest._new_test_session("owned", "sleep 30")
+        assert len(calls) == 1

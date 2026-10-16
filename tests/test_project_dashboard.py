@@ -71,7 +71,8 @@ def test_project_aliases_resolve(alias, canonical):
     assert len(handler.calls) == 1
 
 
-def test_project_start_takes_the_project_from_target_and_the_prompt_from_text():
+def test_project_start_takes_the_project_from_target_and_the_prompt_from_text(monkeypatch):
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "1")
     handler = Recorder({"status": "TASK_STARTED", "task_id": "t1", "session": "s1",
                         "project_id": "demo", "agent_id": "demo-core", "agent_role": "core",
                         "phase": "BUILD", "pm_agent_id": "demo-pm", "poll": False,
@@ -95,7 +96,8 @@ def test_project_bootstrap_takes_the_name_from_target_and_description_from_text(
     assert handler.calls[0] == {"name": "traffic-camera-ai", "description": BIG}
 
 
-def test_a_missing_required_project_argument_is_named():
+def test_a_missing_required_project_argument_is_named(monkeypatch):
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "1")
     tools = _tools({"project_start": Recorder()})
     assert tools.turn(action="project_start", text="x")["error"] == "MISSING_ARGS"
 
@@ -105,7 +107,8 @@ def test_every_project_required_arg_is_one_the_action_accepts():
         assert set(AGENT_REQUIRED.get(action, ())) <= AGENT_ARGS[action], action
 
 
-def test_legacy_and_phase_b_actions_survive_phase_c():
+def test_legacy_and_phase_b_actions_survive_phase_c(monkeypatch):
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "1")
     for action in ("start", "send", "inspect", "route_start", "agent_start", "enqueue_task",
                    "list_agents", "cleanup_candidates"):
         assert action in TURN_ACTIONS

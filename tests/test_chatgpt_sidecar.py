@@ -800,3 +800,14 @@ def test_recursion_is_bounded_on_a_self_referential_cause():
     exc = RuntimeError("loop")
     exc.__cause__ = exc
     assert _looks_like_timeout(exc) is False
+
+
+def test_sidecar_catalog_preserves_actual_confirmation_and_cached_browser_fields():
+    from terminal_mcp.mcp_app import build_mcp
+
+    upstream = asyncio.run(build_mcp().list_tools())
+    served = _list_tools(build_sidecar(FakeBackend(upstream)))
+    assert [tool.name for tool in served] == ["terminal_turn"]
+    properties = served[0].input_schema["properties"]
+    assert {"confirm", "args", "steps", "viewport", "screenshot", "allow_mutations"} <= properties.keys()
+    assert {row.get("type") for row in properties["confirm"]["anyOf"]} == {"boolean", "null"}

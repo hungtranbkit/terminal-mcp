@@ -244,8 +244,9 @@ def classify_status(session: SessionInfo, output: str, now: int | None = None) -
     # reach RUNNING only through their own UI/footer or adapter evidence above.
     if command in ACTIVE_COMMANDS and (command != "codex") and age <= 60:
         return "RUNNING", False, f"current command is {command!r}; tmux activity age is {age}s"
-    if command in {"bash", "zsh", "sh", "fish"} and age > 60:
-        return "IDLE", False, f"shell pane has no tmux activity for {age}s"
+    # A shell's old activity timestamp is not proof the command exited. A
+    # quiet process can run for minutes without writing output; only the shell
+    # prompt at the pane bottom (checked above) is completion evidence.
     return "UNKNOWN", False, f"current command is {command or 'unknown'!r}; activity age is {age}s; {reason}"
 
 
@@ -531,14 +532,13 @@ def classify_supervisor_state(state: str, reason: str, output: str) -> tuple[str
     that maps to IDLE at the loop level instead (idle_threshold)."""
     if state == "WAITING_INPUT":
         return state, reason
-    # ERROR needs the failure to still be LIVE. This function has no clock,
-    # but `state` already carries one: classify_status only returns IDLE for
-    # a pane sitting at a plain shell with no tmux activity for over a
-    # minute -- whatever failed has finished and handed the prompt back, so
-    # text still on screen is history, not a running failure. Audited on hp
-    # 2026-09-21: ALL FIVE sessions reported ERROR were idle shells, the
-    # freshest matching a psql error 44 hours old.
-    if state != "IDLE":
+    # A fresh UNKNOWN pane may contain a live traceback (for example, an
+    # adapter could not classify a new CLI version). When its only evidence is
+    # a very old shell activity timestamp, the same text is just history.
+    age_match = re.search(r"activity age is (\d+)s", reason)
+    error_may_be_live = state == "RUNNING" or (
+        state == "UNKNOWN" and (age_match is None or int(age_match.group(1)) <= 60))
+    if error_may_be_live:
         matched, why = _match_recent(ERROR_PATTERNS, output, window=ERROR_WINDOW,
                                      skip_prompt_lines=True)
         if matched:

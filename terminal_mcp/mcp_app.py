@@ -5,9 +5,9 @@ from pathlib import Path
 import os
 import threading
 import time
-from typing import Annotated
+from typing import Annotated, Any
 
-from pydantic import Field
+from pydantic import Field, StrictBool
 from mcp.server.mcpserver import MCPServer
 
 from . import tool_metrics
@@ -89,7 +89,7 @@ _RETIRED_PUBLIC_QUEUE_TOOLS = (
 _DIRECT_ACTION_SCHEMA_HELP = (
     "For new local headless work: headless_start (agent_type=codex|claude, text, working_directory, "
     "idempotency_key), headless_status/list/checkpoint/cancel/cleanup. "
-    "Direct Terminal MCP action. Normal public actions: inspect, send, send_wait, wait, resume, "
+    "Direct Terminal MCP action. Normal public actions: start (idle local Codex, confirmed RUNNING or error), inspect, send, send_wait, wait, resume, "
     "supervise (long task continued server-side until explicit DONE), supervise_status, "
     "supervise_complete, supervise_cancel, "
     "list_sessions, list_nodes, create_session, delete_session, task_status, task_batch_status, "
@@ -102,8 +102,9 @@ _DIRECT_ACTION_SCHEMA_HELP = (
     "continuations (y, continue, approvals, follow-ups)."
 )
 _LONG_TASK_SCHEMA_HELP = (
-    "Legacy operator-only queue switch. Deprecated for normal direct execution and rejected "
-    "unless the server operator explicitly enables the retired queue."
+    "Deprecated compatibility flag. With queue disabled, send/send_wait stay guarded direct "
+    "sends; this flag creates no queue task and enables no automatic continuation. "
+    "Only queue-enabled operators retain legacy queued send behavior."
 )
 from .queue_service import QueueService
 from .queue_policy import queue_disabled_response, queue_submission_enabled
@@ -805,7 +806,11 @@ def build_mcp(service: TerminalService | None = None,
                       url: str | None = None, args: dict | None = None,
                       path: str | None = None, content_b64: str | None = None,
                       overwrite: bool = False, mode: str | None = None,
-                      confirm: bool | None = None) -> dict:
+                      confirm: StrictBool | None = None,
+                      steps: list[dict[str, Any]] | None = None,
+                      viewport: dict[str, Any] | None = None,
+                      screenshot: str | None = None,
+                      allow_mutations: bool = False) -> dict:
         """THE terminal surface: direct session control only.
 
 HEADLESS FLOW (preferred for new local Codex/Claude work when enabled):
@@ -830,12 +835,17 @@ INTERACTIVE FLOW (existing tmux sessions / remote nodes):
 4. When work is complete, merge/test as appropriate and clean up the finished
    session/worktree/branch.
 
-The durable task queue is RETIRED and disabled by default. Queue-producing
-actions (`start`, `enqueue_task`, `route_start`, `agent_start`,
-`project_start`, aliases such as `run`/`dispatch`, and `send` with
-`long_task=true`) return `QUEUE_DISABLED_USE_DIRECT_SESSION` and do not create
-a new queue row. Read-only task/task-batch/history/metrics and cleanup/cancel
-operations remain available for historical or already-running tasks.
+The durable task queue is RETIRED and disabled by default. With queue disabled,
+legacy `start` (including `run`/`dispatch`/`start_task`) is a guarded `send` to
+an existing target; it never creates a session. `long_task=true` on send or
+send_wait is accepted for compatibility and does not enable queueing or automatic
+continuation. These calls return direct delivery evidence, not a queued task_id;
+request_key is used as idempotency_key when no explicit idempotency_key is given.
+Idle Codex start additionally requires fresh RUNNING evidence. For tracked work, prefer create_session then supervise in new clients.
+Queue-producing actions (`enqueue_task`, `route_start`, `agent_start`,
+`project_start`) and queue dispatch return `QUEUE_DISABLED_USE_DIRECT_SESSION`.
+Read-only task/task-batch/history/metrics and cleanup/cancel operations remain
+available for historical or already-running tasks.
 
 A server operator can deliberately opt back in only by starting Terminal MCP
 with `TERMINAL_MCP_ENABLE_QUEUE=1`; client arguments cannot enable the queue.
@@ -878,6 +888,13 @@ TASK LABEL (shown as "Task hiện tại" on /dashboard/live and /app/live):
 For direct work, prefer one useful session per task and avoid stale duplicates.
         """
         _refresh_local_heartbeat()
+        from .browser_compat import normalize_cached_browser_args
+        try:
+            args = normalize_cached_browser_args(action, args, steps=steps, viewport=viewport,
+                                                 screenshot=screenshot, allow_mutations=allow_mutations)
+        except ValueError as exc:
+            return {"status": "ERROR", "action": action, "error": "INVALID_BROWSER_ARGUMENT",
+                    "reason": str(exc), "verification_scope": "incomplete"}
         return compact_tools.turn(
             action=action, target=target, targets=targets, text=text,
             desired_states=desired_states, resume_token=resume_token,
@@ -6483,6 +6500,10 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         harness_cancel=harness.cancel,
         harness_review=harness.review,
     ))
+
+    # Read-only compatibility lookup: a direct start may not duplicate a
+    # previously enqueued request, even when its lane is disabled.
+    compact_tools.handlers["legacy_task_by_request_key"] = queue.store.task_by_request_key
 
     if not queue_submission_enabled():
         for tool_name in _RETIRED_PUBLIC_QUEUE_TOOLS:

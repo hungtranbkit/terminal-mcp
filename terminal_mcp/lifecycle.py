@@ -20,11 +20,11 @@ from __future__ import annotations
 import time
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .config import AppConfig
 from .launcher_resolution import resolve_launcher
-from .permissions import SENSITIVE_SESSION_WORDS, valid_new_session_name, input_session_allowed
+from .permissions import SENSITIVE_SESSION_WORDS, valid_new_session_name, session_input_denied_by_pattern
 from .session_backend import SessionBackend
 from .tmux import TmuxError
 
@@ -137,9 +137,21 @@ def resolve_cwd(requested: str | None, config: AppConfig) -> tuple[Path | None, 
 
 
 class SessionLifecycleService:
-    def __init__(self, config: AppConfig, tmux: SessionBackend) -> None:
+    def __init__(self, config: AppConfig, tmux: SessionBackend, *,
+                 input_authorized: Callable[[str], bool] | None = None) -> None:
         self.config = config
         self.tmux = tmux
+        self.input_authorized = input_authorized
+
+    def _startup_input_authorized(self, name: str) -> bool:
+        # The hard deny floor applies even to injected grant checks.
+        if (not valid_new_session_name(name)
+                or session_input_denied_by_pattern(name, self.config)
+                or any(word in name.casefold() for word in SENSITIVE_SESSION_WORDS)):
+            return False
+        if self.input_authorized is not None:
+            return self.input_authorized(name)
+        return bool(self.config.session_access.default_input)
 
     def launch_command_for(self, agent_type: str) -> str | None:
         if agent_type == "shell":
@@ -255,7 +267,7 @@ class SessionLifecycleService:
                             reason, key = step
                             permitted = (self.config.permissions.terminal_input
                                 and self.config.permissions.allow_send_keys
-                                and input_session_allowed(name, self.config)
+                                and self._startup_input_authorized(name)
                                 and key in self.config.input_policy.allow_keys
                                 and key not in self.config.input_policy.sensitive_keys_require_confirmation)
                             if (permitted and reason not in startup_choices
@@ -269,7 +281,7 @@ class SessionLifecycleService:
                                         and fresh.created_epoch == info.created_epoch
                                         and fresh.pane_current_command.casefold() == expected_command
                                         and _authorized_startup_step(fresh_lines) == step)
-                                    if same:
+                                    if same and self._startup_input_authorized(name):
                                         self.tmux.send_keys(name, [key])
                                         startup_key_count += 1
                                         startup_actions.append({"menu": reason, "key": key})

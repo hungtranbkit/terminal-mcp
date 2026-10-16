@@ -1,5 +1,25 @@
 # PROJECT_CONTEXT.md
 
+## 2026-10-16 — Cached browser arguments acceptance fix (HP isolated, not deployed)
+
+- Continued existing `fix/p0-terminal-regressions-20261016` from `3045f3b`; no shared service restart or live state changes. Live ChatGPT `browser_verify` was given an intentionally false assert_text and viewport 390x844, but returned PASS, zero checks and 1348x768.
+- Added bounded read-only cached-argument normalization at the actual MCP terminal_turn entrypoint: assert_text/assert_title/assert_status, viewport, screenshot policy. Unsupported/mutating steps and conflicting canonical args fail before backend execution. No auth/confirmation bypass. The cached wrapper default screenshot=on_failure remains harmless for unrelated actions.
+- Failing-first proof: 8 original regression tests failed (including PASS vs FAIL, zero checks); 5 cached-default regressions also failed before their fix. Final `pytest -q tests/test_cached_browser_surface.py tests/test_browser_gateway.py tests/test_compact_delete_confirmation.py tests/test_status.py`: 143 passed, 7 existing MCP deprecation warnings (21.71s). Tests call the real MCP entry and BrowserGateway evaluator with a fixture worker; no real-browser acceptance is claimed.
+- Full repository test attempt used isolated HOME/state and 2GB/150% CPU cap; timeout 300 exited 124 at approximately 30%. No completed full-suite result, no final pass/failure totals, no CI or release acceptance claimed. The full attempt preceded the final cached-default fix.
+- Evidence on HP: /home/kimex/.local/state/portfolio-audit/20261016/{tmcp-cached-red.log,tmcp-default-red.log,tmcp-focused-final.log,tmcp-full-suite.log,tmcp-full-suite.exit}. Private worktree: terminal-client-compat under the same directory.
+- Still open: obtain current-SHA CI/review, full integration testing and narrow managed rollout/rollback; verify true and false assertions from the actual connected client after rollout. The conversation tool schema still lacks confirm: closing sessions cannot be marked fixed from these changes. No delete workaround or relaxed permissions added.
+
+
+## P0-A stale shell completion and browser verification scope — 2026-10-16 (code fixed locally; rollout blocked)
+
+- Audited `/home/dell/workspace/terminal-mcp` without changing its active checkout: branch `fix/codex-session-readiness-20261016` is used by the live `dell-tmcp-readiness-audit-20261016` Codex session, so implementation was isolated in `/tmp/terminal-mcp-p0-regressions` on branch `fix/p0-terminal-regressions-20261016`, based on `origin/main` `28e6450d6211b4fa07ea7d2af35893ad0fc0a710`.
+- Current source already wires a nullable boolean `confirm` into `terminal_turn` and strictly validates it; `build_mcp().list_tools()` exposes it as boolean|null. The connected ChatGPT Terminal MCP tool catalog does not expose `confirm` or `args`, so callers cannot use that source contract. A harmless delete probe against a unique nonexistent name returned `SESSION_LOCATION_UNKNOWN` because two nodes were offline; no session was deleted. No shell audit was closed because the connector cannot submit confirmation, and HP's audit worktree is dirty.
+- Reproduced the `send_wait` early-IDLE condition with a new classifier test: a shell pane with old activity and no returned prompt was `IDLE`. `terminal_mcp/status.py` now returns `UNKNOWN` until a real prompt appears. The supervisor still reports fresh UNKNOWN-pane tracebacks, while old errors in a stale shell tail are not promoted to live failures.
+- `terminal_mcp/browser_gateway.py` now marks the verification scope as `assertions`, `navigation_only`, or `incomplete`; assertion execution and viewport forwarding are covered with fixture-runner tests. The connected tool schema advertises top-level `steps`/`viewport`, while the current source schema uses `args.assertions`/`viewport_width`/`viewport_height`; this cross-surface mismatch still needs resolution and a real connector refresh.
+- Tests: the initial shell regression failed before the source fix (`IDLE` vs expected `UNKNOWN`). Final focused compact/delete/browser/status/MCP-schema run: **318 passed**, 7 existing MCP deprecation warnings. Related terminal-wall/live-session/supervisor/send-reliability/compact run: **559 passed** after retaining fresh UNKNOWN-pane traceback classification and excluding stale shell-history errors. `git diff --check` passed. No full suite, live shell START/DONE exercise, connector confirmation delete, staging fixture/browser, deployment or 10-round E2E was performed.
+- Branch `fix/p0-terminal-regressions-20261016` is pushed. Code/test commit: `d74426060d7e451e5e3d0c8d9e2d85383f84b018`; Issue #52 evidence comment: `https://github.com/hungtranbkit/terminal-mcp/issues/52#issuecomment-6209161740`. No server was restarted. Dell `/version` still reports `d2370663d503c1f1daee0005f5dd60dcce9acca8`; HP runtime was not directly verified during this pass. Keep `hp-portfolio-audit-20261016` (dirty Task Center worktree) and `dell-portfolio-release-audit-20261016` open; do not touch `dell-tmcp-readiness-audit-20261016` or `hp-mamai-app-handoff-20261016`.
+- Next: resolve the external connector schema/refresh with explicit `confirm` and browser step/viewport contract; inspect the HP staging/browser access and backup/rollback policy; integrate this commit through the existing #52 release path, rerun checks on the resulting SHA, then deploy only if the shared-service restart is authorized. Do not claim P0-A complete before these steps.
+
 ## Readiness and headless merge resolution — 2026-10-16 (isolated worktree; not deployed)
 
 - Resolved the readiness merge with the deployed headless safeguards retained. `terminal_mcp/direct_task.py` keeps task intent before send, tracks persisted/input/submit/execution receipts, never replays uncertain input, keeps `DISPATCH_UNCERTAIN` active, and leaves dispatch-ACK timeout as `BLOCKED` with `completed_at=None` so target ownership remains held. `EXECUTION_ACCEPTED` is surfaced after submit acceptance but `running_confirmed` stays false until independent pane evidence; `RUNNING` requires that evidence. Composer-swallow recovery remains bounded Enter-only and exposes `STUCK_COMPOSER`.
@@ -57,6 +77,71 @@
 - Security posture: no sandbox/approval bypass flag or auto-accept path was added; existing `codex_yolo` behavior was not changed. CWD validation remains before process creation.
 - Verification: regression tests were observed failing before their corresponding fixes. Focused run `.venv/bin/python -m pytest -q tests/test_direct_task_lifecycle.py tests/test_session_lifecycle.py tests/test_adapters.py tests/test_verified_submit_watchdog.py` passed **156 tests**; broader lifecycle/dispatch/adapter/compact/MCP/reconciler run passed **328 tests**, with 5 deselected and 7 existing MCP metadata deprecation warnings. `git diff --check` passed. No full suite, headless `codex exec` task integration, HP deployment, or ChatGPT-to-Codex E2E was performed.
 - Not accepted/deployed. Implementation commit `9db06c06f9a99e7f91c17792e269a618aaa92eb2` on `fix/codex-session-readiness-20261016`. Remaining required work: implement and test a durable, permission-preserving `codex exec` execution/receipt path; complete progress watchdog and safe checkpoint/cleanup/restart reconciliation; obtain authorized HP access and prepare rollback; deploy HP first; then run 10 real ChatGPT-to-Codex create/dispatch/execute/cleanup rounds. Do not report DONE until those steps pass.
+
+## Direct-session-first compatibility — 2026-10-08 (branch only, NOT deployed)
+
+- With `TERMINAL_MCP_ENABLE_QUEUE=0` (or unset), `terminal_turn(action="start")`
+  and its `run`/`dispatch`/`start_task` aliases now normalize to the existing guarded
+  `send` path for an **existing** target. No automatic session creation, enqueue,
+  dispatch tick, queue follower, or implicit direct supervisor is started.
+- `long_task=true` is accepted for compatibility on `send`/`send_wait` in this mode;
+  it does not create queue work or enable automatic continuation. New clients should
+  use `create_session` then `send`/`send_wait`; explicit `supervise` remains separate.
+- Compatibility calls preserve explicit `idempotency_key`, or use legacy `request_key`
+  when it is absent. They return canonical direct `action="send"` / `"send_wait"`
+  and guarded delivery evidence, **not** a queue receipt/task ID. Missing target/text,
+  binding resolution, authorization/menu/identity refusals, uncertain delivery and
+  task labels still use the existing direct path. No retry or guard bypass was added.
+- Actual queue producers and manual dispatch remain disabled; server-side opt-in
+  (`TERMINAL_MCP_ENABLE_QUEUE=1`) retains the old queue behavior. Historical task/batch
+  status, queue status/events/metrics remain readable without changing queue data.
+- Updated `terminal_turn` description and deprecated `long_task` schema help, policy
+  v1.4.2 and its generated document. Aligned stale queue-first policy assertions and
+  the title+metadata invariant with the existing guidance. Legacy engine tests now
+  explicitly opt into queue mode. Compact-turn CI includes these regression suites.
+
+Validation evidence:
+- RED before implementation: 23 failures / 4 passes in the 27 new compatibility
+  cases; GREEN after implementation: 27/27. Additional tests cover bound sends,
+  labels and uncertain delivery.
+- Real MCP wiring tests compare a complete SQLite `iterdump()` before/after both
+  confirmed and blocked compatibility sends plus historical reads; all tables and
+  events remain identical. The terminal transport is stubbed, never production.
+- Final targeted run: **540 passed**, 17 MCP deprecated-field warnings, 109.57s.
+  Covers compact routing, policy/schema/sidecar wiring, queue persistence/config,
+  legacy one-call start, delivery guards, direct lifecycle, session resources and
+  send reliability; exact command is in the PR. Full suite/live production tests
+  were not run. Tests use isolated state and tmux sockets. No production controller restart,
+  deployment, API Gateway queue operation, or production queue DB mutation performed.
+
+### Historical issue #52 evidence
+
+## Issue #52 supervised dispatch — 2026-10-12 (deployed on HP)
+
+- PR #53 (`fix/issue52-supervised-dispatch`). The persist-first supervised dispatch has these guarantees:
+  - a receipt ladder, with RUNNING only on observed execution
+  - honest non-running states: STUCK_COMPOSER, WAITING_INPUT, DISPATCH_UNCERTAIN
+  - no typing into boot dialogs (Codex "Hooks need review", Claude trust and auto-mode dialogs)
+  - an ack veto when the composer still holds the prompt
+  - idempotent `supervise` and `supervise_status` that work from any client
+  - queue-OFF guidance that points to supervise
+  - `tail_lines` clamped to 20
+  - details: `docs/CHATGPT_USAGE.md` §3a, `docs/REQUIREMENTS.md` TMCP-DISPATCH-001..010
+- Tests:
+  - Full suite on the branch: 98 failed / 9426 passed.
+  - Baseline main e39bdd1: 99 failed / 9389 passed.
+  - 0 regressions. Pre-existing failures are retired-queue contract tests, knowledge map and work UI.
+  - Deploy tree 5a27028 (branch + reliability d237066): no new non-flaky failures. Windows onboarding/session-host tests that failed in the full run passed on rerun (143 + 31).
+- Live evidence (`docs/evidence/`):
+  - 20/20 isolated Claude cycles DONE, with 0 lost tasks and 0 duplicate sends.
+  - On a real Codex hooks menu, the task went to WAITING_INPUT with `dispatches=0` and nothing typed.
+  - 6/6 production cycles through the HP compact sidecar, routed to dell-linux: DONE, dedup, sessions deleted. HP itself was at 10/10 sessions, so the probes did not run there and no user session was touched.
+- Deployment on HP:
+  - The controller and sidecar run `/home/kimex/.cache/terminal-mcp/issue52-deploy`, branch `deploy/issue52-on-reliability-20261012` @5a27028, via drop-ins `99-zz-terminal-mcp-issue52.conf` in `terminal-mcp-http.service.d/` and `terminal-mcp-chatgpt-v1.service.d/`.
+  - Queue stays `TERMINAL_MCP_ENABLE_QUEUE=0`.
+  - Backup: `~/.local/state/terminal-mcp/backup-issue52-20261012-205717/` holds the unit drop-ins tgz, a `direct_tasks.db` copy, and the tmux list and version before deploy.
+  - Rollback: delete both `99-zz-terminal-mcp-issue52.conf`, run `systemctl --user daemon-reload`, then restart `terminal-mcp-http` and `terminal-mcp-chatgpt-v1`. The direct_tasks migration is additive, so the old code reads the new columns fine. tmux sessions were preserved (KillMode=process); the session list was identical before and after.
+- Not deployed: Dell controller and node-agent are still on their previous build.
 
 ## HP dashboard cutover + m910 memory guardrails — 2026-10-06 (deployed)
 

@@ -98,3 +98,31 @@ def test_skip_exact_update_menu_without_running_installer(tmp_path,monkeypatch):
     result=launch(tmp_path,monkeypatch,backend)
     assert result["state"]=="READY"
     assert backend.keys==["Escape"]
+
+
+def test_startup_whitelist_does_not_override_closed_default(tmp_path, monkeypatch):
+    config = configured(tmp_path)
+    config = replace(config, session_access=replace(config.session_access, default_input=False))
+    backend = MenuBackend("daemon", 0)
+    result = launch(tmp_path, monkeypatch, backend, config)
+    assert result["state"] == "BLOCKED"
+    assert backend.keys == []
+
+
+def test_startup_open_default_does_not_require_retired_whitelist(tmp_path, monkeypatch):
+    config = configured(tmp_path)
+    config = replace(config, allowed_session_patterns=("other-*",),
+                     input_policy=replace(config.input_policy, allowed_session_patterns=("other-*",)))
+    backend = MenuBackend("daemon", 0)
+    assert launch(tmp_path, monkeypatch, backend, config)["state"] == "READY"
+    assert backend.keys == ["Enter"]
+
+
+def test_startup_rechecks_canonical_permission_before_input(tmp_path, monkeypatch):
+    backend = MenuBackend("daemon", 0)
+    decisions = iter([True, False])
+    svc = SessionLifecycleService(configured(tmp_path), backend,
+                                  input_authorized=lambda name: next(decisions, False))
+    monkeypatch.setattr(svc, "launch_command_for", lambda agent: "codex")
+    assert svc.create("codex-nav-check", "codex", str(tmp_path))["state"] == "BLOCKED"
+    assert backend.keys == []
