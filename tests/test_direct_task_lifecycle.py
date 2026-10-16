@@ -51,12 +51,14 @@ class FakePane:
         self.swallow = False
         self.draft = ""
         self.activations: list[str] = []
+        self.send_attempts = 0
 
     @property
     def is_agent(self):
         return self.agent in ("claude", "codex")
 
     def send(self, target, text, key):
+        self.send_attempts += 1
         if self.send_status != "SUBMIT_CONFIRMED":
             return {"status": self.send_status, "reason": "guard refused"}
         self.sent.append((text, key))
@@ -120,8 +122,8 @@ def test_idle_after_turn_is_not_done_and_controller_resumes_until_explicit_done(
 
     _run(sup, clock, 5)  # turn 1 ends -> pane IDLE, settle elapses
     task = sup.get(TASK["id"], refresh=False)["task"]
-    # Issue #52: a confirmed submit is DISPATCHING until execution is observed.
-    assert task["state"] == "DISPATCHING" and not task["business_complete"]
+    # Submit acceptance is distinct from independent execution evidence.
+    assert task["state"] == "EXECUTION_ACCEPTED" and not task["business_complete"]
     assert task["receipt"] == "SUBMIT_CONFIRMED" and task["running_confirmed"] is False
     assert len(pane.sent) == 2, "controller must re-dispatch after a normal turn end"
     assert "continuation 1/6" in pane.sent[1][0]
@@ -216,7 +218,7 @@ def test_shell_steps_run_sequentially_and_end_only_on_explicit_completion(tmp_pa
     assert done["task"]["state"] == "DONE"
 
 
-def test_send_failures_are_capped(tmp_path):
+def test_unconfirmed_continuation_becomes_dispatch_uncertain(tmp_path):
     clock = Clock()
     pane = FakePane()
     sup = _supervisor(tmp_path, pane, clock)
@@ -224,7 +226,59 @@ def test_send_failures_are_capped(tmp_path):
     pane.send_status = "BLOCKED"
     _run(sup, clock, 60)
     task = sup.get(task_id, refresh=False)["task"]
-    assert task["state"] == "BLOCKED" and "dispatch not confirmed" in task["reason"]
+    assert task["state"] == "DISPATCH_UNCERTAIN"
+    assert "submit not confirmed" in task["reason"]
+
+
+def test_text_sent_is_dispatch_uncertain_and_never_auto_retried(tmp_path):
+    clock = Clock()
+    pane = FakePane()
+    pane.send_status = "TEXT_SENT"
+    sup = _supervisor(tmp_path, pane, clock)
+
+    started = sup.start("s", text="goal", idempotency_key="text-sent-once")
+    task_id = started["task"]["task_id"]
+    _run(sup, clock, 60)
+    task = sup.get(task_id, refresh=True)["task"]
+
+    assert started["status"] == "BLOCKED"
+    assert task["state"] == "DISPATCH_UNCERTAIN"
+    assert task["completed_at"] is None
+    assert task["dispatches"] == 1, "uncertain text must be consumed to prevent replay"
+    assert pane.send_attempts == 1
+    retry = sup.start("s", text="goal", idempotency_key="text-sent-once")
+    assert retry["status"] == "BLOCKED"
+    assert retry["task"]["task_id"] == task_id
+    assert pane.send_attempts == 1
+
+
+def test_submit_confirmed_is_not_running_until_execution_evidence(tmp_path):
+    clock = Clock()
+    pane = FakePane(busy_ticks=0)
+    sup = _supervisor(tmp_path, pane, clock)
+
+    started = sup.start("s", text="goal")
+    assert started["task"]["state"] == "EXECUTION_ACCEPTED"
+    _run(sup, clock, 1)
+    task = sup.get(started["task"]["task_id"], refresh=False)["task"]
+    assert task["state"] == "EXECUTION_ACCEPTED"
+    assert task["turn_state"] == "IDLE"
+
+
+def test_execution_acceptance_times_out_after_five_minutes_without_retry(tmp_path):
+    clock = Clock()
+    pane = FakePane(busy_ticks=0)
+    sup = _supervisor(tmp_path, pane, clock)
+
+    started = sup.start("s", text="goal")
+    task_id = started["task"]["task_id"]
+    _run(sup, clock, 101, step=3.0)
+    task = sup.get(task_id, refresh=True)["task"]
+
+    assert task["state"] == "BLOCKED" and task["completed_at"] is None
+    assert task["wait_reason"] == "DISPATCH_ACK_TIMEOUT"
+    assert pane.send_attempts == 1
+    assert sup.start("s", text="duplicate")["error"] == "TARGET_HAS_ACTIVE_SUPERVISED_TASK"
 
 
 def test_supervision_survives_controller_restart(tmp_path):
@@ -352,7 +406,7 @@ def test_compact_wait_matching_idle_reports_task_not_complete(tmp_path):
 
     # The pane never started a turn: a confirmed submit alone is not RUNNING.
     status = tools.turn(action="supervise_status", task_id=task_id)["task"]
-    assert status["state"] == "DISPATCHING" and status["running_confirmed"] is False
+    assert status["state"] == "EXECUTION_ACCEPTED" and status["running_confirmed"] is False
     cancelled = tools.turn(action="supervise_cancel", task_id=task_id)
     assert cancelled["task"]["state"] == "CANCELLED"
     assert "supervised_task" not in tools.turn(action="wait", target="pos", timeout=2)

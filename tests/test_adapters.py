@@ -123,6 +123,16 @@ def test_claude_adapter_still_detects_a_real_permission_dialog_via_menu_chrome()
     assert adapter.identify_target_state(real_permission_menu) == TARGET_WAITING
 
 
+def test_codex_startup_settings_menu_is_waiting_not_a_composer():
+    adapter = CodexAdapter()
+    startup_menu = [
+        "1. Run without daemon this time",
+        "2. Restart with these settings",
+        "3. Cancel",
+    ]
+    assert adapter.identify_target_state(startup_menu) == TARGET_WAITING
+
+
 def test_claude_adapter_never_claims_stuck_composer_evidence():
     # Never reproduced for Claude Code -- no recovery path is enabled for
     # it regardless of how strongly a redraw-without-growth pattern

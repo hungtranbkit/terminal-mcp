@@ -376,9 +376,13 @@ _WAITING_PATTERNS = tuple(
         # strings (never plausible inside the model's own conversational
         # text), not the y/n phrasing above.
         r"enter to select", r"tab/arrow keys to navigate", r"esc to cancel",
-        # Agent boot dialogs (issue #52; Codex hook-trust menu captured live
-        # 2026-10-12, Claude folder trust). A human must answer these.
-        r"hooks need review", r"trust this folder",
+        # Codex first-launch preference menu: it is not the task composer,
+        # and Enter would accept the highlighted setup choice. Keep the
+        # phrases specific to this observed menu rather than treating all
+        # numbered text as an interactive prompt.
+        r"run without daemon this time", r"restart with these settings",
+        # The observed hook-review menu must remain guarded too.
+        r"hooks need review", r"continue without trusting",
         # REMOVED (2026-09-07, real false positive found LIVE against a
         # real attended session, `window2`): this list used to also
         # include bare r"\bapprove\b" and r"\bpermission\b" word-boundary
