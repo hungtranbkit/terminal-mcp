@@ -58,6 +58,9 @@ from .ai_usage_service import AiUsageService
 from . import terminal_wall
 from .live_sessions import EXPANDED_TAIL_LINES, MAX_EXPANDED, LiveSessionMonitor
 from .live_sessions_page import LIVE_SESSIONS_HTML
+from .office_page import OFFICE_HTML
+from .task_center_reader import CONNECTION_LABELS as TC_CONNECTION_LABELS
+from .task_center_reader import TaskCenterReader, build_task_view
 from .session_resource import probe_git_state
 from .recovery_engine import RecoveryEngine
 from .harness_service import HarnessService
@@ -14663,6 +14666,68 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             payload = {"error": "LIVE_SESSIONS_FAILED", "detail": str(exc), "sessions": [],
                        "counts": {}}
         payload["expanded_tail_lines"] = EXPANDED_TAIL_LINES
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    # Văn phòng AI (office_page.py, issue #67): the live sessions above drawn
+    # as a pixel office, next to the AI Gateway Task Center (#115) read
+    # through a GET-only adapter. No store of its own: sessions come from
+    # the SAME live monitor, tasks from the gateway (task_center_reader.py).
+    task_center_reader = getattr(server, "task_center_reader", None) or TaskCenterReader.from_env()
+    server.task_center_reader = task_center_reader
+
+    @server.custom_route("/dashboard/office", methods=["GET"], include_in_schema=False)
+    async def dashboard_office_page(request: Request) -> HTMLResponse | JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        return HTMLResponse(
+            _nav_page(OFFICE_HTML, "office"),
+            headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
+        )
+
+    @server.custom_route("/dashboard/api/office", methods=["GET"], include_in_schema=False)
+    async def dashboard_office(request: Request) -> JSONResponse:
+        """Read-only. Sessions: same rows as /dashboard/api/live-sessions.
+        Task Center rows are the gateway owner's work, so only the
+        operator/owner roles receive them; any other role gets the
+        `forbidden` connection state and no rows (role isolation)."""
+        blocked, identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        privileged = _role(identity) in ("operator", "owner")
+        expand = tuple(part for part in request.query_params.get("expand", "").split(",")
+                       if part)[:1]
+        force = request.query_params.get("refresh") == "1"
+        try:
+            live = await anyio.to_thread.run_sync(
+                lambda: live_monitor.snapshot(expand=expand, include_previews=privileged, force=force))
+        except Exception as exc:  # noqa: BLE001 -- the office never 5xxs
+            live = {"error": "LIVE_SESSIONS_FAILED", "detail": str(exc), "sessions": [], "counts": {}}
+        sessions = live.get("sessions") or []
+        if privileged:
+            try:
+                snap = await anyio.to_thread.run_sync(lambda: task_center_reader.snapshot(force=force))
+                tasks = build_task_view(snap, sessions)
+            except Exception as exc:  # noqa: BLE001
+                tasks = build_task_view({"connection": "error", "connection_label":
+                                         TC_CONNECTION_LABELS["error"],
+                                         "detail": type(exc).__name__}, sessions)
+        else:
+            tasks = build_task_view({"connection": "forbidden", "connection_label":
+                                     TC_CONNECTION_LABELS["forbidden"],
+                                     "detail": "Task Center chỉ hiển thị cho operator/owner."}, [])
+        payload = {
+            "generated_at": live.get("generated_at"),
+            "read_only": True,
+            "sessions": sessions,
+            "counts": live.get("counts") or {},
+            "by_state": live.get("by_state") or {},
+            "unreachable_nodes": live.get("unreachable_nodes") or [],
+            "source_errors": live.get("source_errors") or [],
+            "error": live.get("error"),
+            "task_center": tasks,
+            "privileged": privileged,
+        }
         return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/ai-usage", methods=["GET"], include_in_schema=False)

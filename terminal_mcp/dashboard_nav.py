@@ -91,6 +91,8 @@ DASHBOARD_NAV = NavSurface(
         # What is running right now, direct sends included -- the first
         # place to look after asking ChatGPT to start something.
         NavItem("live", "Đang chạy", "/dashboard/live"),
+        # The same live sessions as a pixel office + the Task Center (#67).
+        NavItem("office", "Văn phòng AI", "/dashboard/office"),
         NavItem("projects", "Projects", "/dashboard/projects"),
         NavItem("agents", "Agents", "/dashboard/agents"),
         NavItem("tasks", "Global Tasks", "/dashboard/tasks"),
