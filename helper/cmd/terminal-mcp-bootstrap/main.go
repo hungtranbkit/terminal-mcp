@@ -1,6 +1,6 @@
 // terminal-mcp-bootstrap -- the Terminal MCP Bootstrap helper.
 //
-// WHAT THIS DOES, AND DELIBERATELY DOES NOT DO
+// # WHAT THIS DOES, AND DELIBERATELY DOES NOT DO
 //
 // It owns the things a browser cannot: elevation, a LocalSystem service,
 // the terminalmcp:// protocol registration, and machine-wide state under
@@ -88,10 +88,11 @@ func nodeConfigPath() string {
 // allowlist here is what makes the protocol handler safe: a page can ask
 // for any controller it likes and be refused.
 type Config struct {
-	Controllers []string `json:"controllers"`
-	InstalledAt string   `json:"installed_at"`
-	Version     string   `json:"version"`
-	MachineID   string   `json:"machine_id"`
+	Controllers      []string `json:"controllers"`
+	DashboardOrigins []string `json:"dashboard_origins,omitempty"`
+	InstalledAt      string   `json:"installed_at"`
+	Version          string   `json:"version"`
+	MachineID        string   `json:"machine_id"`
 }
 
 func configPath() string { return filepath.Join(programDataDir(), "bootstrap.json") }

@@ -66,6 +66,7 @@ func runInstall(controller, session string) int {
 		if existing.MachineID != "" {
 			config.MachineID = existing.MachineID
 		}
+		config.DashboardOrigins = append(config.DashboardOrigins, existing.DashboardOrigins...)
 		// Binding to a second controller is a deliberate act, not a
 		// side effect of running install again.
 		config.Controllers = mergeControllers(existing.Controllers, origin)

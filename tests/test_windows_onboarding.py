@@ -1092,6 +1092,17 @@ def test_create_enrollment_request_key_replays_without_reissuing_code(tmp_path, 
     assert len(onboarding.list_enrollments()) == 1
 
 
+def test_pairing_handle_records_the_authenticated_dashboard_origin(tmp_path, monkeypatch):
+    client, _controller, onboarding = _client(tmp_path, monkeypatch)
+    created = client.post("/dashboard/api/nodes/onboard/enrollments", json={"node_id": "origin-pair"})
+    assert created.status_code == 200
+    enrollment_id = created.json()["enrollment"]["id"]
+    issued = client.post(f"/dashboard/api/nodes/onboard/enrollments/{enrollment_id}/handle",
+                         json={}, headers={"Origin": "http://testserver"})
+    assert issued.status_code == 200
+    assert onboarding.enrollments.handle_dashboard_origin(issued.json()["handle"]) == "http://testserver"
+
+
 def test_create_enrollment_rejects_machine_id_with_a_different_key(tmp_path, monkeypatch):
     client, _controller, _onboarding = _client(tmp_path, monkeypatch)
     first = client.post("/dashboard/api/nodes/onboard/enrollments",
@@ -1134,6 +1145,23 @@ def test_revoked_enrollment_cannot_redeem_an_existing_pairing_handle(tmp_path):
     handle, _expires = store.create_handle(enrollment.id)
     assert store.revoke(enrollment.id, by="owner@example.com")
     assert store.redeem_handle(handle) is None
+
+
+def test_pairing_handle_binds_dashboard_origin_and_stable_helper_identity(tmp_path):
+    store = EnrollmentStore(tmp_path / "enrollment.db")
+    enrollment, _code = store.create(node_id="origin-bound", os_name="linux",
+                                     idempotency_key="join-request-00000011")
+    handle, _expires = store.create_handle(
+        enrollment.id, dashboard_origin="https://dashboard.example")
+    assert store.redeem_handle(handle, expected_origin="https://evil.example",
+                               machine_id="g" * 32) is None
+    record = store.redeem_handle(handle, expected_origin="https://dashboard.example",
+                                 machine_id="g" * 32)
+    assert record is not None and record.id == enrollment.id
+    assert "machine_id" not in record.to_dict()
+    with pytest.raises(DuplicateEnrollmentError):
+        store.create(node_id="another-name", os_name="linux", machine_id="g" * 32,
+                     idempotency_key="join-request-00000012")
 
 
 def test_removing_helper_join_node_retires_consumed_machine_identity(tmp_path):

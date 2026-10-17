@@ -74,6 +74,10 @@ def _add_idempotency_identity(connection) -> None:
         connection.execute(f"ALTER TABLE enrollments ADD COLUMN {column} TEXT")
 
 
+def _add_handle_origin(connection) -> None:
+    connection.execute("ALTER TABLE enrollment_handles ADD COLUMN dashboard_origin TEXT")
+
+
 ENROLLMENT_MIGRATIONS: list[Migration] = [
     Migration(1, "baseline: one-time node enrollment codes", lambda connection: None),
     Migration(2, "installer progress: which stage a machine is on, and for how long",
@@ -81,6 +85,7 @@ ENROLLMENT_MIGRATIONS: list[Migration] = [
     Migration(3, "bootstrap handles: a one-time id the web can hand a local helper",
               _add_handles),
     Migration(4, "idempotent enrollment identity", _add_idempotency_identity),
+    Migration(5, "bind helper pairing to the Dashboard origin", _add_handle_origin),
 ]
 
 # A handle is what travels in a terminalmcp:// URL, so it is sized for the
@@ -428,7 +433,8 @@ class EnrollmentStore:
                         "SELECT * FROM enrollments WHERE idempotency_key = ? AND created_by IS ? "
                         "ORDER BY created_at DESC LIMIT 1", (idempotency_key, created_by)).fetchone()
                     if existing is not None:
-                        same_machine = (existing["machine_id_hash"] or None) == machine_id_hash
+                        same_machine = (machine_id_hash is None or
+                                        (existing["machine_id_hash"] or None) == machine_id_hash)
                         if existing["node_id"] != node_id or not same_machine:
                             raise DuplicateEnrollmentError("IDEMPOTENCY_KEY_REUSED")
                         connection.execute("COMMIT")
@@ -680,6 +686,7 @@ class EnrollmentStore:
     # rest, single-use, and alive for two minutes.
 
     def create_handle(self, enrollment_id: str, *, created_by: str | None = None,
+                      dashboard_origin: str | None = None,
                       ttl_seconds: int = HANDLE_TTL_SECONDS,
                       now: datetime | None = None) -> tuple[str, str] | None:
         """Returns (handle, expires_at) once, or None if the enrollment is
@@ -693,12 +700,23 @@ class EnrollmentStore:
                                                      min(int(ttl_seconds), HANDLE_TTL_MAX_SECONDS))))
         with self._connection() as connection:
             connection.execute(
-                "INSERT INTO enrollment_handles (handle_hash, enrollment_id, created_at, expires_at, created_by) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (hash_code(handle), enrollment_id, _iso(moment), expires, created_by))
+                "INSERT INTO enrollment_handles (handle_hash, enrollment_id, created_at, expires_at, created_by, "
+                "dashboard_origin) VALUES (?, ?, ?, ?, ?, ?)",
+                (hash_code(handle), enrollment_id, _iso(moment), expires, created_by, dashboard_origin))
         return handle, expires
 
-    def redeem_handle(self, handle: str, *, now: datetime | None = None) -> Enrollment | None:
+    def handle_dashboard_origin(self, handle: str) -> str | None:
+        candidate = str(handle or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{32}", candidate):
+            return None
+        with self._connection() as connection:
+            row = connection.execute("SELECT dashboard_origin FROM enrollment_handles WHERE handle_hash = ?",
+                                     (hash_code(candidate),)).fetchone()
+        return row["dashboard_origin"] if row is not None else None
+
+    def redeem_handle(self, handle: str, *, expected_origin: str | None = None,
+                      machine_id: str | None = None,
+                      now: datetime | None = None) -> Enrollment | None:
         """Single-use, atomic, same discipline as consume(): the UPDATE
         that marks it redeemed is the guard, so two helpers racing the
         same handle produce exactly one winner. Returns the enrollment the
@@ -707,27 +725,57 @@ class EnrollmentStore:
         candidate = str(handle or "").strip().lower()
         if not re.fullmatch(r"[0-9a-f]{32}", candidate):
             return None
+        if machine_id is not None and not _MACHINE_ID_RE.fullmatch(str(machine_id).strip()):
+            raise ValueError("machine_id must be a 16-128 character URL-safe helper identity")
         digest = hash_code(candidate)
+        machine_id_hash = hashlib.sha256(str(machine_id).strip().encode()).hexdigest() if machine_id else None
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                handle_row = connection.execute(
+                    "SELECT * FROM enrollment_handles WHERE handle_hash = ? AND redeemed_at IS NULL "
+                    "AND expires_at > ?", (digest, _iso(moment))).fetchone()
+                if handle_row is None:
+                    connection.execute("COMMIT")
+                    return None
+                bound_origin = handle_row["dashboard_origin"]
+                if bound_origin and expected_origin != bound_origin:
+                    connection.execute("COMMIT")
+                    return None
+                enrollment_row = connection.execute(
+                    "SELECT * FROM enrollments WHERE id = ? AND status = ? AND expires_at > ?",
+                    (handle_row["enrollment_id"], STATUS_PENDING, _iso(moment))).fetchone()
+                if enrollment_row is None:
+                    connection.execute("COMMIT")
+                    return None
+                if machine_id_hash:
+                    existing_hash = enrollment_row["machine_id_hash"] or None
+                    if existing_hash is not None and existing_hash != machine_id_hash:
+                        raise DuplicateEnrollmentError("MACHINE_IDENTITY_CHANGED")
+                    duplicate = connection.execute(
+                        "SELECT id FROM enrollments WHERE machine_id_hash = ? AND id != ? AND "
+                        "(status = ? OR (status = ? AND expires_at > ?)) LIMIT 1",
+                        (machine_id_hash, enrollment_row["id"], STATUS_CONSUMED, STATUS_PENDING,
+                         _iso(moment))).fetchone()
+                    if duplicate is not None:
+                        raise DuplicateEnrollmentError("MACHINE_ALREADY_ENROLLED")
+                    connection.execute("UPDATE enrollments SET machine_id_hash = ? WHERE id = ?",
+                                       (machine_id_hash, enrollment_row["id"]))
                 cursor = connection.execute(
                     "UPDATE enrollment_handles SET redeemed_at = ? "
-                    "WHERE handle_hash = ? AND redeemed_at IS NULL AND expires_at > ? "
-                    "AND EXISTS (SELECT 1 FROM enrollments e "
-                    "WHERE e.id = enrollment_handles.enrollment_id AND e.status = ? AND e.expires_at > ?)",
-                    (_iso(moment), digest, _iso(moment), STATUS_PENDING, _iso(moment)))
+                    "WHERE handle_hash = ? AND redeemed_at IS NULL AND expires_at > ?",
+                    (_iso(moment), digest, _iso(moment)))
                 if cursor.rowcount != 1:
                     connection.execute("COMMIT")
                     return None
-                row = connection.execute(
-                    "SELECT enrollment_id FROM enrollment_handles WHERE handle_hash = ?", (digest,)).fetchone()
+                row = connection.execute("SELECT * FROM enrollments WHERE id = ?",
+                                         (handle_row["enrollment_id"],)).fetchone()
                 connection.execute("COMMIT")
             except Exception:
                 with contextlib.suppress(sqlite3.Error):
                     connection.execute("ROLLBACK")
                 raise
-        return self.get(row["enrollment_id"], now=moment) if row else None
+        return _row_to_record(row, now=moment) if row else None
 
     def consume_by_id(self, enrollment_id: str, *, hostname: str | None = None,
                       source_ip: str | None = None,

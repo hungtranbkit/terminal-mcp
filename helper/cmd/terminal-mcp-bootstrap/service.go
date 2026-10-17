@@ -14,16 +14,17 @@ import (
 // carries these -- never a command string. A privileged service that
 // accepted arbitrary RPC would undo every check in internal/proto.
 type pipeRequest struct {
-	Action     string `json:"action"`
-	Handle     string `json:"handle,omitempty"`
-	Session    string `json:"session,omitempty"`
-	Controller string `json:"controller"`
+	Action          string `json:"action"`
+	Handle          string `json:"handle,omitempty"`
+	Session         string `json:"session,omitempty"`
+	Controller      string `json:"controller"`
+	DashboardOrigin string `json:"dashboard_origin,omitempty"`
 }
 
 type pipeResponse struct {
-	OK     bool           `json:"ok"`
-	Error  string         `json:"error,omitempty"`
-	Status *statusReport  `json:"status,omitempty"`
+	OK     bool          `json:"ok"`
+	Error  string        `json:"error,omitempty"`
+	Status *statusReport `json:"status,omitempty"`
 }
 
 var pipeActions = map[string]bool{
@@ -87,13 +88,18 @@ func handlePipeRequest(raw []byte, config Config) pipeResponse {
 	if request.Action == "Bootstrap" && !handleLooksValid(request.Handle) {
 		return pipeResponse{Error: "bad handle"}
 	}
+	if request.DashboardOrigin != "" {
+		if normalized, ok := secureDashboardOrigin(request.DashboardOrigin); !ok || normalized != request.DashboardOrigin {
+			return pipeResponse{Error: "bad dashboard origin"}
+		}
+	}
 
 	switch request.Action {
 	case "GetStatus":
 		status := currentStatus()
 		return pipeResponse{OK: true, Status: &status}
 	case "Bootstrap":
-		if err := continueSession(request.Handle, origin); err != nil {
+		if err := continueSessionWithIdentity(request.Handle, origin, request.DashboardOrigin, config.MachineID); err != nil {
 			return pipeResponse{Error: err.Error()}
 		}
 		return pipeResponse{OK: true}
@@ -142,6 +148,11 @@ func handleLooksValid(handle string) bool {
 const installerTimeout = 45 * time.Minute
 
 func continueSession(handle, controller string) error {
+	config, _ := loadConfig()
+	return continueSessionWithIdentity(handle, controller, "", config.MachineID)
+}
+
+func continueSessionWithIdentity(handle, controller, dashboardOrigin, machineID string) error {
 	report := newReporter(controller, handle)
 	report.report(stageHelperStarted)
 
@@ -160,10 +171,20 @@ func continueSession(handle, controller string) error {
 	if hostname == "" {
 		hostname = "windows"
 	}
-	payload, err := redeemHandle(controller, handle, hostname)
+	payload, err := redeemHandleIdentity(controller, handle, hostname, dashboardOrigin, machineID)
 	if err != nil {
 		report.fail(failPairingRejected)
 		return fmt.Errorf("redeem pairing: %w", err)
+	}
+	if trustedOrigin, ok := payload["dashboard_origin"].(string); ok && trustedOrigin != "" {
+		normalized, valid := secureDashboardOrigin(trustedOrigin)
+		if !valid || normalized != trustedOrigin {
+			report.fail(failPairingRejected)
+			return fmt.Errorf("controller returned an invalid dashboard origin")
+		}
+		if err := persistDashboardOrigin(trustedOrigin); err != nil {
+			return fmt.Errorf("persist dashboard origin: %w", err)
+		}
 	}
 	report.report(stageRedeemed)
 
@@ -200,6 +221,24 @@ func continueSession(handle, controller string) error {
 	// this is the last thing the helper itself says.
 	report.report(stageSetupStarted)
 	return nil
+}
+
+func persistDashboardOrigin(origin string) error {
+	config, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	for _, existing := range config.DashboardOrigins {
+		if existing == origin {
+			return nil
+		}
+	}
+	config.DashboardOrigins = append(config.DashboardOrigins, origin)
+	raw, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeAtomic(configPath(), raw, 0o600)
 }
 
 func runService() int {

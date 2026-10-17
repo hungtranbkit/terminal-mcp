@@ -18867,6 +18867,17 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         scheme = request.url.scheme or "http"
         return f"{scheme}://{host}" if host else ""
 
+    def _dashboard_origin(request: Request) -> str | None:
+        raw_origin = request.headers.get("origin")
+        if not raw_origin:
+            return None
+        parsed = urlparse(raw_origin)
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+            return None
+        if parsed.path not in ("", "/") or parsed.query or parsed.fragment or parsed.username:
+            return None
+        return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
     def _machine_origin(request: Request) -> str:
         """The origin to hand to a MACHINE, as opposed to the one the
         operator's browser happens to be using.
@@ -19289,6 +19300,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         def _compute():
             issued = onboarding.enrollments.create_handle(
                 enrollment_id, created_by=(identity.email if identity else None),
+                dashboard_origin=_dashboard_origin(request),
                 ttl_seconds=terminal.config.nodes.onboarding.pairing_handle_ttl_seconds)
             if issued is None:
                 return None
@@ -19338,13 +19350,16 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return JSONResponse({"error": "INVALID_REQUEST", "detail": "handle and hostname are required"},
                                 status_code=400, headers={"Cache-Control": "no-store"})
         addresses = body.get("addresses") if isinstance(body.get("addresses"), dict) else {}
+        dashboard_origin = str(body.get("dashboard_origin") or "").strip() or None
+        machine_id = str(body.get("machine_id") or "").strip() or None
 
         def _compute() -> dict:
             return onboarding.redeem_handle(
                 str(body.get("handle")), hostname=hostname, source_ip=source,
                 platform=str(body.get("platform") or "windows")[:32], addresses=addresses,
                 rescue_public_key=body.get("rescue_public_key"),
-                request_base_url=_request_base_url(request))
+                request_base_url=_request_base_url(request), dashboard_origin=dashboard_origin,
+                machine_id=machine_id)
 
         try:
             result = await anyio.to_thread.run_sync(_compute)
