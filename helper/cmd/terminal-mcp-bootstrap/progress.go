@@ -29,6 +29,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"runtime"
 	"time"
 )
 
@@ -150,10 +151,16 @@ func (r *reporter) failWithCode(code string, exitCode int) {
 // of its own. Redemption is single-use and the CONTROLLER consumes the
 // enrollment, so nothing this process is left holding can be replayed.
 func redeemHandle(controller, handle, hostname string) (map[string]any, error) {
+	return redeemHandleIdentity(controller, handle, hostname, "", "")
+}
+
+func redeemHandleIdentity(controller, handle, hostname, dashboardOrigin, machineID string) (map[string]any, error) {
 	body, err := json.Marshal(map[string]any{
-		"handle":   handle,
-		"hostname": hostname,
-		"platform": "windows",
+		"handle":           handle,
+		"hostname":         hostname,
+		"platform":         runtime.GOOS,
+		"dashboard_origin": dashboardOrigin,
+		"machine_id":       machineID,
 	})
 	if err != nil {
 		return nil, err

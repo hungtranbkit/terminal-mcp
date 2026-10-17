@@ -374,7 +374,8 @@ class OnboardingService:
     def redeem_handle(self, handle: str, *, hostname: str, source_ip: str | None = None,
                       platform: str = "windows", addresses: dict[str, Any] | None = None,
                       rescue_public_key: str | None = None,
-                      request_base_url: str | None = None) -> dict[str, Any]:
+                      request_base_url: str | None = None, dashboard_origin: str | None = None,
+                      machine_id: str | None = None) -> dict[str, Any]:
         """The Bootstrap helper's entry point: one-time handle in, full
         bootstrap payload out.
 
@@ -383,15 +384,29 @@ class OnboardingService:
         the controller resolves it to an enrollment and consumes THAT.
         Nothing the helper holds afterwards can be replayed -- the handle
         is spent and the code was never issued to it."""
-        record = self.enrollments.redeem_handle(handle)
+        bound_origin = self.enrollments.handle_dashboard_origin(handle)
+        if bound_origin and dashboard_origin and bound_origin != dashboard_origin:
+            raise OnboardingError("HANDLE_ORIGIN_MISMATCH", "pairing was created for another Dashboard origin",
+                                  status=401)
+        try:
+            record = self.enrollments.redeem_handle(
+                handle, expected_origin=dashboard_origin or bound_origin, machine_id=machine_id)
+        except DuplicateEnrollmentError as exc:
+            raise OnboardingError(str(exc), "this helper machine is already joined or changed identity",
+                                  status=409) from exc
+        except ValueError as exc:
+            raise OnboardingError("INVALID_REQUEST", str(exc)) from exc
         if record is None:
             self._audit("node_enrollment_rejected", node_id=None,
                         detail={"reason": "handle_invalid_or_spent", "hostname": hostname,
                                 "source_ip": source_ip})
             raise OnboardingError("HANDLE_INVALID", "handle is unknown, already used, or expired", status=401)
-        return self._consume_record(record, hostname=hostname, source_ip=source_ip, platform=platform,
-                                    addresses=addresses, rescue_public_key=rescue_public_key,
-                                    request_base_url=request_base_url, by_handle=True)
+        result = self._consume_record(record, hostname=hostname, source_ip=source_ip, platform=platform,
+                                      addresses=addresses, rescue_public_key=rescue_public_key,
+                                      request_base_url=request_base_url, by_handle=True)
+        if bound_origin:
+            result["dashboard_origin"] = bound_origin
+        return result
 
     def consume_enrollment(self, code: str, *, hostname: str, source_ip: str | None = None,
                            platform: str = "windows", addresses: dict[str, Any] | None = None,
