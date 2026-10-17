@@ -122,3 +122,16 @@ def test_replay_only_renews_to_original_absolute_lease(tmp_path):
     b.receive(relay,first,peer_id='a')
     now[0]=2801
     assert not b.search(principal('b'),'needle')
+
+
+def test_replayed_page_cannot_reset_clock_rollback_watermark(tmp_path):
+    now=[10000.0];a=store(tmp_path,'a',lambda:now[0]);b=store(tmp_path,'b',lambda:now[0])
+    relay=principal('controller',('reader','relay'))
+    a.publish(principal(),'note','x','p',{'title':'needle'},visibility='shared')
+    page=a.page(relay,0);b.receive(relay,page,peer_id='a')
+    now[0]=1000
+    assert not b.search(principal('b'),'needle')
+    b.receive(relay,page,peer_id='a')
+    now[0]=1901
+    assert not b.search(principal('b'),'needle')
+    assert not b.page(relay,0)['objects']

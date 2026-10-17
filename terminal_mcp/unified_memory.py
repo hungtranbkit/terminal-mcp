@@ -148,6 +148,8 @@ class MemoryStore:
                 # Fresh authenticated snapshots may renew only to their signed-in-transport
                 # absolute deadline; replaying an old page cannot keep data alive.
                 if obj['revision']==old['revision']:
+                    if self.clock()<old['received_at']:
+                        return False  # preserve rollback watermark; replay cannot reactivate cache
                     self.db.execute('UPDATE documents SET lease_until=MAX(lease_until,?),received_at=? WHERE id=?',(lease,self.clock(),obj['id']))
                 return False
         shared=int(obj['visibility']=='shared' or bool(old and old['ever_shared']))
