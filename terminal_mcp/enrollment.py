@@ -69,12 +69,18 @@ def _add_handles(connection) -> None:
                        "ON enrollment_handles(enrollment_id)")
 
 
+def _add_idempotency_identity(connection) -> None:
+    for column in ("machine_id_hash", "idempotency_key"):
+        connection.execute(f"ALTER TABLE enrollments ADD COLUMN {column} TEXT")
+
+
 ENROLLMENT_MIGRATIONS: list[Migration] = [
     Migration(1, "baseline: one-time node enrollment codes", lambda connection: None),
     Migration(2, "installer progress: which stage a machine is on, and for how long",
               _add_progress_columns),
     Migration(3, "bootstrap handles: a one-time id the web can hand a local helper",
               _add_handles),
+    Migration(4, "idempotent enrollment identity", _add_idempotency_identity),
 ]
 
 # A handle is what travels in a terminalmcp:// URL, so it is sized for the
@@ -211,6 +217,12 @@ _GROUP_LEN = 5  # 15 chars * 5 bits = 75 bits of entropy
 _CODE_RE = re.compile(r"^TMCP-[0-9A-HJKMNP-TV-Z]{5}-[0-9A-HJKMNP-TV-Z]{5}-[0-9A-HJKMNP-TV-Z]{5}$")
 
 _NODE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_MACHINE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+_IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+
+
+class DuplicateEnrollmentError(ValueError):
+    """A machine, node id, or idempotency key is already bound."""
 
 
 def default_enrollment_store_path() -> Path:
@@ -381,7 +393,8 @@ class EnrollmentStore:
     def create(self, *, node_id: str, display_name: str | None = None, os_name: str = OS_WINDOWS,
                profile: str = "minimal", connectivity: dict[str, Any] | None = None,
                ttl_seconds: int = DEFAULT_TTL_SECONDS, created_by: str | None = None,
-               now: datetime | None = None) -> tuple[Enrollment, str]:
+               machine_id: str | None = None, idempotency_key: str | None = None,
+               now: datetime | None = None) -> tuple[Enrollment, str | None]:
         """Returns (record, plaintext_code). The plaintext is returned HERE
         and nowhere else, ever -- the caller embeds it in the one download
         it hands the operator and then drops it."""
@@ -390,25 +403,64 @@ class EnrollmentStore:
             raise ValueError(f"os must be one of {', '.join(SUPPORTED_OS)}")
         if ttl_seconds < 60 or ttl_seconds > 86400:
             raise ValueError("ttl_seconds must be between 60 and 86400")
+        if machine_id is not None and not _MACHINE_ID_RE.fullmatch(str(machine_id).strip()):
+            raise ValueError("machine_id must be a 16-128 character URL-safe helper identity")
+        if idempotency_key is not None and not _IDEMPOTENCY_KEY_RE.fullmatch(str(idempotency_key).strip()):
+            raise ValueError("idempotency_key must be a 16-128 character URL-safe value")
         moment = now or _now()
-        code = generate_code()
+        machine_id_hash = hashlib.sha256(str(machine_id).strip().encode()).hexdigest() if machine_id else None
+        idempotency_key = str(idempotency_key).strip() if idempotency_key else None
         record_id = secrets.token_hex(8)
         payload = json.dumps(connectivity or {}, sort_keys=True)
         row = {
-            "id": record_id, "code_hash": hash_code(code), "code_display": code.split("-")[1],
+            "id": record_id,
             "node_id": node_id, "display_name": (display_name or node_id).strip() or node_id,
             "os": os_name, "profile": profile, "connectivity": payload, "status": STATUS_PENDING,
             "created_at": _iso(moment), "expires_at": _iso(moment + timedelta(seconds=ttl_seconds)),
-            "created_by": created_by,
+            "created_by": created_by, "machine_id_hash": machine_id_hash,
+            "idempotency_key": idempotency_key,
         }
         with self._connection() as connection:
-            connection.execute(
-                """INSERT INTO enrollments (id, code_hash, code_display, node_id, display_name, os, profile,
-                                            connectivity, status, created_at, expires_at, created_by)
-                   VALUES (:id, :code_hash, :code_display, :node_id, :display_name, :os, :profile,
-                           :connectivity, :status, :created_at, :expires_at, :created_by)""",
-                row,
-            )
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                if idempotency_key:
+                    existing = connection.execute(
+                        "SELECT * FROM enrollments WHERE idempotency_key = ? AND created_by IS ? "
+                        "ORDER BY created_at DESC LIMIT 1", (idempotency_key, created_by)).fetchone()
+                    if existing is not None:
+                        same_machine = (existing["machine_id_hash"] or None) == machine_id_hash
+                        if existing["node_id"] != node_id or not same_machine:
+                            raise DuplicateEnrollmentError("IDEMPOTENCY_KEY_REUSED")
+                        connection.execute("COMMIT")
+                        return _row_to_record(existing, now=moment), None
+                if machine_id_hash:
+                    existing = connection.execute(
+                        "SELECT id FROM enrollments WHERE machine_id_hash = ? AND "
+                        "(status = ? OR (status = ? AND expires_at > ?)) LIMIT 1",
+                        (machine_id_hash, STATUS_CONSUMED, STATUS_PENDING, _iso(moment))).fetchone()
+                    if existing is not None:
+                        raise DuplicateEnrollmentError("MACHINE_ALREADY_ENROLLED")
+                    existing = connection.execute(
+                        "SELECT id FROM enrollments WHERE node_id = ? AND "
+                        "(status = ? OR (status = ? AND expires_at > ?)) LIMIT 1",
+                        (node_id, STATUS_CONSUMED, STATUS_PENDING, _iso(moment))).fetchone()
+                    if existing is not None:
+                        raise DuplicateEnrollmentError("NODE_ALREADY_ENROLLED")
+                code = generate_code()
+                row["code_hash"] = hash_code(code)
+                row["code_display"] = code.split("-")[1]
+                connection.execute(
+                    """INSERT INTO enrollments (id, code_hash, code_display, node_id, display_name, os, profile,
+                                                connectivity, status, created_at, expires_at, created_by,
+                                                machine_id_hash, idempotency_key)
+                       VALUES (:id, :code_hash, :code_display, :node_id, :display_name, :os, :profile,
+                               :connectivity, :status, :created_at, :expires_at, :created_by,
+                               :machine_id_hash, :idempotency_key)""", row)
+                connection.execute("COMMIT")
+            except Exception:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
         record = self.get(record_id, now=moment)
         assert record is not None  # just inserted
         return record, code
@@ -503,6 +555,22 @@ class EnrollmentStore:
                 "UPDATE enrollments SET status = ?, revoked_at = ?, revoked_by = ? WHERE node_id = ? AND status = ?",
                 (STATUS_REVOKED, _iso(moment), by, node_id, STATUS_PENDING),
             )
+        return cursor.rowcount
+
+    def retire_machine_enrollments_for_node(self, node_id: str, *, by: str | None = None,
+                                            now: datetime | None = None) -> int:
+        """Retire consumed helper identities when a node is fully removed.
+
+        The credential store separately revokes the node's bearer token;
+        retiring this row permits the same installed helper to pair again
+        without making a removed machine's old enrollment active.
+        """
+        moment = now or _now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE enrollments SET status = ?, revoked_at = ?, revoked_by = ? "
+                "WHERE node_id = ? AND status = ? AND machine_id_hash IS NOT NULL",
+                (STATUS_REVOKED, _iso(moment), by, node_id, STATUS_CONSUMED))
         return cursor.rowcount
 
     def purge(self, *, older_than_days: int = 30, now: datetime | None = None) -> int:
@@ -645,8 +713,10 @@ class EnrollmentStore:
             try:
                 cursor = connection.execute(
                     "UPDATE enrollment_handles SET redeemed_at = ? "
-                    "WHERE handle_hash = ? AND redeemed_at IS NULL AND expires_at > ?",
-                    (_iso(moment), digest, _iso(moment)))
+                    "WHERE handle_hash = ? AND redeemed_at IS NULL AND expires_at > ? "
+                    "AND EXISTS (SELECT 1 FROM enrollments e "
+                    "WHERE e.id = enrollment_handles.enrollment_id AND e.status = ? AND e.expires_at > ?)",
+                    (_iso(moment), digest, _iso(moment), STATUS_PENDING, _iso(moment)))
                 if cursor.rowcount != 1:
                     connection.execute("COMMIT")
                     return None
