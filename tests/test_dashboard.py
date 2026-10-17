@@ -2186,6 +2186,20 @@ def test_cloudflare_access_requires_email_role_allowlist(tmux_session_factory, m
     assert response.json()["error"] == "ACCESS_ROLE_ALLOWLIST_REQUIRED"
 
 
+def test_cloudflare_access_runtime_fails_closed_on_incomplete_configuration():
+    config = _cf_access_config()
+    config = replace(config, dashboard=replace(config.dashboard, cloudflare_access_audience=None))
+    service = TerminalService(config)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app())
+
+    response = client.get("/dashboard")
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "CLOUDFLARE_ACCESS_CONFIGURATION_INCOMPLETE"
+
+
 @pytest.mark.parametrize("email,allowed,mutation_allowed", [
     ("read@example.com", True, False),
     ("ops@example.com", True, False),
@@ -2341,6 +2355,18 @@ def test_load_config_rejects_blank_cloudflare_access_fields(tmp_path):
         "dashboard:\n  cloudflare_access_team_domain: ''\n"
     )
     with pytest.raises(ValueError, match="cloudflare_access_team_domain"):
+        load_config(config_path)
+
+
+@pytest.mark.parametrize("configured", [
+    "cloudflare_access_team_domain: team.cloudflareaccess.com",
+    "cloudflare_access_audience: app-aud",
+])
+def test_load_config_rejects_incomplete_cloudflare_access_pair(tmp_path, configured):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(f"allowed_session_patterns: ['test-*']\ndashboard:\n  {configured}\n")
+
+    with pytest.raises(ValueError, match="must be configured together"):
         load_config(config_path)
 
 

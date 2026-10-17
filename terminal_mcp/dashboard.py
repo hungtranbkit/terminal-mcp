@@ -13802,6 +13802,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         project is the same opt-in, no-op-unless-configured shape."""
         team_domain = terminal.config.dashboard.cloudflare_access_team_domain
         audience = terminal.config.dashboard.cloudflare_access_audience
+        if bool(team_domain) != bool(audience):
+            return JSONResponse({"error": "CLOUDFLARE_ACCESS_CONFIGURATION_INCOMPLETE"}, status_code=503,
+                                headers={"Cache-Control": "no-store"}), None
         if not (team_domain and audience):
             return None, None
         token = request.headers.get("cf-access-jwt-assertion") or request.cookies.get("CF_Authorization")

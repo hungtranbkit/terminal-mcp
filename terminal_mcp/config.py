@@ -2949,6 +2949,8 @@ def _load_dashboard_config(dashboard_raw: object) -> DashboardConfig:
         raise ValueError("dashboard.cloudflare_access_team_domain must be a non-empty string")
     if audience is not None and not (isinstance(audience, str) and audience.strip()):
         raise ValueError("dashboard.cloudflare_access_audience must be a non-empty string")
+    if bool(team_domain) != bool(audience):
+        raise ValueError("dashboard.cloudflare_access_team_domain and audience must be configured together")
     role_map_raw = dashboard_raw.get("access_email_roles")
     role_map: tuple[tuple[str, str], ...] | None = None
     if role_map_raw is not None:
