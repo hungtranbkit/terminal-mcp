@@ -103,6 +103,16 @@ func TestLoopbackPreflightRequiresPinnedOriginAndPrivateNetworkPermission(t *tes
 	if preflight.Code != http.StatusNoContent || preflight.Header().Get("Access-Control-Allow-Private-Network") != "true" {
 		t.Fatalf("private network preflight failed: %d %v", preflight.Code, preflight.Header())
 	}
+	challengePreflight := httptest.NewRequest(http.MethodOptions, "http://"+loopbackTestHost+challengePath, nil)
+	challengePreflight.Host = loopbackTestHost
+	challengePreflight.Header.Set("Origin", "https://dashboard.example")
+	challengePreflight.Header.Set("Access-Control-Request-Method", http.MethodGet)
+	challengePreflight.Header.Set("Access-Control-Request-Private-Network", "true")
+	challengeResponse := httptest.NewRecorder()
+	handler.ServeHTTP(challengeResponse, challengePreflight)
+	if challengeResponse.Code != http.StatusNoContent {
+		t.Fatalf("challenge PNA preflight returned %d", challengeResponse.Code)
+	}
 	missingPNA := httptest.NewRequest(http.MethodOptions, "http://"+loopbackTestHost+pairPath, nil)
 	missingPNA.Host = loopbackTestHost
 	missingPNA.Header.Set("Origin", "https://dashboard.example")

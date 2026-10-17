@@ -365,7 +365,8 @@ def test_the_cta_only_offers_a_download_this_controller_actually_published():
 
 def test_an_unsigned_build_is_stated_plainly_not_coached_past():
     assert "chưa ký" in NODES_ADMIN_HTML
-    assert "SmartScreen" in NODES_ADMIN_HTML
+    assert "Windows may block it" in NODES_ADMIN_HTML
+    assert "More info → Run anyway" not in NODES_ADMIN_HTML
     assert "build.signed" in NODES_ADMIN_HTML
 
 
@@ -380,7 +381,8 @@ def test_the_manual_powershell_fallback_is_untouched():
 
 def test_the_one_click_connect_button_still_exists_for_an_installed_helper():
     assert 'id="anHelperBtn"' in NODES_ADMIN_HTML
-    assert "terminalmcp" in NODES_ADMIN_HTML or "issued.data.url" in NODES_ADMIN_HTML
+    assert "http://127.0.0.1:47562/v1/pair" in NODES_ADMIN_HTML
+    assert "nonce: challenge.nonce, handle" in NODES_ADMIN_HTML
 
 
 # -- pairing the download with a pending session ------------------------------------

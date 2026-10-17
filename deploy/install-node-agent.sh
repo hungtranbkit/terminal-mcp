@@ -36,6 +36,7 @@ AGENT_HOST=127.0.0.1
 HEARTBEAT_INTERVAL=20
 USE_SYSTEMD=1
 PAIRED_MODE=0
+ONBOARDING_MODE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -49,6 +50,7 @@ while [[ $# -gt 0 ]]; do
     --heartbeat-interval) HEARTBEAT_INTERVAL="$2"; shift 2 ;;
     --no-systemd) USE_SYSTEMD=0; shift ;;
     --paired) PAIRED_MODE=1; shift ;;
+    --onboarding) ONBOARDING_MODE=1; shift ;;
     -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -109,7 +111,17 @@ fi
 # -- 3. This node's own token -------------------------------------------------
 ENV_FILE="$REPO_DIR/node-agent.env"  # legacy migration source only
 TOKEN_FILE="$REPO_DIR/node-agent.token"
-if [[ -f "$TOKEN_FILE" ]]; then
+if [[ "$ONBOARDING_MODE" -eq 1 ]]; then
+  TOKEN_VALUE="${TERMINAL_MCP_ONBOARDING_NODE_TOKEN:-}"
+  if [[ ! "$TOKEN_VALUE" =~ ^[A-Za-z0-9_-]{32,256}$ ]]; then
+    echo "Error: onboarding token is missing or malformed." >&2; exit 1
+  fi
+  umask 077
+  printf "%s" "$TOKEN_VALUE" > "$TOKEN_FILE"
+  chmod 600 "$TOKEN_FILE"
+  unset TOKEN_VALUE TERMINAL_MCP_ONBOARDING_NODE_TOKEN
+  echo "-> Wrote the controller-issued credential to a protected token file"
+elif [[ -f "$TOKEN_FILE" ]]; then
   chmod 600 "$TOKEN_FILE"
   echo "-> Reusing protected token file $TOKEN_FILE"
 elif [[ -f "$ENV_FILE" ]]; then
@@ -306,6 +318,11 @@ if [[ "$PAIRED_MODE" -eq 1 ]]; then
 fi
 
 echo
+if [[ "$ONBOARDING_MODE" -eq 1 ]]; then
+  echo "== Node agent service installed and started =="
+  echo "The controller already registered this node; its first authenticated heartbeat will confirm readiness."
+  exit 0
+fi
 echo "== Node agent installed. ONE MORE STEP -- on the CONTROLLER (Dell) =="
 echo
 echo "1) Add this node to the controller's config.yaml (nodes.remote list):"

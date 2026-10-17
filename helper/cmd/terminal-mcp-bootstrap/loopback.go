@@ -89,8 +89,10 @@ func (h *loopbackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 
 	if r.Method == http.MethodOptions {
-		if r.URL.Path != pairPath || r.Header.Get("Access-Control-Request-Method") != http.MethodPost ||
-			r.Header.Get("Access-Control-Request-Private-Network") != "true" {
+		requestedMethod := r.Header.Get("Access-Control-Request-Method")
+		validChallenge := r.URL.Path == challengePath && requestedMethod == http.MethodGet
+		validPair := r.URL.Path == pairPath && requestedMethod == http.MethodPost
+		if (!validChallenge && !validPair) || r.Header.Get("Access-Control-Request-Private-Network") != "true" {
 			http.Error(w, "preflight refused", http.StatusForbidden)
 			return
 		}

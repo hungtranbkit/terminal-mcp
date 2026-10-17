@@ -345,6 +345,19 @@ class OnboardingService:
             candidate = validate_node_id(candidate)
         except ValueError as exc:
             raise OnboardingError("INVALID_REQUEST", str(exc)) from exc
+        if idempotency_key and machine_id is None:
+            try:
+                replay = self.enrollments.find_idempotent(
+                    idempotency_key=idempotency_key, created_by=created_by, node_id=candidate)
+            except DuplicateEnrollmentError as exc:
+                raise OnboardingError(str(exc), "idempotency key is already bound to another node",
+                                      status=409) from exc
+            if replay is not None:
+                return {"enrollment": replay.to_dict(), "code": None,
+                        "connectivity": replay.connectivity,
+                        "profile": profile_summary(replay.profile),
+                        "ttl_seconds": self.onboarding_config.enrollment_ttl_seconds,
+                        "idempotent_replay": True}
         existing = self.controller.registry.get(candidate)
         if existing is not None and not replace_existing:
             raise OnboardingError("NODE_ALREADY_EXISTS", f"a node named {candidate!r} is already registered",

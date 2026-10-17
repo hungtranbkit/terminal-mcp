@@ -523,6 +523,22 @@ class EnrollmentStore:
             row = connection.execute("SELECT * FROM enrollments WHERE id = ?", (enrollment_id,)).fetchone()
         return _row_to_record(row, now=now or _now())
 
+    def find_idempotent(self, *, idempotency_key: str, created_by: str | None,
+                        node_id: str) -> Enrollment | None:
+        """Resolve a retry before checking whether its node is now registered."""
+        key = str(idempotency_key or "").strip()
+        if not _IDEMPOTENCY_KEY_RE.fullmatch(key):
+            return None
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM enrollments WHERE idempotency_key = ? AND created_by IS ? "
+                "ORDER BY created_at DESC LIMIT 1", (key, created_by)).fetchone()
+        if row is None:
+            return None
+        if row["node_id"] != node_id:
+            raise DuplicateEnrollmentError("IDEMPOTENCY_KEY_REUSED")
+        return _row_to_record(row, now=_now())
+
     def list(self, *, node_id: str | None = None, include_terminal: bool = True,
              limit: int = 100, now: datetime | None = None) -> list[Enrollment]:
         moment = now or _now()
@@ -713,6 +729,22 @@ class EnrollmentStore:
             row = connection.execute("SELECT dashboard_origin FROM enrollment_handles WHERE handle_hash = ?",
                                      (hash_code(candidate),)).fetchone()
         return row["dashboard_origin"] if row is not None else None
+
+    def handle_is_usable(self, handle: str, *, expected_origin: str | None = None,
+                         now: datetime | None = None) -> bool:
+        candidate = str(handle or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{32}", candidate):
+            return False
+        moment = now or _now()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT h.dashboard_origin FROM enrollment_handles h JOIN enrollments e "
+                "ON e.id = h.enrollment_id WHERE h.handle_hash = ? AND h.redeemed_at IS NULL "
+                "AND h.expires_at > ? AND e.status = ? AND e.expires_at > ?",
+                (hash_code(candidate), _iso(moment), STATUS_PENDING, _iso(moment))).fetchone()
+        if row is None:
+            return False
+        return not row["dashboard_origin"] or row["dashboard_origin"] == expected_origin
 
     def redeem_handle(self, handle: str, *, expected_origin: str | None = None,
                       machine_id: str | None = None,
