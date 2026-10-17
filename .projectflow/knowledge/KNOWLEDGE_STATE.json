@@ -1,10 +1,10 @@
 {
-  "last_indexed_at": "2026-09-24T06:59:13.550189+00:00",
-  "last_indexed_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+  "last_indexed_at": "2026-10-17T09:17:27.995984+00:00",
+  "last_indexed_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
   "modules": {
     "ai_usage": {
-      "last_verified_at": "2026-09-24T06:59:12.145642+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:26.739223+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/ai_usage_client.py",
         "terminal_mcp/ai_usage_index.py",
@@ -14,8 +14,8 @@
       "summary": "Incremental index over local AI-CLI usage, and the aggregates the report page reads"
     },
     "archify": {
-      "last_verified_at": "2026-09-24T06:59:12.169985+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:26.762345+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/archify_dashboard.py",
         "terminal_mcp/archify_policy.py",
@@ -27,8 +27,8 @@
       "summary": "Bounded source inspection and deterministic Archify IR authoring"
     },
     "auth": {
-      "last_verified_at": "2026-09-24T06:59:12.190321+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:26.780117+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/permissions.py",
         "terminal_mcp/grants.py",
@@ -39,8 +39,8 @@
       "summary": "One-time node enrollment codes -- the credential a Windows (or any) machine presents ONCE to trade for its real bootstrap configuration"
     },
     "backlog": {
-      "last_verified_at": "2026-09-24T06:59:12.259339+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:26.836448+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/backlog_db.py",
         "terminal_mcp/backlog_service.py",
@@ -59,16 +59,16 @@
       "summary": "Notes / Ideas Store -- a cross-project, local-first kho ghi chú: the durable half of \"user thấy một ý tưởng hay trong khi chat, nói 'lưu lại', và tìm lại được nó sáu tuần sau\""
     },
     "bridge": {
-      "last_verified_at": "2026-09-24T06:59:12.273599+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:26.851640+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/bridge.py"
       ],
       "summary": "ask_chatgpt bridge -- Phase A (docs/ask-chatgpt-bridge.md)"
     },
     "browser": {
-      "last_verified_at": "2026-10-16T12:22:15.017297+00:00",
-      "last_verified_commit": "ca5b89fa80bc0366524e1d7852d9e1cf560b0aeb",
+      "last_verified_at": "2026-10-17T09:17:26.874932+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/browser_compat.py",
         "terminal_mcp/browser_gateway.py",
@@ -81,8 +81,8 @@
       "summary": "Phase-1 browser gateway: let a chat ask Terminal MCP to verify a web UI"
     },
     "capabilities": {
-      "last_verified_at": "2026-09-24T06:59:12.333475+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:26.900554+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/capability_probe.py",
         "terminal_mcp/agent_availability.py",
@@ -97,8 +97,8 @@
       "summary": "Durable Agent identity and a versioned Skill Registry"
     },
     "config": {
-      "last_verified_at": "2026-09-24T06:59:12.365183+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:26.931147+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/config.py",
         "config.yaml",
@@ -107,8 +107,8 @@
       "summary": ""
     },
     "deployment": {
-      "last_verified_at": "2026-09-24T06:59:12.404750+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:26.962711+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/deployment_redundancy.py",
         "terminal_mcp/deployment_service.py",
@@ -125,8 +125,8 @@
       "summary": "Connection reliability for the OpenAI Secure MCP Tunnel (terminal-mcp- tunnel.service) -- diagnostics + the self-healing decision logic, shared by `terminal-mcp-doctor` (read-only, human/machine output) and `terminal-mcp-tunnel-watchdog` (the same checks, acting on them)"
     },
     "direct_tasks": {
-      "last_verified_at": "2026-10-16T12:22:15.043454+00:00",
-      "last_verified_commit": "ca5b89fa80bc0366524e1d7852d9e1cf560b0aeb",
+      "last_verified_at": "2026-10-17T09:17:26.986275+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/direct_contract.py",
         "terminal_mcp/direct_task.py",
@@ -137,8 +137,8 @@
       "summary": "Supervised direct-session tasks: an agent turn ending is not the task ending"
     },
     "fleet": {
-      "last_verified_at": "2026-09-24T06:59:12.437876+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.012471+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/fleet_registry.py",
         "terminal_mcp/fleet_loop.py",
@@ -153,8 +153,8 @@
       "summary": "Fleet Metadata Registry -- what every node knows about every other node, kept locally so it survives the controller going away"
     },
     "harness": {
-      "last_verified_at": "2026-09-24T06:59:12.522780+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.081193+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/harness_state.py",
         "terminal_mcp/harness_schema.py",
@@ -177,8 +177,8 @@
       "summary": "Durable persistence for the Harness engine, inside the canonical queue db"
     },
     "headless": {
-      "last_verified_at": "2026-10-16T12:22:15.059091+00:00",
-      "last_verified_commit": "ca5b89fa80bc0366524e1d7852d9e1cf560b0aeb",
+      "last_verified_at": "2026-10-17T09:17:27.096588+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/headless.py",
         "terminal_mcp/headless_cleanup.py"
@@ -186,8 +186,8 @@
       "summary": "Durable noninteractive agent runs"
     },
     "http_api": {
-      "last_verified_at": "2026-09-24T06:59:12.543208+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.114050+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/server.py",
         "terminal_mcp/server_http.py",
@@ -200,8 +200,8 @@
       "summary": ""
     },
     "integration": {
-      "last_verified_at": "2026-09-24T06:59:12.600865+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.159089+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/integration_engine.py",
         "terminal_mcp/integration_loop.py",
@@ -224,8 +224,8 @@
       "summary": "Integration Agent -- persistence + state machine for the per-project merge/test pipeline (task: \"3-role model: Coding A/B + Integration Agent\" -- Supervisor Queue v2's own natural extension for throughput on projects with 2+ parallel coding sessions)"
     },
     "knowledge": {
-      "last_verified_at": "2026-09-24T06:59:12.628750+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.184147+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/project_knowledge.py",
         "terminal_mcp/context_pack.py",
@@ -237,8 +237,8 @@
       "summary": "Project Knowledge Map -- what a worker should read BEFORE it reads the repo"
     },
     "mcp_surface": {
-      "last_verified_at": "2026-09-24T06:59:12.691110+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.252631+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/mcp_app.py",
         "terminal_mcp/chat_checkpoint_tools.py",
@@ -248,8 +248,8 @@
       "summary": ""
     },
     "node_onboarding": {
-      "last_verified_at": "2026-09-24T06:59:12.741531+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.290396+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/node_agent.py",
         "terminal_mcp/node_onboarding.py",
@@ -263,8 +263,8 @@
       "summary": "`terminal-node-agent` -- the lightweight process a WORKER node (e.g"
     },
     "nodes": {
-      "last_verified_at": "2026-09-24T06:59:12.798796+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.339260+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/node_registry.py",
         "terminal_mcp/node_models.py",
@@ -282,8 +282,8 @@
       "summary": "The multi-node controller: composes NodeRegistry + one NodeClient per registered node + a session-location cache, and exposes the SAME operations TerminalService already does (terminal_tail/status/send/ create/kill/reopen/...), transparently routed to whichever node actually holds the named session"
     },
     "observer": {
-      "last_verified_at": "2026-09-24T06:59:12.816500+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.354567+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/observer_app.py",
         "terminal_mcp/observer_auth.py"
@@ -291,8 +291,8 @@
       "summary": "OAuth 2.1 authorization server for the public read-only observer surface"
     },
     "orchestration": {
-      "last_verified_at": "2026-09-24T06:59:12.863291+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.391513+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/event_bus.py",
         "terminal_mcp/event_wiring.py",
@@ -309,8 +309,8 @@
       "summary": "P0.5 Verify Queue -- verification as CLAIMABLE WORK routed by capability, instead of a state only the implementing session can leave"
     },
     "planner": {
-      "last_verified_at": "2026-09-24T06:59:12.890325+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.414315+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/bug_spec.py",
         "terminal_mcp/task_classifier.py",
@@ -323,8 +323,8 @@
       "summary": "Bug Execution Spec -- the analysis, done once, handed to whoever executes"
     },
     "pm": {
-      "last_verified_at": "2026-09-24T06:59:12.908356+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.432093+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/pm_router.py",
         "terminal_mcp/pm_service.py",
@@ -335,8 +335,8 @@
       "summary": "PM/Orchestrator Agent -- persistence (docs/REQUIREMENTS.md §20.2)"
     },
     "policy": {
-      "last_verified_at": "2026-09-24T06:59:12.925114+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.449336+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/work_policy.py",
         "terminal_mcp/impl_contract.py",
@@ -345,8 +345,8 @@
       "summary": "Implementation Contract v1 -- the Analysis Gate's data format, its validation rules, and the coding-agent prompt built from it"
     },
     "procedures": {
-      "last_verified_at": "2026-09-24T06:59:12.941526+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.467465+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/procedures.py",
         "terminal_mcp/runbook_registry.py",
@@ -355,8 +355,8 @@
       "summary": "Procedure registry -- the runbook layer, so a settled workflow is CALLED rather than re-derived"
     },
     "prompt_submission": {
-      "last_verified_at": "2026-09-24T06:59:12.962756+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.489880+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/prompt_transport.py",
         "terminal_mcp/submit_flow.py",
@@ -369,8 +369,8 @@
       "summary": "Durable, evidence-driven prompt submission for interactive agents"
     },
     "queue": {
-      "last_verified_at": "2026-10-16T12:22:15.122967+00:00",
-      "last_verified_commit": "ca5b89fa80bc0366524e1d7852d9e1cf560b0aeb",
+      "last_verified_at": "2026-10-17T09:17:27.554330+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/queue_engine.py",
         "terminal_mcp/queue_store.py",
@@ -388,8 +388,8 @@
       "summary": "Supervisor Queue v2 -- persistence + state machine (task: \"Supervisor Queue v2 cho Terminal MCP\")"
     },
     "repo_read": {
-      "last_verified_at": "2026-09-24T06:59:13.061236+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.575225+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/repo_read.py",
         "terminal_mcp/repo_service.py",
@@ -398,8 +398,8 @@
       "summary": "Read-only repository introspection -- the engine behind the `repo_*` MCP tools, so an external agent (ChatGPT, via the MCP surface) can read Git and file content DIRECTLY instead of asking a Claude session to read it and paste the result back"
     },
     "security": {
-      "last_verified_at": "2026-09-24T06:59:13.086220+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.595285+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/access_policy.py",
         "terminal_mcp/redaction.py",
@@ -412,8 +412,8 @@
       "summary": ""
     },
     "session_ops": {
-      "last_verified_at": "2026-10-16T12:22:15.179953+00:00",
-      "last_verified_commit": "ca5b89fa80bc0366524e1d7852d9e1cf560b0aeb",
+      "last_verified_at": "2026-10-17T09:17:27.651710+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/core.py",
         "terminal_mcp/tmux.py",
@@ -432,8 +432,8 @@
       "summary": ""
     },
     "session_registry": {
-      "last_verified_at": "2026-10-16T12:22:15.216409+00:00",
-      "last_verified_commit": "ca5b89fa80bc0366524e1d7852d9e1cf560b0aeb",
+      "last_verified_at": "2026-10-17T09:17:27.683406+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/session_registry.py",
         "terminal_mcp/session_knowledge.py",
@@ -446,8 +446,8 @@
       "summary": "Persistent Session Registry -- a durable SQLite record of every session this project has ever discovered/created, independent of whether the underlying tmux/Windows-backend process is still alive"
     },
     "session_state": {
-      "last_verified_at": "2026-09-24T06:59:13.233293+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.700816+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/status.py",
         "terminal_mcp/adapters.py",
@@ -456,8 +456,8 @@
       "summary": ""
     },
     "supervisor": {
-      "last_verified_at": "2026-09-24T06:59:13.271970+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.729636+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/supervisor.py",
         "terminal_mcp/supervisor2.py",
@@ -467,8 +467,8 @@
       "summary": "Supervisor Loop v1 — local detection + a durable event queue"
     },
     "unified_memory": {
-      "last_verified_at": "2026-10-17T01:15:42.718080+00:00",
-      "last_verified_commit": "8d8209f9dda12cfe21c4417730819cb43ecb1151",
+      "last_verified_at": "2026-10-17T09:17:27.747453+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/unified_memory.py",
         "terminal_mcp/memory_sync.py",
@@ -478,8 +478,8 @@
       "summary": "Additive, permission-scoped memory projection; never an execution authority"
     },
     "webauth": {
-      "last_verified_at": "2026-09-24T06:59:13.291019+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.765690+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/webauth.py",
         "terminal_mcp/webauth_cli.py",
@@ -488,8 +488,8 @@
       "summary": "Alternate, local-username/password entry point to the same dashboard -- /login, /logout, /app, /app/api/* -- coexisting with, and never weakening, the existing Cloudflare-Access-gated /dashboard path in dashboard.py"
     },
     "windows": {
-      "last_verified_at": "2026-09-24T06:59:13.319514+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.790392+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/windows_backend.py",
         "terminal_mcp/windows_agent.py",
@@ -501,8 +501,8 @@
       "summary": "Generates `windows-setup.ps1` -- the ONE file a user downloads and runs as Administrator to turn a Windows machine into a Terminal MCP node"
     },
     "work_planning": {
-      "last_verified_at": "2026-09-24T06:59:13.348137+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.815863+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/work_spec.py",
         "terminal_mcp/work_planning.py",
@@ -513,8 +513,8 @@
       "summary": "Work Execution Spec -- the planning contract for EVERY kind of task"
     },
     "work_runtime": {
-      "last_verified_at": "2026-09-24T06:59:13.383782+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.853300+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/work_store.py",
         "terminal_mcp/work_service.py",
@@ -530,8 +530,8 @@
       "summary": "Work Runtime V1 -- the binding layer"
     },
     "work_telemetry": {
-      "last_verified_at": "2026-09-24T06:59:13.424516+00:00",
-      "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
+      "last_verified_at": "2026-10-17T09:17:27.891933+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/work_telemetry.py",
         "terminal_mcp/work_telemetry_runtime.py",
@@ -544,8 +544,8 @@
       "summary": "Work Efficiency Telemetry -- durable storage + schema (TASK A: \"add additive telemetry needed to measure whether Analysis Gate + implementation contracts reduce model turns/token cost\")"
     },
     "work_ui": {
-      "last_verified_at": "2026-10-16T12:22:15.328905+00:00",
-      "last_verified_commit": "ca5b89fa80bc0366524e1d7852d9e1cf560b0aeb",
+      "last_verified_at": "2026-10-17T09:17:27.985690+00:00",
+      "last_verified_commit": "4573845afb3524fca62da68c294607ef28e36d0c",
       "paths": [
         "terminal_mcp/dashboard.py",
         "terminal_mcp/dashboard_nav.py",
@@ -556,7 +556,9 @@
         "terminal_mcp/novaretail_dispatch_dashboard.py",
         "terminal_mcp/ui_workflow.py",
         "terminal_mcp/live_sessions.py",
-        "terminal_mcp/live_sessions_page.py"
+        "terminal_mcp/live_sessions_page.py",
+        "terminal_mcp/office_page.py",
+        "terminal_mcp/task_center_reader.py"
       ],
       "summary": ""
     }
