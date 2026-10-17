@@ -209,3 +209,9 @@ expected node is `online` in the registry.
 and `100.117.214.87`. If the tailnet one is missing, `dell-linux` cannot
 heartbeat at all; check that the `30-tailnet-overlay.conf` drop-in survived
 (`systemctl --user show terminal-mcp-http -p Environment`).
+
+## Publishing a project URL (Cloudflare)
+
+To expose a local app at `https://<sub>.mesflow.net`, do not create a new tunnel: run
+`tunnelctl publish --hostname <sub>.mesflow.net --origin http://127.0.0.1:<port> [--apply]`
+on dell-linux. See [TUNNEL_PUBLISHER_RUNBOOK.md](TUNNEL_PUBLISHER_RUNBOOK.md).
