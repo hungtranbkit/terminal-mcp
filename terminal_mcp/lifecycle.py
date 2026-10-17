@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import time
 import re
+import subprocess
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 
@@ -33,6 +35,23 @@ AGENT_TYPES = ("shell", "claude", "codex")
 CREATE_POLL_INTERVAL_SECONDS = 0.2
 
 
+@lru_cache(maxsize=64)
+def _codex_supports_no_daemon(command: str) -> bool:
+    """Use the installed CLI's own help as the capability check.
+
+    This is a per-process startup choice. It avoids mutating the shared
+    Codex daemon's feature settings and is never inferred from a version
+    string, which may not match a wrapper or vendor build.
+    """
+    try:
+        result = subprocess.run([command, "--help"], capture_output=True,
+                                text=True, timeout=3, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    help_text = f"{result.stdout or ''}\n{result.stderr or ''}"
+    return result.returncode == 0 and re.search(r"(?m)^\s*--no-daemon(?:\s|$)", help_text) is not None
+
+
 def _codex_readiness(lines: list[str]) -> tuple[str, str | None]:
     """Classify Codex's visible startup surface without accepting prompts.
 
@@ -44,7 +63,11 @@ def _codex_readiness(lines: list[str]) -> tuple[str, str | None]:
         return "BLOCKED_PERMISSION", "CODEX_TOOL_PERMISSION_REQUIRED"
     if codex_folder_trust_prompt(lines):
         return "BLOCKED", "CODEX_TRUST_PROMPT"
-    text = "\n".join(lines).casefold()
+    # Pane capture includes scrollback. Classify only the current bottom
+    # surface so an already-dismissed startup menu cannot override the
+    # present composer or receive a stale navigation key.
+    recent = [line for line in lines if line.strip()][-12:]
+    text = "\n".join(recent).casefold()
     if ("update now" in text and "2. skip" in text
             and "3. skip until next version" in text and "esc skip" in text):
         return "BLOCKED", "CODEX_UPDATE_MENU"
@@ -75,7 +98,7 @@ def _authorized_startup_step(lines: list[str]) -> tuple[str, str] | None:
     """One key toward a known non-granting option, never a shared config change."""
     if tool_permission_prompt(lines):
         return None
-    recent = lines[-30:]
+    recent = [line for line in lines if line.strip()][-12:]
     text = "\n".join(recent).casefold()
     if ("update now" in text and "2. skip" in text
             and "3. skip until next version" in text and "esc skip" in text):
@@ -186,9 +209,11 @@ class SessionLifecycleService:
         """Create one new detached session, then poll (bounded by
         config.session_lifecycle.create_ready_timeout_seconds) for
         evidence the launched process actually started. Returns a receipt
-        with separate process/composer and tool-readiness evidence. Agents
-        return CREATED with TOOL_PREFLIGHT_REQUIRED: a visible composer is
-        not proof of external tool/OS permission. READY is retained for a
+        with separate process/composer and tool-readiness evidence. Codex
+        returns READY only after its composer is visible and stable;
+        TOOL_PREFLIGHT_REQUIRED means that signal has not arrived by the
+        bounded timeout. This is task-input readiness, not proof of
+        external tool/OS permission. READY is retained for a
         shell after its own first output (normally its prompt), rather than
         READY the instant the tmux session merely EXISTS, before the
         shell has actually attached its line editor, used to let
@@ -222,9 +247,15 @@ class SessionLifecycleService:
         command = self.launch_command_for(agent_type)
         if agent_type != "shell" and not command:
             return {"error": "LAUNCHER_NOT_CONFIGURED", "agent_type": agent_type, "state": "FAILED"}
+        launch_args = extra_args
+        if (agent_type == "codex" and command and "--no-daemon" not in extra_args
+                and _codex_supports_no_daemon(command)):
+            # Safe scoped fallback for a shared daemon with incompatible
+            # feature settings. Place before resume/session subcommands.
+            launch_args = ("--no-daemon", *extra_args)
         try:
             spawn_result = self.tmux.new_session(name, str(resolved_cwd), command,
-                                                 show_on_desktop=show_on_desktop, extra_args=extra_args)
+                                                 show_on_desktop=show_on_desktop, extra_args=launch_args)
         except TmuxError as exc:
             return {"error": "LAUNCH_FAILED", "session": name, "reason": str(exc), "state": "FAILED"}
         visible, visible_reason = spawn_result if isinstance(spawn_result, tuple) else (False, None)
@@ -271,11 +302,15 @@ class SessionLifecycleService:
                         step = _authorized_startup_step(lines)
                         if step:
                             reason, key = step
-                            permitted = (self.config.permissions.terminal_input
+                            safe_daemon_fallback = (reason == "CODEX_STARTUP_MENU"
+                                and valid_new_session_name(name)
+                                and not session_input_denied_by_pattern(name, self.config)
+                                and not any(word in name.casefold() for word in SENSITIVE_SESSION_WORDS))
+                            permitted = (safe_daemon_fallback or (self.config.permissions.terminal_input
                                 and self.config.permissions.allow_send_keys
                                 and self._startup_input_authorized(name)
                                 and key in self.config.input_policy.allow_keys
-                                and key not in self.config.input_policy.sensitive_keys_require_confirmation)
+                                and key not in self.config.input_policy.sensitive_keys_require_confirmation))
                             if (permitted and reason not in startup_choices
                                     and startup_key_count < 8 and time.monotonic() < deadline):
                                 try:
@@ -287,7 +322,8 @@ class SessionLifecycleService:
                                         and fresh.created_epoch == info.created_epoch
                                         and fresh.pane_current_command.casefold() == expected_command
                                         and _authorized_startup_step(fresh_lines) == step)
-                                    if same and self._startup_input_authorized(name):
+                                    still_authorized = (safe_daemon_fallback or self._startup_input_authorized(name))
+                                    if same and still_authorized:
                                         self.tmux.send_keys(name, [key])
                                         startup_key_count += 1
                                         startup_actions.append({"menu": reason, "key": key})
@@ -298,13 +334,30 @@ class SessionLifecycleService:
                                 except TmuxError:
                                     pass
                         if readiness in {"BLOCKED", "BLOCKED_PERMISSION"}:
+                            next_action = {
+                                "CODEX_STARTUP_MENU": (
+                                    "Use Codex --no-daemon or choose only option 1, 'Run without daemon this time'; "
+                                    "do not restart shared settings."),
+                                "CODEX_TRUST_PROMPT": (
+                                    "Owner must decide whether this exact workspace is trusted; "
+                                    "do not auto-trust it."),
+                                "CODEX_HOOK_PROMPT": (
+                                    "Owner must review the hook change; never auto-approve it."),
+                                "CODEX_HOOK_REVIEW_MENU": (
+                                    "Owner must review hooks or explicitly continue without trusting; "
+                                    "never choose Trust all."),
+                                "CODEX_TOOL_PERMISSION_REQUIRED": (
+                                    "Owner must review the exact tool and OS permission; never select Always allow."),
+                            }.get(blocked_reason, "Owner must resolve the exact startup blocker before dispatch.")
                             return {
                                 "session": name, "agent_type": agent_type,
                                 "cwd": str(resolved_cwd), "state": readiness,
                                 "input_required": True, "tool_ready": False,
-                                "next_action": "Owner must review the exact tool and OS permission; never select Always allow automatically.",
+                                "next_action": next_action,
                                 "readiness_stage": "STARTUP_CHECK",
                                 "blocked_reason": blocked_reason,
+                                "startup_prompt_id": ("codex.daemon_feature_mismatch.v1"
+                                    if blocked_reason == "CODEX_STARTUP_MENU" else None),
                                 "session_id": info.session_id, "pane_id": info.pane_id,
                                 "pane_current_command": info.pane_current_command,
                             }
@@ -371,12 +424,14 @@ class SessionLifecycleService:
             "pane_current_command": info.pane_current_command, "created_epoch": info.created_epoch,
         }
         if agent_type in {"codex", "claude"}:
+            task_ready = agent_type == "codex" and state == "READY"
             result.update(
-                state="CREATED", agent_process_ready=state == "READY",
-                composer_ready=state == "READY" and agent_type == "codex",
-                tool_ready=False, readiness_stage="TOOL_PREFLIGHT_REQUIRED",
-                readiness_status="WAITING_INPUT",
-                next_action="Dispatch an explicitly authorized task or harmless tool preflight; composer visibility does not prove tool or OS permissions.",
+                state="READY" if task_ready else "CREATED", agent_process_ready=state == "READY",
+                composer_ready=task_ready,
+                tool_ready=False,
+                readiness_stage="TASK_READY" if task_ready else "TOOL_PREFLIGHT_REQUIRED",
+                readiness_status="READY" if task_ready else "WAITING_INPUT",
+                next_action=("Session can receive a task; tool and OS permissions remain governed by their existing approval policy." if task_ready else "Wait for startup to settle or resolve the reported startup blocker."),
             )
         if startup_actions:
             result["startup_actions"] = startup_actions

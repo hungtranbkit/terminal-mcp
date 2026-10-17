@@ -155,6 +155,12 @@ def test_prompt_echo_never_completes_its_own_task():
     assert find_marker(f"TMCP-DONE:{task_id}ff", task_id) is None
 
 
+def test_generic_finished_text_is_not_a_completion_receipt(tmp_path):
+    task_id = "dt_0123456789abcdef"
+    assert find_marker("● FINISHED\nThe task is complete.", task_id) is None
+    assert find_marker(f"TMCP-DONE:{task_id}", task_id) == ("DONE", "")
+
+
 def test_continuation_limit_stops_without_spinning(tmp_path):
     clock = Clock()
     pane = FakePane()

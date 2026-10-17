@@ -396,7 +396,7 @@ def test_codex_selects_only_visible_authorized_non_granting_startup_choice(
 
     result = service.lifecycle.create(name, "codex", str(tmp_path))
 
-    assert result["state"] == "CREATED"
+    assert result["state"] == "READY"
     assert result["composer_ready"] is True
     assert result["tool_ready"] is False
     assert state["keys"] == ["Enter"]
