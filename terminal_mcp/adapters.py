@@ -377,6 +377,16 @@ def tool_permission_prompt(lines: list[str]) -> bool:
     )
 
 
+def codex_folder_trust_prompt(lines: list[str]) -> bool:
+    """Recognize Codex's folder trust modal even when its composer remains visible."""
+    # Like other modal detectors, limit evidence to the current pane bottom:
+    # scrollback can retain a completed first-run prompt after it was answered.
+    text = "\n".join(line.strip() for line in lines if line.strip())
+    text = "\n".join(text.splitlines()[-12:]).casefold()
+    return ("folder settings can run code automatically" in text
+            and "trust and continue" in text and "quit" in text)
+
+
 _WAITING_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -400,6 +410,7 @@ _WAITING_PATTERNS = tuple(
         # phrases specific to this observed menu rather than treating all
         # numbered text as an interactive prompt.
         r"run without daemon this time", r"restart with these settings",
+        r"folder settings can run code automatically",
         # The observed hook-review menu must remain guarded too.
         r"hooks need review", r"continue without trusting",
         # REMOVED (2026-09-07, real false positive found LIVE against a
@@ -514,6 +525,8 @@ class CodexAdapter(AgentAdapter):
 
     def identify_target_state(self, lines: list[str]) -> str:
         if tool_permission_prompt(lines):
+            return TARGET_WAITING
+        if codex_folder_trust_prompt(lines):
             return TARGET_WAITING
         tail = _tail(lines, 6)
         if any(self._IDLE_COMPOSER.search(line) for line in tail.splitlines()):

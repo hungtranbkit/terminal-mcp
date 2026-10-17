@@ -185,6 +185,8 @@ def detect_waiting_input(output: str) -> tuple[bool, str]:
     lines = [line.strip() for line in output.splitlines() if line.strip()]
     if adapters.tool_permission_prompt(lines):
         return True, "tool approval requires an explicit owner decision; no automatic permission grant"
+    if adapters.codex_folder_trust_prompt(lines):
+        return True, "Codex folder trust prompt requires an explicit owner decision"
     recent = lines[-12:]
     # Common full-screen pagers are interactive even when their prompt has no
     # question mark. Restrict these exact affordances to the bottom line so

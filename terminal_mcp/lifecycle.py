@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import AppConfig
-from .adapters import tool_permission_prompt
+from .adapters import codex_folder_trust_prompt, tool_permission_prompt
 from .launcher_resolution import resolve_launcher
 from .permissions import SENSITIVE_SESSION_WORDS, valid_new_session_name, session_input_denied_by_pattern
 from .session_backend import SessionBackend
@@ -42,6 +42,8 @@ def _codex_readiness(lines: list[str]) -> tuple[str, str | None]:
     """
     if tool_permission_prompt(lines):
         return "BLOCKED_PERMISSION", "CODEX_TOOL_PERMISSION_REQUIRED"
+    if codex_folder_trust_prompt(lines):
+        return "BLOCKED", "CODEX_TRUST_PROMPT"
     text = "\n".join(lines).casefold()
     if ("update now" in text and "2. skip" in text
             and "3. skip until next version" in text and "esc skip" in text):
