@@ -50,6 +50,8 @@ from .enrollment import (
     DuplicateEnrollmentError,
     EnrollmentStore,
     OS_WINDOWS,
+    STATUS_EXPIRED,
+    STATUS_REVOKED,
     SUPPORTED_OS,
     suggest_node_id,
     validate_node_id,
@@ -346,7 +348,7 @@ class OnboardingService:
             except DuplicateEnrollmentError as exc:
                 raise OnboardingError(str(exc), "idempotency key is already bound to another node",
                                       status=409) from exc
-            if replay is not None:
+            if replay is not None and replay.status not in (STATUS_EXPIRED, STATUS_REVOKED):
                 return {"enrollment": replay.to_dict(), "code": None,
                         "connectivity": replay.connectivity,
                         "profile": profile_summary(replay.profile),

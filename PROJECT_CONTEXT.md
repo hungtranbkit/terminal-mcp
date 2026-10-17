@@ -1,5 +1,12 @@
 # PROJECT_CONTEXT.md
 
+# 2026-10-17 — P0 node-join retry review follow-up
+
+- PR #65 remains open on `feat/p0-dashboard-node-join-20261017`; last confirmed GitHub head was `867207f`, with all five required checks green. A PR review found a concrete retry defect: the browser intentionally keeps its idempotency key, but server replay returned an expired/revoked enrollment with no usable handle. `terminal_mcp/enrollment.py` and `terminal_mcp/node_onboarding.py` now let terminal records roll over to a fresh enrollment for the same key and machine; newest rows use `created_at, rowid` ordering. Added `test_join_current_retry_after_enrollment_expiry_creates_fresh_pairing` in `tests/test_windows_onboarding.py`.
+- Verification after the fix: `uv run --no-sync --extra test pytest -q tests/test_windows_onboarding.py` -> **101 passed, 4 skipped** (PowerShell unavailable); the three relevant idempotency/success/expiry retry tests -> **3 passed**; `git diff --check` passed before this handoff edit. Full focused integration and browser QA results remain as recorded below; no production/OS installation was performed.
+- Cloudflare review confirms app-level Access JWT signature/issuer/audience verification and role checks when `access_email_roles` is configured. Production Access Google IdP, application audience/policies, explicit role allowlist, and deployed route are still unverified; no Access admin credentials/API are available, so do not merge/deploy yet. PR #65 description still says browser QA could not run, although later browser QA succeeded; update that description when the authorized PR workflow is available.
+- Next: `git diff --check`, commit/push this retry fix and handoff, verify resulting PR checks; then proceed only when an authorized Cloudflare Access admin and approved email-to-role mapping are available. HP `unified-memory-multinode` remains untouched.
+
 # Current P0 dashboard/node-join handoff — 2026-10-17 (isolated; not deployed)
 
 - Implemented on `feat/p0-dashboard-node-join-20261017` in `/home/dell/workspace/.terminal-mcp-worktrees/p0-dashboard-node-join-20261017`, rebased onto fetched `origin/main` `f07a0e5`. Feature commits: `56180dd` design/plan, `7a9291f` verified Access email roles, `b1b9fd9` idempotent/revocable enrollment, `e11ed67` origin-bound loopback helper, `5ce457a` sanitized metadata inventory, `1edb848` responsive current-machine join; the current handoff/docs commit is the branch tip.
