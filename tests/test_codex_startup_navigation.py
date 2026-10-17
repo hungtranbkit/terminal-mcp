@@ -206,6 +206,22 @@ def test_exact_incompatible_daemon_prompt_is_classified_and_selects_only_run_onc
     assert backend.keys == ["Enter"]
 
 
+def test_old_daemon_menu_in_scrollback_does_not_block_current_composer():
+    from terminal_mcp.lifecycle import _authorized_startup_step, _codex_readiness
+    lines = [
+        "Background server has incompatible feature settings",
+        "This session requires api_key_model_discovery to be enabled",
+        "› 1. Run without daemon this time",
+        "2. Restart with these settings",
+        "3. Cancel",
+        *(["ordinary Codex output"] * 20),
+        "› Ask Codex to do anything",
+        "codex default",
+    ]
+    assert _codex_readiness(lines) == ("READY", None)
+    assert _authorized_startup_step(lines) is None
+
+
 @pytest.mark.parametrize("version,supports", [("0.154.0", False), ("0.162.0", True)])
 def test_codex_no_daemon_flag_is_detected_from_cli_help(monkeypatch, version, supports):
     from terminal_mcp.lifecycle import _codex_supports_no_daemon

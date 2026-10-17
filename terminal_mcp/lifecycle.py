@@ -63,7 +63,11 @@ def _codex_readiness(lines: list[str]) -> tuple[str, str | None]:
         return "BLOCKED_PERMISSION", "CODEX_TOOL_PERMISSION_REQUIRED"
     if codex_folder_trust_prompt(lines):
         return "BLOCKED", "CODEX_TRUST_PROMPT"
-    text = "\n".join(lines).casefold()
+    # Pane capture includes scrollback. Classify only the current bottom
+    # surface so an already-dismissed startup menu cannot override the
+    # present composer or receive a stale navigation key.
+    recent = [line for line in lines if line.strip()][-12:]
+    text = "\n".join(recent).casefold()
     if ("update now" in text and "2. skip" in text
             and "3. skip until next version" in text and "esc skip" in text):
         return "BLOCKED", "CODEX_UPDATE_MENU"
@@ -94,7 +98,7 @@ def _authorized_startup_step(lines: list[str]) -> tuple[str, str] | None:
     """One key toward a known non-granting option, never a shared config change."""
     if tool_permission_prompt(lines):
         return None
-    recent = lines[-30:]
+    recent = [line for line in lines if line.strip()][-12:]
     text = "\n".join(recent).casefold()
     if ("update now" in text and "2. skip" in text
             and "3. skip until next version" in text and "esc skip" in text):
