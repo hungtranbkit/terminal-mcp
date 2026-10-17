@@ -36,3 +36,23 @@ def test_mcp_search_defaults_to_actual_terminal_instance(tmp_path,monkeypatch):
     assert len(fn('needle')['results'])==1
     assert fn('needle',project='forbidden')['error']=='BLOCKED_PERMISSION'
     runtime.close()
+
+
+def test_global_read_disable_withdraws_session_even_with_valid_grant(tmp_path):
+    import sqlite3
+    from types import SimpleNamespace
+    from terminal_mcp.config import AppConfig,PermissionsConfig
+    db=tmp_path/'sessions.db'
+    with sqlite3.connect(db) as con:
+        con.execute('CREATE TABLE session_records(node_id,session_name,status,agent_type,git_branch,last_commit,repo_root,read_granted)')
+        con.execute('INSERT INTO session_records VALUES (?,?,?,?,?,?,?,?)',('a','needle-session','READY','codex','main','abc',str(tmp_path),1))
+    terminal=SimpleNamespace(config=AppConfig(permissions=PermissionsConfig(False,False),allowed_session_patterns=()),_read_authorized=lambda name:True)
+    runtime=MemoryRuntime({'node':'a','controller':'hub','database':str(tmp_path/'memory.db'),'projects':{'p':{'roots':[str(tmp_path)]}},'session_database':str(db),'share_projects':['p']},terminal=terminal)
+    runtime.tick()
+    assert not runtime.search('needle')['results']
+    terminal.config=AppConfig(permissions=PermissionsConfig(True,False),allowed_session_patterns=())
+    runtime.tick()
+    assert runtime.search('needle')['results']
+    terminal.config=AppConfig(permissions=PermissionsConfig(False,False),allowed_session_patterns=())
+    runtime.tick()
+    assert not runtime.search('needle')['results']

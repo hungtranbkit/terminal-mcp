@@ -48,9 +48,13 @@ class MemoryRuntime:
         if client is None or not hasattr(client,'memory_request'):raise MemoryError('NEEDS_AUTH')
         return client.memory_request(action,body)
 
+    def session_authorized(self, name):
+        from .permissions import require_read
+        return bool(self.terminal and require_read(self.terminal.config) is None and self.terminal._read_authorized(name))
+
     def tick(self):
         with self._cycle_lock:
-            projection=project_sources(self.store,self.projects,shared_projects=self.config.get('share_projects',[]),session_db=self.config.get('session_database'),session_authorized=self.terminal._read_authorized if self.terminal else None)
+            projection=project_sources(self.store,self.projects,shared_projects=self.config.get('share_projects',[]),session_db=self.config.get('session_database'),session_authorized=self.session_authorized)
             peers=[]
             for peer,scope in self.config.get('peers',{}).items():
                 try:peers.append(synchronize(self.store,peer,set(scope),self.transport))
