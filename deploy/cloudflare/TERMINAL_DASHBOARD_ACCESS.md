@@ -72,8 +72,18 @@ Repository/runtime observations made during the P0 implementation:
   consistent with an Access login redirect.
 - `https://terminal-bootstrap.mesflow.net/health/live` returned HTTP 200.
 - The workspace had no Cloudflare API/Wrangler credential variable names and
-  no `wrangler` CLI. `cloudflared` was installed, but no tunnel account
-  credentials were verified.
+  no `wrangler` CLI. A Cloudflare tunnel account certificate and named tunnel
+  credentials are present: `cloudflared tunnel list` and `cloudflared tunnel
+  info` succeeded. This permits tunnel metadata inspection, but does not
+  expose the Cloudflare Access application's Google IdP, audience, or
+  allow/deny policies through the available CLI.
+- The local account lists an active `terminal-mcp-dashboard` tunnel. Its
+  local config routes only `terminal-dashboard.mesflow.net` dashboard paths
+  to loopback port 8766; the local current-user systemd unit is inactive, but
+  the tunnel reports remote connector connections. Testing that local config
+  maps `terminal-bootstrap.mesflow.net` to its catch-all 404 rule. The public
+  bootstrap liveness endpoint returns 200, so that hostname is served through
+  a different active configuration/tunnel or a separately managed ingress.
 - The private `config.yaml` in this local worktree has Access team-domain and
   audience settings, but no `dashboard.access_email_roles` mapping. This is
   a local configuration observation, not evidence of the production host's
