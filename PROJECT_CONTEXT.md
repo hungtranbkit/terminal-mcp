@@ -1,5 +1,11 @@
 # PROJECT_CONTEXT.md
 
+# 2026-10-17 — P0 production-readiness continuation audit
+
+- Latest branch tip is `c1711b0cc730a2488b3a7da5502edd3a9ea1632d` on `feat/p0-dashboard-node-join-20261017`; worktree is clean. PR #65 remains open and mergeable (`CLEAN`), with all five required GitHub checks green at this tip. Repository Actions secrets and variables are empty. GitHub CLI is authenticated for repo access, but that does not provide Cloudflare Access administration.
+- The public dashboard redirects to a Cloudflare Access login page. Its initial HTML does not establish whether Google SSO is configured. No authorized Access admin/API session or approved email-to-role mapping has been provided; production IdP, audience/policies, and deployed ingress remain unverified. No production Cloudflare changes, merge, or deployment occurred.
+- This audit confirms the existing stop condition; the branch implementation, tests, and browser QA are summarized below. Next concrete action remains obtaining authorized Cloudflare Access admin/API access and the approved role map, then verifying production login/route and performing the deployment acceptance checks. HP `unified-memory-multinode` remains untouched.
+
 # 2026-10-17 — P0 node-join retry review follow-up
 
 - PR #65 remains open on `feat/p0-dashboard-node-join-20261017`; retry fix commit `697adc02efe4d10c00edd641e9a77bb277ed1f59` and Access allowlist enforcement commit `177044a1dd7e833da4eea093fda048955d7f0885` are pushed. All five GitHub checks pass at `177044a` (targeted, permission-contract Ubuntu/macOS, Unified Memory Ubuntu/macOS). A PR review found a concrete retry defect: the browser intentionally keeps its idempotency key, but server replay returned an expired/revoked enrollment with no usable handle. `terminal_mcp/enrollment.py` and `terminal_mcp/node_onboarding.py` now let terminal records roll over to a fresh enrollment for the same key and machine; newest rows use `created_at, rowid` ordering. Added `test_join_current_retry_after_enrollment_expiry_creates_fresh_pairing` in `tests/test_windows_onboarding.py`.
