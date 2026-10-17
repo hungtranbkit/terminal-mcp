@@ -717,3 +717,12 @@ Direct dispatch (`create_session` -> `send`/`send_wait`) leaves no queue row, so
 - No HP controller deployment needed for Dell-local Codex registration. Browser Gateway remains independently operational. A separate Terminal MCP direct interactive Codex submission issue (TEXT_SENT, Enter not delivered) was observed; work proceeded via the confirmed direct shell pathway; not part of this repository change.
 
 - Harness unit regression: python3 -m pytest -q tests/test_harness_core.py tests/test_harness_prerequisites.py -> 88 passed (2026-10-09).
+
+## 2026-10-17 — Codex startup menu readiness regression (in progress)
+
+- Isolated branch `fix/codex-startup-non-daemon-20261017`, based on `origin/main` `f07a0e58061531cc986f418d0812cdab549d7904` (PR #61 included). Dashboard PR #65 and the shared checkout/session remain untouched.
+- Dell Codex CLI is `0.162.0`; its own `codex --help` documents `--no-daemon`. HP CLI was observed as `0.154.0` and lacks that flag. `terminal_mcp/lifecycle.py` now detects the flag from CLI help, passes it before resume args per process, and has a bounded, identity-rechecked fallback that can choose only option 1 in the exact incompatible-daemon menu. It never selects option 2. Trust/hook/tool permission prompts remain blocked.
+- Codex lifecycle now reports `READY` / `TASK_READY` after a stable composer, while keeping `tool_ready=false`; unready/blocked startup stays `CREATED` or a structured `BLOCKED` state. First-turn submit and execution receipts remain separate in the supervisor.
+- New regressions cover exact Dell prompt text, CLI `0.154.0`/`0.162.0` capability detection, scoped flag placement before resume args, trust blocking, task-ready receipt, and generic `FINISHED` text not completing a supervised task. Existing issue #52 first-dispatch tests are retained.
+- Verification so far: `pytest -q tests/test_codex_startup_navigation.py tests/test_direct_task_lifecycle.py tests/test_issue52_supervised_dispatch.py` -> **91 passed** before the scoped option-1 fallback assertions were added. A rerun after those additions is pending. `tests/test_session_lifecycle.py` collection is currently blocked in system Python because `starlette` is not installed (`ModuleNotFoundError`); no application failure is established.
+- Live patched-source smoke, full suite, commit/PR, and deployment are pending. Do not claim runtime fixed until a fresh patched create + first supervised task returns READY and EXECUTION_ACCEPTED. If live runtime topology or safe rollout is unavailable, leave PR open and record the blocker.

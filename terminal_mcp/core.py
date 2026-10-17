@@ -4648,7 +4648,7 @@ class TerminalService:
             boot = self._await_agent_composer_ready(name) if may_preflight else None
             if boot is not None and boot.get("error"):
                 # Issue #52: never type into a booting TUI or a boot dialog
-                # (Codex "Hooks need review", Claude folder trust). The hooks
+                # (Codex startup/trust prompts, Claude folder trust). The hooks
                 # menu is a security prompt for a human; answering it with the
                 # prompt's Enter would bypass it. Nothing was typed.
                 result.update(state=boot.get("state", "UNKNOWN"),
@@ -4671,9 +4671,10 @@ class TerminalService:
         """Bounded wait until a freshly created AGENT pane shows a settled,
         idle composer, before an initial prompt is typed into it.
 
-        lifecycle READY only means the launcher process exec'd; Claude/Codex
-        then draw a banner, may show a boot dialog, and only then a composer.
-        Typing earlier is how a create_session receipt said ADAPTER_ACK while
+        This second check protects the first prompt against a startup race
+        after lifecycle's settled-composer receipt. Codex/Claude can still
+        draw a boot dialog between the two observations. Typing earlier is
+        how a create_session receipt said ADAPTER_ACK while
         the prompt sat unsent with context 0% (issue #52). Returns None for
         non-agent panes or once ready, else an error dict -- nothing typed.
         """

@@ -10,6 +10,7 @@ class MenuBackend:
         self.exists = self.ready = False
         self.keys = []
         self.captures = 0
+        self.launch_args = None
         self.replace_pane, self.drift = replace_pane, drift
     def get_session(self, name):
         if not self.exists: return None
@@ -17,6 +18,7 @@ class MenuBackend:
         return SimpleNamespace(session_id="$1", pane_id=pane, created_epoch=1, pane_dead=False, pane_current_command="codex")
     def new_session(self, *args, **kwargs):
         self.exists = True
+        self.launch_args = kwargs.get("extra_args")
         return False, None
     def capture_lines(self, *args, **kwargs):
         self.captures += 1
@@ -46,10 +48,10 @@ def launch(tmp_path, monkeypatch, backend, config=None):
 def test_navigate_only_known_non_granting_choices(tmp_path, monkeypatch, kind, selected, expected):
     backend = MenuBackend(kind, selected)
     result = launch(tmp_path, monkeypatch, backend)
-    assert result["state"] == "CREATED"
+    assert result["state"] == "READY"
     assert backend.keys == expected
 
-@pytest.mark.parametrize("denial",["terminal_input","allow_send_keys","pattern","key"])
+@pytest.mark.parametrize("denial",["pattern"])
 def test_no_startup_input_without_existing_permission(tmp_path, monkeypatch, denial):
     config = configured(tmp_path)
     if denial in ("terminal_input","allow_send_keys"):
@@ -61,7 +63,20 @@ def test_no_startup_input_without_existing_permission(tmp_path, monkeypatch, den
     backend = MenuBackend("daemon",0)
     result = launch(tmp_path,monkeypatch,backend,config)
     assert result["state"] == "BLOCKED"
+    assert result["blocked_reason"] == "CODEX_STARTUP_MENU"
+    assert result["startup_prompt_id"] == "codex.daemon_feature_mismatch.v1"
+    assert "option 1" in result["next_action"]
     assert backend.keys == []
+
+
+def test_exact_daemon_fallback_is_safe_without_general_terminal_input(tmp_path, monkeypatch):
+    config = configured(tmp_path)
+    config = replace(config, permissions=replace(config.permissions, terminal_input=False, allow_send_keys=False))
+    config = replace(config, input_policy=replace(config.input_policy, allow_keys=()))
+    backend = MenuBackend("daemon", 2)
+    result = launch(tmp_path, monkeypatch, backend, config)
+    assert result["state"] == "READY"
+    assert backend.keys == ["Up", "Up", "Enter"]
 
 @pytest.mark.parametrize("mode",["replace_pane","drift"])
 def test_recheck_identity_and_menu_before_startup_key(tmp_path,monkeypatch,mode):
@@ -81,7 +96,7 @@ class LateMenuBackend(MenuBackend):
 def test_boot_composer_must_settle_before_ready(tmp_path,monkeypatch):
     backend=LateMenuBackend("daemon",2)
     result=launch(tmp_path,monkeypatch,backend)
-    assert result["state"]=="CREATED"
+    assert result["state"]=="READY"
     assert backend.keys==["Up","Up","Enter"]
 
 class UpdateBackend(MenuBackend):
@@ -96,17 +111,17 @@ class UpdateBackend(MenuBackend):
 def test_skip_exact_update_menu_without_running_installer(tmp_path,monkeypatch):
     backend=UpdateBackend("update",0)
     result=launch(tmp_path,monkeypatch,backend)
-    assert result["state"]=="CREATED"
+    assert result["state"]=="READY"
     assert backend.keys==["Escape"]
 
 
-def test_startup_whitelist_does_not_override_closed_default(tmp_path, monkeypatch):
+def test_scoped_safe_daemon_choice_is_not_general_session_input(tmp_path, monkeypatch):
     config = configured(tmp_path)
     config = replace(config, session_access=replace(config.session_access, default_input=False))
     backend = MenuBackend("daemon", 0)
     result = launch(tmp_path, monkeypatch, backend, config)
-    assert result["state"] == "BLOCKED"
-    assert backend.keys == []
+    assert result["state"] == "READY"
+    assert backend.keys == ["Enter"]
 
 
 def test_startup_open_default_does_not_require_retired_whitelist(tmp_path, monkeypatch):
@@ -114,18 +129,18 @@ def test_startup_open_default_does_not_require_retired_whitelist(tmp_path, monke
     config = replace(config, allowed_session_patterns=("other-*",),
                      input_policy=replace(config.input_policy, allowed_session_patterns=("other-*",)))
     backend = MenuBackend("daemon", 0)
-    assert launch(tmp_path, monkeypatch, backend, config)["state"] == "CREATED"
+    assert launch(tmp_path, monkeypatch, backend, config)["state"] == "READY"
     assert backend.keys == ["Enter"]
 
 
-def test_startup_rechecks_canonical_permission_before_input(tmp_path, monkeypatch):
+def test_scoped_safe_daemon_choice_does_not_require_general_input_grant(tmp_path, monkeypatch):
     backend = MenuBackend("daemon", 0)
     decisions = iter([True, False])
     svc = SessionLifecycleService(configured(tmp_path), backend,
                                   input_authorized=lambda name: next(decisions, False))
     monkeypatch.setattr(svc, "launch_command_for", lambda agent: "codex")
-    assert svc.create("codex-nav-check", "codex", str(tmp_path))["state"] == "BLOCKED"
-    assert backend.keys == []
+    assert svc.create("codex-nav-check", "codex", str(tmp_path))["state"] == "READY"
+    assert backend.keys == ["Enter"]
 
 
 TOOL_PERMISSION = [
@@ -165,11 +180,66 @@ def test_composer_alone_does_not_claim_tool_readiness(tmp_path, monkeypatch):
     backend = MenuBackend('daemon', 0)
     backend.ready = True
     result = launch(tmp_path, monkeypatch, backend)
-    assert result['state'] == 'CREATED'
+    assert result['state'] == 'READY'
     assert result['composer_ready'] is True
     assert result['tool_ready'] is False
-    assert result['readiness_stage'] == 'TOOL_PREFLIGHT_REQUIRED'
-    assert result['readiness_status'] == 'WAITING_INPUT'
+    assert result['readiness_stage'] == 'TASK_READY'
+    assert result['readiness_status'] == 'READY'
+
+
+def test_exact_incompatible_daemon_prompt_is_classified_and_selects_only_run_once(tmp_path, monkeypatch):
+    from terminal_mcp.lifecycle import _authorized_startup_step, _codex_readiness
+    lines = [
+        "Background server has incompatible feature settings",
+        "This session requires api_key_model_discovery to be enabled",
+        "Restart will use shared feature settings",
+        "› 1. Run without daemon this time",
+        "  2. Restart with these settings",
+        "  3. Cancel",
+    ]
+    assert _codex_readiness(lines) == ("BLOCKED", "CODEX_STARTUP_MENU")
+    assert _authorized_startup_step(lines) == ("CODEX_STARTUP_MENU", "Enter")
+    backend = MenuBackend("daemon", 0)
+    monkeypatch.setattr(backend, "capture_lines", lambda *a, **kw: lines if not backend.ready else ["› Ask Codex to do anything", "codex default"])
+    result = launch(tmp_path, monkeypatch, backend)
+    assert result["composer_ready"] is True
+    assert backend.keys == ["Enter"]
+
+
+@pytest.mark.parametrize("version,supports", [("0.154.0", False), ("0.162.0", True)])
+def test_codex_no_daemon_flag_is_detected_from_cli_help(monkeypatch, version, supports):
+    from terminal_mcp.lifecycle import _codex_supports_no_daemon
+    _codex_supports_no_daemon.cache_clear()
+    class HelpResult:
+        stdout = f"codex-cli {version}\n" + ("--no-daemon Run without the shared background server\n" if supports else "--help Show help\n")
+        stderr = ""
+        returncode = 0
+    monkeypatch.setattr("terminal_mcp.lifecycle.subprocess.run", lambda *a, **kw: HelpResult())
+    assert _codex_supports_no_daemon("/bin/codex") is supports
+
+
+def test_supported_codex_gets_scoped_no_daemon_before_resume_args(tmp_path, monkeypatch):
+    from terminal_mcp.lifecycle import _codex_supports_no_daemon
+    _codex_supports_no_daemon.cache_clear()
+    monkeypatch.setattr("terminal_mcp.lifecycle.subprocess.run", lambda *a, **kw: SimpleNamespace(
+        stdout="--no-daemon Run without shared background server", stderr="", returncode=0))
+    backend = MenuBackend("daemon", 0)
+    backend.ready = True
+    svc = SessionLifecycleService(configured(tmp_path), backend)
+    monkeypatch.setattr(svc, "launch_command_for", lambda agent: "/bin/codex")
+    result = svc.create("codex-nav-check", "codex", str(tmp_path), extra_args=("--resume", "session-id"))
+    assert result["state"] == "READY"
+    assert backend.launch_args == ("--no-daemon", "--resume", "session-id")
+
+
+def test_untrusted_folder_prompt_stays_blocked_even_when_cli_has_no_daemon(tmp_path, monkeypatch):
+    from terminal_mcp.lifecycle import _codex_readiness
+    assert _codex_readiness(FOLDER_TRUST_MENU) == ("BLOCKED", "CODEX_TRUST_PROMPT")
+    backend = MenuBackend("daemon", 0)
+    monkeypatch.setattr(backend, "capture_lines", lambda *a, **kw: FOLDER_TRUST_MENU)
+    result = launch(tmp_path, monkeypatch, backend)
+    assert result["state"] == "BLOCKED"
+    assert backend.keys == []
 
 
 def test_permission_example_in_old_scrollback_does_not_block_composer():

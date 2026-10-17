@@ -1227,8 +1227,9 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         server-side-only command from config, never anything this caller
         supplies as text). working_directory is optional and must resolve
         inside config.session_lifecycle.allowed_cwd_roots. Returns a
-        receipt with state: READY (shell ready), CREATED (agent launched;
-        tool readiness is unverified), BLOCKED_PERMISSION (owner approval
+        receipt with state: READY (shell ready, or a Codex stable composer
+        ready for the first task), CREATED (agent launched but its task-ready
+        signal is not established; tool readiness is unverified), BLOCKED_PERMISSION (owner approval
         is required), BLOCKED (startup/trust/config prompt or deadline),
         or FAILED (nothing usable was created; any disposable
         session this call itself made is already cleaned up). Duplicate
