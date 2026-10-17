@@ -2,7 +2,7 @@
 
 # 2026-10-17 — P0 production-readiness continuation audit
 
-- Latest branch tip is `c1711b0cc730a2488b3a7da5502edd3a9ea1632d` on `feat/p0-dashboard-node-join-20261017`; worktree is clean. PR #65 remains open and mergeable (`CLEAN`), with all five required GitHub checks green at this tip. Repository Actions secrets and variables are empty. GitHub CLI is authenticated for repo access, but that does not provide Cloudflare Access administration.
+- Application branch tip before this audit was `c1711b0cc730a2488b3a7da5502edd3a9ea1632d`; this production-readiness handoff is commit `8aae9dcc8bdaf3d6e1c5097dca63b8ab3913529c` on `feat/p0-dashboard-node-join-20261017`. PR #65 remains open and mergeable; all five required GitHub checks pass at the handoff commit. Repository Actions secrets and variables are empty. GitHub CLI is authenticated for repo access, but that does not provide Cloudflare Access administration.
 - The public dashboard redirects to a Cloudflare Access login page. Its initial HTML does not establish whether Google SSO is configured. No authorized Access admin/API session or approved email-to-role mapping has been provided; production IdP, audience/policies, and deployed ingress remain unverified. No production Cloudflare changes, merge, or deployment occurred.
 - This audit confirms the existing stop condition; the branch implementation, tests, and browser QA are summarized below. Next concrete action remains obtaining authorized Cloudflare Access admin/API access and the approved role map, then verifying production login/route and performing the deployment acceptance checks. HP `unified-memory-multinode` remains untouched.
 
