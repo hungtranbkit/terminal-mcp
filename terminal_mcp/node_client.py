@@ -460,6 +460,11 @@ class RemoteNodeClient:
         return self._request("POST", "/v1/fleet/objects",
                              body={"objects": objects, "since": since, "from": source_node})
 
+    def memory_request(self, action: str, body: dict[str, Any]) -> dict[str, Any]:
+        if action not in ("join", "pull", "push", "search"):
+            raise NodeClientError("unsupported memory action")
+        return self._request("POST", f"/v1/memory/{action}", body=body, timeout_seconds=10)
+
     def _request(self, method: str, path: str, *, params: dict[str, Any] | None = None,
                 body: dict[str, Any] | None = None,
                 timeout_seconds: float | None = None) -> dict[str, Any]:

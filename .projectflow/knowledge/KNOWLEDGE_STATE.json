@@ -466,6 +466,17 @@
       ],
       "summary": "Supervisor Loop v1 — local detection + a durable event queue"
     },
+    "unified_memory": {
+      "last_verified_at": "2026-10-17T01:15:42.718080+00:00",
+      "last_verified_commit": "8d8209f9dda12cfe21c4417730819cb43ecb1151",
+      "paths": [
+        "terminal_mcp/unified_memory.py",
+        "terminal_mcp/memory_sync.py",
+        "terminal_mcp/memory_projection.py",
+        "terminal_mcp/memory_runtime.py"
+      ],
+      "summary": "Additive, permission-scoped memory projection; never an execution authority"
+    },
     "webauth": {
       "last_verified_at": "2026-09-24T06:59:13.291019+00:00",
       "last_verified_commit": "4d0b9f0fd6d123aa38c29e05e310a63da1267e5a",
