@@ -286,7 +286,7 @@ def build_mcp(service: TerminalService | None = None,
               browser: BrowserGateway | None = None,
               agents: "AgentService | None" = None,
               project_runtime: "ProjectRuntimeService | None" = None,
-              run_journal: Any = None) -> MCPServer:
+              run_journal: Any = None, memory: Any = None) -> MCPServer:
     """Build one MCP surface over the shared, transport-independent service.
 
     `supervisor`/`supervisor_v2` are always constructed and their tools
@@ -722,6 +722,19 @@ def build_mcp(service: TerminalService | None = None,
             return queue.store.lane_status(session).get("current_task")
         except Exception:  # noqa: BLE001 -- a metrics/warning lookup must never break a real send
             return None
+
+    if memory is not None:
+        @server.tool()
+        def terminal_memory_search(query: str, project: str | None = None, limit: int = 20) -> dict:
+            """Search approved local/cached metadata and curated memory, with provenance and offline expiry."""
+            from .permissions import require_read
+            from .unified_memory import MemoryError
+            if (error := require_read(terminal.config)) is not None:
+                return {"error": error}
+            try:
+                return memory.search(query, project=project, limit=limit)
+            except MemoryError as exc:
+                return {"error": str(exc)}
 
     @server.tool()
     def terminal_list_sessions() -> dict:

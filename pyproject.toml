@@ -57,6 +57,7 @@ test = ["pytest>=9,<10"]
 windows = ["pywinpty>=2,<3; sys_platform == 'win32'"]
 
 [project.scripts]
+terminal-mcp-memory = "terminal_mcp.memory_runtime:main"
 terminal-mcp = "terminal_mcp.server:main"
 terminal-mcp-http = "terminal_mcp.server_http:main"
 terminal-mcp-observer = "terminal_mcp.observer_app:main"

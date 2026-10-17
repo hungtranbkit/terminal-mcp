@@ -610,9 +610,14 @@ def main() -> None:
     )
     from .run_journal import RunJournalStore
     run_journal = RunJournalStore()
+    from .memory_runtime import from_environment
+    memory_runtime = from_environment(local_node_id, controller=controller)
+    if memory_runtime is not None:
+        memory_runtime.start()
+        atexit.register(memory_runtime.close)
     server = build_mcp(terminal, supervisor, supervisor_v2, controller, queue=queue, integration=integration, pm=pm,
                        planner=planner, ai_usage=ai_usage, recovery=recovery, backlog=backlog, notes=notes,
-                       events=events, fleet=fleet, run_journal=run_journal)
+                       events=events, fleet=fleet, run_journal=run_journal, memory=memory_runtime)
     # Reattach task-specific followers after a process restart. The queue
     # rows remain authoritative; only explicitly opted-in fast-agent tasks
     # are followed, and the same engine still enforces acceptance/evidence.

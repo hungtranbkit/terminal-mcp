@@ -1,13 +1,13 @@
 # Unified Memory for Terminal MCP: architecture audit and proposed design
 
-Status: **proposed; implementation/staging not performed**. User design review pending.
+Status: **MVP scope approved and implemented**. See `docs/unified-memory.md` for the delivered contract and staging commands; production activation remains separately gated.
 Audited base: `79d93e8430703f0fdb4b9d92c6caece91cdb1227`.
 
 ## Outcome and constraints
 
 Provide a durable, searchable view of Git repositories, projects, installed skill metadata, tasks, nodes, and explicitly shared memory across enrolled Terminal MCP nodes. Continue serving permitted cached results offline, with honest freshness and provenance. Discover joined nodes without treating discovery as authorization. Changes are additive: no deletion of source data, no automatic retention/compaction of the new memory journal, no migration that overwrites existing stores. Stage on isolated databases, sockets, and processes before any production activation. Existing production-approval restrictions remain in force.
 
-Assumption awaiting user correction: share metadata and selected redacted notes/checkpoints, not all source files, terminal transcripts, credentials, or executable skill bodies. No embeddings service, new cloud account, credential redistribution, or automatic execution of retrieved content is required.
+User-approved scope: share metadata and selected redacted notes/checkpoints, not all source files, terminal transcripts, credentials, or executable skill bodies. No embeddings service, new cloud account, credential redistribution, or automatic execution of retrieved content is required.
 
 ## Audit: reusable sources of truth
 

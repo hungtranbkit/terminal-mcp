@@ -226,7 +226,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
                      workspace_root: str = "/",
                      fleet: "FleetService | None" = None,
                      throttle: "AuthThrottle | None" = None,
-                     trust_forwarded_for: bool = False) -> Starlette:
+                     trust_forwarded_for: bool = False, memory=None) -> Starlette:
     # A plain string still works (every existing caller and test passes
     # one); it is wrapped so that THIS process has exactly one credential
     # object, and a rotation adopted by the heartbeat loop is immediately
@@ -1158,6 +1158,10 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
         Route("/v1/internal/shutdown", internal_shutdown, methods=["POST"]),
         WebSocketRoute("/v1/ws/terminal", terminal_ws, name="node_agent_terminal_ws"),
     ]
+    if memory is not None:
+        from .memory_sync import memory_routes
+        routes.extend(memory_routes(memory, require_auth))
+
     watchdog_config = getattr(getattr(terminal, "config", None), "submit_watchdog", None)
     watchdog_enabled = bool(getattr(watchdog_config, "enabled", False))
     @asynccontextmanager
@@ -1354,7 +1358,14 @@ def main(argv: list[str] | None = None) -> int:
                       _deny_migration.get("errors"))
     except Exception:  # noqa: BLE001 -- never block startup on a migration
         _log.exception("deny-record migration failed -- grants left unchanged")
+    from .memory_runtime import from_environment
+    memory_runtime = from_environment(args.node_id)
+    if memory_runtime is not None:
+        import atexit
+        memory_runtime.start()
+        atexit.register(memory_runtime.close)
     app = build_node_agent(node_id=args.node_id, terminal=terminal, token=credential,
+                           memory=memory_runtime.endpoint if memory_runtime else None,
                            workspace_root=(config.session_lifecycle.allowed_cwd_roots[0]
                                           if config.session_lifecycle.allowed_cwd_roots else "/"))
 
