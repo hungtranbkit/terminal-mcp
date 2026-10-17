@@ -42,6 +42,46 @@ def test_dashboard_routes_are_registered(read_config):
     assert routes["/dashboard/api/session/input"] == {"POST"}
 
 
+def test_nodes_dashboard_offers_current_machine_join_and_loopback_pair_states():
+    from terminal_mcp.dashboard import NODES_ADMIN_HTML
+
+    assert 'id="joinCurrentMachineBtn"' in NODES_ADMIN_HTML
+    assert "Join this machine" in NODES_ADMIN_HTML
+    assert "127.0.0.1:47562/v1/challenge" in NODES_ADMIN_HTML
+    assert "127.0.0.1:47562/v1/pair" in NODES_ADMIN_HTML
+    assert "permission prompt" in NODES_ADMIN_HTML
+    assert "/dashboard/api/nodes/onboard/helper/install-script/" in NODES_ADMIN_HTML
+    assert "localStorage.getItem(JOIN_CURRENT_KEY)" in NODES_ADMIN_HTML
+    assert "localStorage.setItem(JOIN_CURRENT_KEY, key)" in NODES_ADMIN_HTML
+    assert "node.status === 'online' && node.last_heartbeat_at" in NODES_ADMIN_HTML
+    assert "first heartbeat reached the controller" in NODES_ADMIN_HTML
+
+
+@pytest.mark.parametrize("email,status", [
+    ("viewer@example.com", 403), ("operator@example.com", 200),
+])
+def test_current_machine_join_obeys_verified_access_role(email, status, monkeypatch, tmp_path):
+    from terminal_mcp import dashboard as dashboard_module
+    from terminal_mcp.cf_access import AccessIdentity
+
+    monkeypatch.setattr(
+        dashboard_module, "verify_access_assertion",
+        lambda token, **kw: AccessIdentity(email=email, subject="subject", raw_claims={}),
+    )
+    config = _cf_access_config(access_email_roles=(
+        ("viewer@example.com", "viewer"), ("operator@example.com", "operator"),
+    ))
+    service = TerminalService(config)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app(), headers={
+        "Origin": "http://testserver", "Cf-Access-Jwt-Assertion": "verified-test-token",
+        "Idempotency-Key": "join-current-role-test-0001",
+    })
+    response = client.post("/dashboard/api/nodes/onboard/join/current", json={"platform": "windows"})
+    assert response.status_code == status
+
+
 def test_sessions_admin_page_reachable_and_uses_the_same_api(tmp_path, tmux_session_factory):
     # /dashboard/sessions is a second VIEW of the same data/mutations, not
     # a new privilege surface -- same read guard as /dashboard, same
@@ -1442,6 +1482,8 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         # itself. Split into two, this path-keyed dict would record only
         # whichever registered last, and silently stop guarding the other.
         "/dashboard/api/nodes/onboard/enrollments": {"GET", "POST", "HEAD"},
+        "/dashboard/api/nodes/onboard/join/current": {"POST"},
+        "/dashboard/api/nodes/onboard/helper/install-script/{platform}": {"POST"},
         "/dashboard/api/nodes/onboard/enrollments/{enrollment_id}/revoke": {"POST"},
         "/dashboard/api/nodes/onboard/gateway": {"GET", "HEAD"},
         # Bootstrap helper artifact: operator-facing reads, _read_guard only.

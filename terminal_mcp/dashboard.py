@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import hashlib
 import hmac
 import json
 import logging
@@ -25,6 +26,7 @@ from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
 from . import harness_policy
+from .bootstrap_install_script import render_install_script as render_paired_install_script
 from . import lan_discovery, network_bind, remote_connect, tunnel_diagnostics
 from html import escape as html_escape
 from . import dashboard_nav
@@ -6057,6 +6059,7 @@ NODES_ADMIN_HTML = """<!doctype html>
     a.back:hover { color:var(--text); border-color:var(--muted) }
     button.icon-btn { background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:5px 11px; cursor:pointer; font:inherit; font-size:12px }
     button.icon-btn:hover { background:#233252 }
+    .join-current-button { min-height:44px; white-space:nowrap }
     main { flex:1; min-height:0; overflow:auto; padding:18px 24px 24px }
     #cards { display:grid; grid-template-columns:repeat(auto-fill, minmax(300px, 1fr)); gap:14px }
     .node-card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px; cursor:pointer; transition:border-color .15s }
@@ -6161,6 +6164,17 @@ NODES_ADMIN_HTML = """<!doctype html>
               border-radius:6px; white-space:pre-wrap; word-break:break-all }
     .an-cmd:focus { outline:2px solid var(--accent); outline-offset:1px }
     .an-big-btn { font-size:13px; padding:9px 18px }
+    .join-current-panel { background:var(--panel); border:1px solid var(--accent); border-radius:12px;
+      padding:16px; margin-bottom:16px; display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px 16px; align-items:center }
+    .join-current-panel[hidden] { display:none }
+    .join-current-copy { min-width:0; overflow-wrap:anywhere }
+    .join-current-actions { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end }
+    .join-current-actions button { min-height:44px }
+    #joinCurrentStatus { grid-column:1 / -1; min-width:0; padding:10px 12px; border-radius:8px;
+      background:#0f1730; border:1px solid var(--line); overflow-wrap:anywhere }
+    #joinCurrentStatus[data-state="ready"] { border-color:var(--green); color:var(--green) }
+    #joinCurrentStatus[data-state="failed"] { border-color:var(--red); color:#ff9aa8 }
+    #joinCurrentStatus[data-state="permission"] { border-color:var(--amber); color:var(--amber) }
     /* The one primary CTA is never hidden, so its unusable states have to
        read as unusable rather than as "nothing happened when I clicked". */
     .an-big-btn[disabled] { opacity:.5; cursor:not-allowed }
@@ -6204,7 +6218,12 @@ NODES_ADMIN_HTML = """<!doctype html>
       .tr-table th:nth-child(4), .tr-table td:nth-child(4) { display:none }
     }
     @media (max-width:760px) {
-      header { padding:12px 14px } main { padding:14px } #cards { grid-template-columns:1fr }
+      header { padding:12px 14px } header > div:last-child { width:100%; flex-wrap:wrap }
+      main { padding:14px } #cards { grid-template-columns:minmax(0,1fr) }
+      .join-current-button { flex:1 1 100% }
+      .join-current-panel { grid-template-columns:minmax(0,1fr); padding:14px }
+      .join-current-actions { justify-content:stretch }
+      .join-current-actions button { flex:1 1 100%; white-space:nowrap }
     }
   </style>
 </head>
@@ -6212,6 +6231,7 @@ NODES_ADMIN_HTML = """<!doctype html>
   <header>
     <div><h1>Quản lý node</h1><div class="muted">Trạng thái, tài nguyên và session theo từng node</div></div>
     <div style="display:flex;align-items:center;gap:10px">
+      <button class="icon-btn an-primary join-current-button" id="joinCurrentMachineBtn" type="button">Join this machine</button>
       <button class="icon-btn an-primary" id="addNodeWizardBtn" type="button">+ Add Node</button>
       <button class="icon-btn" id="connectNodeBtn" type="button">+ Connect Node</button>
       <button class="icon-btn" id="addNodeBtn" type="button">+ Thêm node</button>
@@ -6222,6 +6242,18 @@ NODES_ADMIN_HTML = """<!doctype html>
     </div>
   </header>
   <main>
+    <section id="joinCurrentPanel" class="join-current-panel" hidden aria-labelledby="joinCurrentTitle">
+      <div class="join-current-copy">
+        <strong id="joinCurrentTitle">Join this machine</strong>
+        <div class="muted">Pair qua helper loopback. Nếu chưa có helper, tải installer theo hệ điều hành rồi tự mở và chấp thuận quyền cài service.</div>
+      </div>
+      <div class="join-current-actions">
+        <button class="icon-btn an-primary" id="joinCurrentRetryBtn" type="button">Retry join</button>
+        <button class="icon-btn" id="joinCurrentRevokeBtn" type="button" hidden>Revoke node</button>
+        <button class="icon-btn" id="joinCurrentCloseBtn" type="button">Close</button>
+      </div>
+      <div id="joinCurrentStatus" role="status" aria-live="polite" data-state="idle">Ready to check this machine.</div>
+    </section>
     <!-- ==================================================================
          + Add Node -> Windows. Three steps, one screen, no scrolling
          through options nobody changes: pick the OS, name it, pick a
@@ -6958,6 +6990,7 @@ NODES_ADMIN_HTML = """<!doctype html>
     let anCtaBuild = null;        // the published helper build, in download mode
     let anCtaExpired = false;     // the enrollment behind the CTA has run out
     let anDetectTimer = null;
+    let anHelperChallenge = null;
     // One handle in flight at a time. Without this an impatient double
     // click mints two handles for one enrollment: the second invalidates
     // the first, and the helper already holding the first fails at redeem.
@@ -7021,7 +7054,7 @@ NODES_ADMIN_HTML = """<!doctype html>
         anCtaSetState(button, true, false);
         // Unsigned is stated plainly rather than coaching anyone past
         // SmartScreen.
-        const warn = build && build.signed ? '' : ' (bản DEV chưa ký — Windows SmartScreen sẽ cảnh báo, chọn More info → Run anyway)';
+        const warn = build && build.signed ? '' : ' (bản DEV chưa ký — Windows có thể chặn file)';
         why.textContent = `Chưa có helper trên máy này — bấm để tải Bootstrap helper v${(build && build.version) || '?'} đã gắn sẵn phiên cài đặt này${warn}. Mở file vừa tải, rồi bấm Yes khi Windows hỏi quyền Administrator; phần còn lại tự chạy.`;
         return;
       }
@@ -7066,17 +7099,178 @@ NODES_ADMIN_HTML = """<!doctype html>
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 1200);
       try {
-        const response = await fetch('http://127.0.0.1:8791/detect',
-                                     {signal: controller.signal, cache: 'no-store'});
+        const response = await fetch('http://127.0.0.1:47562/v1/challenge',
+                                     {signal: controller.signal, cache: 'no-store', mode: 'cors',
+                                      credentials: 'omit', redirect: 'error'});
         if (!response.ok) return null;
         const body = await response.json();
-        return body && body.product === 'terminal-mcp-bootstrap' ? body : null;
+        if (!body || body.product !== 'terminal-mcp-bootstrap' || !body.nonce) return null;
+        anHelperChallenge = body;
+        return body;
       } catch (error) {
+        anHelperChallenge = null;
         return null;   // not installed, or not reachable -- same outcome
       } finally {
         clearTimeout(timer);
       }
     }
+
+    const JOIN_CURRENT_KEY = 'tmcp.join-current.idempotency';
+    let joinCurrentBusy = false;
+    let joinCurrentNodeId = '';
+    function joinCurrentStatus(state, text) {
+      const status = document.getElementById('joinCurrentStatus');
+      status.dataset.state = state;
+      status.textContent = text;
+    }
+    function joinCurrentIdempotencyKey() {
+      try {
+        let key = localStorage.getItem(JOIN_CURRENT_KEY);
+        if (!key) {
+          key = 'join-current-' + crypto.randomUUID().replaceAll('-', '');
+          localStorage.setItem(JOIN_CURRENT_KEY, key);
+        }
+        return key;
+      } catch (error) {
+        return 'join-current-' + Array.from(crypto.getRandomValues(new Uint8Array(20)),
+                                            (byte) => byte.toString(16).padStart(2, '0')).join('');
+      }
+    }
+    function joinCurrentDownload(response, fallbackName) {
+      const disposition = response.headers.get('Content-Disposition') || '';
+      const match = /filename="([^"]+)"/.exec(disposition);
+      return response.blob().then((blob) => {
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = match ? match[1] : fallbackName;
+        document.body.append(link); link.click(); link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+      });
+    }
+    async function joinCurrentMachine() {
+      if (joinCurrentBusy) return;
+      joinCurrentBusy = true;
+      const panel = document.getElementById('joinCurrentPanel');
+      const retry = document.getElementById('joinCurrentRetryBtn');
+      const revoke = document.getElementById('joinCurrentRevokeBtn');
+      panel.hidden = false;
+      retry.disabled = true;
+      revoke.hidden = true;
+      joinCurrentStatus('checking', 'Checking for the local pairing helper…');
+      try {
+        const helper = await anDetectHelper();
+        const platformHint = String((helper && helper.platform) ||
+          ((navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '')).toLowerCase();
+        const platform = platformHint.includes('win') ? 'windows'
+          : (platformHint.includes('mac') || platformHint.includes('darwin')) ? 'macos'
+          : platformHint.includes('linux') ? 'linux' : '';
+        if (!platform) {
+          joinCurrentStatus('failed', 'Could not identify a supported machine platform. Use Add Node for the manual setup path.');
+          return;
+        }
+        const key = joinCurrentIdempotencyKey();
+        const joined = await api('/dashboard/api/nodes/onboard/join/current', {
+          method: 'POST', headers: {'Content-Type': 'application/json', 'Idempotency-Key': key},
+          body: JSON.stringify({platform}),
+        });
+        if (!joined.ok) {
+          joinCurrentStatus('failed', joined.data.detail || joined.data.error || 'Could not create a pairing session.');
+          return;
+        }
+        const enrollment = joined.data.enrollment;
+        joinCurrentNodeId = enrollment.node_id;
+        if (joined.data.joined) {
+          joinCurrentStatus('pairing', 'Pairing was already redeemed. Waiting for the node service and heartbeat…');
+          document.getElementById('joinCurrentRevokeBtn').hidden = false;
+          anBeginWatch(enrollment.id, enrollment.node_id, 0);
+          return;
+        }
+        if (!joined.data.handle) {
+          joinCurrentStatus('failed', 'The server did not issue a pairing handle. Retry or revoke the pending enrollment.');
+          return;
+        }
+        const handle = joined.data.handle;
+        const expires = Date.parse(joined.data.handle_expires_at || '') || 0;
+        // Drop the in-memory handle as soon as its one authorized use is sent.
+        if (helper) {
+          let challenge = anHelperChallenge;
+          if (!challenge || Date.parse(challenge.expires_at || '') < Date.now() + 5000) {
+            await anDetectHelper();
+            challenge = anHelperChallenge;
+          }
+          if (!challenge) {
+            joinCurrentStatus('failed', 'Helper disappeared before pairing. Retry to create a fresh short-lived handle.');
+            return;
+          }
+          const paired = await fetch('http://127.0.0.1:47562/v1/pair', {
+            method: 'POST', mode: 'cors', credentials: 'omit', cache: 'no-store', redirect: 'error',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({nonce: challenge.nonce, handle}),
+          });
+          if (!paired.ok) {
+            const detail = await paired.text();
+            joinCurrentStatus('failed', detail || `Local helper refused pairing (${paired.status}). Retry for a new nonce and handle.`);
+            return;
+          }
+          joinCurrentStatus('pairing', 'Pairing accepted. Windows may ask for Administrator permission while the service installs or updates.');
+        } else if (platform === 'windows') {
+          const download = await fetch('/dashboard/api/nodes/onboard/helper/windows-x64', {
+            method: 'POST', cache: 'no-store', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({session: handle}),
+          });
+          if (!download.ok) {
+            joinCurrentStatus('failed', 'No verified Windows helper artifact is published on this controller. Use Add Node for the manual installer.');
+            return;
+          }
+          const version = download.headers.get('X-Artifact-Version') || 'unknown version';
+          const signature = download.headers.get('X-Artifact-Signed') === 'true'
+            ? 'The artifact manifest reports it signed.'
+            : 'The artifact manifest reports an unsigned development build; Windows may block it.';
+          await joinCurrentDownload(download, 'terminal-mcp-bootstrap.exe');
+          joinCurrentStatus('permission', `Helper ${version} downloaded. ${signature} Open it yourself and approve any Windows permission prompt. Download does not mean installation is complete.`);
+        } else {
+          const download = await fetch(`/dashboard/api/nodes/onboard/helper/install-script/${platform}`, {
+            method: 'POST', cache: 'no-store', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({handle}),
+          });
+          if (!download.ok) {
+            let reason = 'No paired installer is available for this platform.';
+            try { reason = (await download.json()).detail || reason; } catch (error) { /* keep fallback */ }
+            joinCurrentStatus('failed', reason);
+            return;
+          }
+          await joinCurrentDownload(download, `terminal-mcp-join-${platform}.sh`);
+          const service = platform === 'macos' ? 'LaunchAgent' : 'systemd user service';
+          joinCurrentStatus('permission', `Installer downloaded. Open it yourself in Terminal and confirm its prompt; it installs a ${service}. Download does not mean installation is complete.`);
+        }
+        anBeginWatch(enrollment.id, enrollment.node_id, expires);
+      } catch (error) {
+        joinCurrentStatus('failed', 'Could not reach the local helper or controller. Retry after checking the connection.');
+      } finally {
+        joinCurrentBusy = false;
+        retry.disabled = false;
+      }
+    }
+
+    document.getElementById('joinCurrentMachineBtn').addEventListener('click', joinCurrentMachine);
+    document.getElementById('joinCurrentRetryBtn').addEventListener('click', joinCurrentMachine);
+    document.getElementById('joinCurrentCloseBtn').addEventListener('click', () => {
+      document.getElementById('joinCurrentPanel').hidden = true;
+    });
+    document.getElementById('joinCurrentRevokeBtn').addEventListener('click', async () => {
+      if (!joinCurrentNodeId) return;
+      const result = await api(`/dashboard/api/nodes/${encodeURIComponent(joinCurrentNodeId)}/remove`,
+                               {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+      if (result.ok) {
+        joinCurrentStatus('ready', 'Node credentials revoked and node removed.');
+        document.getElementById('joinCurrentRevokeBtn').hidden = true;
+        try { localStorage.removeItem(JOIN_CURRENT_KEY); } catch (error) { /* ignore */ }
+        loadAll();
+      } else {
+        joinCurrentStatus('failed', result.data.detail || result.data.error || 'Could not revoke this node.');
+      }
+    });
 
     // While the installer runs, the enrollment row carries the stage it is
     // on. Polling it is what turns "nothing is happening" into "installing
@@ -7226,10 +7420,8 @@ NODES_ADMIN_HTML = """<!doctype html>
       hintEl.hidden = !stalled;
       if (stalled) {
         hintEl.textContent = veryQuiet
-          ? 'Helper chưa liên hệ máy chủ — kiểm tra SmartScreen/UAC hoặc chạy lại. '
-            + 'Mở file vừa tải trên máy Windows, chọn More info → Run anyway nếu bị chặn, rồi bấm Yes.'
-          : 'Chưa thấy helper kết nối. Mở file vừa tải trên máy đó và bấm Yes khi Windows hỏi '
-            + 'quyền Administrator.';
+          ? 'Helper chưa liên hệ máy chủ — xác nhận bạn đã tự mở installer và chấp thuận hộp thoại quyền của Windows.'
+          : 'Chưa thấy helper kết nối. Tự mở file installer trên máy này và xem yêu cầu quyền của Windows.';
       }
       actions.hidden = !stalled;
     }
@@ -7245,6 +7437,9 @@ NODES_ADMIN_HTML = """<!doctype html>
         anLiveRow = {progress_stage: 'failed',
                      progress_label: 'Mã cài đặt đã hết hạn hoặc bị thu hồi'};
         anRenderLive(anLiveRow);
+        if (joinCurrentNodeId && anWatch.nodeId === joinCurrentNodeId) {
+          joinCurrentStatus('failed', 'Enrollment expired or was revoked. Retry to create a fresh pairing.');
+        }
         if (anProgressTimer) { clearInterval(anProgressTimer); anProgressTimer = null; }
         return;
       }
@@ -7255,6 +7450,21 @@ NODES_ADMIN_HTML = """<!doctype html>
         anSaveWatch();
       }
       anRenderLive(row);
+      if (joinCurrentNodeId && row.node_id === joinCurrentNodeId) {
+        const liveNode = nodesCache.find((node) => node.id === joinCurrentNodeId &&
+          node.status === 'online' && node.last_heartbeat_at);
+        if (stage === 'ready' || liveNode) {
+          joinCurrentStatus('ready', liveNode && stage !== 'ready'
+            ? 'Node service is online and its first heartbeat reached the controller.'
+            : 'Node service is installed and the controller reported it ready.');
+          document.getElementById('joinCurrentRevokeBtn').hidden = false;
+        } else if (stage === 'failed') {
+          joinCurrentStatus('failed', row.progress_label || 'Installation failed. Retry or revoke this node.');
+          document.getElementById('joinCurrentRevokeBtn').hidden = false;
+        } else {
+          joinCurrentStatus('pairing', row.progress_label || 'Pairing accepted; waiting for service installation progress.');
+        }
+      }
       if (stage === 'ready' || stage === 'failed') {
         if (anProgressTimer) { clearInterval(anProgressTimer); anProgressTimer = null; }
         try { localStorage.removeItem(AN_WATCH_KEY); } catch (error) { /* ignore */ }
@@ -7507,8 +7717,8 @@ NODES_ADMIN_HTML = """<!doctype html>
       anCtaSetState(button, false, true);
       anSetMsg('anHelperMsg', 'Đang tạo phiên cài đặt...', '');
       try {
-        // The handle is minted per click and lives ~2 minutes: it is what
-        // travels in the terminalmcp:// URL instead of the enrollment code.
+        // The one-time handle is redeemed by the local helper; the
+        // browser never receives the bootstrap payload.
         const issued = await api(
           `/dashboard/api/nodes/onboard/enrollments/${encodeURIComponent(anGenerated.enrollment.id)}/handle`,
           {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
@@ -7516,10 +7726,28 @@ NODES_ADMIN_HTML = """<!doctype html>
           anSetMsg('anHelperMsg', issued.data.detail || issued.data.error || 'Không tạo được phiên cài đặt.', 'error');
           return;
         }
-        // Hand it to the local helper. The page never sees the bootstrap
-        // payload -- the helper redeems the handle itself, over HTTPS.
-        window.location.href = issued.data.url;
-        anSetMsg('anHelperMsg', 'Đã gửi sang Bootstrap helper — bấm Yes khi Windows hỏi quyền Administrator.', 'ok');
+        // Hand the nonce + handle to the loopback helper. The server-side
+        // enrollment already bound the handle to this authenticated page's
+        // Origin, and the helper redeems it directly over HTTPS.
+        let challenge = anHelperChallenge;
+        if (!challenge || Date.parse(challenge.expires_at || '') < Date.now() + 5000) {
+          await anDetectHelper();
+          challenge = anHelperChallenge;
+        }
+        if (!challenge) {
+          anSetMsg('anHelperMsg', 'Không lấy được challenge từ helper. Bấm Retry để thử lại.', 'error');
+          return;
+        }
+        const paired = await fetch('http://127.0.0.1:47562/v1/pair', {
+          method: 'POST', mode: 'cors', credentials: 'omit', cache: 'no-store', redirect: 'error',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({nonce: challenge.nonce, handle: issued.data.handle}),
+        });
+        if (!paired.ok) {
+          anSetMsg('anHelperMsg', 'Helper từ chối phiên pair. Bấm Retry để lấy nonce và handle mới.', 'error');
+          return;
+        }
+        anSetMsg('anHelperMsg', 'Pairing được nhận. Windows có thể hỏi quyền Administrator khi cài/cập nhật service.', 'ok');
         anBeginWatch(anGenerated.enrollment.id, anGenerated.enrollment.node_id,
                      Date.parse(issued.data.expires_at || '') || 0);
       } finally {
@@ -18959,6 +19187,102 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             records = await anyio.to_thread.run_sync(lambda: onboarding.list_enrollments(limit=50))
             return JSONResponse({"enrollments": records}, headers={"Cache-Control": "no-store"})
         return await onboard_create_enrollment(request)
+
+    @server.custom_route("/dashboard/api/nodes/onboard/join/current", methods=["POST"],
+                        include_in_schema=False)
+    async def onboard_join_current(request: Request) -> JSONResponse:
+        """Create a current-machine enrollment and its short-lived handle.
+
+        The enrollment code is created only inside the store and never
+        returned. The helper receives only an origin-bound, single-use
+        pairing handle; retries reuse the idempotent enrollment identity.
+        """
+        blocked, identity = _mutation_guard(request, required_role=ROLE_OPERATOR)
+        if blocked is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        idempotency_key = request.headers.get("idempotency-key") or body.get("idempotency_key")
+        platform = str(body.get("platform") or "").strip().lower()
+        if platform not in ("windows", "linux", "macos"):
+            return JSONResponse({"error": "HELPER_PLATFORM_UNAVAILABLE",
+                                 "detail": "No current-machine installer is available for this platform. "
+                                          "Use Connect Node."},
+                                status_code=501, headers={"Cache-Control": "no-store"})
+        if not isinstance(idempotency_key, str) or not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", idempotency_key):
+            return JSONResponse({"error": "INVALID_REQUEST",
+                                 "detail": "Idempotency-Key must be a 16-128 character URL-safe value"},
+                                status_code=400, headers={"Cache-Control": "no-store"})
+        node_id = "join-" + hashlib.sha256(idempotency_key.encode("ascii")).hexdigest()[:14]
+
+        def _compute() -> dict:
+            created = onboarding.create_enrollment(
+                node_id=node_id, display_name="This machine", os_name=platform, profile="minimal",
+                created_by=(identity.email if identity else None), idempotency_key=idempotency_key)
+            enrollment = created["enrollment"]
+            if enrollment.get("status") != "pending":
+                return {"enrollment": enrollment, "joined": enrollment.get("status") == "consumed",
+                        "idempotent_replay": True, "handle": None}
+            issued = onboarding.enrollments.create_handle(
+                enrollment["id"], created_by=(identity.email if identity else None),
+                dashboard_origin=_dashboard_origin(request),
+                ttl_seconds=terminal.config.nodes.onboarding.pairing_handle_ttl_seconds)
+            if issued is None:
+                raise OnboardingError("ENROLLMENT_NOT_PENDING", "enrollment expired or was revoked", status=409)
+            handle, expires_at = issued
+            return {"enrollment": enrollment, "joined": False, "handle": handle,
+                    "handle_expires_at": expires_at,
+                    "idempotent_replay": bool(created.get("idempotent_replay"))}
+
+        try:
+            result = await anyio.to_thread.run_sync(_compute)
+        except OnboardingError as exc:
+            return _onboarding_error(exc)
+        except ValueError as exc:
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": str(exc)}, status_code=400,
+                                headers={"Cache-Control": "no-store"})
+        _log.info("dashboard join-current node_id=%s replay=%s identity=%s",
+                  result["enrollment"]["node_id"], result["idempotent_replay"],
+                  identity.email if identity else None)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/onboard/helper/install-script/{platform}", methods=["POST"],
+                        include_in_schema=False)
+    async def onboard_paired_install_script(request: Request) -> Response:
+        blocked, _identity = _mutation_guard(request, required_role=ROLE_OPERATOR)
+        if blocked is not None:
+            return blocked
+        platform = str(request.path_params.get("platform") or "").lower()
+        if platform not in ("linux", "macos"):
+            return JSONResponse({"error": "HELPER_PLATFORM_UNAVAILABLE"}, status_code=404,
+                                headers={"Cache-Control": "no-store"})
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        handle = str(body.get("handle") or "").strip().lower() if isinstance(body, dict) else ""
+        dashboard_origin = _dashboard_origin(request)
+        if not dashboard_origin or not onboarding.enrollments.handle_is_usable(
+                handle, expected_origin=dashboard_origin):
+            return JSONResponse({"error": "HANDLE_INVALID",
+                                 "detail": "Pairing handle is expired, spent, or belongs to another Dashboard origin."},
+                                status_code=409, headers={"Cache-Control": "no-store"})
+        controller_origin = _machine_origin(request) or onboarding.controller_urls()[0]
+        try:
+            script = render_paired_install_script(
+                platform=platform, handle=handle, controller=controller_origin,
+                dashboard_origin=dashboard_origin)
+        except ValueError as exc:
+            return JSONResponse({"error": "INSTALLER_UNAVAILABLE", "detail": str(exc)}, status_code=409,
+                                headers={"Cache-Control": "no-store"})
+        return PlainTextResponse(script, media_type="text/x-shellscript",
+                                 headers={"Content-Disposition": f'attachment; filename="terminal-mcp-join-{platform}.sh"',
+                                          "Cache-Control": "no-store",
+                                          "X-Content-Type-Options": "nosniff"})
 
     async def onboard_create_enrollment(request: Request) -> JSONResponse:
         """Creates the one-time code AND renders the script that carries

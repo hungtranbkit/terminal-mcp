@@ -815,6 +815,76 @@ def test_pairing_handle_records_the_authenticated_dashboard_origin(tmp_path, mon
     assert onboarding.enrollments.handle_dashboard_origin(issued.json()["handle"]) == "http://testserver"
 
 
+def test_join_current_creates_origin_bound_pairing_without_returning_enrollment_code(tmp_path, monkeypatch):
+    client, _controller, onboarding = _client(tmp_path, monkeypatch)
+    response = client.post("/dashboard/api/nodes/onboard/join/current",
+                           headers={"Idempotency-Key": "join-current-machine-0001"},
+                           json={"platform": "windows"})
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["enrollment"]["node_id"].startswith("join-")
+    assert payload["handle"] and len(payload["handle"]) == 32
+    assert "code" not in payload and "script" not in payload and "node_token" not in payload
+    assert onboarding.enrollments.handle_dashboard_origin(payload["handle"]) == "http://testserver"
+
+
+def test_join_current_idempotency_key_reuses_the_same_enrollment(tmp_path, monkeypatch):
+    client, _controller, _onboarding = _client(tmp_path, monkeypatch)
+    headers = {"Idempotency-Key": "join-current-machine-0002"}
+    first = client.post("/dashboard/api/nodes/onboard/join/current", headers=headers,
+                        json={"platform": "windows"})
+    second = client.post("/dashboard/api/nodes/onboard/join/current", headers=headers,
+                         json={"platform": "windows"})
+    assert first.status_code == second.status_code == 200
+    assert first.json()["enrollment"]["id"] == second.json()["enrollment"]["id"]
+    assert first.json()["enrollment"]["node_id"] == second.json()["enrollment"]["node_id"]
+    assert first.json()["handle"] != second.json()["handle"]
+
+
+def test_join_current_retry_after_success_reports_the_existing_node(tmp_path, monkeypatch):
+    client, _controller, onboarding = _client(tmp_path, monkeypatch)
+    headers = {"Idempotency-Key": "join-current-machine-0003"}
+    first = client.post("/dashboard/api/nodes/onboard/join/current", headers=headers,
+                        json={"platform": "windows"})
+    assert first.status_code == 200
+    redeemed = onboarding.redeem_handle(
+        first.json()["handle"], hostname="127.0.0.1", dashboard_origin="http://testserver",
+        machine_id="stable-machine-identity-0003")
+    assert redeemed["node_id"] == first.json()["enrollment"]["node_id"]
+    retry = client.post("/dashboard/api/nodes/onboard/join/current", headers=headers,
+                        json={"platform": "windows"})
+    assert retry.status_code == 200
+    assert retry.json()["joined"] is True
+    assert retry.json()["enrollment"]["id"] == first.json()["enrollment"]["id"]
+    assert "handle" in retry.json() and retry.json()["handle"] is None
+
+
+def test_non_windows_current_join_serves_a_paired_user_run_installer(tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    config = _config(tmp_path)
+    config = replace(config, nodes=replace(
+        config.nodes, onboarding=replace(config.nodes.onboarding,
+                                         bootstrap_origin="https://bootstrap.example")))
+    client, _controller, _onboarding = _client(tmp_path, monkeypatch, config=config)
+    joined = client.post("/dashboard/api/nodes/onboard/join/current",
+                         headers={"Idempotency-Key": "join-current-linux-test-0001"},
+                         json={"platform": "linux"})
+    assert joined.status_code == 200, joined.text
+    handle = joined.json()["handle"]
+    installer = client.post("/dashboard/api/nodes/onboard/helper/install-script/linux",
+                            json={"handle": handle})
+    assert installer.status_code == 200, installer.text
+    assert installer.headers["content-type"].startswith("text/x-shellscript")
+    assert handle in installer.text
+    assert "Continue on this machine?" in installer.text
+    assert "--onboarding" in installer.text
+    assert 'result.get("node_token")' in installer.text
+    wrong_origin = TestClient(client.app, headers={"Origin": "http://evil.example"}).post(
+        "/dashboard/api/nodes/onboard/helper/install-script/linux", json={"handle": handle})
+    assert wrong_origin.status_code == 403
+
+
 def test_create_enrollment_rejects_machine_id_with_a_different_key(tmp_path, monkeypatch):
     client, _controller, _onboarding = _client(tmp_path, monkeypatch)
     first = client.post("/dashboard/api/nodes/onboard/enrollments",

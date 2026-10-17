@@ -58,7 +58,7 @@
 
 **Files:** `helper/cmd/terminal-mcp-bootstrap/main.go`, new platform-specific loopback listener files under `helper/cmd/terminal-mcp-bootstrap/`, `helper/internal/proto/`; tests in helper package.
 
-**Interfaces:** `GET /v1/challenge` returns helper/platform/version/nonce/expiry; `POST /v1/pair` accepts `{origin, nonce, handle}` once. Listener binds only `127.0.0.1`/`::1`, exact pinned origin, exact loopback Host, CORS preflight, short challenge TTL, bounded request body, and controller origin loaded from installed config. Pair calls existing handle redemption and installer/update path.
+**Interfaces:** `GET /v1/challenge` returns helper/platform/version/nonce/expiry; `POST /v1/pair` accepts `{nonce, handle}` once. The browser Origin header is bound to the challenge and server-side handle; the listener binds only `127.0.0.1:47562`, validates loopback Host and secure origin, supports the exact CORS/PNA preflight, and bounds challenge lifetime and request body. Successful redemption persists the Dashboard origin in helper config. Pair calls existing handle redemption and installer/update path.
 
 - [ ] Add Go tests for allowed origin/Host, denied remote/alternate Host, replay, expiry, malformed body, and nonce consumption.
 - [ ] Run `go test ./...` in `helper` to establish the expected red tests.
@@ -82,7 +82,7 @@
 
 **Files:** `terminal_mcp/dashboard.py`, `terminal_mcp/helper_artifact.py`, `deploy/install-node-agent.sh`, `deploy/install-node-agent-macos.sh`, `deploy/install-node-agent.ps1`; tests `tests/test_dashboard_mobile_portrait.py`, new dashboard join tests, helper installer tests.
 
-**Interfaces:** Add a dashboard join-state endpoint and UI flow: detect installed helper by loopback challenge; otherwise offer explicit signed/versioned OS installer and user-run instructions; after challenge, create one-time pairing handle, submit to helper, poll enrollment progress, and render verified ready/retry/revoke states.
+**Interfaces:** Add a dashboard join-state endpoint and UI flow: detect installed helper by loopback challenge; otherwise offer the manifest-verified Windows helper or a paired Linux/macOS user-run shell installer with explicit consent; after challenge, create one-time pairing handle, submit to helper, poll enrollment progress, and render verified ready/retry/revoke states.
 
 - [ ] Add route/UI contract tests for mobile and desktop, helper absent, helper present, permission pending, retry, ready and revoke states.
 - [ ] Run targeted tests and verify they fail before implementation.

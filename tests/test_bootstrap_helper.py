@@ -331,18 +331,20 @@ def test_cta_exists_and_its_ACTION_is_gated_on_real_detection():
     assert "anDetectHelper" in page
     # Loopback only -- a helper reachable on a LAN address would be
     # drivable by anything on the network.
-    assert "http://127.0.0.1:8791/detect" in page
-    assert "product === 'terminal-mcp-bootstrap'" in page
+    assert "http://127.0.0.1:47562/v1/challenge" in page
+    assert "body.product !== 'terminal-mcp-bootstrap'" in page
     # Detection failure is the NORMAL case and must be silent.
     assert "return null;   // not installed, or not reachable" in page
 
 
-def test_cta_mints_a_handle_per_click_and_never_sends_the_code():
+def test_cta_mints_a_handle_per_click_and_posts_it_with_loopback_nonce():
     page = _page()
     assert "/handle`" in page and "method: 'POST'" in page
-    # The page navigates to the protocol URL the SERVER built; it does not
-    # assemble one, and it never puts the enrollment code in a URL.
-    assert "issued.data.url" in page
+    # The page posts the handle directly to the loopback listener, alongside
+    # its one-use challenge. It never navigates to a URL carrying a secret.
+    assert "127.0.0.1:47562/v1/pair" in page
+    assert "JSON.stringify({nonce: challenge.nonce, handle: issued.data.handle})" in page
+    assert "window.location.href = issued.data.url" not in page
     assert "terminalmcp://" not in page.split("anHelperBtn")[1][:2000], \
         "the page must not hand-build protocol URLs"
 
@@ -635,7 +637,7 @@ def test_a_stall_is_warned_about_after_thirty_seconds():
     # nobody can guess from a silent screen.
     assert "Mở file vừa tải" in js
     assert "bấm Yes" in js
-    assert "SmartScreen" in js
+    assert "Windows may block it" in page
     # Stalled is amber, not red: the install may still be grinding.
     assert "'an-live' + (stalled ? ' stalled' : '')" in js
     assert ".an-live.stalled" in page
@@ -712,7 +714,7 @@ def test_ninety_seconds_says_plainly_that_it_never_reached_the_server():
     page = _page()
     assert "const AN_STALL_HARD_AFTER_MS = 90000;" in page
     js = _status_js()
-    assert "Helper chưa liên hệ máy chủ — kiểm tra SmartScreen/UAC hoặc chạy lại" in js
+    assert "xác nhận bạn đã tự mở installer và chấp thuận hộp thoại quyền của Windows" in js
     assert "veryQuiet" in js
 
 
