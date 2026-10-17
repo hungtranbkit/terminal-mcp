@@ -18510,6 +18510,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
 
         def _compute() -> dict:
             from .host_metrics import NodeMetrics
+            from .public_inventory import sanitize_public_inventory
             metrics_raw = body.get("metrics") or {}
             metrics = NodeMetrics(**{k: metrics_raw.get(k) for k in NodeMetrics.__dataclass_fields__})
             node = controller.receive_remote_heartbeat(
@@ -18532,6 +18533,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                 # (legacy) rather than inheriting whatever it had before.
                 contract_version=int(body.get("contract_version") or 0),
                 contract_capabilities=tuple(body.get("contract_capabilities") or ()),
+                public_inventory=sanitize_public_inventory(body.get("public_inventory")),
             )
             if node is None:
                 return {"error": "NODE_NOT_FOUND", "node_id": node_id}

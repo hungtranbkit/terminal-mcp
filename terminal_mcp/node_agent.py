@@ -53,6 +53,7 @@ from starlette.websockets import WebSocket
 from . import __version__, host_metrics
 from .agent_availability import available_agent_types
 from .capability_probe import probe_capabilities
+from .public_inventory import collect_public_inventory
 from .auth_throttle import AuthThrottle, client_key
 from .contract import describe as contract_describe
 from .replay_guard import HEADER_NONCE, HEADER_TIMESTAMP
@@ -1281,6 +1282,7 @@ async def _heartbeat_loop(*, node_id: str, terminal: TerminalService, controller
                 "capabilities": list(probe_capabilities()),
                 "platform": platform, "session_backend": session_backend,
                 "shell_capabilities": list(shell_capabilities), "wsl_available": wsl_available,
+                "public_inventory": collect_public_inventory(session_rows),
             }).encode()
             request = urllib.request.Request(url, data=body, method="POST")
             request.add_header("Authorization", f"Bearer {credential.current}")

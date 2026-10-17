@@ -412,8 +412,17 @@ def test_agent_token_connect_real_e2e_then_scheduler_sees_it_once_healthy(tmp_pa
                                        "disk_total_bytes": 100_000_000_000, "disk_used_bytes": 10_000_000_000,
                                        "disk_free_bytes": 90_000_000_000},  # comfortably above scheduler's 1 GiB floor
                            "tmux_session_count": 0, "agent_counts": {}, "agent_types": ["shell"],
-                           "agent_version": "0.1", "labels": []})
+                           "agent_version": "0.1", "labels": [],
+                           "public_inventory": {
+                               "schema_version": 1, "project_ids": ["demo-project", "/home/private"],
+                               "skill_names": ["review"], "prompt": "private prompt",
+                               "environment": {"TOKEN": "must-not-persist"},
+                           }})
     assert hb.status_code == 200, hb.text
+    recorded = controller.node_status("real-connect-e2e")
+    assert recorded.public_inventory == {
+        "schema_version": 1, "project_ids": ["demo-project"], "skill_names": ["review"],
+    }
 
     placement = choose_node(controller.list_nodes(), required_agent_type="shell")
     assert placement.node_id == "real-connect-e2e"

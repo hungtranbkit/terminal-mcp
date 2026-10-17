@@ -233,6 +233,8 @@ class NodeRegistry:
                 # not report them -- simply has an empty list rather than
                 # a wrong one.
                 ("capabilities", "TEXT NOT NULL DEFAULT '[]'"),
+                ("public_inventory",
+                 "TEXT NOT NULL DEFAULT '{\"schema_version\":1,\"project_ids\":[],\"skill_names\":[]}'"),
                 # PROTOCOL generation, deliberately separate from the tool
                 # capabilities above -- they answer different questions
                 # ("can this node run docker?" vs "does this node speak the
@@ -358,7 +360,8 @@ class NodeRegistry:
                  wsl_available: bool = False,
                  capabilities: tuple[str, ...] = (),
                  contract_version: int = 0,
-                 contract_capabilities: tuple[str, ...] = ()) -> Node | None:
+                 contract_capabilities: tuple[str, ...] = (),
+                 public_inventory: dict[str, Any] | None = None) -> Node | None:
         """Writes a fresh sample, applies EWMA smoothing on top of
         whatever was previously stored, updates the sustained-high-CPU/
         load duration trackers, recomputes capacity_status/
@@ -379,6 +382,8 @@ class NodeRegistry:
         now = now or _now()
         now_iso = _iso(now)
         platform = canonical_platform(platform)
+        from .public_inventory import sanitize_public_inventory
+        public_inventory = sanitize_public_inventory(public_inventory)
         thresholds = self.overload_thresholds
 
         with self._connection() as connection:
@@ -441,6 +446,7 @@ class NodeRegistry:
                     disk_total_bytes = ?, disk_used_bytes = ?, disk_free_bytes = ?, disk_percent = ?,
                     tmux_session_count = ?, agent_counts = ?, agent_types = ?, agent_version = ?, labels = ?,
                     capabilities = ?,
+                    public_inventory = ?,
                     high_cpu_since = ?, high_load_since = ?, capacity_status = ?, overload_reasons = ?,
                     platform = ?, session_backend = ?, shell_capabilities = ?, wsl_available = ?,
                     contract_version = ?, contract_capabilities = ?,
@@ -455,6 +461,7 @@ class NodeRegistry:
                  metrics.disk_total_bytes, metrics.disk_used_bytes, metrics.disk_free_bytes, metrics.disk_percent,
                  tmux_session_count, json.dumps(agent_counts), json.dumps(list(agent_types)), agent_version,
                  json.dumps(list(labels)), json.dumps(list(capabilities)),
+                 json.dumps(public_inventory or {"schema_version": 1, "project_ids": [], "skill_names": []}),
                  high_cpu_since, high_load_since, capacity_status, json.dumps(reasons),
                  platform, session_backend, json.dumps(list(shell_capabilities)), int(wsl_available),
                  int(contract_version), json.dumps(sorted(contract_capabilities)),
@@ -498,6 +505,8 @@ class NodeRegistry:
             agent_version=data.get("agent_version"),
             labels=tuple(json.loads(data.get("labels") or "[]")),
             capabilities=tuple(json.loads(data.get("capabilities") or "[]")),
+            public_inventory=json.loads(data.get("public_inventory") or
+                                        '{"schema_version":1,"project_ids":[],"skill_names":[]}'),
             max_sessions=data.get("max_sessions"),
             capacity_status=data.get("capacity_status") or CAPACITY_UNKNOWN,
             overload_reasons=tuple(json.loads(data.get("overload_reasons") or "[]")),

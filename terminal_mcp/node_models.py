@@ -283,6 +283,8 @@ class Node:
     # operator-supplied grouping tag -- see capability_probe.py for why
     # conflating declared and probed capability is the bug this avoids.
     capabilities: tuple[str, ...] = ()
+    public_inventory: dict[str, Any] = field(default_factory=lambda: {
+        "schema_version": 1, "project_ids": [], "skill_names": []})
     max_sessions: int | None = None
     capacity_status: str = CAPACITY_UNKNOWN
     overload_reasons: tuple[str, ...] = ()
@@ -337,6 +339,7 @@ def node_to_dict(node: Node) -> dict[str, Any]:
         "tmux_session_count": node.tmux_session_count, "agent_counts": node.agent_counts,
         "agent_types": list(node.agent_types), "agent_version": node.agent_version,
         "labels": list(node.labels), "capabilities": list(node.capabilities),
+        "public_inventory": node.public_inventory,
         "contract_version": node.contract_version,
         "contract_capabilities": list(node.contract_capabilities),
         "max_sessions": node.max_sessions,

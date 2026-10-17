@@ -12,7 +12,9 @@ regression coverage for the same surface.
 """
 from __future__ import annotations
 
+import json
 import subprocess
+from types import SimpleNamespace
 
 import anyio
 import pytest
@@ -411,6 +413,54 @@ async def test_heartbeat_loop_survives_unreachable_controller():
     # after the first failed push -- reaching here at all (no exception
     # propagated out of the `with` block) IS the assertion.
     assert scope.cancelled_caught
+
+
+@pytest.mark.anyio
+async def test_heartbeat_serializes_allowlisted_inventory_without_paths_or_secrets(tmp_path, monkeypatch):
+    from terminal_mcp import node_agent
+    from terminal_mcp.host_metrics import NodeMetrics
+
+    project = tmp_path / "work" / "demo-project"
+    project.mkdir(parents=True)
+    skills = tmp_path / ".codex" / "skills" / "review"
+    skills.mkdir(parents=True)
+    (skills / "SKILL.md").write_text("PRIVATE SKILL CONTENT")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(node_agent.host_metrics, "collect", lambda **_: NodeMetrics(
+        cpu_percent=1, load1=0, load5=0, load15=0, cpu_count=1,
+        ram_total_bytes=10, ram_used_bytes=1, ram_percent=10,
+        swap_total_bytes=0, swap_used_bytes=0, swap_percent=0,
+        disk_total_bytes=10, disk_used_bytes=1, disk_free_bytes=9, disk_percent=10))
+    monkeypatch.setattr(node_agent, "probe_capabilities", lambda: ("git",))
+    fake_terminal = SimpleNamespace(
+        config=SimpleNamespace(session_lifecycle=SimpleNamespace(launch_commands=())),
+        terminal_list_sessions=lambda: {"sessions": [{"pane_current_path": str(project)}]},
+    )
+    captured = {}
+
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *_): return None
+        def read(self): return b"{}"
+
+    def capture(request, timeout):
+        captured["body"] = request.data
+        assert request.full_url.startswith("https://controller.example/")
+        return Response()
+
+    monkeypatch.setattr(node_agent.urllib.request, "urlopen", capture)
+    with anyio.move_on_after(0.1):
+        await node_agent._heartbeat_loop(
+            node_id="n1", terminal=fake_terminal, controller_url="https://controller.example",
+            token=TOKEN, workspace_root=str(tmp_path), interval_seconds=60,
+        )
+    body = captured["body"].decode()
+    parsed = json.loads(body)
+    assert parsed["public_inventory"] == {
+        "schema_version": 1, "project_ids": ["demo-project"], "skill_names": ["review"],
+    }
+    for forbidden in (str(project), str(skills), "PRIVATE SKILL CONTENT", "TOKEN", "prompt"):
+        assert forbidden not in body
 
 
 def _config_for_loop_test() -> AppConfig:
