@@ -74,6 +74,13 @@ Repository/runtime observations made during the P0 implementation:
 - The workspace had no Cloudflare API/Wrangler credential variable names and
   no `wrangler` CLI. `cloudflared` was installed, but no tunnel account
   credentials were verified.
+- The private `config.yaml` in this local worktree has Access team-domain and
+  audience settings, but no `dashboard.access_email_roles` mapping. This is
+  a local configuration observation, not evidence of the production host's
+  configuration. The public Access login response showed a Cloudflare Access
+  sign-in page but did not expose a Google provider in its initial HTML; that
+  response alone cannot establish whether Google is enabled behind its
+  client-side login flow.
 - These public responses do not show the configured Google IdP, Access
   application audience, current allow/deny policy, production email role map,
   or live tunnel configuration. Do not mark production SSO or role policy
