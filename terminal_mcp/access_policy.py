@@ -51,12 +51,13 @@ TIER_OPERATIONAL = "OPERATIONAL"
 ROLE_ANONYMOUS = "anonymous"    # no verified identity
 ROLE_OPERATOR = "operator"      # a verified Access identity
 ROLE_OWNER = "owner"            # reserved; identical read rights to operator
+ROLE_VIEWER = "viewer"          # a verified, explicitly read-only identity
 
 # Identity is the boundary, not role. This project has no user store to build
 # a real role hierarchy on (see cf_access.AccessIdentity), and inventing one
 # would be a fiction that reads like a guarantee. So: authenticated operators
 # read operational data, anonymous callers read nothing.
-READING_ROLES = (ROLE_OPERATOR, ROLE_OWNER)
+READING_ROLES = (ROLE_VIEWER, ROLE_OPERATOR, ROLE_OWNER)
 
 
 # --------------------------------------------------------------------------
@@ -217,6 +218,27 @@ def role_for_identity(identity: Any, *, access_configured: bool) -> str:
     if not access_configured:
         return ROLE_OPERATOR
     return ROLE_OPERATOR if identity is not None else ROLE_ANONYMOUS
+
+
+def resolve_access_role(identity: Any, role_map: Iterable[tuple[str, str]] | None) -> str | None:
+    """Resolve a verified Access identity through the explicit email allowlist.
+
+    A `None` map means the deployment has not enabled allowlist mode. An
+    empty map is configured and denies everyone. Email matching is
+    case-insensitive and whitespace-normalized; unverified/missing email
+    never receives a role.
+    """
+    if identity is None or not isinstance(getattr(identity, "email", None), str):
+        return None
+    email = identity.email.strip().casefold()
+    if not email or role_map is None:
+        return None
+    for allowed_email, role in role_map:
+        if isinstance(allowed_email, str) and allowed_email.strip().casefold() == email:
+            if role in ("viewer", ROLE_OPERATOR, ROLE_OWNER):
+                return role
+            return None
+    return None
 
 
 def policy_table() -> list[dict[str, Any]]:

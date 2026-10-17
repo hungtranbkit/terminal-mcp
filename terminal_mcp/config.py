@@ -587,6 +587,11 @@ class DashboardConfig:
     # behavior is unchanged.
     cloudflare_access_team_domain: str | None = None
     cloudflare_access_audience: str | None = None
+    # Verified-email -> role allowlist. Required whenever Cloudflare Access
+    # JWT verification is configured; an explicitly empty map denies all.
+    # With Access itself unset, the existing self-hosted auth behavior stays
+    # unchanged.
+    access_email_roles: tuple[tuple[str, str], ...] | None = None
     # CSRF/Origin defense (P1 hardening item #3): unlike the Access check
     # above, this is NOT opt-in -- every mutation route always requires a
     # same-origin Origin (or Referer) header, since the dashboard's own JS
@@ -2944,6 +2949,21 @@ def _load_dashboard_config(dashboard_raw: object) -> DashboardConfig:
         raise ValueError("dashboard.cloudflare_access_team_domain must be a non-empty string")
     if audience is not None and not (isinstance(audience, str) and audience.strip()):
         raise ValueError("dashboard.cloudflare_access_audience must be a non-empty string")
+    if bool(team_domain) != bool(audience):
+        raise ValueError("dashboard.cloudflare_access_team_domain and audience must be configured together")
+    role_map_raw = dashboard_raw.get("access_email_roles")
+    role_map: tuple[tuple[str, str], ...] | None = None
+    if role_map_raw is not None:
+        if not isinstance(role_map_raw, dict):
+            raise ValueError("dashboard.access_email_roles must be a mapping of email to role")
+        role_rows = []
+        for email, role in role_map_raw.items():
+            if not isinstance(email, str) or "@" not in email or not email.strip():
+                raise ValueError("dashboard.access_email_roles keys must be valid email addresses")
+            if not isinstance(role, str) or role.strip().lower() not in ("viewer", "operator", "owner"):
+                raise ValueError("dashboard.access_email_roles values must be viewer, operator, or owner")
+            role_rows.append((email.strip().casefold(), role.strip().lower()))
+        role_map = tuple(sorted(role_rows))
     origins = dashboard_raw.get("allowed_origins", [])
     if not isinstance(origins, list) or not all(isinstance(o, str) and o for o in origins):
         raise ValueError("dashboard.allowed_origins must be a list of strings")
@@ -2951,6 +2971,7 @@ def _load_dashboard_config(dashboard_raw: object) -> DashboardConfig:
         mutations_enabled=bool(dashboard_raw.get("mutations_enabled", True)),
         cloudflare_access_team_domain=team_domain,
         cloudflare_access_audience=audience,
+        access_email_roles=role_map,
         allowed_origins=tuple(origins),
         web_terminal_enabled=bool(dashboard_raw.get("web_terminal_enabled", False)),
     )

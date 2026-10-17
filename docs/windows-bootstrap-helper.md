@@ -1,175 +1,78 @@
-# Terminal MCP Bootstrap — web-only Windows onboarding
+# Terminal MCP current-machine join
 
-## What a browser actually cannot do
+## User-visible flow
 
-Stating this first, because every design below is shaped by it and because
-a plan that pretends otherwise wastes a week.
+The Dashboard `Join this machine` action creates an idempotent enrollment for
+the browser's current platform. The enrollment code is never returned to the
+browser. The Dashboard receives a short-lived, one-use pairing handle bound to
+its HTTPS origin.
 
-A web page on an **unmanaged** Windows machine cannot install OpenSSH,
-create a service, write a firewall rule, or write under `ProgramData`. No
-browser API exposes that, deliberately. Nothing about this architecture
-changes that. So:
+If the Windows Bootstrap helper is already installed, the page fetches a
+fresh loopback challenge and sends `{nonce, handle}` to the helper. The helper
+redeems the handle over HTTPS, installs or updates its Windows service using
+the normal Windows permission prompt, and reports bounded installation stages.
+The page shows success only after the helper reports ready.
 
-| | clicks | why |
-|---|---|---|
-| **First** machine, no helper yet | 1 download + 1 **UAC Yes** | something native has to install the helper |
-| **Every later** enrollment on that machine | **1 click, web-only** | the helper is already installed and elevated-capable |
-| Enterprise-managed (Intune/GPO) | **0** — helper pre-deployed | see *Zero-touch* below; not a V1 dependency |
+If no helper answers, the Dashboard downloads the verified Windows helper
+artifact paired to that pending enrollment. The user must open the download
+and approve the Windows permission prompt. Downloading is not installation.
+The artifact manifest's signature state is shown as recorded; an unsigned
+development build may be blocked by Windows.
 
-The honest target is therefore **one button + one UAC on a new machine,
-and one button after that** — not "zero touch on an unmanaged box", which
-is not achievable from a browser.
+Linux and macOS use a paired shell installer instead of the Windows helper.
+The user opens the downloaded script in Terminal and explicitly confirms its
+prompt. It redeems the one-time handle over HTTPS and installs the existing
+user-level systemd service or LaunchAgent. It asks for no sudo permission.
+The Dashboard reports success after the controller receives that node's
+authenticated first heartbeat.
 
-## Flow
+The manual Add Node workflow remains available. Repeating Join with the same
+browser idempotency key reuses the enrollment and never reissues a consumed
+handle. Retry can mint a fresh handle while the enrollment is pending. Revoke
+removes the node credential and invalidates its pending enrollment state.
 
-```
-  Dashboard                          Browser                      Windows machine
-  ─────────                          ───────                      ───────────────
-  + Add Node → Windows
-  [ Kết nối máy này ]  ──click──►  probe 127.0.0.1:<port>/detect ──► helper?
-                                        │
-                    ┌───────────────────┴────────────────────┐
-                    │ helper present                          │ helper absent
-                    ▼                                         ▼
-        POST .../enrollments/{id}/handle           show ONE step:
-        → short-lived one-time handle              [ Cài Terminal MCP Bootstrap ]
-                    │                                         │
-        terminalmcp://enroll?handle=…&controller=…             download + run once (UAC)
-                    │                                         │
-                    ▼                                         └──► helper installs itself,
-        helper redeems handle over HTTPS                            registers terminalmcp://,
-        → enrollment code + controller candidates                   then the page RESUMES
-                    │                                              (it re-probes and continues)
-                    ▼
-        helper elevates (UAC) and runs the same
-        setup logic as windows-setup.ps1
-                    │
-                    ▼
-        POST /dashboard/api/enroll/progress  ──► Dashboard shows live stage
-```
+## Windows helper loopback protocol
 
-## The handle, and why the code is not in the URL
+The Windows service listens only on `127.0.0.1:47562`. Its routes are:
 
-A custom-protocol URL is not a private channel. It can land in the
-registry's MRU, in browser history, in a crash report. So the URL carries
-a **handle**, not the enrollment code:
+| Method and path | Purpose |
+|---|---|
+| `GET /v1/challenge` | Issue a random 32-byte, 90-second, one-use nonce and report product/version/platform metadata. |
+| `POST /v1/pair` | Accept `{ "nonce": "…", "handle": "…" }` once and start pairing. |
+| `OPTIONS` | Allow only the matching challenge/pair CORS preflight with Private Network Access enabled. |
 
-- 128 bits, **sha256-hashed at rest**, single-use, **120-second TTL**
-  (the gap between a click and a helper launching, not longer)
-- minted only by an **authenticated operator action** — the same
-  `_mutation_guard` as every other dashboard mutation
-- redeemed **once**, over HTTPS, for the enrollment code; the second
-  redemption of the same handle is refused
+Requests require the exact loopback `Host`, a secure Dashboard `Origin`, and
+an origin-bound nonce. The origin is added to the helper's configured
+Dashboard origins after successful redemption. Responses use `no-store`; the
+challenge contains no machine identifier or credential. Pairing handles are
+not logged. The body is bounded and rejects extra JSON fields, replayed or
+expired nonces, and concurrent pairing.
 
-So a handle leaking after the fact buys nothing: it is spent, or expired,
-usually both. The enrollment code — itself single-use and 15-minute —
-never appears in a URL at all.
+The browser never sends an enrollment code to loopback. The handle is
+redeemed by the helper over the configured HTTPS bootstrap controller. On a
+machine without the helper, a shell installer redeems the same one-time handle
+directly over HTTPS after the user confirms the install.
 
-## Protocol security: what the helper accepts
+## Cloudflare boundary
 
-The helper's attack surface is a URL any web page on the machine can
-trigger. The rules are therefore narrow and absolute:
+Dashboard APIs remain protected by Cloudflare Access and independently
+validate the signed Access assertion in the application. With
+`dashboard.access_email_roles` configured, role assignment comes only from
+the verified JWT email: viewers may read, operators may join and revoke nodes,
+and owners retain the existing owner-only mutation permissions. Configure the
+Google identity provider and Access application in the Cloudflare Zero Trust
+dashboard; see `deploy/cloudflare/TERMINAL_DASHBOARD_ACCESS.md`.
 
-1. **No commands, ever.** The URL grammar is
-   `terminalmcp://enroll?handle=<32 hex>&controller=<origin>` and nothing
-   else. There is no field that carries a script, a path, an argument
-   list, or a package name. A helper that accepted one would be a remote
-   code execution primitive dressed as a convenience.
-2. **`action` is a closed set** — `enroll`, `repair`, `status`. Unknown
-   actions are refused, not ignored.
-3. **`controller` must be in the helper's own allowlist**, written at
-   install time from the controller that installed it. A page cannot
-   point the helper at an attacker's controller, which is the obvious way
-   to turn this into "install my software instead".
-4. **`handle` must match `^[0-9a-f]{32}$`** before it is used for
-   anything — no length-flexible, no unicode, no path separators.
-5. The helper does the redemption itself. The browser never sees the
-   bootstrap payload, and the helper never accepts one from the page.
+Machine-facing enrollment and heartbeat requests cannot use the operator's
+Access session. Only the explicit routes in
+`deploy/cloudflare/bootstrap-ingress.template.yml` belong on the bootstrap
+hostname; the Dashboard and helper download remain Access protected.
 
-`terminal_mcp/bootstrap_protocol.py` implements exactly this and nothing
-else; `tests/test_bootstrap_helper.py` is largely a list of URLs that must
-be refused.
+## Verification limits
 
-## Detection: loopback, not protocol-sniffing
-
-There is no reliable way to feature-detect a custom protocol handler from
-a page. So the helper runs a **loopback-only** listener and the page
-probes it:
-
-- binds `127.0.0.1` **only** — never a LAN address
-- answers `GET /detect` with its version and nothing else
-- **requires an `Origin` header in the allowlist** on every request, which
-  is what stops a hostile page (or DNS rebinding) from driving it
-- exposes **no** enroll endpoint over loopback: enrollment arrives only
-  via the protocol handler, so a page cannot start an install by fetch
-
-## Getting the binary to the machine
-
-The Dashboard serves the built helper itself. Two routes, both behind
-`_read_guard` — the same Cloudflare Access check every other fleet read
-route uses, on the Dashboard's own hostname:
-
-    GET /dashboard/api/nodes/onboard/helper            what is published
-    GET /dashboard/api/nodes/onboard/helper/{target}   the bytes
-
-`target` is an allowlist (`windows-x64`, `windows-arm64`), never a path the
-caller shapes. **No credential travels with the download** — no enrollment
-code, no handle, no node token, not in the URL and not in a header. The
-helper earns its credential afterwards by redeeming a `terminalmcp://`
-handle itself.
-
-Artifacts live under the state directory, versioned, never a temp path:
-
-    <XDG_STATE_HOME>/terminal-mcp/helper/<version>/terminal-mcp-bootstrap.exe
-    <XDG_STATE_HOME>/terminal-mcp/helper/<version>/manifest.json
-
-The manifest records version, build SHA, size, SHA256 and `signed`. The hash
-is re-checked against the bytes on disk on **every** request rather than
-trusted from publish time, and a mismatch is refused rather than served with
-a warning: the reason to check at all is that the operator about to run it
-elevated cannot check for themselves.
-
-The CTA offers the download only when this controller has actually published
-a build. Otherwise it stays hidden and the copy/paste path remains primary —
-a button that 404s in front of an operator is worse than no button.
-
-This route is deliberately NOT public. A first install on a machine that
-cannot reach the Dashboard hostname still needs a public bootstrap hostname,
-which does not exist yet.
-
-## Signing
-
-**Unsigned artifacts are marked dev-only, in the UI, in plain words.**
-There is no code-signing certificate in this project today. SmartScreen
-will warn, and the download panel says so rather than coaching the user to
-click past it. When a certificate exists, sign the artifact and the same
-panel drops the warning — no other change.
-
-MSIX was considered and rejected for V1: it implies Store distribution or
-sideloading policy changes, and an unsigned MSIX cannot install at all. A
-plain executable (or, today, the PowerShell installer in helper mode) has
-none of those constraints.
-
-## Zero-touch (Intune / GPO) — documented, not depended on
-
-For managed fleets the helper is pre-deployed and the first machine costs
-zero clicks. Deploy the helper package with the controller origin
-pre-seeded; the Dashboard CTA then finds it on first probe. **V1 does not
-depend on this** and works without any management stack.
-
-## Repair / uninstall
-
-Same discipline as the installer: machine-wide `ProgramData`, token 0600
-equivalent (SYSTEM + Administrators only), atomic writes, no secret in any
-log line. `repair` re-verifies and fixes; `uninstall` removes the helper,
-its protocol registration and its loopback task, and nothing the machine's
-owner installed.
-
-## What is NOT verified
-
-The helper cannot be executed in this project's environment: there is no
-Windows host and no signing certificate. What **is** verified here is the
-protocol validation, the handle lifecycle, the backend routes, the
-Dashboard states and the generated artifact's syntax. Running the helper
-on real Windows is outstanding, and it is marked dev-only until it has
-been.
+Go protocol, enrollment/API, script generation, shell syntax, and dashboard
+contract tests run in CI/local verification. This Linux environment cannot
+exercise Windows UAC, Windows service control, macOS LaunchAgent registration,
+or first-run package-manager prompts. Production Google IdP, Access policies,
+and tunnel activation must be verified in Cloudflare before claiming
+production readiness.

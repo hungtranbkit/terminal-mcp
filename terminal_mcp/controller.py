@@ -387,7 +387,8 @@ class ControllerService:
                                  contract_version: int = 0,
                                  contract_capabilities: tuple[str, ...] = (),
                                  session_backend: str = "tmux", shell_capabilities: tuple[str, ...] = (),
-                                 wsl_available: bool = False) -> Node | None:
+                                 wsl_available: bool = False,
+                                 public_inventory: dict[str, Any] | None = None) -> Node | None:
         """Called by the heartbeat-receiving HTTP route (dashboard.py) once
         the pushing node agent's bearer token has already been verified
         against this node_id -- this method itself does no auth, it
@@ -404,7 +405,8 @@ class ControllerService:
                                        session_backend=session_backend, shell_capabilities=shell_capabilities,
                                        wsl_available=wsl_available, capabilities=capabilities,
                                        contract_version=contract_version,
-                                       contract_capabilities=contract_capabilities)
+                                       contract_capabilities=contract_capabilities,
+                                       public_inventory=public_inventory)
 
     def describe_session_permissions(self, session: str) -> dict[str, Any]:
         """Routed to the session's HOME NODE, which is authoritative for its

@@ -163,6 +163,20 @@ def test_register_then_heartbeat_produces_online_healthy_node(tmp_path):
     assert node.labels == ("primary",)
 
 
+def test_heartbeat_persists_only_sanitized_public_inventory_metadata(tmp_path):
+    registry = NodeRegistry(tmp_path / "nodes.db")
+    registry.register("n1", display_name="N1", hostname="h1", endpoint="local")
+    node = registry.heartbeat(
+        "n1", metrics=_metrics(), tmux_session_count=0, agent_counts={}, agent_types=(),
+        agent_version="1", labels=(), public_inventory={
+            "schema_version": 1, "project_ids": ["alpha", "/home/private"],
+            "skill_names": ["review"], "prompt": "secret",
+        })
+    assert node.public_inventory == {
+        "schema_version": 1, "project_ids": ["alpha"], "skill_names": ["review"],
+    }
+
+
 def test_heartbeat_for_unregistered_node_returns_none(tmp_path):
     registry = NodeRegistry(tmp_path / "nodes.db")
     result = registry.heartbeat("ghost", metrics=_metrics(), tmux_session_count=0,

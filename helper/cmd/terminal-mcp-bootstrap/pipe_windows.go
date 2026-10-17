@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"time"
 
@@ -47,6 +48,28 @@ func servePipeUntil(config Config, stop <-chan struct{}) int {
 	}
 	defer listener.Close()
 	fmt.Printf("service: listening on %s\n", PipeName)
+	localListener, err := net.Listen("tcp4", loopbackAddress)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "service: cannot listen on the local pairing interface: %v\n", err)
+		return 1
+	}
+	localServer := &http.Server{Handler: newLoopbackHandler(config, func(handle, origin string) error {
+		if len(config.Controllers) == 0 {
+			return fmt.Errorf("no controller is configured")
+		}
+		response, err := sendToPipe(pipeRequest{Action: "Bootstrap", Handle: handle,
+			Controller: config.Controllers[0], DashboardOrigin: origin})
+		if err != nil {
+			return err
+		}
+		if !response.OK {
+			return fmt.Errorf("bootstrap refused")
+		}
+		return nil
+	})}
+	go func() { _ = localServer.Serve(localListener) }()
+	defer localServer.Close()
+	fmt.Printf("service: local pairing interface listening on %s\n", loopbackAddress)
 
 	if stop != nil {
 		go func() {

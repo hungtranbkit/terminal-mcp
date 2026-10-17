@@ -73,6 +73,13 @@ supervisor:
 #   mutations_enabled: true
 #   cloudflare_access_team_domain: "your-team.cloudflareaccess.com"
 #   cloudflare_access_audience: "the-access-application-aud-tag"
+#   # Optional: when set, only verified Access JWT emails listed here can
+#   # read the Dashboard. viewer is read-only; operator can join/revoke nodes;
+#   # owner can perform all Dashboard mutations. An empty mapping denies all.
+#   access_email_roles:
+#     owner@example.com: owner
+#     ops@example.com: operator
+#     observer@example.com: viewer
 #   allowed_origins: []
 #   web_terminal_enabled: false   # xterm.js "Open Terminal" over a WebSocket
 

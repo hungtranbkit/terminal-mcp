@@ -42,6 +42,61 @@ def test_dashboard_routes_are_registered(read_config):
     assert routes["/dashboard/api/session/input"] == {"POST"}
 
 
+def test_nodes_dashboard_offers_current_machine_join_and_loopback_pair_states():
+    from terminal_mcp.dashboard import NODES_ADMIN_HTML
+
+    assert 'id="joinCurrentMachineBtn"' in NODES_ADMIN_HTML
+    assert "Join this machine" in NODES_ADMIN_HTML
+    assert "127.0.0.1:47562/v1/challenge" in NODES_ADMIN_HTML
+    assert "127.0.0.1:47562/v1/pair" in NODES_ADMIN_HTML
+    assert "permission prompt" in NODES_ADMIN_HTML
+    assert "/dashboard/api/nodes/onboard/helper/install-script/" in NODES_ADMIN_HTML
+    assert "localStorage.getItem(JOIN_CURRENT_KEY)" in NODES_ADMIN_HTML
+    assert "localStorage.setItem(JOIN_CURRENT_KEY, key)" in NODES_ADMIN_HTML
+    assert "node.status === 'online' && node.last_heartbeat_at" in NODES_ADMIN_HTML
+    assert "first heartbeat reached the controller" in NODES_ADMIN_HTML
+
+
+def test_current_machine_join_keeps_os_permission_guidance_during_progress_polling():
+    from terminal_mcp.dashboard import NODES_ADMIN_HTML
+
+    join = NODES_ADMIN_HTML[NODES_ADMIN_HTML.index("async function joinCurrentMachine()"):
+                            NODES_ADMIN_HTML.index("document.getElementById('joinCurrentMachineBtn')")]
+    poll_start = NODES_ADMIN_HTML.index("async function anPollProgress()")
+    poll = NODES_ADMIN_HTML[poll_start:NODES_ADMIN_HTML.index("function anRenderDone()", poll_start)]
+
+    # A pending progress response arrives immediately after pairing. Keep the
+    # OS-specific user-consent instruction visible until the helper reports a
+    # terminal outcome, rather than replacing it with a generic waiting label.
+    assert "joinCurrentPermissionReminder(platform)" in join
+    assert "joinStatus.dataset.state !== 'permission'" in poll
+
+
+@pytest.mark.parametrize("email,status", [
+    ("viewer@example.com", 403), ("operator@example.com", 200),
+])
+def test_current_machine_join_obeys_verified_access_role(email, status, monkeypatch, tmp_path):
+    from terminal_mcp import dashboard as dashboard_module
+    from terminal_mcp.cf_access import AccessIdentity
+
+    monkeypatch.setattr(
+        dashboard_module, "verify_access_assertion",
+        lambda token, **kw: AccessIdentity(email=email, subject="subject", raw_claims={}),
+    )
+    config = _cf_access_config(access_email_roles=(
+        ("viewer@example.com", "viewer"), ("operator@example.com", "operator"),
+    ))
+    service = TerminalService(config)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app(), headers={
+        "Origin": "http://testserver", "Cf-Access-Jwt-Assertion": "verified-test-token",
+        "Idempotency-Key": "join-current-role-test-0001",
+    })
+    response = client.post("/dashboard/api/nodes/onboard/join/current", json={"platform": "windows"})
+    assert response.status_code == status
+
+
 def test_sessions_admin_page_reachable_and_uses_the_same_api(tmp_path, tmux_session_factory):
     # /dashboard/sessions is a second VIEW of the same data/mutations, not
     # a new privilege surface -- same read guard as /dashboard, same
@@ -1442,6 +1497,8 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         # itself. Split into two, this path-keyed dict would record only
         # whichever registered last, and silently stop guarding the other.
         "/dashboard/api/nodes/onboard/enrollments": {"GET", "POST", "HEAD"},
+        "/dashboard/api/nodes/onboard/join/current": {"POST"},
+        "/dashboard/api/nodes/onboard/helper/install-script/{platform}": {"POST"},
         "/dashboard/api/nodes/onboard/enrollments/{enrollment_id}/revoke": {"POST"},
         "/dashboard/api/nodes/onboard/gateway": {"GET", "HEAD"},
         # Bootstrap helper artifact: operator-facing reads, _read_guard only.
@@ -2005,6 +2062,29 @@ def test_load_config_parses_dashboard_allowed_origins(tmp_path):
     assert config.dashboard.allowed_origins == ("https://a.example.com", "https://b.example.com")
 
 
+def test_load_config_parses_dashboard_access_email_roles(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "dashboard:\n"
+        "  access_email_roles:\n"
+        "    Owner@Example.com: owner\n"
+        "    ops@example.com: operator\n"
+        "    read@example.com: viewer\n"
+    )
+    config = load_config(config_file)
+    assert config.dashboard.access_email_roles == (
+        ("ops@example.com", "operator"), ("owner@example.com", "owner"),
+        ("read@example.com", "viewer"))
+
+
+@pytest.mark.parametrize("role", ["admin", "", "viewer,owner"])
+def test_load_config_rejects_unknown_access_role(tmp_path, role):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(f"dashboard:\n  access_email_roles:\n    ops@example.com: '{role}'\n")
+    with pytest.raises(ValueError, match="access_email_roles"):
+        load_config(config_file)
+
+
 # ---------------------------------------------------------------------------
 # P1 hardening #2: Cloudflare Access identity verification (opt-in, no-op
 # unless both cloudflare_access_team_domain and _audience are configured --
@@ -2072,7 +2152,7 @@ def test_cloudflare_access_configured_allows_mutation_with_verified_assertion(tm
     identity = AccessIdentity(email="operator@example.com", subject="user-1", raw_claims={})
     monkeypatch.setattr(dashboard_module, "verify_access_assertion", lambda token, **kw: identity)
     session = tmux_session_factory("test-dashboard-cfok", "bash -lc 'read x; sleep 10'")
-    config = _cf_access_config()
+    config = _cf_access_config(access_email_roles=(("operator@example.com", "owner"),))
     service = TerminalService(config)
     server = build_mcp(service)
     register_dashboard(server, service)
@@ -2084,6 +2164,76 @@ def test_cloudflare_access_configured_allows_mutation_with_verified_assertion(tm
     assert response.status_code == 200
 
 
+def test_cloudflare_access_requires_email_role_allowlist(tmux_session_factory, monkeypatch):
+    import terminal_mcp.dashboard as dashboard_module
+    from terminal_mcp.cf_access import AccessIdentity
+
+    monkeypatch.setattr(
+        dashboard_module, "verify_access_assertion",
+        lambda token, **kw: AccessIdentity(email="operator@example.com", subject="user-1", raw_claims={}),
+    )
+    config = _cf_access_config()
+    service = TerminalService(config)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app(), headers={
+        "Origin": "http://testserver", "Cf-Access-Jwt-Assertion": "verified-test-token",
+    })
+
+    response = client.get("/dashboard")
+
+    assert response.status_code == 403
+    assert response.json()["error"] == "ACCESS_ROLE_ALLOWLIST_REQUIRED"
+
+
+def test_cloudflare_access_runtime_fails_closed_on_incomplete_configuration():
+    config = _cf_access_config()
+    config = replace(config, dashboard=replace(config.dashboard, cloudflare_access_audience=None))
+    service = TerminalService(config)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app())
+
+    response = client.get("/dashboard")
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "CLOUDFLARE_ACCESS_CONFIGURATION_INCOMPLETE"
+
+
+@pytest.mark.parametrize("email,allowed,mutation_allowed", [
+    ("read@example.com", True, False),
+    ("ops@example.com", True, False),
+    ("owner@example.com", True, True),
+    ("unknown@example.com", False, False),
+])
+def test_cloudflare_access_email_roles_gate_dashboard_reads_and_mutations(
+        tmux_session_factory, monkeypatch, email, allowed, mutation_allowed):
+    import terminal_mcp.dashboard as dashboard_module
+    from terminal_mcp.cf_access import AccessIdentity
+
+    monkeypatch.setattr(
+        dashboard_module, "verify_access_assertion",
+        lambda token, **kw: AccessIdentity(email=email, subject="user-1", raw_claims={}))
+    session = tmux_session_factory("test-dashboard-role-gate", "bash -lc 'read x; sleep 10'")
+    config = _cf_access_config(access_email_roles=(
+        ("read@example.com", "viewer"), ("ops@example.com", "operator"),
+        ("owner@example.com", "owner")))
+    service = TerminalService(config)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app(), headers={
+        "Origin": "http://testserver", "Cf-Access-Jwt-Assertion": "verified-test-token"})
+
+    page = client.get("/dashboard")
+    assert page.status_code == (200 if allowed else 403)
+    mutation = client.post("/dashboard/api/session/input", json={"name": session, "text": "y"})
+    assert mutation.status_code == (200 if mutation_allowed else 403)
+    if not allowed:
+        assert page.json()["error"] == "ACCESS_IDENTITY_NOT_ALLOWED"
+    elif not mutation_allowed:
+        assert mutation.json()["error"] == "ACCESS_ROLE_INSUFFICIENT"
+
+
 def test_cloudflare_access_accepts_cf_authorization_cookie_fallback(tmux_session_factory, monkeypatch):
     import terminal_mcp.dashboard as dashboard_module
     from terminal_mcp.cf_access import AccessIdentity
@@ -2091,7 +2241,7 @@ def test_cloudflare_access_accepts_cf_authorization_cookie_fallback(tmux_session
     identity = AccessIdentity(email="operator@example.com", subject="user-1", raw_claims={})
     monkeypatch.setattr(dashboard_module, "verify_access_assertion", lambda token, **kw: identity)
     session = tmux_session_factory("test-dashboard-cfcookie", "bash -lc 'read x; sleep 10'")
-    config = _cf_access_config()
+    config = _cf_access_config(access_email_roles=(("operator@example.com", "owner"),))
     service = TerminalService(config)
     server = build_mcp(service)
     register_dashboard(server, service)
@@ -2142,7 +2292,7 @@ def test_cloudflare_access_configured_allows_get_routes_with_verified_assertion(
     identity = AccessIdentity(email="viewer@example.com", subject="user-2", raw_claims={})
     monkeypatch.setattr(dashboard_module, "verify_access_assertion", lambda token, **kw: identity)
     session = tmux_session_factory("test-dashboard-cf-get-ok", "bash -lc 'sleep 10'")
-    config = _cf_access_config()
+    config = _cf_access_config(access_email_roles=(("viewer@example.com", "viewer"),))
     service = TerminalService(config)
     server = build_mcp(service)
     register_dashboard(server, service)
@@ -2162,7 +2312,7 @@ def test_cloudflare_access_get_routes_never_require_an_origin_header(tmux_sessio
 
     identity = AccessIdentity(email="viewer@example.com", subject="user-3", raw_claims={})
     monkeypatch.setattr(dashboard_module, "verify_access_assertion", lambda token, **kw: identity)
-    config = _cf_access_config()
+    config = _cf_access_config(access_email_roles=(("viewer@example.com", "viewer"),))
     service = TerminalService(config)
     server = build_mcp(service)
     register_dashboard(server, service)
@@ -2182,7 +2332,8 @@ def test_cloudflare_access_get_routes_work_even_when_mutations_disabled(tmux_ses
 
     identity = AccessIdentity(email="viewer@example.com", subject="user-4", raw_claims={})
     monkeypatch.setattr(dashboard_module, "verify_access_assertion", lambda token, **kw: identity)
-    config = _cf_access_config(mutations_enabled=False)
+    config = _cf_access_config(mutations_enabled=False,
+                               access_email_roles=(("viewer@example.com", "viewer"),))
     service = TerminalService(config)
     server = build_mcp(service)
     register_dashboard(server, service)
@@ -2204,6 +2355,18 @@ def test_load_config_rejects_blank_cloudflare_access_fields(tmp_path):
         "dashboard:\n  cloudflare_access_team_domain: ''\n"
     )
     with pytest.raises(ValueError, match="cloudflare_access_team_domain"):
+        load_config(config_path)
+
+
+@pytest.mark.parametrize("configured", [
+    "cloudflare_access_team_domain: team.cloudflareaccess.com",
+    "cloudflare_access_audience: app-aud",
+])
+def test_load_config_rejects_incomplete_cloudflare_access_pair(tmp_path, configured):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(f"allowed_session_patterns: ['test-*']\ndashboard:\n  {configured}\n")
+
+    with pytest.raises(ValueError, match="must be configured together"):
         load_config(config_path)
 
 
