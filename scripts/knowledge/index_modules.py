@@ -155,7 +155,8 @@ GROUPS['headless'] = ['headless.py', 'headless_cleanup.py']
 GROUPS['queue'].append('queue_policy.py')
 GROUPS['session_ops'].append('session_admission.py')
 GROUPS['session_registry'].append('session_reconciler.py')
-GROUPS['work_ui'].extend(['live_sessions.py', 'live_sessions_page.py'])
+GROUPS['work_ui'].extend(['live_sessions.py', 'live_sessions_page.py',
+                          'office_page.py', 'task_center_reader.py'])
 
 # Operational artifacts that are part of the system but are not Python. Kept
 # separate from GROUPS so the completeness check over the package stays
