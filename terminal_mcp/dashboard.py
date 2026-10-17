@@ -7123,6 +7123,15 @@ NODES_ADMIN_HTML = """<!doctype html>
       status.dataset.state = state;
       status.textContent = text;
     }
+    function joinCurrentPermissionReminder(platform) {
+      if (platform === 'windows') {
+        return 'Windows may ask for Administrator permission while the service installs or updates.';
+      }
+      if (platform === 'macos') {
+        return 'The helper installs or updates a user LaunchAgent; approve any macOS permission prompt if shown.';
+      }
+      return 'The helper installs or updates a user systemd service; approve any Linux permission prompt if shown.';
+    }
     function joinCurrentIdempotencyKey() {
       try {
         let key = localStorage.getItem(JOIN_CURRENT_KEY);
@@ -7213,7 +7222,7 @@ NODES_ADMIN_HTML = """<!doctype html>
             joinCurrentStatus('failed', detail || `Local helper refused pairing (${paired.status}). Retry for a new nonce and handle.`);
             return;
           }
-          joinCurrentStatus('pairing', 'Pairing accepted. Windows may ask for Administrator permission while the service installs or updates.');
+          joinCurrentStatus('permission', `Pairing accepted. ${joinCurrentPermissionReminder(platform)}`);
         } else if (platform === 'windows') {
           const download = await fetch('/dashboard/api/nodes/onboard/helper/windows-x64', {
             method: 'POST', cache: 'no-store', headers: {'Content-Type': 'application/json'},
@@ -7451,6 +7460,7 @@ NODES_ADMIN_HTML = """<!doctype html>
       }
       anRenderLive(row);
       if (joinCurrentNodeId && row.node_id === joinCurrentNodeId) {
+        const joinStatus = document.getElementById('joinCurrentStatus');
         const liveNode = nodesCache.find((node) => node.id === joinCurrentNodeId &&
           node.status === 'online' && node.last_heartbeat_at);
         if (stage === 'ready' || liveNode) {
@@ -7461,7 +7471,7 @@ NODES_ADMIN_HTML = """<!doctype html>
         } else if (stage === 'failed') {
           joinCurrentStatus('failed', row.progress_label || 'Installation failed. Retry or revoke this node.');
           document.getElementById('joinCurrentRevokeBtn').hidden = false;
-        } else {
+        } else if (joinStatus.dataset.state !== 'permission') {
           joinCurrentStatus('pairing', row.progress_label || 'Pairing accepted; waiting for service installation progress.');
         }
       }

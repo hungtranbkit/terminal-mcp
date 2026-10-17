@@ -57,6 +57,21 @@ def test_nodes_dashboard_offers_current_machine_join_and_loopback_pair_states():
     assert "first heartbeat reached the controller" in NODES_ADMIN_HTML
 
 
+def test_current_machine_join_keeps_os_permission_guidance_during_progress_polling():
+    from terminal_mcp.dashboard import NODES_ADMIN_HTML
+
+    join = NODES_ADMIN_HTML[NODES_ADMIN_HTML.index("async function joinCurrentMachine()"):
+                            NODES_ADMIN_HTML.index("document.getElementById('joinCurrentMachineBtn')")]
+    poll_start = NODES_ADMIN_HTML.index("async function anPollProgress()")
+    poll = NODES_ADMIN_HTML[poll_start:NODES_ADMIN_HTML.index("function anRenderDone()", poll_start)]
+
+    # A pending progress response arrives immediately after pairing. Keep the
+    # OS-specific user-consent instruction visible until the helper reports a
+    # terminal outcome, rather than replacing it with a generic waiting label.
+    assert "joinCurrentPermissionReminder(platform)" in join
+    assert "joinStatus.dataset.state !== 'permission'" in poll
+
+
 @pytest.mark.parametrize("email,status", [
     ("viewer@example.com", 403), ("operator@example.com", 200),
 ])
