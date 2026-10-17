@@ -44,6 +44,7 @@ from terminal_mcp.controller import ControllerService
 from terminal_mcp.core import TerminalService
 from terminal_mcp.dashboard import register_dashboard
 from terminal_mcp.enrollment import (
+    DuplicateEnrollmentError,
     ERR_ALREADY_USED,
     ERR_EXPIRED,
     ERR_NOT_FOUND,
@@ -715,6 +716,21 @@ def test_remove_node_revokes_everything_it_owns(tmp_path, rescue_keys_dir, monke
     assert "win1" not in (rescue_keys_dir / "authorized_keys").read_text()
 
 
+def test_remove_node_retires_join_machine_identity_for_safe_rejoin(tmp_path, monkeypatch):
+    _terminal, _controller, _connection_store, onboarding = _service(tmp_path)
+    first = onboarding.create_enrollment(node_id="join-again", os_name="linux",
+                                         machine_id="f" * 32,
+                                         idempotency_key="join-request-00000009")
+    onboarding.consume_enrollment(first["code"], hostname="join-again",
+                                  addresses={"lan_ip": "192.168.1.50"})
+    removed = onboarding.remove_node("join-again", by="owner@example.com")
+    assert removed["retired_machine_enrollments"] == 1
+    replacement = onboarding.create_enrollment(node_id="join-again", os_name="linux",
+                                              machine_id="f" * 32,
+                                              idempotency_key="join-request-00000010")
+    assert replacement["enrollment"]["id"] != first["enrollment"]["id"]
+
+
 def test_controller_public_key_reader_refuses_a_private_key(tmp_path):
     config = _onboarding_config(tmp_path)
     key, reason = read_controller_ssh_public_key(config)
@@ -766,6 +782,84 @@ def test_create_enrollment_returns_the_script_once(tmp_path, monkeypatch):
     assert body["code"] not in json.dumps(listing)
     assert listing[0]["code_display"].startswith("TMCP-") and listing[0]["code_display"].endswith("…")
     assert listing[0]["status"] == "pending"
+
+
+def test_create_enrollment_request_key_replays_without_reissuing_code(tmp_path, monkeypatch):
+    client, _controller, onboarding = _client(tmp_path, monkeypatch)
+    first = client.post("/dashboard/api/nodes/onboard/enrollments",
+                        json={"node_id": "join-retry", "os": "linux", "machine_id": "c" * 32},
+                        headers={"Idempotency-Key": "join-request-00000004"})
+    assert first.status_code == 200
+    first_body = first.json()
+    assert first_body["code"].startswith("TMCP-")
+
+    retry = client.post("/dashboard/api/nodes/onboard/enrollments",
+                        json={"node_id": "join-retry", "os": "linux", "machine_id": "c" * 32},
+                        headers={"Idempotency-Key": "join-request-00000004"})
+    assert retry.status_code == 200
+    retry_body = retry.json()
+    assert retry_body["idempotent_replay"] is True
+    assert retry_body["enrollment"]["id"] == first_body["enrollment"]["id"]
+    assert "code" not in retry_body and "script" not in retry_body
+    assert len(onboarding.list_enrollments()) == 1
+
+
+def test_create_enrollment_rejects_machine_id_with_a_different_key(tmp_path, monkeypatch):
+    client, _controller, _onboarding = _client(tmp_path, monkeypatch)
+    first = client.post("/dashboard/api/nodes/onboard/enrollments",
+                        json={"node_id": "join-duplicate-a", "os": "linux", "machine_id": "d" * 32},
+                        headers={"Idempotency-Key": "join-request-00000005"})
+    assert first.status_code == 200
+    duplicate = client.post("/dashboard/api/nodes/onboard/enrollments",
+                            json={"node_id": "join-duplicate-b", "os": "linux", "machine_id": "d" * 32},
+                            headers={"Idempotency-Key": "join-request-00000006"})
+    assert duplicate.status_code == 409
+    assert duplicate.json()["error"] == "MACHINE_ALREADY_ENROLLED"
+    assert len(_onboarding.list_enrollments()) == 1
+
+
+def test_enrollment_create_retry_reuses_machine_and_idempotency_key(tmp_path):
+    store = EnrollmentStore(tmp_path / "enrollment.db")
+    first, code = store.create(node_id="join-laptop", os_name="linux",
+                               machine_id="a" * 32, idempotency_key="join-request-00000001",
+                               created_by="operator@example.com")
+    retry, retry_code = store.create(node_id="join-laptop", os_name="linux",
+                                     machine_id="a" * 32, idempotency_key="join-request-00000001",
+                                     created_by="operator@example.com")
+    assert code.startswith("TMCP-")
+    assert retry.id == first.id
+    assert retry_code is None
+
+
+def test_enrollment_create_rejects_same_machine_with_a_different_request_key(tmp_path):
+    store = EnrollmentStore(tmp_path / "enrollment.db")
+    store.create(node_id="join-laptop", os_name="linux", machine_id="b" * 32,
+                 idempotency_key="join-request-00000002", created_by="operator@example.com")
+    with pytest.raises(DuplicateEnrollmentError):
+        store.create(node_id="join-laptop-2", os_name="linux", machine_id="b" * 32,
+                     idempotency_key="join-request-00000003", created_by="operator@example.com")
+
+
+def test_revoked_enrollment_cannot_redeem_an_existing_pairing_handle(tmp_path):
+    store = EnrollmentStore(tmp_path / "enrollment.db")
+    enrollment, _code = store.create(node_id="join-laptop")
+    handle, _expires = store.create_handle(enrollment.id)
+    assert store.revoke(enrollment.id, by="owner@example.com")
+    assert store.redeem_handle(handle) is None
+
+
+def test_removing_helper_join_node_retires_consumed_machine_identity(tmp_path):
+    store = EnrollmentStore(tmp_path / "enrollment.db")
+    enrolled, code = store.create(node_id="joined-machine", os_name="linux",
+                                  machine_id="e" * 32, idempotency_key="join-request-00000007")
+    consumed, error = store.consume(code, hostname="joined-machine")
+    assert error is None and consumed is not None
+    assert store.retire_machine_enrollments_for_node("joined-machine") == 1
+    assert store.get(enrolled.id).status == enrollment_mod.STATUS_REVOKED
+    replacement, _new_code = store.create(node_id="joined-machine", os_name="linux",
+                                          machine_id="e" * 32,
+                                          idempotency_key="join-request-00000008")
+    assert replacement.id != enrolled.id
 
 
 def test_enrollment_routes_require_the_dashboard_mutation_guard(tmp_path, monkeypatch):

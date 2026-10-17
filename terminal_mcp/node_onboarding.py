@@ -47,6 +47,7 @@ from typing import Any, Callable
 from . import rescue_gateway
 from .enrollment import (
     DEFAULT_TTL_SECONDS,
+    DuplicateEnrollmentError,
     EnrollmentStore,
     OS_WINDOWS,
     SUPPORTED_OS,
@@ -325,7 +326,8 @@ class OnboardingService:
     def create_enrollment(self, *, node_id: str | None, display_name: str | None = None,
                           os_name: str = OS_WINDOWS, profile: str = "minimal",
                           connectivity: dict[str, Any] | None = None, created_by: str | None = None,
-                          hostname_hint: str | None = None) -> dict[str, Any]:
+                          hostname_hint: str | None = None, machine_id: str | None = None,
+                          idempotency_key: str | None = None) -> dict[str, Any]:
         if not self.onboarding_config.enabled:
             raise OnboardingError("ONBOARDING_DISABLED", "nodes.onboarding.enabled is false", status=403)
         if os_name not in SUPPORTED_OS:
@@ -341,17 +343,22 @@ class OnboardingService:
             raise OnboardingError("NODE_ALREADY_EXISTS", f"a node named {candidate!r} is already registered",
                                   status=409)
         plan = self.plan_connectivity(connectivity)
-        record, code = self.enrollments.create(
-            node_id=candidate, display_name=display_name, os_name=os_name, profile=profile,
-            connectivity=plan.to_dict(), ttl_seconds=self.onboarding_config.enrollment_ttl_seconds,
-            created_by=created_by)
+        try:
+            record, code = self.enrollments.create(
+                node_id=candidate, display_name=display_name, os_name=os_name, profile=profile,
+                connectivity=plan.to_dict(), ttl_seconds=self.onboarding_config.enrollment_ttl_seconds,
+                created_by=created_by, machine_id=machine_id, idempotency_key=idempotency_key)
+        except DuplicateEnrollmentError as exc:
+            raise OnboardingError(str(exc), "this machine or node id already has an active enrollment",
+                                  status=409) from exc
         self._audit("node_enrollment_created", node_id=candidate,
                     detail={"enrollment_id": record.id, "profile": profile, "os": os_name,
                             "connectivity": plan.to_dict()})
         _log.info("onboarding: enrollment created node_id=%s profile=%s os=%s expires_at=%s by=%s",
                   candidate, profile, os_name, record.expires_at, created_by)
         return {"enrollment": record.to_dict(), "code": code, "connectivity": plan.to_dict(),
-                "profile": profile_summary(profile), "ttl_seconds": self.onboarding_config.enrollment_ttl_seconds}
+                "profile": profile_summary(profile), "ttl_seconds": self.onboarding_config.enrollment_ttl_seconds,
+                "idempotent_replay": code is None}
 
     def list_enrollments(self, *, limit: int = 50) -> list[dict[str, Any]]:
         return [record.to_dict() for record in self.enrollments.list(limit=limit)]
@@ -630,6 +637,7 @@ class OnboardingService:
         a removal that hangs on an unreachable host is a removal that
         never completes."""
         revoked_codes = self.enrollments.revoke_pending_for_node(node_id, by=by)
+        retired_machine_enrollments = self.enrollments.retire_machine_enrollments_for_node(node_id, by=by)
         released = self.ports.release(node_id)
         directory = rescue_authorized_keys_dir()
         stale = directory / f"{node_id}.pub"
@@ -645,12 +653,15 @@ class OnboardingService:
         self.controller._clients.pop(node_id, None)
         os.environ.pop(_token_env_var(node_id), None)
         self._audit("node_removed", node_id=node_id,
-                    detail={"revoked_codes": revoked_codes, "rescue_port_released": released,
+                    detail={"revoked_codes": revoked_codes,
+                            "retired_machine_enrollments": retired_machine_enrollments,
+                            "rescue_port_released": released,
                             "transports_removed": transports_removed,
                             "connection_removed": connection_removed, "deregistered": deregistered})
         _log.info("onboarding: node removed node_id=%s codes=%s rescue=%s transports=%s registry=%s by=%s",
                   node_id, revoked_codes, released, transports_removed, deregistered, by)
         return {"ok": True, "node_id": node_id, "revoked_enrollments": revoked_codes,
+                "retired_machine_enrollments": retired_machine_enrollments,
                 "rescue_port_released": released, "transports_removed": transports_removed,
                 "credentials_removed": connection_removed, "deregistered": deregistered,
                 "gateway_resync_required": released}

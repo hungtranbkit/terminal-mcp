@@ -18685,7 +18685,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         """Refuse a credential from now on. With no token_id, refuses
         every credential this node has -- which is what "revoke this
         node" means and is the safe default. Idempotent."""
-        blocked, identity = _mutation_guard(request)
+        blocked, identity = _mutation_guard(request, required_role=ROLE_OPERATOR)
         if blocked is not None:
             return blocked
         node_id = request.path_params["node_id"]
@@ -18963,13 +18963,18 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if not isinstance(body, dict):
             body = {}
         connectivity = body.get("connectivity") if isinstance(body.get("connectivity"), dict) else {}
+        idempotency_key = request.headers.get("idempotency-key") or body.get("idempotency_key")
 
         def _compute() -> dict:
             created = onboarding.create_enrollment(
                 node_id=body.get("node_id"), display_name=body.get("display_name"),
                 os_name=(body.get("os") or "windows"), profile=(body.get("profile") or "minimal"),
                 connectivity=connectivity, created_by=(identity.email if identity else None),
-                hostname_hint=body.get("hostname"))
+                hostname_hint=body.get("hostname"), machine_id=body.get("machine_id"),
+                idempotency_key=idempotency_key)
+            if created.get("idempotent_replay"):
+                return {"enrollment": created["enrollment"], "idempotent_replay": True,
+                        "ttl_seconds": created["ttl_seconds"]}
             node_id = created["enrollment"]["node_id"]
             controller_urls = onboarding.controller_urls(request_base_url=_request_base_url(request))
             controller_url = controller_urls[0]
