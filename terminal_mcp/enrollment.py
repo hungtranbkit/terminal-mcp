@@ -431,14 +431,16 @@ class EnrollmentStore:
                 if idempotency_key:
                     existing = connection.execute(
                         "SELECT * FROM enrollments WHERE idempotency_key = ? AND created_by IS ? "
-                        "ORDER BY created_at DESC LIMIT 1", (idempotency_key, created_by)).fetchone()
+                        "ORDER BY created_at DESC, rowid DESC LIMIT 1", (idempotency_key, created_by)).fetchone()
                     if existing is not None:
                         same_machine = (machine_id_hash is None or
                                         (existing["machine_id_hash"] or None) == machine_id_hash)
                         if existing["node_id"] != node_id or not same_machine:
                             raise DuplicateEnrollmentError("IDEMPOTENCY_KEY_REUSED")
-                        connection.execute("COMMIT")
-                        return _row_to_record(existing, now=moment), None
+                        replay = _row_to_record(existing, now=moment)
+                        if replay is not None and replay.status not in (STATUS_EXPIRED, STATUS_REVOKED):
+                            connection.execute("COMMIT")
+                            return replay, None
                 if machine_id_hash:
                     existing = connection.execute(
                         "SELECT id FROM enrollments WHERE machine_id_hash = ? AND "
@@ -532,7 +534,7 @@ class EnrollmentStore:
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT * FROM enrollments WHERE idempotency_key = ? AND created_by IS ? "
-                "ORDER BY created_at DESC LIMIT 1", (key, created_by)).fetchone()
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1", (key, created_by)).fetchone()
         if row is None:
             return None
         if row["node_id"] != node_id:

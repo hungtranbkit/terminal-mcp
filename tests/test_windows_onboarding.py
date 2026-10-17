@@ -1129,6 +1129,25 @@ def test_join_current_idempotency_key_reuses_the_same_enrollment(tmp_path, monke
     assert first.json()["handle"] != second.json()["handle"]
 
 
+def test_join_current_retry_after_enrollment_expiry_creates_fresh_pairing(tmp_path, monkeypatch):
+    client, _controller, _onboarding = _client(tmp_path, monkeypatch)
+    headers = {"Idempotency-Key": "join-current-machine-expiry-0001"}
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr(enrollment_mod, "_now", lambda: now)
+    first = client.post("/dashboard/api/nodes/onboard/join/current", headers=headers,
+                        json={"platform": "linux"})
+    assert first.status_code == 200
+
+    monkeypatch.setattr(enrollment_mod, "_now", lambda: now + timedelta(days=1))
+    retry = client.post("/dashboard/api/nodes/onboard/join/current", headers=headers,
+                        json={"platform": "linux"})
+
+    assert retry.status_code == 200
+    assert retry.json()["enrollment"]["id"] != first.json()["enrollment"]["id"]
+    assert retry.json()["enrollment"]["status"] == "pending"
+    assert retry.json()["handle"] and retry.json()["handle"] != first.json()["handle"]
+
+
 def test_join_current_retry_after_success_reports_the_existing_node(tmp_path, monkeypatch):
     client, _controller, onboarding = _client(tmp_path, monkeypatch)
     headers = {"Idempotency-Key": "join-current-machine-0003"}
