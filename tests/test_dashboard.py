@@ -2005,6 +2005,29 @@ def test_load_config_parses_dashboard_allowed_origins(tmp_path):
     assert config.dashboard.allowed_origins == ("https://a.example.com", "https://b.example.com")
 
 
+def test_load_config_parses_dashboard_access_email_roles(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "dashboard:\n"
+        "  access_email_roles:\n"
+        "    Owner@Example.com: owner\n"
+        "    ops@example.com: operator\n"
+        "    read@example.com: viewer\n"
+    )
+    config = load_config(config_file)
+    assert config.dashboard.access_email_roles == (
+        ("ops@example.com", "operator"), ("owner@example.com", "owner"),
+        ("read@example.com", "viewer"))
+
+
+@pytest.mark.parametrize("role", ["admin", "", "viewer,owner"])
+def test_load_config_rejects_unknown_access_role(tmp_path, role):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(f"dashboard:\n  access_email_roles:\n    ops@example.com: '{role}'\n")
+    with pytest.raises(ValueError, match="access_email_roles"):
+        load_config(config_file)
+
+
 # ---------------------------------------------------------------------------
 # P1 hardening #2: Cloudflare Access identity verification (opt-in, no-op
 # unless both cloudflare_access_team_domain and _audience are configured --
@@ -2082,6 +2105,40 @@ def test_cloudflare_access_configured_allows_mutation_with_verified_assertion(tm
         headers={"Cf-Access-Jwt-Assertion": "a-token-that-would-verify"},
     )
     assert response.status_code == 200
+
+
+@pytest.mark.parametrize("email,allowed,mutation_allowed", [
+    ("read@example.com", True, False),
+    ("ops@example.com", True, False),
+    ("owner@example.com", True, True),
+    ("unknown@example.com", False, False),
+])
+def test_cloudflare_access_email_roles_gate_dashboard_reads_and_mutations(
+        tmux_session_factory, monkeypatch, email, allowed, mutation_allowed):
+    import terminal_mcp.dashboard as dashboard_module
+    from terminal_mcp.cf_access import AccessIdentity
+
+    monkeypatch.setattr(
+        dashboard_module, "verify_access_assertion",
+        lambda token, **kw: AccessIdentity(email=email, subject="user-1", raw_claims={}))
+    session = tmux_session_factory("test-dashboard-role-gate", "bash -lc 'read x; sleep 10'")
+    config = _cf_access_config(access_email_roles=(
+        ("read@example.com", "viewer"), ("ops@example.com", "operator"),
+        ("owner@example.com", "owner")))
+    service = TerminalService(config)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app(), headers={
+        "Origin": "http://testserver", "Cf-Access-Jwt-Assertion": "verified-test-token"})
+
+    page = client.get("/dashboard")
+    assert page.status_code == (200 if allowed else 403)
+    mutation = client.post("/dashboard/api/session/input", json={"name": session, "text": "y"})
+    assert mutation.status_code == (200 if mutation_allowed else 403)
+    if not allowed:
+        assert page.json()["error"] == "ACCESS_IDENTITY_NOT_ALLOWED"
+    elif not mutation_allowed:
+        assert mutation.json()["error"] == "ACCESS_ROLE_INSUFFICIENT"
 
 
 def test_cloudflare_access_accepts_cf_authorization_cookie_fallback(tmux_session_factory, monkeypatch):

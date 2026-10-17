@@ -30,7 +30,8 @@ from html import escape as html_escape
 from . import dashboard_nav
 from .cf_access import verify_access_assertion
 from .agent_availability import available_agent_types
-from .access_policy import filter_record, policy_table, role_for_identity
+from .access_policy import (ROLE_OWNER, ROLE_OPERATOR, filter_record, policy_table,
+                            resolve_access_role, role_for_identity)
 from .connection_store import ConnectionStore, generate_node_token
 from .enrollment import (
     STAGES as ENROLL_STAGES,
@@ -13570,6 +13571,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if identity is None:
             return JSONResponse({"error": "CLOUDFLARE_ACCESS_VERIFICATION_FAILED"}, status_code=403,
                                 headers={"Cache-Control": "no-store"}), None
+        roles = terminal.config.dashboard.access_email_roles
+        if roles is not None and resolve_access_role(identity, roles) is None:
+            return JSONResponse({"error": "ACCESS_IDENTITY_NOT_ALLOWED"}, status_code=403,
+                                headers={"Cache-Control": "no-store"}), None
         return None, identity
 
     def _queue_store_for_worktrees():
@@ -13582,7 +13587,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return queue.store
         return QueueStore()
 
-    def _mutation_guard(request: Request):
+    def _mutation_guard(request: Request, *, required_role: str = ROLE_OWNER):
         """Independent boundary in front of every dashboard POST route
         (session input, supervisor ack, supervisor2 pause) -- checked
         before any of them touch terminal/supervisor/supervisor_v2 at all.
@@ -13600,7 +13605,18 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if not _origin_allowed(request):
             return JSONResponse({"error": "ORIGIN_NOT_ALLOWED"}, status_code=403,
                                 headers={"Cache-Control": "no-store"}), None
-        return _cloudflare_access_guard(request)
+        blocked, identity = _cloudflare_access_guard(request)
+        if blocked is not None:
+            return blocked, identity
+        roles = terminal.config.dashboard.access_email_roles
+        if roles is not None:
+            role = resolve_access_role(identity, roles)
+            allowed = ({ROLE_OPERATOR, ROLE_OWNER} if required_role == ROLE_OPERATOR
+                       else {ROLE_OWNER})
+            if role not in allowed:
+                return JSONResponse({"error": "ACCESS_ROLE_INSUFFICIENT"}, status_code=403,
+                                    headers={"Cache-Control": "no-store"}), identity
+        return None, identity
 
     def _node_of(qualified: str | None) -> str | None:
         """The node half of a `node/session` qualified name, for the audit's
@@ -13788,6 +13804,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         """
         configured = bool(terminal.config.dashboard.cloudflare_access_team_domain
                           and terminal.config.dashboard.cloudflare_access_audience)
+        roles = terminal.config.dashboard.access_email_roles
+        if roles is not None:
+            return resolve_access_role(identity, roles) or "anonymous"
         return role_for_identity(identity, access_configured=configured)
 
     @server.custom_route("/dashboard/audit", methods=["GET"], include_in_schema=False)
@@ -18934,7 +18953,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         never appears in a URL, a log line, or any later response -- if
         the operator loses this response they generate a new code, which
         is the correct outcome for a single-use credential."""
-        blocked, identity = _mutation_guard(request)
+        blocked, identity = _mutation_guard(request, required_role=ROLE_OPERATOR)
         if blocked is not None:
             return blocked
         try:
@@ -18988,7 +19007,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     @server.custom_route("/dashboard/api/nodes/onboard/enrollments/{enrollment_id}/revoke",
                         methods=["POST"], include_in_schema=False)
     async def onboard_revoke_enrollment(request: Request) -> JSONResponse:
-        blocked, identity = _mutation_guard(request)
+        blocked, identity = _mutation_guard(request, required_role=ROLE_OPERATOR)
         if blocked is not None:
             return blocked
         enrollment_id = request.path_params["enrollment_id"]
@@ -19145,7 +19164,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         terminalmcp:// URL instead of the enrollment code -- see
         docs/windows-bootstrap-helper.md for why a custom-protocol URL is
         not treated as a private channel."""
-        blocked, identity = _mutation_guard(request)
+        blocked, identity = _mutation_guard(request, required_role=ROLE_OPERATOR)
         if blocked is not None:
             return blocked
         enrollment_id = request.path_params["enrollment_id"]

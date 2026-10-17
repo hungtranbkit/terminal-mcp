@@ -17,7 +17,7 @@ from starlette.testclient import TestClient
 from terminal_mcp.access_policy import (ROLE_ANONYMOUS, ROLE_OPERATOR, ROLE_OWNER,
                                         TIER_OPERATIONAL, TIER_SECRET, TIER_SENSITIVE,
                                         Decision, filter_record, may_read, policy_table,
-                                        role_for_identity, tier_for)
+                                        resolve_access_role, role_for_identity, tier_for)
 from terminal_mcp.audit import AuditStore
 from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig
 from terminal_mcp.core import TerminalService
@@ -115,6 +115,25 @@ def test_access_not_being_configured_does_not_lock_the_operator_out():
     assert role_for_identity(None, access_configured=False) == ROLE_OPERATOR
     assert role_for_identity(None, access_configured=True) == ROLE_ANONYMOUS
     assert role_for_identity(object(), access_configured=True) == ROLE_OPERATOR
+
+
+@pytest.mark.parametrize("email,expected", [
+    (" Owner@Example.com ", ROLE_OWNER),
+    ("ops@example.com", ROLE_OPERATOR),
+    ("read@example.com", "viewer"),
+])
+def test_access_role_comes_from_normalized_verified_email_allowlist(email, expected):
+    identity = type("Identity", (), {"email": email})()
+    roles = (("owner@example.com", ROLE_OWNER), ("ops@example.com", ROLE_OPERATOR),
+             ("read@example.com", "viewer"))
+    assert resolve_access_role(identity, roles) == expected
+
+
+def test_access_role_denies_missing_identity_email_and_unknown_allowlist_entry():
+    roles = (("owner@example.com", ROLE_OWNER),)
+    assert resolve_access_role(None, roles) is None
+    assert resolve_access_role(type("Identity", (), {"email": None})(), roles) is None
+    assert resolve_access_role(type("Identity", (), {"email": "other@example.com"})(), roles) is None
 
 
 def test_the_policy_table_is_published_not_inferred():
