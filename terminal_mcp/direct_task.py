@@ -48,6 +48,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from .adapters import codex_folder_trust_prompt
 from .redaction import redact_text
 
 _log = logging.getLogger(__name__)
@@ -884,7 +885,9 @@ class DirectTaskSupervisor:
     def _first_dispatch(self, task, base, turn_state, observed, output, now):
         bottom = "\n".join([line for line in (output or "").splitlines()
                              if line.strip()][-DIALOG_TAIL_LINES:])
-        if turn_state == "WAITING_INPUT" or _BOOT_DIALOG.search(bottom):
+        if (turn_state == "WAITING_INPUT" or _BOOT_DIALOG.search(bottom)
+                or (task.get("agent") == "codex"
+                    and codex_folder_trust_prompt((output or "").splitlines()))):
             # Never type into a dialog -- in particular never let our Enter
             # answer a hooks-review/trust menu. Nothing was sent.
             return self.store.update(task["task_id"], **base, state="WAITING_INPUT",

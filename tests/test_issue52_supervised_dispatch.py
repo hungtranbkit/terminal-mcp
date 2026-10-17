@@ -171,6 +171,25 @@ def test_boot_hooks_menu_blocks_dispatch_and_mode_is_agent(tmp_path):
     assert len(pane.sent) == 1 and task["state"] in ("DISPATCHING", "EXECUTION_ACCEPTED", "RUNNING")
 
 
+def test_codex_folder_trust_dialog_with_composer_never_dispatches_first_task(tmp_path):
+    clock = Clock()
+    pane = FakePane(agent="codex")
+    pane.output.extend([
+        "Folder settings can run code automatically",
+        "Trust and continue",
+        "Quit",
+        "› Ask Codex to do anything",
+    ])
+    sup = _sup(tmp_path, pane, clock)
+
+    task = sup.start("codex-trust", text="do not send into trust dialog")['task']
+
+    assert task["state"] == "WAITING_INPUT"
+    assert task["wait_reason"] == "SESSION_INPUT_BEFORE_DISPATCH"
+    assert task["dispatches"] == 0
+    assert pane.sent == []
+
+
 def test_classifier_names_the_agent_on_waiting_input_and_sees_hooks_menu():
     session = SimpleNamespace(pane_dead=False, activity_epoch=0, pane_current_command="codex")
     state, waiting, reason = classify_status(session, HOOKS_MENU, now=10)

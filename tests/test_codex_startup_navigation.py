@@ -204,3 +204,31 @@ def test_tool_permission_header_clipped_by_capture_still_blocks():
     assert CodexAdapter().identify_target_state(lines) == TARGET_WAITING
     assert _codex_readiness(lines)[0] == "BLOCKED_PERMISSION"
     assert _authorized_startup_step(lines) is None
+
+
+FOLDER_TRUST_MENU = [
+    "Folder settings can run code automatically",
+    "Trust and continue",
+    "Quit",
+    "› Ask Codex to do anything",
+]
+
+
+def test_codex_folder_trust_prompt_dominates_visible_composer_and_is_not_auto_accepted():
+    from terminal_mcp.adapters import CodexAdapter, TARGET_WAITING
+    from terminal_mcp.lifecycle import _codex_readiness, _authorized_startup_step
+    from terminal_mcp.status import detect_waiting_input
+
+    assert CodexAdapter().identify_target_state(FOLDER_TRUST_MENU) == TARGET_WAITING
+    assert detect_waiting_input("\n".join(FOLDER_TRUST_MENU))[0] is True
+    assert _codex_readiness(FOLDER_TRUST_MENU) == ("BLOCKED", "CODEX_TRUST_PROMPT")
+    assert _authorized_startup_step(FOLDER_TRUST_MENU) is None
+
+
+def test_old_folder_trust_dialog_in_scrollback_does_not_block_composer():
+    from terminal_mcp.adapters import CodexAdapter, TARGET_COMPOSER
+    from terminal_mcp.lifecycle import _codex_readiness
+
+    lines = FOLDER_TRUST_MENU[:3] + ["ordinary output"] * 20 + ["› Ask Codex to do anything"]
+    assert CodexAdapter().identify_target_state(lines) == TARGET_COMPOSER
+    assert _codex_readiness(lines) == ("READY", None)
