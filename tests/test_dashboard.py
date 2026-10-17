@@ -2152,7 +2152,7 @@ def test_cloudflare_access_configured_allows_mutation_with_verified_assertion(tm
     identity = AccessIdentity(email="operator@example.com", subject="user-1", raw_claims={})
     monkeypatch.setattr(dashboard_module, "verify_access_assertion", lambda token, **kw: identity)
     session = tmux_session_factory("test-dashboard-cfok", "bash -lc 'read x; sleep 10'")
-    config = _cf_access_config()
+    config = _cf_access_config(access_email_roles=(("operator@example.com", "owner"),))
     service = TerminalService(config)
     server = build_mcp(service)
     register_dashboard(server, service)
@@ -2162,6 +2162,28 @@ def test_cloudflare_access_configured_allows_mutation_with_verified_assertion(tm
         headers={"Cf-Access-Jwt-Assertion": "a-token-that-would-verify"},
     )
     assert response.status_code == 200
+
+
+def test_cloudflare_access_requires_email_role_allowlist(tmux_session_factory, monkeypatch):
+    import terminal_mcp.dashboard as dashboard_module
+    from terminal_mcp.cf_access import AccessIdentity
+
+    monkeypatch.setattr(
+        dashboard_module, "verify_access_assertion",
+        lambda token, **kw: AccessIdentity(email="operator@example.com", subject="user-1", raw_claims={}),
+    )
+    config = _cf_access_config()
+    service = TerminalService(config)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app(), headers={
+        "Origin": "http://testserver", "Cf-Access-Jwt-Assertion": "verified-test-token",
+    })
+
+    response = client.get("/dashboard")
+
+    assert response.status_code == 403
+    assert response.json()["error"] == "ACCESS_ROLE_ALLOWLIST_REQUIRED"
 
 
 @pytest.mark.parametrize("email,allowed,mutation_allowed", [
@@ -2205,7 +2227,7 @@ def test_cloudflare_access_accepts_cf_authorization_cookie_fallback(tmux_session
     identity = AccessIdentity(email="operator@example.com", subject="user-1", raw_claims={})
     monkeypatch.setattr(dashboard_module, "verify_access_assertion", lambda token, **kw: identity)
     session = tmux_session_factory("test-dashboard-cfcookie", "bash -lc 'read x; sleep 10'")
-    config = _cf_access_config()
+    config = _cf_access_config(access_email_roles=(("operator@example.com", "owner"),))
     service = TerminalService(config)
     server = build_mcp(service)
     register_dashboard(server, service)
@@ -2256,7 +2278,7 @@ def test_cloudflare_access_configured_allows_get_routes_with_verified_assertion(
     identity = AccessIdentity(email="viewer@example.com", subject="user-2", raw_claims={})
     monkeypatch.setattr(dashboard_module, "verify_access_assertion", lambda token, **kw: identity)
     session = tmux_session_factory("test-dashboard-cf-get-ok", "bash -lc 'sleep 10'")
-    config = _cf_access_config()
+    config = _cf_access_config(access_email_roles=(("viewer@example.com", "viewer"),))
     service = TerminalService(config)
     server = build_mcp(service)
     register_dashboard(server, service)
@@ -2276,7 +2298,7 @@ def test_cloudflare_access_get_routes_never_require_an_origin_header(tmux_sessio
 
     identity = AccessIdentity(email="viewer@example.com", subject="user-3", raw_claims={})
     monkeypatch.setattr(dashboard_module, "verify_access_assertion", lambda token, **kw: identity)
-    config = _cf_access_config()
+    config = _cf_access_config(access_email_roles=(("viewer@example.com", "viewer"),))
     service = TerminalService(config)
     server = build_mcp(service)
     register_dashboard(server, service)
@@ -2296,7 +2318,8 @@ def test_cloudflare_access_get_routes_work_even_when_mutations_disabled(tmux_ses
 
     identity = AccessIdentity(email="viewer@example.com", subject="user-4", raw_claims={})
     monkeypatch.setattr(dashboard_module, "verify_access_assertion", lambda token, **kw: identity)
-    config = _cf_access_config(mutations_enabled=False)
+    config = _cf_access_config(mutations_enabled=False,
+                               access_email_roles=(("viewer@example.com", "viewer"),))
     service = TerminalService(config)
     server = build_mcp(service)
     register_dashboard(server, service)

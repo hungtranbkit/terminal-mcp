@@ -13810,7 +13810,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return JSONResponse({"error": "CLOUDFLARE_ACCESS_VERIFICATION_FAILED"}, status_code=403,
                                 headers={"Cache-Control": "no-store"}), None
         roles = terminal.config.dashboard.access_email_roles
-        if roles is not None and resolve_access_role(identity, roles) is None:
+        if roles is None:
+            return JSONResponse({"error": "ACCESS_ROLE_ALLOWLIST_REQUIRED"}, status_code=403,
+                                headers={"Cache-Control": "no-store"}), None
+        if resolve_access_role(identity, roles) is None:
             return JSONResponse({"error": "ACCESS_IDENTITY_NOT_ALLOWED"}, status_code=403,
                                 headers={"Cache-Control": "no-store"}), None
         return None, identity

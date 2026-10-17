@@ -10,8 +10,10 @@ Cf-Access-Jwt-Assertion header Access attaches to every request once a
 browser has completed its login -- signature verified against the Access
 team's own published JWKS, audience pinned to this specific Access
 Application, expiry/not-before enforced. See dashboard.py for where this
-is wired into the mutation-route gate; see config.py's DashboardConfig for
-the (opt-in, no-op-unless-configured) team_domain/audience settings.
+is wired into the Dashboard route guards; see config.py's DashboardConfig
+for the (opt-in, no-op-unless-configured) team_domain/audience settings.
+Once configured, Dashboard access also requires an explicit verified-email
+role allowlist; an authenticated identity alone is not sufficient.
 
 Fails closed, always: any missing header, network error fetching the
 JWKS, signature mismatch, wrong audience, or expired/premature token all

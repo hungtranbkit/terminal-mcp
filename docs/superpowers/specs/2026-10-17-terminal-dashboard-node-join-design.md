@@ -10,7 +10,7 @@ Audit of `origin/main` `79d93e8` found: `terminal_mcp/cf_access.py` verifies RS2
 
 ### Identity and roles
 
-Cloudflare Access remains responsible for Google identity-provider login. The application trusts only a JWT verified with its configured team JWKS, issuer, audience, expiry and not-before checks. It then normalizes the verified email and resolves it through an explicit email-to-role allowlist. Unknown, missing, malformed, or unverified identities fail closed. Roles are `viewer` (read), `operator` (read and join/revoke nodes), and `owner` (all current dashboard mutations plus join/revoke). Existing installs without role configuration retain the documented legacy authenticated-operator behavior until an operator opts into the allowlist; when allowlist mode is enabled it is deny-by-default. Never infer a Google identity from an unverified header or browser-supplied email.
+Cloudflare Access remains responsible for Google identity-provider login. The application trusts only a JWT verified with its configured team JWKS, issuer, audience, expiry and not-before checks. When Access verification is configured, a verified email-role allowlist is mandatory; missing, empty, unknown, malformed, or unverified identities fail closed. Roles are `viewer` (read), `operator` (read and join/revoke nodes), and `owner` (all current dashboard mutations plus join/revoke). Installations without Cloudflare Access configuration retain the existing self-hosted behavior. Never infer a Google identity from an unverified header or browser-supplied email.
 
 ### Join this machine
 

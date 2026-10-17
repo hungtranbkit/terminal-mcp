@@ -4,7 +4,7 @@
 
 **Goal:** Deliver an allowlist-authorized, responsive current-machine node join flow with safe helper pairing, explicit first install, metadata-only heartbeat inventory, retry, idempotency, and revocation.
 
-**Architecture:** Extend verified Cloudflare Access identity handling with an opt-in email-role map. Reuse the existing enrollment store and one-time handles; add a pinned-origin loopback bridge in the existing Go helper, plus honest installer states in the Dashboard. Reuse agent heartbeat/service installers and add a closed metadata inventory contract.
+**Architecture:** Require an explicit verified-email role map whenever Cloudflare Access JWT verification is enabled; retain existing auth behavior when Cloudflare Access is not configured. Reuse the existing enrollment store and one-time handles; add a pinned-origin loopback bridge in the existing Go helper, plus honest installer states in the Dashboard. Reuse agent heartbeat/service installers and add a closed metadata inventory contract.
 
 **Tech Stack:** Python/Starlette, PyYAML config loader, embedded dashboard HTML/JS, SQLite enrollment and node stores, Go helper, systemd/launchd/Windows SCM installers, pytest and Go tests.
 
@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Access JWT verification remains RS256 with configured issuer and audience and enforced token lifetime.
-- Allowlist mode denies unknown identities; role assignment uses only verified JWT email.
+- A missing/empty allowlist and unknown identities are denied when Access is configured; role assignment uses only verified JWT email.
 - Loopback listeners bind to localhost, validate exact pinned Dashboard origin and loopback Host, use short-lived one-use nonces, and never log pairing credentials.
 - First-time service installation must be launched by the user and use native OS permissions; never claim success before native confirmation.
 - Inventory is limited to platform/version, capability names, project identifiers, skill names, and health metadata.
@@ -34,11 +34,11 @@
 
 **Files:** `terminal_mcp/config.py`, `terminal_mcp/access_policy.py`, `terminal_mcp/dashboard.py`, `config.example.yaml`; tests `tests/test_access_policy.py`, `tests/test_cf_access.py`, new dashboard auth tests.
 
-**Interfaces:** Add immutable `DashboardConfig.access_email_roles: tuple[tuple[str, str], ...]`; add `resolve_access_role(identity, role_map) -> str | None`; `_cloudflare_access_guard` returns 403 for verified but unlisted email when allowlist mode is configured; join/revoke routes require `operator` or `owner`.
+**Interfaces:** Add immutable `DashboardConfig.access_email_roles: tuple[tuple[str, str], ...]`; add `resolve_access_role(identity, role_map) -> str | None`; `_cloudflare_access_guard` requires this map whenever Access JWT verification is configured and returns 403 for missing or unlisted roles; join/revoke routes require `operator` or `owner`.
 
 - [x] Add tests for normalized email, each role, unknown email, malformed role, and missing verified identity.
 - [x] Run the focused tests and confirm new policy tests fail before implementation.
-- [x] Parse and validate the optional YAML map; preserve the legacy operator mode only when no map is configured.
+- [x] Parse and validate the YAML map; preserve self-hosted behavior only when Cloudflare Access itself is not configured.
 - [x] Enforce allowlist on authenticated Dashboard requests and enforce role requirements on join/revoke endpoints.
 - [x] Run `pytest -q tests/test_access_policy.py tests/test_cf_access.py` plus the new route tests.
 

@@ -587,8 +587,10 @@ class DashboardConfig:
     # behavior is unchanged.
     cloudflare_access_team_domain: str | None = None
     cloudflare_access_audience: str | None = None
-    # Optional verified-email -> role allowlist. None preserves the legacy
-    # authenticated-operator behavior; an explicitly empty map denies all.
+    # Verified-email -> role allowlist. Required whenever Cloudflare Access
+    # JWT verification is configured; an explicitly empty map denies all.
+    # With Access itself unset, the existing self-hosted auth behavior stays
+    # unchanged.
     access_email_roles: tuple[tuple[str, str], ...] | None = None
     # CSRF/Origin defense (P1 hardening item #3): unlike the Access check
     # above, this is NOT opt-in -- every mutation route always requires a
