@@ -20,6 +20,9 @@ def test_git_skills_tasks_notes_services_without_source_or_skill_body(tmp_path):
     data=' '.join(records)
     for secret in ('DO_NOT_COPY_SOURCE','DO_NOT_COPY_SKILL_BODY','DO_NOT_COPY_DESCRIPTION','fake-password','z'*40,'?token='):
         assert secret not in data
+    parsed=[json.loads(r) for r in records]
+    repo_ids={r['id'] for r in parsed if r['kind']=='repo'}
+    assert all(r['payload']['repo_id'] in repo_ids for r in parsed if r['kind'] in ('branch','worktree'))
     kinds={json.loads(r)['kind'] for r in records}
     assert {'repo','worktree','project','skill','task','checkpoint','service','node'}<=kinds
     assert all(json.loads(r)['visibility']=='private' for r in records)

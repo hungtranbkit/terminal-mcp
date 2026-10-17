@@ -53,6 +53,7 @@ def project_sources(store: MemoryStore, projects: dict, *, shared_projects=(), s
             obj=store.publish(actor,kind,key(project+':'+str(identity)),project,payload,visibility=visibility,projected=True)
             seen.add(obj['id'])
             result['published']+=1
+            return obj
         def attempt(fn):
             try:fn()
             except (MemoryError,OSError,ValueError,TypeError,KeyError,AttributeError,sqlite3.Error,subprocess.SubprocessError,yaml.YAMLError):
@@ -68,8 +69,8 @@ def project_sources(store: MemoryStore, projects: dict, *, shared_projects=(), s
                 try:head=git(root,'rev-parse','HEAD')
                 except MemoryError:head=''
                 branch=git(root,'symbolic-ref','--short','-q','HEAD') if head=='' else git(root,'rev-parse','--abbrev-ref','HEAD')
-                repo_id=key(repo)
-                put('repo',repo,{'title':root.name,'path':str(root),'remote':remote,'head':head,'branch':branch,'dirty':bool(git(root,'status','--porcelain','--untracked-files=no'))})
+                record=put('repo',repo,{'title':root.name,'path':str(root),'remote':remote,'head':head,'branch':branch,'dirty':bool(git(root,'status','--porcelain','--untracked-files=no'))})
+                repo_id=record['id']
                 for line in git(root,'for-each-ref','--format=%(refname:short)\t%(objectname)','refs/heads').splitlines():
                     name,sha=line.split('\t',1)
                     put('branch',repo+'#'+name,{'title':name,'head':sha,'repo_id':repo_id})
