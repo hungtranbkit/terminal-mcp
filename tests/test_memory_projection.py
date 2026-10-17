@@ -76,3 +76,20 @@ def test_malformed_backlog_does_not_prevent_withdrawal(tmp_path):
     result=project_sources(s,config,shared_projects=['p'])
     assert result['errors']
     assert not s.search(Principal('a',frozenset({'reader'}),frozenset({'p'})),'needle')
+
+
+def test_session_snapshot_requires_live_authorization_and_revocation(tmp_path):
+    import sqlite3
+    root=tmp_path/'repo';root.mkdir()
+    db=tmp_path/'sessions.db'
+    with sqlite3.connect(db) as con:
+        con.execute('CREATE TABLE session_records(node_id,session_name,status,agent_type,git_branch,last_commit,repo_root,read_granted)')
+        con.execute('INSERT INTO session_records VALUES (?,?,?,?,?,?,?,?)',('a','needle-session','READY','codex','main','abc',str(root),1))
+    s=MemoryStore(tmp_path/'memory.db','a');config={'p':{'roots':[str(root)]}}
+    reader=Principal('a',frozenset({'reader'}),frozenset({'p'}))
+    project_sources(s,config,session_db=db,shared_projects=['p'])
+    assert not s.search(reader,'needle') # informational grant snapshot alone is insufficient
+    project_sources(s,config,session_db=db,shared_projects=['p'],session_authorized=lambda name:True)
+    assert s.search(reader,'needle')
+    project_sources(s,config,session_db=db,shared_projects=['p'],session_authorized=lambda name:False)
+    assert not s.search(reader,'needle')

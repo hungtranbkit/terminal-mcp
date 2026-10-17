@@ -40,7 +40,9 @@ Node-agent startup and HTTP-controller startup load the config and start the bou
 background worker. Restart only an isolated staging instance during evaluation;
 production activation requires separate approval. Config changes take effect on restart.
 The optional `session_database` is opened read-only; only local-node sessions with
-`read_granted=1` and approved repository roots contribute status metadata.
+`read_granted=1`, approved repository roots and a live TerminalService read-authorization
+check contribute status metadata. Snapshot grants alone never authorize export.
+The standalone CLI has no live permission provider and therefore omits sessions.
 
 The projector reads Git repository/branch/worktree facts, explicit project/service
 entries, selected SKILL.md frontmatter plus digest, `.terminal-mcp/backlog.json`

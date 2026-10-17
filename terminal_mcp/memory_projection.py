@@ -43,7 +43,7 @@ def git(root,*args):
     return result.stdout.strip()
 
 
-def project_sources(store: MemoryStore, projects: dict, *, shared_projects=(), session_db=None) -> dict:
+def project_sources(store: MemoryStore, projects: dict, *, shared_projects=(), session_db=None, session_authorized=None) -> dict:
     actor=Principal(store.node,frozenset({'reader','writer'}),frozenset(projects))
     result={'published':0,'errors':[]};seen=set()
     for project,config in projects.items():
@@ -115,6 +115,7 @@ def project_sources(store: MemoryStore, projects: dict, *, shared_projects=(), s
                     rows=db.execute('SELECT session_name,status,agent_type,git_branch,last_commit,repo_root FROM session_records WHERE node_id=? AND read_granted=1 AND repo_root IN ('+','.join('?' for _ in roots)+') LIMIT 2001',[store.node,*map(str,roots)]).fetchall()
                     if len(rows)>2000:raise MemoryError('SOURCE_TOO_LARGE')
                     for row in rows:
+                        if session_authorized is None or not session_authorized(row['session_name']):continue
                         put('session',row['session_name'],{'title':row['session_name'],'status':row['status'],'agent_type':row['agent_type'],'branch':row['git_branch'],'head':row['last_commit']})
             attempt(sessions)
     store.reconcile_projection(seen)

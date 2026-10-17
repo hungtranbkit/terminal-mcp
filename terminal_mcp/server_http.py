@@ -611,7 +611,7 @@ def main() -> None:
     from .run_journal import RunJournalStore
     run_journal = RunJournalStore()
     from .memory_runtime import from_environment
-    memory_runtime = from_environment(local_node_id, controller=controller)
+    memory_runtime = from_environment(local_node_id, controller=controller, terminal=terminal)
     if memory_runtime is not None:
         memory_runtime.start()
         atexit.register(memory_runtime.close)

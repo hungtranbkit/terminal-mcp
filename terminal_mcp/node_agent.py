@@ -1359,7 +1359,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:  # noqa: BLE001 -- never block startup on a migration
         _log.exception("deny-record migration failed -- grants left unchanged")
     from .memory_runtime import from_environment
-    memory_runtime = from_environment(args.node_id)
+    memory_runtime = from_environment(args.node_id, terminal=terminal)
     if memory_runtime is not None:
         import atexit
         memory_runtime.start()

@@ -15,8 +15,8 @@ CONFIG_ENV='TERMINAL_MCP_MEMORY_CONFIG'
 
 
 class MemoryRuntime:
-    def __init__(self, config, *, controller=None):
-        self.config=config;self.controller=controller
+    def __init__(self, config, *, controller=None, terminal=None):
+        self.config=config;self.controller=controller;self.terminal=terminal
         self.store=MemoryStore(config['database'],config['node'])
         self.projects=config.get('projects',{})
         self.actor=Principal(self.store.node,frozenset({'reader','writer'}),frozenset(self.projects))
@@ -25,7 +25,7 @@ class MemoryRuntime:
         self._status={'state':'NOT_STARTED','peers':[]}
 
     @classmethod
-    def load(cls, path, *, node, controller=None):
+    def load(cls, path, *, node, controller=None, terminal=None):
         with Path(path).open('rb') as f:raw=f.read(1048577)
         if len(raw)>1048576:raise MemoryError('CONFIG_TOO_LARGE')
         config=json.loads(raw)
@@ -40,7 +40,7 @@ class MemoryRuntime:
         if peers and node!=config['controller']:raise MemoryError('CONTROLLER_ONLY')
         interval=config.get('interval_seconds',60)
         if not isinstance(interval,int) or not 10<=interval<=300:raise MemoryError('INVALID_INTERVAL')
-        return cls(config,controller=controller)
+        return cls(config,controller=controller,terminal=terminal)
 
     def transport(self, peer, action, body):
         if self.controller is None:raise MemoryError('NEEDS_AUTH')
@@ -50,7 +50,7 @@ class MemoryRuntime:
 
     def tick(self):
         with self._cycle_lock:
-            projection=project_sources(self.store,self.projects,shared_projects=self.config.get('share_projects',[]),session_db=self.config.get('session_database'))
+            projection=project_sources(self.store,self.projects,shared_projects=self.config.get('share_projects',[]),session_db=self.config.get('session_database'),session_authorized=self.terminal._read_authorized if self.terminal else None)
             peers=[]
             for peer,scope in self.config.get('peers',{}).items():
                 try:peers.append(synchronize(self.store,peer,set(scope),self.transport))
@@ -84,9 +84,9 @@ class MemoryRuntime:
         if not self._thread or not self._thread.is_alive():self.store.close()
 
 
-def from_environment(node, *, controller=None):
+def from_environment(node, *, controller=None, terminal=None):
     path=os.environ.get(CONFIG_ENV)
-    return MemoryRuntime.load(path,node=node,controller=controller) if path else None
+    return MemoryRuntime.load(path,node=node,controller=controller,terminal=terminal) if path else None
 
 
 def main(argv=None):
