@@ -107,7 +107,19 @@ _TASK_ID = re.compile(r"^dt_[0-9a-f]{16}$")
 # Leading decoration an agent UI may put before its own output line (Claude's
 # ●/⏺, Codex's •, list bullets, box-drawing borders). `>` is deliberately NOT
 # stripped: it is the prompt-echo prefix in agent composers.
-_MARKER_PREFIX = r"^[ \t●⏺•◦·*\-–—│|]*"
+_MARKER_PREFIX = r"^[ \t●⏺•◦·*\-–—│|`]*"
+#: Wrapped rows of a BLOCKED reason that are folded back into it.
+MARKER_REASON_MAX_LINES = 6
+# A row that starts something new, so it cannot continue a wrapped reason.
+_REASON_STOP = re.compile(r"^\s*(?:[●⏺•❯›»>■⎿╭╰│┃║─]|TMCP-)")
+# A provider usage/quota limit the agent CLI printed instead of working.
+# Anchored at row start (after the CLI's own glyphs) so prose that merely
+# mentions a limit does not match.
+_USAGE_LIMIT = re.compile(
+    r"^[ \t■⎿●⏺•✗⚠]*(?:You've hit your (?:usage )?limit|You have hit your (?:usage )?limit"
+    r"|Claude(?: AI)? usage limit reached|\d+-hour limit reached|Weekly limit reached"
+    r"|Rate limit reached|Usage limit reached|Quota exceeded)\b.*$",
+    re.IGNORECASE | re.MULTILINE)
 _AGENT_HINTS = ("claude", "codex")
 _COMMAND_IN_REASON = re.compile(r"current command is '([^']+)'")
 _COMPOSER_MARKER = re.compile(r"^[│┃║]?\s*[❯›»>](?:\s|$)")
@@ -167,9 +179,41 @@ def find_marker(output: str, task_id: str) -> tuple[str, str] | None:
     pattern = re.compile(
         _MARKER_PREFIX + r"TMCP-(DONE|BLOCKED):" + re.escape(task_id)
         + r"(?![0-9A-Za-z_])[ \t:\-–—]*(.*)$", re.MULTILINE)
+    text = output or ""
     found = None
-    for match in pattern.finditer(output or ""):
-        found = (match.group(1), match.group(2).strip())
+    for match in pattern.finditer(text):
+        detail = match.group(2)
+        if match.group(1) == "BLOCKED":
+            # The pane hard-wraps a long reason; fold the wrapped rows back.
+            for row in text[match.end():].split("\n")[1:MARKER_REASON_MAX_LINES + 1]:
+                if not row.strip() or _REASON_STOP.match(row):
+                    break
+                detail += " " + row
+        found = (match.group(1), _collapse(detail).strip("*` "))
+    return found
+
+
+def usage_limit_notice(output: str, needle: str) -> str | None:
+    """The agent CLI's usage-limit notice printed after the latest dispatch.
+
+    Only rows after the newest echo of this dispatch's needle count, so an
+    old notice (or the prompt text itself) never blocks a fresh dispatch;
+    when the echo has scrolled away, only the bottom rows are searched.
+    """
+    lines = [line for line in str(output or "").splitlines() if line.strip()]
+    region = _composer_region(lines)
+    history = lines[:len(lines) - len(region)] if region else lines
+    wanted = _collapse(needle)
+    start = None
+    if wanted:
+        for index in range(len(history) - 1, -1, -1):
+            if wanted in _collapse(history[index]):
+                start = index + 1
+                break
+    rows = history[start:] if start is not None else history[-DIALOG_TAIL_LINES:]
+    found = None
+    for match in _USAGE_LIMIT.finditer("\n".join(rows)):
+        found = _collapse(match.group(0)).lstrip("■⎿●⏺•✗⚠ ")
     return found
 
 
@@ -1031,6 +1075,16 @@ class DirectTaskSupervisor:
         if now - task["idle_since"] < self.settle_seconds:
             return self.store.update(task["task_id"], **base)
         task = self.store.update(task["task_id"], **base)
+        tail = self._tail(task["target"], MARKER_TAIL_LINES)
+        notice = (usage_limit_notice(str(tail.get("output") or ""), task.get("dispatch_needle") or "")
+                  if task["mode"] == "agent" and "error" not in tail else None)
+        if notice:
+            # Every further prompt would bounce off the same limit and burn
+            # the continuation budget into a misleading FAILED; a human must
+            # wait for the reset or switch account/model.
+            return self.store.update(
+                task["task_id"], state="BLOCKED", completed_at=now, wait_reason=None,
+                reason=_clip(f"AGENT_USAGE_LIMIT: {notice}"))
         return self._dispatch(task, now)
 
 
