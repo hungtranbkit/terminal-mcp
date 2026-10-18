@@ -42,6 +42,7 @@ from .notes_store import NotesError
 from .orchestrator_checkpoint import OrchestratorCheckpointStore
 from .browser_gateway import BrowserGateway
 from .browser_tools import register_browser_tools
+from .camofox_provider import build_from_env as build_camofox_from_env, register_camofox_tools
 from .chat_checkpoint_tools import register_chat_checkpoint_tools
 from .planner_service import PlannerService
 from .planner_store import PlannerStore
@@ -5705,6 +5706,12 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
     browser_handlers: dict[str, Any] = {}
     if browser is not None:
         browser_handlers = register_browser_tools(server, browser)
+    # Optional Camofox provider (docs/camofox-browser.md). Registered only
+    # when TERMINAL_MCP_CAMOFOX_ENABLED is on, so the default catalog and the
+    # browser_* contracts above are unchanged.
+    camofox = build_camofox_from_env()
+    if camofox is not None:
+        register_camofox_tools(server, camofox)
 
     # ------------------------------------------------------------------
     # P0.2 Event Bus. Publish/claim/ack only -- NOTHING here starts an

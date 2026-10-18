@@ -1,0 +1,9 @@
+Full suite on Dell (~/workspace/terminal-mcp/.venv, temp worktrees, --ignore=tests/test_dashboard_nav_browser_smoke.py)
+(m910 stalls at ~31-36% on main as well, so Dell is the reference)
+
+origin/main f2dd2c7            : 1 failed, 9733 passed, 16 skipped, 24 deselected
+branch d1f1d0d (first commit)  : 4 failed, 9772 passed, 18 skipped, 24 deselected
+  new failures (all fixed in the follow-up commit): tests/test_efficiency_benchmark.py x3,
+  camofox_provider.py was not claimed by the knowledge module index.
+  The 1 remaining failure also fails on untouched main.
+After fix (m910): tests/test_efficiency_benchmark.py + tests/test_camofox_provider.py -> 83 passed, 2 skipped
