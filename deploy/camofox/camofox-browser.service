@@ -1,0 +1,57 @@
+# Camofox Browser worker (jo-inc/camofox-browser v1.18.1, pinned commit
+# 39c82094013480b373df6600d44c7f036f58356e) for the optional Terminal MCP
+# camofox provider. systemd --user unit; see deploy/camofox/README.md.
+#
+# Loopback only, access key required, telemetry off, cookie import and VNC
+# off, small session/tab caps, cgroup memory/CPU limits. The secret lives
+# in %h/.config/camofox/camofox.env (chmod 600), never in this file.
+[Unit]
+Description=Camofox Browser worker (loopback-only, pilot) for Terminal MCP
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h/opt/camofox/current
+ExecStart=%h/.local/bin/node %h/opt/camofox/current/server.js
+EnvironmentFile=%h/.config/camofox/camofox.env
+Environment=NODE_ENV=production
+Environment=CAMOFOX_BIND_HOST=127.0.0.1
+Environment=CAMOFOX_PORT=9377
+Environment=CAMOFOX_CRASH_REPORT_ENABLED=false
+Environment=SENTRY_DSN=
+Environment=PROMETHEUS_ENABLED=false
+Environment=ENABLE_VNC=0
+Environment=CAMOFOX_INTERACTIVE=off
+Environment=MAX_SESSIONS=2
+Environment=MAX_TABS_PER_SESSION=2
+Environment=MAX_TABS_GLOBAL=4
+Environment=MAX_CONCURRENT_PER_USER=1
+Environment=SESSION_TIMEOUT_MS=600000
+Environment=TAB_INACTIVITY_MS=180000
+Environment=BROWSER_IDLE_TIMEOUT_MS=120000
+Environment=NAVIGATE_TIMEOUT_MS=20000
+Environment=HANDLER_TIMEOUT_MS=30000
+Environment=BROWSER_RSS_RESTART_THRESHOLD_MB=900
+Environment=CAMOFOX_COOKIES_DIR=%h/.local/state/camofox/cookies
+Environment=CAMOFOX_UPLOADS_DIR=%h/.local/state/camofox/uploads
+Environment=CAMOFOX_PROFILE_DIR=%h/.local/state/camofox/profiles
+Environment=CAMOFOX_TRACES_DIR=%h/.local/state/camofox/traces
+Environment=CAMOFOX_TRACES_MAX_BYTES=10485760
+# CAMOFOX_API_KEY and CAMOFOX_ADMIN_KEY are deliberately unset: no cookie
+# import key, and POST /stop answers 403.
+UnsetEnvironment=CAMOFOX_API_KEY CAMOFOX_ADMIN_KEY PROXY_HOST PROXY_STRATEGY
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+MemoryHigh=1100M
+MemoryMax=1400M
+MemorySwapMax=256M
+CPUQuota=150%
+TasksMax=512
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=default.target

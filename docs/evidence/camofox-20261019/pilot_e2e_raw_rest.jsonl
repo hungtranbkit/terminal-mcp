@@ -1,0 +1,11 @@
+{"check": "health", "ok": true, "status": 200, "engine": "camoufox", "memory": {"rssMb": 211, "heapUsedMb": 91, "nativeMemMb": 120}}
+{"check": "auth_missing_key_rejected", "ok": true, "status": 401}
+{"check": "auth_wrong_key_rejected", "ok": true, "status": 401}
+{"check": "admin_stop_disabled", "ok": true, "status": 403}
+{"check": "create_tab", "ok": true, "status": 200, "ms": 564}
+{"check": "snapshot_contains_expected", "ok": true, "status": 200, "url": "https://example.com/", "chars": 2984}
+{"check": "screenshot_png", "ok": true, "status": 200, "bytes": 85366, "content_type": "image/png"}
+{"check": "list_tabs_title", "ok": true, "status": 200, "titles": ["Example Domain"]}
+{"check": "close_tab", "ok": true, "status": 200}
+{"check": "health_after", "ok": true, "status": 200, "active_tabs": 0, "memory": {"rssMb": 215, "heapUsedMb": 96, "nativeMemMb": 119}}
+{"summary": "PASS", "checks": 10}
