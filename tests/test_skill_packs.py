@@ -301,6 +301,8 @@ def test_the_launcher_runs_from_a_standalone_copy(isolated):
         "browser.newPage: Target page, context or browser has been closed\n"
         "[err] FATAL:gpu_data_manager_impl_private.cc:417] GPU process isn't usable. Goodbye.\n"
         "    at /kit/scripts/axe_audit.mjs:34:28 {", sp.BLOCKED),
+    (1, "    triggerUncaughtException(\n\nbrowser.newPage: Target crashed \n"
+        "    at /kit/scripts/axe_audit.mjs:34:28 {", sp.BLOCKED),
     (None, "timed out", sp.ERROR),
     (139, "", sp.ERROR),
 ])

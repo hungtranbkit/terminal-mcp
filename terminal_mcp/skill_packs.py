@@ -996,7 +996,7 @@ _CATALOGUE_JS = ("import(process.argv[1]).then(m => process.stdout.write(JSON.st
 # or browser has been closed".
 _BROWSER_MISSING = re.compile(r"playwright not installed|Executable doesn't exist|browserType\.launch|"
                               r"Failed to launch|Host system is missing dependencies|"
-                              r"Target (?:page, context or browser|closed)|browser has been closed|"
+                              r"Target (?:page, context or browser|closed|crashed)|Page crashed|browser has been closed|"
                               r"GPU process isn't usable|Browser closed", re.IGNORECASE)
 # An exception nobody caught is a crash, not a finding.
 _CRASH = re.compile(r"Traceback \(most recent call last\)|triggerUncaughtException|"
