@@ -137,6 +137,9 @@ terminal-mcp-skill-packs disable|enable  # remove/restore router skills; release
   `install-node-agent-macos.sh` run `sync --best-effort` after `pip install`.
   A failure is logged to `/tmp/terminal-mcp-skill-packs-sync.log` and never
   blocks the join. Opt out with `TERMINAL_MCP_SKIP_SKILL_PACKS=1`.
+- **Footprint (measured on Dell):** kit 14 MB + Playwright 19 MB per
+  release; up to 3 releases are kept. A Playwright Chromium is downloaded only
+  when the node has no Chrome. `selfcheck` adds a ~50 MB working copy.
 - **Existing node:** run `sync` once from any checkout at or after this
   change. New sessions see the router skill at their next start; nothing
   restarts.
