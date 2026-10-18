@@ -21,7 +21,7 @@ Audited 2026-10-18 from the tag itself, not from its README:
 | Claude skills | 25 directories with a `SKILL.md` under `.claude/skills` (plus one test fixture that is not a skill) |
 | Design systems | 138 (`design-systems/library`) |
 | MCP gates | 23 in the kit's own `mcp/gates.mjs` catalogue, 16 of which open a browser |
-| "52 objective gates" | the README's number is the **checks in `scripts/accuracy_report.mjs`**, the kit's self-test over its *own* examples. They are not 52 gates you can point at a project page. Terminal MCP runs them as `selfcheck` (below) and reports the real N/52. |
+| "52 objective gates" | the README's number is the **checks in `scripts/accuracy_report.mjs`**, the kit's self-test over its *own* examples. They are not 52 gates you can point at a project page. Terminal MCP runs them as `selfcheck` (below) and reports the real N/52. Measured on Dell 2026-10-18: **49/52**, not the advertised 52/52 (see `docs/evidence/ux-ui-skill-pack-71/README.md`). |
 | Runtime deps | none; `devDependencies` are playwright, esbuild, react, react-dom |
 
 The pin is refused if the tag moved (resolves to another commit), if the tree
@@ -113,6 +113,11 @@ missing, skipped, or a gate that printed its usage). `DS_REQUIRE_BROWSER=1` is
 set, so a render gate without a browser fails instead of skipping. A review
 is `PASS` only when every catalogued gate ran and passed. CLI exit: 0 PASS,
 1 FAIL, 2 INCOMPLETE.
+
+A browser that launches and then dies (seen on m910 when the gates ran inside
+a user namespace where Chrome's setuid sandbox cannot work: "GPU process isn't
+usable", "Target crashed") is `BLOCKED`, so such a node reports INCOMPLETE,
+never a FAIL of a clean page or a PASS.
 
 Fixtures: `examples/ux-ui-skill-pack/clean` must review PASS 23/23 with
 `--focustrap-open '#open-dialog'`, and `examples/ux-ui-skill-pack/broken` must

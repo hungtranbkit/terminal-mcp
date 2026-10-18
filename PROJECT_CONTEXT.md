@@ -1,5 +1,14 @@
 # PROJECT_CONTEXT.md
 
+## 2026-10-18 — Shared UX/UI skill pack, issue #71 (branch feat/ux-ui-skill-pack-71)
+
+- `terminal_mcp/skill_packs.py` + CLI `terminal-mcp-skill-packs` + launcher `ux-ui-gates`: one pinned, read-only copy of plugin87/ux-ui-agent-skills v2.9.8 (`62092bd83bc3`, MIT, tree sha256 pinned) per node under `~/.local/share/terminal-mcp/skill-packs`, with `current`/`previous` rollback, provenance and state. A lazy router skill `ux-ui-kit` goes to `~/.claude/skills` and `~/.codex/skills` (marker-owned; a foreign dir is a CONFLICT and left alone). It does not touch AGENTS.md/CLAUDE.md, installs no upstream hooks, and registers MCP only on opt-in (`--claude-mcp`/`--codex-mcp`).
+- Gates: PASS/FAIL/BLOCKED/ERROR/NOT_RUN per run with real exit codes, and the review is PASS only when all 23 catalogued gates ran and passed (CLI exit 0/1/2). `selfcheck` runs upstream accuracy_report (the README's "52"): Dell measures 49/52.
+- Visibility: `terminal-mcp-skill-packs status`, MCP tool `terminal_skill_pack_status`, node-profile `skill_packs` entry (fleet view). Join scripts run `sync --best-effort`.
+- Live: installed on Dell and m910. Clean fixture PASS 23/23 / broken FAIL exit 1 on both. Claude Code and Codex smoke on Dell used the pack for a UI review and ignored it for a non-UI task. Evidence: `docs/evidence/ux-ui-skill-pack-71/README.md`.
+- Gotcha: inside a user namespace without root mapping (e.g. an agent's sandbox on m910), Chrome's setuid sandbox fails and every render gate crashes. That now reports BLOCKED/INCOMPLETE, not FAIL. Run gates from a normal user session.
+- Real-kit tests are opt-in: `TERMINAL_MCP_SKILL_PACK_E2E=1 pytest tests/test_skill_packs_e2e.py` (needs the pack installed). CI: `.github/workflows/skill-packs.yml`.
+
 ## 2026-10-17 — Codex folder-trust first-dispatch regression (merged; HP rollout blocked by release drift)
 
 - Implemented in isolated worktree `/home/dell/workspace/.terminal-mcp-worktrees/codex-first-use-recovery-20261017`, branch `fix/codex-first-use-recovery-20261017`, based on `origin/main` `79d93e8430703f0fdb4b9d92c6caece91cdb1227`. Source commit `f6c039321c6743b660e8360903a76534c47e8f0f`, PR #61 merged 2026-10-17 as main merge commit `73939e439a91403bed7da213bd98f1ea05d95d8a`. The active dashboard/join worktree and tmux sessions were not touched.
