@@ -125,7 +125,7 @@ GROUPS: dict[str, list[str]] = {
 # Files recovered from the fleet branch consolidation, indexed by subsystem.
 GROUPS.setdefault('auth', []).extend(['auth_throttle.py'])
 GROUPS.setdefault('backlog', []).extend(['notes_service.py', 'notes_store.py', 'project_analyzer.py', 'project_coordinator.py', 'project_dispatch_bridge.py', 'project_runtime.py', 'project_task_feeder.py', 'project_workflows.py'])
-GROUPS.setdefault('browser', []).extend(['browser_compat.py', 'browser_gateway.py', 'browser_network.py', 'browser_safety.py', 'browser_script.py', 'browser_tools.py', 'browser_worker.py'])
+GROUPS.setdefault('browser', []).extend(['browser_compat.py', 'browser_gateway.py', 'browser_network.py', 'browser_safety.py', 'browser_script.py', 'browser_tools.py', 'browser_worker.py', 'camofox_provider.py'])
 GROUPS.setdefault('capabilities', []).extend(['agent_bundle.py', 'agent_registry.py', 'agent_service.py', 'ai_context_window.py', 'capability_profile.py'])
 GROUPS.setdefault('deployment', []).extend(['effective_bind.py', 'endpoint_policy.py', 'listen_evidence.py', 'release_manifest.py', 'system_report.py'])
 GROUPS.setdefault('fleet', []).extend(['fleet_audit.py', 'fleet_registry_read.py', 'scheduler_health.py'])
