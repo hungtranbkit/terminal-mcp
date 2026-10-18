@@ -59,6 +59,8 @@ def standard_routes(worker, landed_url="https://example.com/"):
     worker.routes[("POST", "/tabs/t1/click")] = lambda p, b: (200, {"ok": True, "url": landed_url})
     worker.routes[("POST", "/tabs/t1/type")] = lambda p, b: (200, {"ok": True})
     worker.routes[("POST", "/tabs/t1/scroll")] = lambda p, b: (200, {"ok": True})
+    worker.routes[("POST", "/tabs/t1/evaluate")] = lambda p, b: (200, {"ok": True, "result": {
+        "bx": 0, "by": 0, "x": 0, "y": 500, "maxX": 0, "maxY": 2000}})
     worker.routes[("GET", "/tabs/t1/screenshot")] = lambda p, b: (200, b"\x89PNG\r\n\x1a\n" + b"0" * 10)
     worker.routes[("DELETE", "/sessions/")] = lambda p, b: (200, {"ok": True})
     worker.routes[("GET", "/health")] = lambda p, b: (200, {"ok": True, "browserRunning": True,
@@ -243,9 +245,8 @@ def test_idempotent_reads_retry_but_posts_do_not():
     assert len(worker.calls) == 2
     worker.calls.clear()
     worker.fail.append((503, {"error": "busy"}))
-    result = provider.run("scroll", agent_id="a", tab_id="t1")
+    result = provider.run("click", agent_id="a", tab_id="t1", ref="e1", allow_mutations=True)
     assert result["status"] == "ERROR" and len(worker.calls) == 1
-    assert "scroll before typing" in result["hint"]
 
 
 def test_unreachable_and_timeout_classified():
@@ -301,7 +302,14 @@ def test_live_worker_example_com(tmp_path):
         # Upstream v1.18.1 screenshots intermittently time out ("waiting for
         # fonts"); the provider must classify that, never crash or hang.
         shot = provider.run("screenshot", agent_id="pytest-live", tab_id=tab)
-        assert shot["status"] == "OK" or shot["error"] == "CAMOFOX_UPSTREAM_ERROR", shot
+        assert shot["status"] == "OK" or (shot["error"] in ("CAMOFOX_UPSTREAM_ERROR", "CAMOFOX_TIMEOUT")
+                                          and shot["fallback_call"]["tool"] == "browser_screenshot"), shot
+        assert shot["duration_ms"] < 15_000
+        # example.com fits the viewport: scroll reports the edge, fast, no wheel.
+        flat = provider.run("scroll", agent_id="pytest-live", tab_id=tab)
+        if flat.get("error") != "CAMOFOX_TAB_BUSY":  # busy only if the screenshot timed out
+            assert flat["status"] == "OK" and flat["scrolled"] is False, flat
+            assert flat["duration_ms"] < 3_000
         assert provider.run("list_tabs", agent_id="other-agent")["count"] == 0
         assert provider.run("click", agent_id="pytest-live", tab_id=tab, ref="e999",
                             allow_mutations=True)["status"] == "ERROR"
@@ -342,12 +350,16 @@ def test_live_worker_type_scroll_on_local_fixture():
                                url=f"http://127.0.0.1:{server.server_port}/form")
         assert created["status"] == "OK", created
         tab = created["tab_id"]
-        # Scroll first: upstream v1.18.1 wheel hangs once an input has focus.
         scrolled = provider.run("scroll", agent_id="pytest-fixture", tab_id=tab)
-        assert scrolled["status"] == "OK" or "hint" in scrolled, scrolled
+        assert scrolled["status"] == "OK" and scrolled["scrolled"] is True, scrolled
         typed = provider.run("type", agent_id="pytest-fixture", tab_id=tab, selector="#q",
                              text="hello camofox", allow_mutations=True)
         assert typed["status"] == "OK", typed
+        # The input now has focus (upstream's wheel always hung here); the
+        # scrollBy path must still scroll, fast, without typing into the field.
+        after = provider.run("scroll", agent_id="pytest-fixture", tab_id=tab)
+        assert after["status"] == "OK" and after["scrolled"] is True, after
+        assert after["duration_ms"] < 3_000
         assert "row 1" in provider.run("snapshot", agent_id="pytest-fixture", tab_id=tab)["snapshot"]
     finally:
         provider.run("close_all", agent_id="pytest-fixture")
@@ -364,3 +376,116 @@ def test_build_mcp_registers_camofox_only_when_enabled(monkeypatch):
     monkeypatch.setenv("TERMINAL_MCP_CAMOFOX_ENABLED", "1")
     enabled_names = set(build_mcp()._tool_manager._tools)
     assert enabled_names - default_names == {"camofox_browser"}
+
+
+# -- upstream hang mitigation (constant scrollBy, busy cooldown, screenshot fast-fail) --
+
+def scroll_route(worker, moved=True, maxY=2000):
+    def handler(p, b):
+        y = 500 if moved else 0
+        return 200, {"ok": True, "result": {"bx": 0, "by": 0, "x": 0, "y": y, "maxX": 0, "maxY": maxY}}
+    worker.routes[("POST", "/tabs/t1/evaluate")] = handler
+
+
+def test_scroll_uses_constant_scrollby_template_not_the_wheel():
+    from terminal_mcp import camofox_provider as cp
+    provider, worker = make()
+    standard_routes(worker)
+    scroll_route(worker)
+    result = provider.run("scroll", agent_id="a", tab_id="t1", amount=700)
+    assert result["status"] == "OK" and result["scrolled"] is True
+    assert result["position"] == {"x": 0, "y": 500, "max_y": 2000}
+    assert not any(c["url"].split("?")[0].endswith("/scroll") for c in worker.calls)
+    sent = [c["body"]["expression"] for c in worker.calls if "/evaluate" in c["url"]]
+    assert sent == [cp._SCROLL_SCRIPT.format(dx=0, dy=700)]
+    assert "evaluate" not in cp.ACTIONS
+
+
+@pytest.mark.parametrize("direction,dx,dy", [("down", 0, 500), ("up", 0, -500),
+                                             ("right", 500, 0), ("left", -500, 0)])
+def test_scroll_direction_mapping_and_integer_only_inputs(direction, dx, dy):
+    from terminal_mcp import camofox_provider as cp
+    provider, worker = make()
+    standard_routes(worker)
+    scroll_route(worker)
+    provider.run("scroll", agent_id="a", tab_id="t1", direction=direction)
+    sent = [c["body"]["expression"] for c in worker.calls if "/evaluate" in c["url"]]
+    assert sent == [cp._SCROLL_SCRIPT.format(dx=dx, dy=dy)]
+    bad = provider.run("scroll", agent_id="a", tab_id="t1", amount="1); fetch('x')")
+    assert bad["error"] == "CAMOFOX_BAD_REQUEST"
+    assert provider.run("scroll", agent_id="a", tab_id="t1", direction="sideways")["error"] == "CAMOFOX_BAD_REQUEST"
+
+
+def test_scroll_reports_edge_without_error():
+    provider, worker = make()
+    standard_routes(worker)
+    scroll_route(worker, moved=False, maxY=0)
+    result = provider.run("scroll", agent_id="a", tab_id="t1")
+    assert result["status"] == "OK" and result["scrolled"] is False
+    assert result["reason"] == "at_edge_or_not_scrollable"
+
+
+def test_scroll_bad_response_classified():
+    provider, worker = make()
+    standard_routes(worker)
+    worker.routes[("POST", "/tabs/t1/evaluate")] = lambda p, b: (200, {"ok": True, "result": "nope"})
+    assert provider.run("scroll", agent_id="a", tab_id="t1")["error"] == "CAMOFOX_BAD_RESPONSE"
+
+
+def test_scroll_timeout_marks_tab_busy_then_fails_fast_until_cooldown():
+    now = {"t": 100.0}
+    provider, worker = make(retries=0)
+    provider.clock = lambda: now["t"]
+    standard_routes(worker)
+    worker.routes[("POST", "/tabs/t1/evaluate")] = lambda p, b: (500, {"error": "Internal server error"})
+    first = provider.run("scroll", agent_id="a", tab_id="t1")
+    assert first["error"] == "CAMOFOX_UPSTREAM_ERROR" and first["retry_after_seconds"] == 32
+    calls_before = len(worker.calls)
+    busy = provider.run("click", agent_id="a", tab_id="t1", ref="e1", allow_mutations=True)
+    assert busy["error"] == "CAMOFOX_TAB_BUSY" and busy["duration_ms"] < 1000
+    assert provider.run("snapshot", agent_id="a", tab_id="t1")["error"] == "CAMOFOX_TAB_BUSY"
+    assert len(worker.calls) == calls_before  # nothing queued behind the upstream lock
+    # another agent / tab is unaffected; list and close still work
+    assert provider.run("list_tabs", agent_id="a")["status"] == "OK"
+    now["t"] += 33
+    assert provider.run("snapshot", agent_id="a", tab_id="t1")["status"] == "OK"
+
+
+def test_close_clears_busy_state():
+    provider, worker = make(retries=0)
+    standard_routes(worker)
+    worker.routes[("POST", "/tabs/t1/evaluate")] = lambda p, b: (500, {"error": "x"})
+    provider.run("scroll", agent_id="a", tab_id="t1")
+    assert provider.run("close_tab", agent_id="a", tab_id="t1")["status"] == "OK"
+    assert provider._busy_until == {}
+
+
+def test_screenshot_timeout_fails_fast_with_default_engine_fallback(tmp_path):
+    provider, worker = make(retries=0, screenshots_enabled=True, artifact_dir=str(tmp_path))
+    standard_routes(worker)
+    worker.routes[("GET", "/tabs/t1/screenshot")] = lambda p, b: (500, {"error": "Internal server error"})
+    created = provider.run("create_tab", agent_id="a", url="https://example.com/")
+    assert created["status"] == "OK"
+    shot = provider.run("screenshot", agent_id="a", tab_id="t1")
+    assert shot["error"] == "CAMOFOX_UPSTREAM_ERROR" and shot["retry_after_seconds"] == 32
+    assert shot["fallback_call"] == {"tool": "browser_screenshot", "url": "https://example.com/"}
+    assert provider.run("screenshot", agent_id="a", tab_id="t1")["error"] == "CAMOFOX_TAB_BUSY"
+
+
+def test_screenshot_and_scroll_use_short_client_timeouts():
+    seen = {}
+
+    def transport(method, url, body, headers, timeout):
+        seen[url.split("?")[0].rsplit("/", 1)[-1]] = timeout
+        if url.endswith("/evaluate"):
+            return 200, b'{"result": {"bx": 0, "by": 0, "x": 0, "y": 500, "maxX": 0, "maxY": 900}}', ""
+        if "/screenshot" in url:
+            return 200, b"\x89PNG\r\n\x1a\n0", "image/png"
+        return 200, b"{}", ""
+
+    config = CamofoxConfig(enabled=True, screenshots_enabled=True, artifact_dir="/tmp")
+    client = CamofoxClient(config, transport=transport, key_loader=lambda _p: KEY, sleep=lambda _s: None)
+    provider = CamofoxBrowser(config, client=client, resolve_dns=False)
+    provider.run("scroll", agent_id="a", tab_id="t1")
+    provider.run("screenshot", agent_id="a", tab_id="t1")
+    assert seen["evaluate"] <= 10 and seen["screenshot"] <= 12 and "scroll" not in seen

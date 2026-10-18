@@ -1,0 +1,30 @@
+# Optional SSH local forward from a Terminal MCP node (Dell/HP) to the
+# loopback-only Camofox worker on m910. DEFAULT OFF: installed by
+# deploy/camofox/camofox-tunnel.sh, started only on request, never enabled
+# at boot by the script unless --enable is passed.
+#
+# Listens on 127.0.0.1 only. The worker still requires its access key, so
+# the forward adds reachability, not authority. Settings come from
+# %h/.config/camofox/tunnel.env (CAMOFOX_TUNNEL_HOST, CAMOFOX_TUNNEL_LOCAL_PORT,
+# CAMOFOX_TUNNEL_IDENTITY).
+[Unit]
+Description=SSH forward 127.0.0.1:<local port> -> m910 Camofox 127.0.0.1:9377 (operator-run, default off)
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/camofox/tunnel.env
+ExecStart=/usr/bin/ssh -F none -N -T \
+  -i ${CAMOFOX_TUNNEL_IDENTITY} -o IdentitiesOnly=yes -o BatchMode=yes \
+  -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=20 -o ServerAliveCountMax=3 \
+  -o ClearAllForwardings=no -o PermitLocalCommand=no \
+  -L 127.0.0.1:${CAMOFOX_TUNNEL_LOCAL_PORT}:127.0.0.1:9377 ${CAMOFOX_TUNNEL_HOST}
+Restart=on-failure
+RestartSec=15
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
