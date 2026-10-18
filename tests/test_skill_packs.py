@@ -483,6 +483,8 @@ def _fake_accuracy(monkeypatch, body: str) -> None:
 
 def test_selfcheck_reports_the_real_count_and_exit_code(fake_kit, monkeypatch):
     _fake_accuracy(monkeypatch, "print('  PASS  Tokens valid')\nprint('  FAIL  axe sample-app')\n"
+                                "print('      FAIL - 3 state(s) below WCAG AA:')\n"
+                                "print(' RESULT: 2/3 checks passed  =  67%')\n"
                                     "print('  PASS  RTL')\nimport sys; sys.exit(1)\n")
     result = sp.selfcheck()
     assert (result["verdict"], result["exit_code"], result["passed"], result["total"]) == (sp.FAIL, 1, 2, 3)

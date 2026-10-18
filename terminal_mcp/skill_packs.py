@@ -1218,7 +1218,9 @@ def run_gate(gate_name: str, paths: Sequence[str], extra: Sequence[str] = (), *,
     return run
 
 
-_SELFCHECK_LINE = re.compile(r"^\s+(PASS|FAIL)\s+(.+?)\s*$", re.MULTILINE)
+# The check list is exactly "  PASS  name" / "  FAIL  name"; a gate's own
+# detail lines ("      FAIL - 3 state(s) ...") are indented deeper.
+_SELFCHECK_LINE = re.compile(r"^ {2}(PASS|FAIL) {2}(\S.*?)\s*$", re.MULTILINE)
 SELFCHECK_TIMEOUT_SECONDS = 1800
 
 
@@ -1251,9 +1253,12 @@ def selfcheck(pack_id: str = "ux-ui-agent-skills", *, record: bool = True,
         except subprocess.TimeoutExpired as exc:
             code, out = None, f"timed out after {timeout}s\n{exc.stdout or ''}"
         checks = _SELFCHECK_LINE.findall(out)
-        passed = sum(1 for status, _ in checks if status == PASS)
-        outcome = PASS if code == 0 and checks and passed == len(checks) else (FAIL if code == 1 else ERROR)
-        result = {"verdict": outcome, "exit_code": code, "passed": passed, "total": len(checks),
+        passed, total = sum(1 for status, _ in checks if status == PASS), len(checks)
+        stated = re.search(r"RESULT:\s*(\d+)/(\d+) checks passed", out)
+        if stated:  # upstream's own count wins over our reading of its lines
+            passed, total = int(stated.group(1)), int(stated.group(2))
+        outcome = PASS if code == 0 and total and passed == total else (FAIL if code == 1 else ERROR)
+        result = {"verdict": outcome, "exit_code": code, "passed": passed, "total": total,
                   "failed": [name for status, name in checks if status == FAIL], "dev_deps": deps,
                   "duration_s": round(time.monotonic() - started, 2),
                   "output": out.strip() if len(out) <= MAX_OUTPUT_CHARS else "...\n" + out.strip()[-MAX_OUTPUT_CHARS:]}
