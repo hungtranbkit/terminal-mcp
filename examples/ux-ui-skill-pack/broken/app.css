@@ -1,0 +1,10 @@
+/* Broken on purpose: every rule below is something a gate must catch. */
+body { margin: 0; font-family: Arial, sans-serif; color: #000; background: #fff; }
+main { width: 900px; padding: 24px; }
+h1 { font-size: 28px; }
+p { color: #b8b8b8; }
+.cards { display: flex; gap: 16px; }
+.card { width: 300px; border-left: 4px solid #6366f1; border-radius: 12px; padding: 16px; background: linear-gradient(135deg, #6366f1, #8b5cf6); }
+.btn { padding: 2px 4px; font-size: 11px; border-radius: 12px; background: #e5e7eb; color: #9ca3af; border: 0; margin-left: 8px; }
+.btn-danger { background: var(--color-action-primary); color: var(--color-text-on-action); }
+.ghost { color: var(--color-does-not-exist); }

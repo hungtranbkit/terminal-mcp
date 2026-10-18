@@ -422,6 +422,9 @@ async def test_server_registers_v1_and_binding_tools():
         "terminal_ui_workflow_plan",
         "terminal_ui_workflow_audit_gate",
         "terminal_ui_workflow_policy",
+        # Shared skill packs (issue #71): read-only status of the pinned
+        # UX/UI kit on this node. Install/rollback stay operator CLI steps.
+        "terminal_skill_pack_status",
         # Durable Agent identity + versioned Skill Registry (8bef6bd). An
         # agent is a durable record rather than whatever process happens to
         # own a pane, and a skill is bound to it by version -- so both need a

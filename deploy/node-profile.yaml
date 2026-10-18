@@ -149,6 +149,13 @@ skill_packs:
     min_version: "1.84.1.0"
     required: false
     install_hint: "see docs/GSTACK_INTEGRATION.md -- operator-run, pinned to a commit"
+  - id: ux-ui-agent-skills
+    provider: terminal-mcp-pack
+    pack: ux-ui-agent-skills
+    description: Shared UX/UI design-system kit + 23 MCP gates (plugin87, MIT), pinned in deploy/skill-packs/.
+    hosts: [claude, codex]
+    required: false
+    install_hint: "terminal-mcp-skill-packs sync   (docs/UX_UI_SKILL_PACK.md)"
 
 auth:
   - id: claude_auth

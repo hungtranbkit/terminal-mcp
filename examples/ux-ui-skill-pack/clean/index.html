@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Release notes</title>
+  <link rel="stylesheet" href="theme.css">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <main>
+    <h1>Release notes</h1>
+    <p>Three changes shipped this week. Each one is behind a flag you can switch off from the settings page.</p>
+    <div class="actions">
+      <button class="btn btn-primary" type="button" id="open-dialog">Read the summary</button>
+      <button class="btn" type="button" id="toggle-details" aria-expanded="false" aria-controls="details">Show details</button>
+    </div>
+    <p id="details" hidden>Rollout reaches every account by Friday. Nothing changes for accounts that opted out.</p>
+    <section class="cards" aria-label="Changes">
+      <article class="card"><h2>Faster search</h2><p>Results now load while you type.</p></article>
+      <article class="card"><h2>Export to CSV</h2><p>Every table can be downloaded as a file.</p></article>
+      <article class="card"><h2>Audit log</h2><p>Admins can see who changed a setting and when.</p></article>
+    </section>
+    <p><a href="#top">Back to top</a></p>
+  </main>
+  <dialog id="summary" aria-labelledby="summary-title">
+    <h2 id="summary-title">Summary</h2>
+    <p>Search, export and audit log are live.</p>
+    <button class="btn" type="button" id="close-dialog">Close</button>
+  </dialog>
+  <script>
+    const dialog = document.getElementById('summary');
+    const opener = document.getElementById('open-dialog');
+    opener.addEventListener('click', () => dialog.showModal());
+    document.getElementById('close-dialog').addEventListener('click', () => dialog.close());
+    dialog.addEventListener('close', () => opener.focus());
+    const toggle = document.getElementById('toggle-details');
+    toggle.addEventListener('click', () => {
+      const open = toggle.getAttribute('aria-expanded') === 'true';
+      toggle.setAttribute('aria-expanded', String(!open));
+      document.getElementById('details').hidden = open;
+      toggle.textContent = open ? 'Show details' : 'Hide details';
+    });
+  </script>
+</body>
+</html>
