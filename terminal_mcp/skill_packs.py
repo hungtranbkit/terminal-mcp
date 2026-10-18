@@ -553,7 +553,13 @@ def install(manifest: Manifest, *, install_browser: bool = True, force: bool = F
         if target.exists() and not force and verify_release(manifest, target)["ok"]:
             reused = True
         else:
-            staging = Path(tempfile.mkdtemp(prefix=f".staging-{manifest.release_name}-", dir=str(releases)))
+            # Not tempfile's private-dir helper (tests/test_ephemeral_state.py):
+            # a named dir inside releases/, removed below on failure, swept by
+            # _prune if this process dies. Stdlib only, like the rest of the
+            # standalone copy.
+            staging = releases / f".staging-{manifest.release_name}-{os.getpid()}"
+            _remove_tree(staging)
+            staging.mkdir()
             try:
                 kit = staging / "kit"
                 proc = _run([git, "-c", "advice.detachedHead=false", "clone", "--quiet", "--depth", "1",
@@ -604,6 +610,8 @@ def install(manifest: Manifest, *, install_browser: bool = True, force: bool = F
 
 def _prune(pack_id: str) -> None:
     releases = pack_dir(pack_id) / "releases"
+    for leftover in releases.glob(".staging-*"):  # a sync that died mid-install
+        _remove_tree(leftover)
     keep = {p for p in (_current_release(pack_id), _previous_release(pack_id)) if p}
     candidates = sorted((p for p in releases.iterdir() if p.is_dir() and not p.name.startswith(".")),
                         key=lambda p: p.stat().st_mtime, reverse=True)

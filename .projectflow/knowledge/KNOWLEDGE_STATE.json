@@ -230,11 +230,12 @@
         "terminal_mcp/project_knowledge.py",
         "terminal_mcp/context_pack.py",
         "terminal_mcp/skill_provider.py",
+        "terminal_mcp/skill_packs.py",
         "terminal_mcp/context_compiler.py",
         "terminal_mcp/graphify_bridge.py",
         "terminal_mcp/skill_packages.py"
       ],
-      "summary": "Project Knowledge Map -- what a worker should read BEFORE it reads the repo"
+      "summary": "Shared skill packs: one pinned, read-only copy per node, used by every session"
     },
     "mcp_surface": {
       "last_verified_at": "2026-09-24T06:59:12.691110+00:00",

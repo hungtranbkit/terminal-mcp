@@ -90,7 +90,7 @@ GROUPS: dict[str, list[str]] = {
                       "work_reuse.py", "work_writeback.py"],
     "work_telemetry": ["work_telemetry.py", "work_telemetry_runtime.py",
                        "efficiency_benchmark.py", "metrics.py"],
-    "knowledge": ["project_knowledge.py", "context_pack.py", "skill_provider.py"],
+    "knowledge": ["project_knowledge.py", "context_pack.py", "skill_provider.py", "skill_packs.py"],
     "unified_memory": ["unified_memory.py", "memory_sync.py",
                        "memory_projection.py", "memory_runtime.py"],
     "procedures": ["procedures.py"],
