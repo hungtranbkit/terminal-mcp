@@ -294,6 +294,13 @@ def test_the_launcher_runs_from_a_standalone_copy(isolated):
     (1, "  at app.css:12:5  raw hex #ff0000", sp.FAIL),
     (1, "Traceback (most recent call last):\n  File \"x.py\", line 1", sp.ERROR),
     (1, "TypeError: boom\n    at run (file:///kit/scripts/x.mjs:10:3)", sp.ERROR),
+    (1, "node:internal/modules/run_main:107\n    triggerUncaughtException(\n\nTypeError: x\n"
+        "    at /kit/scripts/axe_audit.mjs:34:28 {", sp.ERROR),
+    # Real m910 output: Chrome's GPU process died, so the gate measured nothing.
+    (1, "node:internal/modules/run_main:107\n    triggerUncaughtException(\n\n"
+        "browser.newPage: Target page, context or browser has been closed\n"
+        "[err] FATAL:gpu_data_manager_impl_private.cc:417] GPU process isn't usable. Goodbye.\n"
+        "    at /kit/scripts/axe_audit.mjs:34:28 {", sp.BLOCKED),
     (None, "timed out", sp.ERROR),
     (139, "", sp.ERROR),
 ])

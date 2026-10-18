@@ -990,10 +990,17 @@ def status(pack_id: str, *, verify: bool = True) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 _CATALOGUE_JS = ("import(process.argv[1]).then(m => process.stdout.write(JSON.stringify(m.catalogue())))"
                  ".catch(e => { console.error(String(e)); process.exit(2); })")
+# A browser that could not start, or died under the gate, measured nothing:
+# BLOCKED, never FAIL. Seen live on m910: Chrome launched, its GPU process
+# could not start, and every render gate exited 1 with "Target page, context
+# or browser has been closed".
 _BROWSER_MISSING = re.compile(r"playwright not installed|Executable doesn't exist|browserType\.launch|"
-                              r"Failed to launch|Host system is missing dependencies", re.IGNORECASE)
-_CRASH = re.compile(r"Traceback \(most recent call last\)|"
-                    r"^\s+at (?:\S+ \()?(?:file://|node:|/)\S*:\d+:\d+\)?$", re.MULTILINE)
+                              r"Failed to launch|Host system is missing dependencies|"
+                              r"Target (?:page, context or browser|closed)|browser has been closed|"
+                              r"GPU process isn't usable|Browser closed", re.IGNORECASE)
+# An exception nobody caught is a crash, not a finding.
+_CRASH = re.compile(r"Traceback \(most recent call last\)|triggerUncaughtException|"
+                    r"^\s+at (?:\S+ \()?(?:file://|node:|/)\S*:\d+:\d+\)?(?: \{)?$", re.MULTILINE)
 
 FILE_GATES_ON_PATHS = ("check_no_emoji", "lint_hardcodes", "lint_native_select")
 TOKEN_GATES = ("validate_tokens", "validate_contrast")
