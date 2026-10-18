@@ -77,9 +77,10 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any
 
 PACK_HOME_ENV = "TERMINAL_MCP_SKILL_PACK_HOME"
 MANIFEST_DIR_ENV = "TERMINAL_MCP_SKILL_PACK_MANIFESTS"
@@ -700,7 +701,7 @@ def router_skill_text(manifest: Manifest, *, host: str) -> str:
         "",
         "## Kit skills (read only the one the task needs)",
         "",
-        f"Read `KIT/.claude/skills/<name>/SKILL.md` on demand. When a kit skill says `scripts/...`, "
+        "Read `KIT/.claude/skills/<name>/SKILL.md` on demand. When a kit skill says `scripts/...`, "
         "`tokens/...` or `.claude/rules/...`, that path is inside KIT; run it against the PROJECT's files.",
         "",
     ]
@@ -843,7 +844,7 @@ def _codex_mcp(manifest: Manifest, *, register: bool) -> dict[str, Any]:
     if register:
         if ours:
             return {"host": "codex", "status": "PRESENT"}
-        if re.search(rf"^\[mcp_servers\.{re.escape(name)}\]", text, re.M):
+        if re.search(rf"^\[mcp_servers\.{re.escape(name)}\]", text, re.MULTILINE):
             return {"host": "codex", "status": "CONFLICT", "detail": f"{config} already defines {name}"}
         if config.is_file():
             shutil.copy2(config, config.with_name(f"config.toml.bak-skillpack-{int(time.time())}"))
@@ -990,9 +991,9 @@ def status(pack_id: str, *, verify: bool = True) -> dict[str, Any]:
 _CATALOGUE_JS = ("import(process.argv[1]).then(m => process.stdout.write(JSON.stringify(m.catalogue())))"
                  ".catch(e => { console.error(String(e)); process.exit(2); })")
 _BROWSER_MISSING = re.compile(r"playwright not installed|Executable doesn't exist|browserType\.launch|"
-                              r"Failed to launch|Host system is missing dependencies", re.I)
+                              r"Failed to launch|Host system is missing dependencies", re.IGNORECASE)
 _CRASH = re.compile(r"Traceback \(most recent call last\)|"
-                    r"^\s+at (?:\S+ \()?(?:file://|node:|/)\S*:\d+:\d+\)?$", re.M)
+                    r"^\s+at (?:\S+ \()?(?:file://|node:|/)\S*:\d+:\d+\)?$", re.MULTILINE)
 
 FILE_GATES_ON_PATHS = ("check_no_emoji", "lint_hardcodes", "lint_native_select")
 TOKEN_GATES = ("validate_tokens", "validate_contrast")
@@ -1210,7 +1211,7 @@ def run_gate(gate_name: str, paths: Sequence[str], extra: Sequence[str] = (), *,
     return run
 
 
-_SELFCHECK_LINE = re.compile(r"^\s+(PASS|FAIL)\s+(.+?)\s*$", re.M)
+_SELFCHECK_LINE = re.compile(r"^\s+(PASS|FAIL)\s+(.+?)\s*$", re.MULTILINE)
 SELFCHECK_TIMEOUT_SECONDS = 1800
 
 
@@ -1501,7 +1502,7 @@ def mcp_config(host: str, manifest: Manifest) -> str:
 _UI_WORDS = re.compile(
     r"\b(ui|ux|frontend|front-end|css|tailwind|html|design[- ]system|design tokens?|theme|"
     r"ui components?|layout|responsive|accessib\w*|a11y|wcag|colou?r contrast|landing page|web ?page|"
-    r"figma|mockup|typography|dark mode|button|modal|navbar|stylesheet)\b", re.I)
+    r"figma|mockup|typography|dark mode|button|modal|navbar|stylesheet)\b", re.IGNORECASE)
 
 
 def activation(task: str, pack_id: str = "ux-ui-agent-skills") -> dict[str, Any]:
