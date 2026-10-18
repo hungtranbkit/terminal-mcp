@@ -1,0 +1,36 @@
+/* Project theme: the ONLY file allowed to hold raw values. The kit never replaces it. */
+:root {
+  --color-text-primary: #1f2933;
+  --color-text-secondary: #4b5563;
+  --color-text-link: #1d4ed8;
+  --color-text-on-action: #ffffff;
+  --color-surface-page: #ffffff;
+  --color-surface-card: #f8fafc;
+  --color-surface-raised: #f1f5f9;
+  --color-action-primary: #1d4ed8;
+  --color-action-primary-hover: #1e40af;
+  --color-border-strong: #64748b;
+  --color-border-default: #cbd5e1;
+  --color-focus-ring: #1d4ed8;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --radius-sm: 0.25rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --font-body: system-ui, sans-serif;
+  --font-size-body: 1rem;
+  --font-size-small: 0.875rem;
+  --font-size-h1: 1.75rem;
+  --font-size-h2: 1.25rem;
+  --line-height-body: 1.5;
+  --measure: 65ch;
+  --target-min: 2.75rem;
+  --border-width: 1px;
+  --focus-width: 2px;
+  --duration-fast: 150ms;
+  --content-max: 60rem;
+}

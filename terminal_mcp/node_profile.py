@@ -380,6 +380,8 @@ def check_skill_pack(entry: dict[str, Any]) -> Check:
     from .skill_provider import STATUS_DRIFT, STATUS_READY, GstackProvider
 
     pack_id = entry["id"]
+    if entry.get("provider") == "terminal-mcp-pack":
+        return _check_shared_pack(entry)
     if entry.get("provider") != "gstack":
         return Check(pack_id, "skill_pack", UNKNOWN, False,
                      detail=f"no reader for provider {entry.get('provider')!r}")
@@ -402,6 +404,37 @@ def check_skill_pack(entry: dict[str, Any]) -> Check:
     return Check(pack_id, "skill_pack", MISSING, False, detail=detail,
                  wanted_version=entry.get("min_version"),
                  remediation=entry.get("install_hint"))
+
+
+def _check_shared_pack(entry: dict[str, Any]) -> Check:
+    """A pack Terminal MCP itself installs (skill_packs.py): verified pin,
+    runtime and last gate result, so the fleet view answers "which nodes can
+    run the UI gates" without a second probe. DEGRADED (installed, but no
+    node/browser for the render gates) is reported as DRIFT: present, not
+    usable as pinned."""
+    from . import skill_packs
+
+    pack_id = entry["id"]
+    result = skill_packs.status(entry.get("pack") or pack_id, verify=True)
+    state = result.get("state")
+    manifest = result.get("manifest") or {}
+    last = result.get("last_gate") or {}
+    detail = f"{state}: {result.get('detail', '')}"
+    if last:
+        detail += f"; last gate {last.get('verdict')} at {last.get('at')}"
+    routers = result.get("router_skills") or {}
+    if routers:
+        detail += "; router " + ", ".join(f"{h}={s.lower()}" for h, s in sorted(routers.items()))
+    common = {"found_version": (result.get("release") or None), "wanted_version": manifest.get("version"),
+              "remediation": entry.get("install_hint")}
+    if state == skill_packs.READY:
+        return Check(pack_id, "skill_pack", PASS, False, detail=detail, found_version=common["found_version"],
+                     wanted_version=common["wanted_version"])
+    if state in (skill_packs.DRIFT, skill_packs.DEGRADED, skill_packs.TAMPERED):
+        return Check(pack_id, "skill_pack", DRIFT, False, detail=detail, **common)
+    if state == skill_packs.DISABLED:
+        return Check(pack_id, "skill_pack", SKIPPED, False, detail=detail, **common)
+    return Check(pack_id, "skill_pack", MISSING, False, detail=detail, **common)
 
 
 def detect_roles() -> tuple[str, ...]:

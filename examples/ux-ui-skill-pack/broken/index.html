@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Release notes</title>
+  <link rel="stylesheet" href="theme.css">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <main>
+    <h1>Release notes 🚀</h1>
+    <p style="color:#cccccc">Three changes shipped this week.</p>
+    <div>
+      <div class="btn" onclick="document.getElementById('summary').showModal()">Read the summary</div>
+      <button class="btn btn-danger" type="button">Delete account</button>
+      <button class="btn" type="button" aria-expanded="false">Show details</button>
+      <select><option>All teams</option><option>Platform</option></select>
+      <input type="text" placeholder="Search">
+    </div>
+    <section class="cards">
+      <article class="card"><h2 class="ghost">Faster search</h2><p>Results now load while you type.</p></article>
+      <article class="card"><h2>Export to CSV</h2><p>Every table can be downloaded as a file.</p></article>
+      <article class="card"><h2>Audit log</h2><p>Admins can see who changed a setting and when.</p></article>
+    </section>
+  </main>
+  <dialog id="summary"><p>Search, export and audit log are live.</p><span>Close</span></dialog>
+</body>
+</html>

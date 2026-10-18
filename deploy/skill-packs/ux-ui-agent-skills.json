@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "id": "ux-ui-agent-skills",
+  "display_name": "UX/UI Agent Skills",
+  "version": "2.9.8",
+  "source": {
+    "repo": "https://github.com/plugin87/ux-ui-agent-skills.git",
+    "tag": "v2.9.8",
+    "commit": "62092bd83bc3df0bcb9a2b3b643305ab11c547da",
+    "tree_sha256": "7debe02179890b627db17511683134f423d1a54afd84d27eadd1f8fbf360b44c",
+    "tree_files": 640
+  },
+  "license": {
+    "spdx": "MIT",
+    "file": "LICENSE",
+    "sha256": "c8f168486c91894115315055a08e017cedb41189b331196f879c74b985a51f81",
+    "copyright": "Copyright (c) 2026 Thientan Soparat"
+  },
+  "upstream_counts": {
+    "claude_skills": 25,
+    "design_systems": 138,
+    "advertised_gates": 52,
+    "mcp_gates": 23,
+    "mcp_browser_gates": 16,
+    "upstream_mcp_tools": 6
+  },
+  "runtime": {
+    "node_min": "20",
+    "playwright": "1.63.0"
+  },
+  "router_skill": "ux-ui-kit",
+  "hosts": ["claude", "codex"],
+  "register_mcp": {
+    "claude": true,
+    "codex": false
+  },
+  "mcp_server_name": "ux-ui-gates",
+  "audited": "2026-10-18: tag v2.9.8 is the latest upstream tag; MIT; package.json declares no runtime dependencies; plugin hooks (SessionStart/PostToolUse/Stop) are NOT installed by Terminal MCP."
+}

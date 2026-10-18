@@ -86,6 +86,16 @@ echo "-> Installing terminal-mcp (pip install -e .)"
 ./.venv/bin/pip install --quiet --upgrade pip
 ./.venv/bin/pip install --quiet -e .
 
+# -- 2b. Shared skill packs (best-effort: a failure never blocks the join) -----
+# One pinned, read-only copy per node plus a lazy router skill for Claude and
+# Codex -- see docs/UX_UI_SKILL_PACK.md. Opt out with TERMINAL_MCP_SKIP_SKILL_PACKS=1.
+if [[ "${TERMINAL_MCP_SKIP_SKILL_PACKS:-0}" != "1" ]]; then
+  echo "-> Syncing shared skill packs (terminal-mcp-skill-packs sync)"
+  ./.venv/bin/terminal-mcp-skill-packs sync --best-effort >/tmp/terminal-mcp-skill-packs-sync.log 2>&1 \
+    && echo "   skill packs: see /tmp/terminal-mcp-skill-packs-sync.log" \
+    || echo "   skill pack sync failed; node join continues (log: /tmp/terminal-mcp-skill-packs-sync.log)"
+fi
+
 # -- 3. This node's own token -------------------------------------------------
 ENV_FILE="$REPO_DIR/node-agent.env"  # legacy migration source only
 TOKEN_FILE="$REPO_DIR/node-agent.token"

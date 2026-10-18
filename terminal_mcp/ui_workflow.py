@@ -222,6 +222,12 @@ SKILL_CATALOG: tuple[SkillRef, ...] = (
     SkillRef(name="ui-ux-pro-max",
              purpose="generic UI support, DELIBERATELY lowest precedence",
              precedence_layer="generic_ui_skill"),
+    SkillRef(name="ux-ui-agent-skills",
+             purpose="shared pinned design-system kit + objective gates (router skill `ux-ui-kit`); "
+                     "references only -- the project's tokens and branding win",
+             precedence_layer="generic_ui_skill",
+             source="github.com/plugin87/ux-ui-agent-skills (MIT), deploy/skill-packs/",
+             revision="v2.9.8@62092bd83bc3"),
     SkillRef(name="awesome-design-agent-skills",
              purpose="curated index only -- never bulk-loaded at runtime",
              precedence_layer="generic_ui_skill",

@@ -6436,6 +6436,25 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
             "document": ui_workflow.policy_document(),
         }
 
+    @server.tool()
+    def terminal_skill_pack_status(pack_id: str = "ux-ui-agent-skills", task: str = "") -> dict:
+        """A shared skill pack on THIS server's node (docs/UX_UI_SKILL_PACK.md):
+        pinned version, provenance and licence, tree verification, node/browser
+        runtime for the gates, router skill per agent host (claude/codex),
+        agent compatibility, rollback history, last gate result and last error.
+
+        With `task`, also says whether that task would activate the pack -- it
+        is for UI work only and unrelated tasks get nothing. Per-node coverage
+        across the fleet is terminal_fleet_environment (its skill_pack checks).
+        Read-only: sync/rollback/disable are the operator CLI
+        `terminal-mcp-skill-packs` on each node."""
+        from . import skill_packs
+
+        result = skill_packs.status(pack_id, verify=True)
+        if task:
+            result["activation"] = skill_packs.activation(task, pack_id)
+        return result
+
     # TMCP-HARNESS-001. One HarnessService per build, sharing the QUEUE's own
     # store -- the harness tables live in that same database (see the
     # migration ladder in queue_store), so a second connection to a second

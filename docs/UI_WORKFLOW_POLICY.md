@@ -71,6 +71,7 @@ missing skill is reported missing.
 | `web-design-guidelines` | `web_design_guidelines` | post-implementation audit gate (Vercel Web Design Guidelines) |
 | `frontend-design` | `generic_ui_skill` | Anthropic frontend-design skill; generic UI support |
 | `ui-ux-pro-max` | `generic_ui_skill` | generic UI support, DELIBERATELY lowest precedence |
+| `ux-ui-agent-skills` | `generic_ui_skill` | shared pinned design-system kit + objective gates (router skill `ux-ui-kit`); references only -- the project's tokens and branding win |
 | `awesome-design-agent-skills` (catalog only) | `generic_ui_skill` | curated index only -- never bulk-loaded at runtime |
 
 ## Verification
