@@ -31,7 +31,7 @@
   "router_skill": "ux-ui-kit",
   "hosts": ["claude", "codex"],
   "register_mcp": {
-    "claude": true,
+    "claude": false,
     "codex": false
   },
   "mcp_server_name": "ux-ui-gates",

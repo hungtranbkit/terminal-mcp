@@ -723,8 +723,9 @@ def router_skill_text(manifest: Manifest, *, host: str) -> str:
         "skipped) - never report that as a pass. Report the printed verdict line and per-gate exit codes.",
         "",
     ]
-    if host == "claude" and manifest.register_mcp.get("claude"):
-        lines.append(f"The same gates are available as the `{manifest.mcp_server_name}` MCP server "
+    if host == "claude":
+        lines.append(f"Optional: the same gates as the `{manifest.mcp_server_name}` MCP server (opt-in via "
+                     "`terminal-mcp-skill-packs sync --claude-mcp`) "
                      "(review_ui, run_gate, list_gates, get_doctrine, get_design_system, get_tokens, pack_status).")
     elif host == "codex":
         lines.append("Codex: Claude Code hooks and plugin skills are not automatic here; this router skill, "
@@ -857,12 +858,18 @@ def _codex_mcp(manifest: Manifest, *, register: bool) -> dict[str, Any]:
     return {"host": "codex", "status": "UNCHANGED"}
 
 
-def integrate(manifest: Manifest, *, codex_mcp: bool | None = None) -> dict[str, Any]:
+def integrate(manifest: Manifest, *, codex_mcp: bool | None = None,
+              claude_mcp: bool | None = None) -> dict[str, Any]:
+    """Launcher + router skills always; MCP registration only when the
+    manifest or the operator asks. Registering writes the host's USER config
+    (~/.claude.json, ~/.codex/config.toml) and loads the tools into every
+    session, which is the opposite of lazy -- so both default to off."""
     launcher = _install_launcher()
     routers = [_install_router(manifest, host) for host in manifest.hosts]
     mcp = []
     if manifest.mcp_server_name:
-        if "claude" in manifest.hosts and manifest.register_mcp.get("claude"):
+        want_claude = manifest.register_mcp.get("claude") if claude_mcp is None else claude_mcp
+        if "claude" in manifest.hosts and want_claude:
             mcp.append(_claude_mcp(manifest, register=True))
         want_codex = manifest.register_mcp.get("codex") if codex_mcp is None else codex_mcp
         if "codex" in manifest.hosts and want_codex:
@@ -887,7 +894,7 @@ def set_enabled(pack_id: str, enabled: bool) -> dict[str, Any]:
 
 
 def sync(pack_ids: Iterable[str] | None = None, *, install_browser: bool = True,
-         codex_mcp: bool | None = None, force: bool = False) -> dict[str, Any]:
+         codex_mcp: bool | None = None, claude_mcp: bool | None = None, force: bool = False) -> dict[str, Any]:
     """Bring this node to the manifests: install a missing/drifted/tampered
     pin, then (re)write the router skills and launcher. Idempotent."""
     manifests = [load_manifest(p) for p in pack_ids] if pack_ids else list_manifests()
@@ -910,7 +917,7 @@ def sync(pack_ids: Iterable[str] | None = None, *, install_browser: bool = True,
             elif before["state"] == DEGRADED and _current_release(manifest.id):
                 entry["runtime"] = install_runtime(manifest, _current_release(manifest.id),
                                                    install_browser=install_browser)
-            entry["integrate"] = integrate(manifest, codex_mcp=codex_mcp)
+            entry["integrate"] = integrate(manifest, codex_mcp=codex_mcp, claude_mcp=claude_mcp)
             entry["status"] = status(manifest.id, verify=False)["state"]
         except (SkillPackError, OSError, subprocess.SubprocessError) as exc:
             entry["status"] = "ERROR"
@@ -935,6 +942,7 @@ def status(pack_id: str, *, verify: bool = True) -> dict[str, Any]:
     result: dict[str, Any] = {"pack": pack_id, "manifest": manifest.to_dict(), "home": str(pack_dir(pack_id)),
                               "enabled": state.get("enabled", True), "pinned_release": state.get("pinned_release"),
                               "history": (state.get("history") or [])[-5:], "last_gate": state.get("last_gate"),
+                              "last_selfcheck": state.get("last_selfcheck"),
                               "last_error": state.get("last_error"), "launcher": str(launcher_path())
                               if launcher_path().exists() else None}
     routers = {}
@@ -1202,6 +1210,86 @@ def run_gate(gate_name: str, paths: Sequence[str], extra: Sequence[str] = (), *,
     return run
 
 
+_SELFCHECK_LINE = re.compile(r"^\s+(PASS|FAIL)\s+(.+?)\s*$", re.M)
+SELFCHECK_TIMEOUT_SECONDS = 1800
+
+
+def selfcheck(pack_id: str = "ux-ui-agent-skills", *, record: bool = True,
+              timeout: int = SELFCHECK_TIMEOUT_SECONDS) -> dict[str, Any]:
+    """The kit's own `scripts/accuracy_report.mjs` -- the checks behind the
+    README's "52 objective gates" -- run inside the pinned, read-only tree.
+
+    It measures the KIT's examples, not a project: it proves this node can run
+    the gates as upstream intends (browser, node, deps), nothing about a page.
+    Some checks build into the kit (`dist/`) and need its devDependencies, so
+    it runs in a writable scratch copy with `npm ci --ignore-scripts` from the
+    kit's own lockfile; the pinned release stays read-only. The verdict is the
+    script's own exit code; the per-check lines are parsed only to say which
+    checks failed."""
+    node = node_runtime()
+    if not node["ok"]:
+        result = {"verdict": BLOCKED, "exit_code": None, "passed": 0, "total": 0, "failed": [],
+                  "output": node["detail"]}
+    else:
+        kit, deps = _selfcheck_workdir(pack_id)
+        env = dict(os.environ)
+        env["DS_REQUIRE_BROWSER"] = "1"
+        env["CLAUDE_PLUGIN_DATA"] = str(pack_dir(pack_id) / "selfcheck")
+        started = time.monotonic()
+        try:
+            proc = subprocess.run([node["node"], "scripts/accuracy_report.mjs"], cwd=str(kit), capture_output=True,
+                                  text=True, timeout=timeout, env=env)
+            code, out = proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+        except subprocess.TimeoutExpired as exc:
+            code, out = None, f"timed out after {timeout}s\n{exc.stdout or ''}"
+        checks = _SELFCHECK_LINE.findall(out)
+        passed = sum(1 for status, _ in checks if status == PASS)
+        outcome = PASS if code == 0 and checks and passed == len(checks) else (FAIL if code == 1 else ERROR)
+        result = {"verdict": outcome, "exit_code": code, "passed": passed, "total": len(checks),
+                  "failed": [name for status, name in checks if status == FAIL], "dev_deps": deps,
+                  "duration_s": round(time.monotonic() - started, 2),
+                  "output": out.strip() if len(out) <= MAX_OUTPUT_CHARS else "...\n" + out.strip()[-MAX_OUTPUT_CHARS:]}
+    result["summary"] = f"{result['verdict']}: {result['passed']}/{result['total']} upstream accuracy checks passed"
+    if record:
+        with contextlib.suppress(OSError):
+            state = load_state(pack_id)
+            state["last_selfcheck"] = {"at": _now(), "verdict": result["verdict"], "exit_code": result["exit_code"],
+                                       "passed": result["passed"], "total": result["total"],
+                                       "failed": result["failed"][:20], "dev_deps": result.get("dev_deps"),
+                                       "release": _server_version(pack_id)}
+            save_state(pack_id, state)
+    return result
+
+
+def _selfcheck_workdir(pack_id: str) -> tuple[Path, str]:
+    """A writable copy of the current kit with its locked devDependencies,
+    rebuilt only when the release changes. Returns (kit copy, deps note)."""
+    release = _current_release(pack_id)
+    if release is None:
+        raise SkillPackError(f"{pack_id} is not installed on this node; run `terminal-mcp-skill-packs sync`")
+    work = pack_dir(pack_id) / "selfcheck" / release.name
+    kit, marker = work / "kit", work / "deps.json"
+    note = (_read_json(marker, {}) or {}).get("deps")
+    if not kit.is_dir() or not note:
+        _remove_tree(work)
+        work.mkdir(parents=True)
+        shutil.copytree(release / "kit", kit, symlinks=True)
+        _set_writable(kit, True)
+        npm = find_executable("npm")
+        if not npm:
+            note = "not installed: npm not found (checks that need esbuild/react will fail)"
+        elif not (kit / "package-lock.json").is_file():
+            note = "not installed: the kit has no package-lock.json"
+        else:
+            env = dict(os.environ)
+            env["PATH"] = os.pathsep.join([str(Path(npm).parent), env.get("PATH", "")])
+            proc = _run([npm, "ci", "--ignore-scripts", "--no-audit", "--no-fund"], cwd=kit, timeout=900, env=env)
+            note = ("npm ci --ignore-scripts from the kit's package-lock.json" if proc.returncode == 0 else
+                    f"npm ci failed (exit {proc.returncode}): {(proc.stderr or proc.stdout)[-300:]}")
+        _write_json_atomic(marker, {"deps": note, "release": release.name, "at": _now()})
+    return kit, note
+
+
 def _record_gate(pack_id: str, entry: dict[str, Any]) -> None:
     with contextlib.suppress(OSError):
         state = load_state(pack_id)
@@ -1446,6 +1534,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_sync.add_argument("packs", nargs="*")
     p_sync.add_argument("--no-browser", action="store_true", help="do not download Playwright Chromium")
     p_sync.add_argument("--codex-mcp", action="store_true", help="also register the MCP server for Codex")
+    p_sync.add_argument("--claude-mcp", action="store_true",
+                        help="also register the MCP server for Claude Code (user scope, opt-in)")
     p_sync.add_argument("--best-effort", action="store_true", help="always exit 0 (node join must not fail)")
     p_sync.add_argument("--force", action="store_true", help="move past a rollback pin to the manifest's release")
     p_status = sub.add_parser("status")
@@ -1466,6 +1556,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_gate = sub.add_parser("gate", help="run one gate")
     p_gate.add_argument("gate")
     p_gate.add_argument("paths", nargs="+")
+    sub.add_parser("selfcheck", help="upstream accuracy_report (the README's 52 checks) on the pinned kit")
     p_shot = sub.add_parser("screenshot")
     p_shot.add_argument("html")
     p_shot.add_argument("out")
@@ -1483,7 +1574,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.cmd == "sync":
             try:
                 report = sync(args.packs or None, install_browser=not args.no_browser,
-                              codex_mcp=True if args.codex_mcp else None, force=args.force)
+                              codex_mcp=True if args.codex_mcp else None,
+                              claude_mcp=True if args.claude_mcp else None, force=args.force)
             except Exception as exc:  # noqa: BLE001
                 if not args.best_effort:
                     raise
@@ -1518,6 +1610,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             run = run_gate(args.gate, args.paths, unknown)
             print(f"{run['status']}: {run['gate']} exited {run['exit_code']}\n\n{run['output']}")
             return {PASS: 0, FAIL: 1}.get(run["status"], 2)
+        if args.cmd == "selfcheck":
+            result = selfcheck()
+            print(result["output"])
+            print(f"\n{result['summary']} (exit {result['exit_code']})")
+            if result["failed"]:
+                print("failed: " + "; ".join(result["failed"]))
+            return {PASS: 0, FAIL: 1}.get(result["verdict"], 2)
         if args.cmd == "screenshot":
             result = screenshot(args.html, args.out, width=args.width, height=args.height)
             _print(result)

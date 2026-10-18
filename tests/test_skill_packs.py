@@ -3,7 +3,7 @@ and gate verdicts that never call a partial review a pass.
 
 Everything runs against a throwaway git repository and fake gate scripts
 written in Python, so no network, no Node and no browser are needed. The real
-kit is exercised by scripts/smoke_ux_ui_skill_pack.sh.
+kit is exercised by tests/test_skill_packs_e2e.py.
 """
 from __future__ import annotations
 
@@ -95,8 +95,8 @@ def test_the_shipped_manifest_pins_a_full_commit_hash_and_licence():
     assert manifest.license_spdx == "MIT"
     assert manifest.upstream_counts["claude_skills"] == 25
     assert manifest.upstream_counts["design_systems"] == 138
-    # Codex MCP is opt-in: a Codex session loads every configured server.
-    assert manifest.register_mcp == {"claude": True, "codex": False}
+    # MCP is opt-in for both hosts: registering writes the user config and loads in every session.
+    assert manifest.register_mcp == {"claude": False, "codex": False}
 
 
 @pytest.mark.parametrize("field,value", [
@@ -460,3 +460,57 @@ def test_the_join_scripts_sync_packs_without_blocking_the_join():
         text = (REPO_ROOT / "deploy" / script).read_text()
         assert "terminal-mcp-skill-packs sync --best-effort" in text
         assert "TERMINAL_MCP_SKIP_SKILL_PACKS" in text
+
+
+# -- upstream selfcheck (the README's "52") ----------------------------------------
+
+def _fake_accuracy(monkeypatch, body: str) -> None:
+    """accuracy_report.mjs as a Python script, run by a `node` that is Python."""
+    (sp.current_kit() / "scripts" / "accuracy_report.mjs").write_text(body)
+    monkeypatch.setattr(sp, "_selfcheck_workdir", lambda pack_id: (sp.current_kit(pack_id), "fake"))
+    monkeypatch.setattr(sp, "node_runtime",
+                        lambda *a: {"ok": True, "node": sys.executable, "version": "v99", "detail": "ok"})
+
+
+def test_selfcheck_reports_the_real_count_and_exit_code(fake_kit, monkeypatch):
+    _fake_accuracy(monkeypatch, "print('  PASS  Tokens valid')\nprint('  FAIL  axe sample-app')\n"
+                                    "print('  PASS  RTL')\nimport sys; sys.exit(1)\n")
+    result = sp.selfcheck()
+    assert (result["verdict"], result["exit_code"], result["passed"], result["total"]) == (sp.FAIL, 1, 2, 3)
+    assert result["failed"] == ["axe sample-app"]
+    assert sp.load_state("ux-ui-agent-skills")["last_selfcheck"]["total"] == 3
+
+
+def test_selfcheck_exit_zero_with_no_checks_printed_is_not_a_pass(fake_kit, monkeypatch):
+    _fake_accuracy(monkeypatch, "print('nothing measured')\n")
+    assert sp.selfcheck()["verdict"] == sp.ERROR
+
+
+def test_selfcheck_without_node_is_blocked(fake_kit, monkeypatch):
+    monkeypatch.setattr(sp, "node_runtime", lambda *a: {"ok": False, "node": None, "detail": "node not found"})
+    result = sp.selfcheck()
+    assert result["verdict"] == sp.BLOCKED and result["exit_code"] is None
+
+
+def test_sync_registers_no_mcp_server_unless_asked(isolated, monkeypatch):
+    repo, commit = make_upstream(isolated, "1.0.0")
+    write_manifest(isolated, repo, commit, "1.0.0", register_mcp={"claude": False, "codex": False})
+
+    def refuse(*a, **k):
+        raise AssertionError("MCP registration touches the user's global config; it must be opt-in")
+
+    monkeypatch.setattr(sp, "_claude_mcp", refuse)
+    monkeypatch.setattr(sp, "_codex_mcp", refuse)
+    report = sp.sync(["kit-pack"])
+    assert report["packs"][0]["integrate"]["mcp"] == []
+
+
+def test_selfcheck_runs_in_a_writable_copy_and_leaves_the_pin_read_only(isolated):
+    repo, commit = make_upstream(isolated, "1.0.0")
+    write_manifest(isolated, repo, commit, "1.0.0")
+    sp.sync(["kit-pack"])
+    kit, deps = sp._selfcheck_workdir("kit-pack")
+    assert kit != sp.current_kit("kit-pack") and os.access(kit, os.W_OK)
+    assert "npm not found" in deps
+    assert not os.access(sp.current_kit("kit-pack"), os.W_OK)
+    assert sp.status("kit-pack")["state"] != sp.TAMPERED
