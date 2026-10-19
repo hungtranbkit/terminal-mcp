@@ -76,6 +76,19 @@
   - 1 orchestration policy assertion and 2 transport assertions: tests assert older/missing policy phrases while generated server instructions use the current policy text.
 - The original full run had 56 failures. Its extra two—concurrent integration-loop merge and untagged tmux-squatter cleanup—both passed when rerun together on baseline and branch. They did not reproduce outside the full-suite run; classify as suite-order/flaky, not a regression.
 - Rerun on the final code: focused reliability suites **305 passed**; affected-module comparison **54 failed, 319 passed** on both baseline and branch; the two additional full-run failures passed on both. Full-suite release remains not green due the 54 existing failures and the two non-reproduced full-run failures. No source fix was warranted for this task's change set; triage these baseline failures in their respective workstreams before treating the repository-wide suite as green.
+## 2026-10-19 — ECC project-local opt-in (in progress; branch `feat/ecc-integration-20261019`)
+
+- Worktree `/home/dell/workspace/.terminal-mcp-worktrees/ecc-integration-20261019`, based on `origin/main` `b97046d`; no production deployment. Upstream ECC reviewed from `affaan-m/ECC` commit `76aaa77df6adc5b889e689007bf99b9a4f74af34`, version 2.2.3.
+- Added `terminal-mcp-ecc-setup`: default/explicit dry-run preflight, explicit `--apply`, selected skills copied only to project-local `.claude/skills` and `.agents/skills`; rejects path traversal, symlink payloads/parent escapes, missing files and collisions; does not copy hooks or touch global config/skill roots.
+- Added read-only `EccProvider` stage resolution, optional node-profile reporting for Claude/Codex, and docs in `docs/ECC_INTEGRATION.md`. Skill provider integration remains opt-in per enabled stage.
+- Verification: `tests/test_ecc_project_setup.py tests/test_skill_provider.py tests/test_node_profile.py` -> **57 passed**; `compileall` and `git diff --check` passed. Manual reviewed-upstream smoke: dry-run showed six local paths and created no skills; explicit apply copied the selected three skills to Claude and Codex project roots. The temporary upstream smoke project was removed after verification.
+- Commit `c9b9dd1` pushed; PR https://github.com/hungtranbkit/terminal-mcp/pull/76 OPEN; Graphify and unified-memory Ubuntu/macOS checks all SUCCESS. Do not deploy.
+
+## P0 dispatch repair status — PR #75 (separate branch)
+
+- `fix/p0-task-dispatch-20261019` head `882e1dcf47538e91120de6f058827939d2554787`, PR https://github.com/hungtranbkit/terminal-mcp/pull/75, OPEN; GitHub targeted, submit-invariant, and unified-memory Ubuntu/macOS checks all SUCCESS. Local suites: 89 focused and 229 broader passed.
+- Local Codex CLI scratch commands were rejected with exit 159. A separate live Terminal MCP run on mac17 executed a unique Codex task: `SUBMIT_CONFIRMED` -> `RUNNING` -> `IDLE`, created/read the exact marker file, removed it, and its test session was deleted with `tmux_absent_verified: true` and a `KILLED` tombstone. This exercised deployed code, not PR #75. The patch branch is un-deployed and still awaits patched-code runtime acceptance/review; do not deploy.
+
 ## Codex readiness and dispatch safety — 2026-10-16 (local fix; not deployed)
 
 - Verified repository: `/home/dell/workspace/terminal-mcp`, branch `main` at start (`e39bdd1`), initially clean; current patch branch is `fix/codex-session-readiness-20261016`. Dell has Codex CLI `0.162.0`; `codex exec --help` confirms stdin prompt (`-`), `--cd`, `--sandbox`, `--json`, and `--output-last-message`. HP SSH from Dell failed with `Permission denied (publickey)`. Read-only access through Terminal MCP verified HP checkout/service facts below; no deploy or rollback was attempted.
