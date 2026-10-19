@@ -1,0 +1,4 @@
+PASSED tests/test_camofox_render.py::test_cli_refuses_when_disabled
+PASSED tests/test_camofox_render.py::test_live_render_js_fixture
+PASSED tests/test_camofox_render.py::test_live_render_example_com
+25 passed in 3.86s

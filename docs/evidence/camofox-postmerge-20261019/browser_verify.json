@@ -1,0 +1,1 @@
+{"verify_status": "PASS", "checks": [{"assertion": "title is: Example Domain", "status": "PASS"}, {"assertion": "text contains: documentation examples", "status": "PASS"}, {"assertion": "status is: 200", "status": "PASS"}], "engine": "playwright-chromium", "screenshot_status": "OK", "screenshot": true}
