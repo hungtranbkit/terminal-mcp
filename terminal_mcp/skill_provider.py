@@ -2,9 +2,9 @@
 
 WHAT THIS IS FOR
 ----------------
-gstack (github.com/garrytan/gstack, MIT) is a set of Claude Code / Codex
-*skills* -- SKILL.md files a coding agent loads to run a review, a QA pass,
-a ship checklist. It is prompt-level work done INSIDE a worker session.
+gstack and Everything Claude Code (ECC, github.com/affaan-m/ECC) provide
+Claude Code / Codex *skills* -- `SKILL.md` files a coding agent loads to run
+a review, a QA pass, or a ship checklist. It is prompt-level work done INSIDE a worker session.
 
 It is not an orchestrator, and this module is careful not to let it become
 one. ProjectFlow already owns the decisions:
@@ -25,18 +25,17 @@ the coordinator.
 WHAT A PROVIDER RESOLVES
 ------------------------
 A (stage, host) pair -> a SkillRef, or nothing. "Nothing" is a first-class
-answer: gstack may not be installed, may not support that host, or the
+answer: a provider may not be installed, may not support that host, or the
 project may have that stage switched off. Every caller must work when the
 answer is None, which is why resolution returns a Resolution carrying the
 REASON rather than raising.
 
 SECURITY POSTURE
 ----------------
-This module only ever READS the filesystem to see what is installed. It
-never installs, never upgrades, never registers a shell hook, and never
-executes a skill -- gstack ships an opt-in Stop hook (`gstack-verify-gate`)
-which this deliberately does not touch. Installation stays a documented,
-operator-run step (docs/GSTACK_INTEGRATION.md).
+This module only ever reads the filesystem to see what is installed. It
+never installs, upgrades, registers a shell hook, or executes a skill.
+Installation is separate and explicit; the ECC setup helper copies only
+named skills into project-local roots.
 """
 from __future__ import annotations
 
@@ -220,6 +219,69 @@ class GstackProvider:
         return None
 
 
+
+# -- Everything Claude Code --------------------------------------------------
+
+ECC_STAGE_SKILLS: Mapping[str, tuple[str, ...]] = {
+    "plan_review": ("plan-canvas",),
+    "architecture_review": ("agent-architecture-audit",),
+    "pre_merge_review": ("security-review",),
+    "verification": ("verification-loop",),
+    "retro": ("brownfield-retrospective",),
+    # No release or implementation skill is implicitly inserted into a task.
+}
+ECC_KNOWN_SKILLS = frozenset({"tdd-workflow", "verification-loop", "security-review",
+                              *(skill for skills in ECC_STAGE_SKILLS.values() for skill in skills)})
+
+
+class EccProvider:
+    """Read project-local or existing per-user ECC skills; never writes files."""
+
+    name = "ecc"
+
+    def __init__(self, *, project_root: Path | None = None,
+                 claude_root: Path | None = None, codex_root: Path | None = None) -> None:
+        self.project_root = (project_root or Path.cwd()).expanduser().resolve()
+        self._claude_root = claude_root
+        self._codex_root = codex_root
+
+    def _roots_for(self, host: str) -> tuple[Path, ...] | None:
+        if host == "claude":
+            user = self._claude_root or (Path(os.environ.get("CLAUDE_CONFIG_DIR") or
+                                             (Path.home() / ".claude")) / "skills")
+            return (self.project_root / ".claude" / "skills", user)
+        if host == "codex":
+            user = self._codex_root or (Path(os.environ.get("CODEX_HOME") or
+                                             (Path.home() / ".codex")) / "skills")
+            return (self.project_root / ".agents" / "skills", user)
+        return None
+
+    def status(self, host: str) -> ProviderStatus:
+        roots = self._roots_for(host)
+        if roots is None:
+            return ProviderStatus(STATUS_UNSUPPORTED, f"ECC has no known skill path for host {host!r}")
+        skills = tuple(sorted({child.name for root in roots for child in _iterdir(root)
+                               if child.name in ECC_KNOWN_SKILLS
+                               and (child / "SKILL.md").is_file()}))
+        if not skills:
+            return ProviderStatus(STATUS_MISSING, f"no ECC skills for {host} in project or user skill roots",
+                                  skills=())
+        return ProviderStatus(STATUS_READY, f"{len(skills)} ECC skills available for {host}", skills=skills)
+
+    def resolve(self, stage: str, host: str) -> SkillRef | None:
+        candidates = ECC_STAGE_SKILLS.get(stage, ())
+        if not candidates:
+            return None
+        current = self.status(host)
+        if not current.usable:
+            return None
+        skill = next((candidate for candidate in candidates if candidate in current.skills), None)
+        if skill is None:
+            return None
+        invocation = f"/{skill}" if host == "claude" else f"${skill}"
+        return SkillRef(provider=self.name, skill=skill, host=host,
+                        invocation=invocation, version=None)
+
 def _iterdir(root: Path) -> Iterable[Path]:
     try:
         return sorted(root.iterdir())
@@ -266,7 +328,7 @@ def resolve_stage(policy: WorkflowPolicy, stage: str, host: str,
                   providers: Mapping[str, SkillProvider]) -> Resolution:
     """The one place a stage turns into a skill, or into an honest no.
 
-    Callers never branch on whether gstack is installed; they read
+    Callers never branch on whether a skill pack is installed; they read
     `resolution.skill` and, when it is None, run the stage exactly as they
     did before this module existed.
     """

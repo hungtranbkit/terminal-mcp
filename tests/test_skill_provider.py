@@ -195,3 +195,34 @@ def test_resolution_is_host_specific(tmp_path, host):
     policy = WorkflowPolicy(project="pilot", enabled_stages=frozenset({"pre_merge_review"}))
     result = resolve_stage(policy, "pre_merge_review", host, providers)
     assert (result.skill is not None) == (host == "claude")
+
+
+def test_ecc_provider_is_opt_in_and_reads_project_local_skills(tmp_path):
+    from terminal_mcp.skill_provider import EccProvider
+
+    root = tmp_path / ".agents" / "skills" / "security-review"
+    root.mkdir(parents=True)
+    (root / "SKILL.md").write_text("---\nname: security-review\n---\n", encoding="utf-8")
+    provider = EccProvider(project_root=tmp_path,
+                           claude_root=tmp_path / "absent-claude",
+                           codex_root=tmp_path / "absent-codex")
+    assert provider.status("codex").status == STATUS_READY
+    assert provider.status("claude").status == STATUS_MISSING
+    policy = WorkflowPolicy(project="pilot", enabled_stages=frozenset({"pre_merge_review"}),
+                            provider="ecc")
+    resolution = resolve_stage(policy, "pre_merge_review", "codex", {"ecc": provider})
+    assert resolution.skill is not None
+    assert resolution.skill.skill == "security-review"
+    assert resolution.skill.invocation == "$security-review"
+
+
+def test_ecc_provider_falls_back_for_disabled_or_unmapped_stages(tmp_path):
+    from terminal_mcp.skill_provider import EccProvider
+
+    provider = EccProvider(project_root=tmp_path)
+    disabled = resolve_stage(WorkflowPolicy(project="p"), "verification", "claude", {"ecc": provider})
+    assert disabled.skill is None and disabled.fallback is False
+    enabled = resolve_stage(WorkflowPolicy(project="p", enabled_stages=frozenset({"implementation"}),
+                                           provider="ecc"),
+                            "implementation", "claude", {"ecc": provider})
+    assert enabled.skill is None and enabled.fallback is True
