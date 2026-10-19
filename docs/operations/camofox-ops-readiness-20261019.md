@@ -41,7 +41,7 @@ screenshot fallback, SSH tunnel bootstrap. See "Mitigations".
 | Follow-up branch: live tests × 5 | **5/5 PASS**, ~1.5 s per test (previously up to 30+ s) |
 | Follow-up branch: stress on a long loopback page (30 scrolls incl. after focusing an input, 10 screenshots) | 29 moved + 1 at-edge, 0 errors, worst 119 ms; screenshots 10/10, worst 79 ms |
 | Follow-up branch: `camofox-tunnel.sh` lifecycle on Dell (install → disabled/inactive, start, smoke, provider canary, uninstall) | install did not enable/start; listener 127.0.0.1:19377 only; smoke health ok + unauthenticated 401; canary OK (scroll at-edge 136 ms); teardown left nothing |
-| Full suite (Dell), follow-up branch | 1 failed, 9786 passed, 18 skipped; the failure (`test_transports.py::test_http_real_node_tools_full_lifecycle_round_trip`) also fails on main (earlier Dell run of main: 1 failed, the same test) |
+| Full suite (Dell), follow-up branch vs fresh main run | branch **1 failed / 9786 passed / 18 skipped**; main b97046d **1 failed / 9775 passed / 18 skipped**; identical failure set (`test_transports.py::test_http_real_node_tools_full_lifecycle_round_trip`, pre-existing) |
 
 Evidence: `docs/evidence/camofox-postmerge-20261019/` (no secrets; checked).
 
