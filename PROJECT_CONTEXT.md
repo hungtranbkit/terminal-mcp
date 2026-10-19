@@ -718,6 +718,14 @@ Direct dispatch (`create_session` -> `send`/`send_wait`) leaves no queue row, so
 
 - Harness unit regression: python3 -m pytest -q tests/test_harness_core.py tests/test_harness_prerequisites.py -> 88 passed (2026-10-09).
 
+## 2026-10-19 — P0 dispatch repair (in progress; branch `fix/p0-task-dispatch-20261019`)
+
+- Worktree: `/home/dell/workspace/.terminal-mcp-worktrees/p0-task-dispatch-20261019`, based on `origin/main` `b97046d`. Shared checkout and `unified-memory-multinode` were not modified.
+- Root causes: remote `require_idle=True` is rejected locally with `IDLE_GUARD_UNSUPPORTED` and was not handed to the durable queue; `send_wait` could match the pre-existing `IDLE` composer after only `SUBMIT_CONFIRMED`, falsely signaling task completion.
+- Changes in `terminal_mcp/compact_tools.py` and `terminal_mcp/run_journal.py`: remote direct starts use the existing durable queue when enabled and fail closed with `REMOTE_DURABLE_QUEUE_REQUIRED` otherwise; migration-safe wait journal fields persist execution requirement/evidence; send_wait only matches after RUNNING or WAITING_INPUT evidence, including across resume. Previously saved unsupported-guard receipts are migrated idempotently through the queue. Regressions are in `tests/test_codex_direct_dispatch.py` and `tests/test_compact_tools.py`.
+- Verification: focused dispatch/journal suite **89 passed**; broader lifecycle/adapter/startup suite **229 passed**; `git diff --check` passed. A real local `codex exec` scratch attempt had its shell commands rejected (exit 159). Separately, a live Terminal MCP smoke on `mac17-macbook-pro` created and read back `TMCP_LIVE_TERMINAL_DISPATCH_20261019`, returned `RUNNING` then `IDLE`; the artifact was verified and removed, and test session deletion was verified (`tmux_absent_verified: true`, tombstone `KILLED`). This exercised the currently deployed service, not this branch’s patched code.
+- No deployment. Commit `de201c8` pushed; PR #75 open; GitHub checks were SUCCESS at last check. The isolated live smoke verifies the deployed dispatch path can execute an agent, but this patched branch has not been runtime-tested because deployment is explicitly forbidden. Keep PR #75 open pending review; ECC integration is a separate branch/worktree.
+
 ## 2026-10-17 — Codex startup menu readiness regression (in progress)
 
 - Isolated branch `fix/codex-startup-non-daemon-20261017`, based on `origin/main` `f07a0e58061531cc986f418d0812cdab549d7904` (PR #61 included). Dashboard PR #65 and the shared checkout/session remain untouched.

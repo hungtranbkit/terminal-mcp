@@ -400,7 +400,10 @@ def test_turn_send_wait_sends_once_then_creates_one_durable_wait():
         "agent_type": "codex", "enter_sent": True, "enter_count": 1,
         "attempts": 1, "correlation_id": "corr-turn",
     }
-    controller.statuses["worker"] = {"session": "worker", "state": "IDLE"}
+    controller.statuses["worker"] = [
+        {"session": "worker", "state": "RUNNING"},
+        {"session": "worker", "state": "IDLE"},
+    ]
     controller.tails["worker"] = "done"
 
     result = compact.turn(
@@ -508,10 +511,41 @@ def test_send_wait_shares_budget_with_submission_and_resume_never_resends():
     controller.statuses['worker'] = {'state': 'RUNNING'}
     result = compact.turn(action='send_wait', target='worker', text='sleep 60', timeout=10)
     assert result['status'] == 'PENDING'
+    assert result['wait']['execution_required'] is True
+    assert result['wait']['execution_observed'] is True
     assert clock.now <= 10
     controller.statuses['worker'] = {'state': 'IDLE'}
     resumed = compact.resume_wait(result['wait']['resume_token'], timeout=1)
     assert resumed['status'] == 'MATCHED'
+    assert resumed['execution_observed'] is True
+    assert len(controller.send_calls) == 1
+
+
+def test_send_wait_does_not_match_preexisting_idle_without_execution_evidence():
+    """SUBMIT_CONFIRMED alone is not proof the agent executed the task."""
+    compact, _, controller = service()
+    clock = FakeClock()
+    compact.monotonic, compact.sleep = clock.monotonic, clock.sleep
+    controller.send_result = {
+        "delivery_state": "SUBMIT_CONFIRMED", "enter_sent": True,
+        "agent_type": "codex", "enter_count": 1,
+    }
+    # The target stays in its original idle/composer state after the send.
+    controller.statuses["codex"] = {"state": "IDLE", "exists": True,
+                                     "agent_type": "codex"}
+
+    result = compact.turn(action="send_wait", target="codex", text="run the task",
+                          timeout=2, poll_interval=1)
+
+    assert result["send"]["status"] == "SUBMIT_CONFIRMED"
+    assert result["status"] == "PENDING"
+    assert result["wait"]["status"] == "PENDING"
+    assert result["wait"]["last_observed_state"] == "IDLE"
+    assert result["wait"]["resume_token"]
+    assert len(controller.send_calls) == 1
+    resumed = compact.resume_wait(result["wait"]["resume_token"], timeout=1)
+    assert resumed["status"] == "PENDING"
+    assert resumed["execution_observed"] is False
     assert len(controller.send_calls) == 1
 
 
@@ -614,7 +648,12 @@ def test_direct_compatibility_uses_guarded_send_without_queue(monkeypatch, queue
         ("enqueue_task", "dispatch_tick", "follow_task", "create_session", "task_status"), forbidden)
     result = compact.turn(action=action, target="node/worker", text="do work",
                           long_task=long_task, request_key="retry-1")
-    assert result["status"] in {"SUBMIT_CONFIRMED", "MATCHED"}
+    if action == "send_wait":
+        assert result["status"] == "PENDING"
+        assert result["send"]["status"] == "SUBMIT_CONFIRMED"
+        assert result["wait"]["execution_required"] is True
+    else:
+        assert result["status"] == "SUBMIT_CONFIRMED"
     assert result["action"] == ("send_wait" if action == "send_wait" else "send")
     assert controller.send_calls == [
         ("node/worker", "do work", True, False, {"idempotency_key": "retry-1"})]

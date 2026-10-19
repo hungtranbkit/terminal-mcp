@@ -211,3 +211,75 @@ def test_explicit_idempotency_key_takes_precedence_over_legacy_request_key(rig):
                         request_key='changed-legacy', idempotency_key='explicit')
     assert replay == first
     assert len(controller.send_calls) == 1
+
+
+def test_remote_codex_start_uses_durable_queue_when_atomic_idle_guard_is_unsupported(rig):
+    """A remote node without the atomic guard must not strand direct-start."""
+    tools, _, controller = rig
+    controller.statuses['codex'] = {
+        'state': 'IDLE', 'agent_type': 'codex', 'node_id': 'remote-codex',
+        'exists': True,
+    }
+    controller.local_node_id = 'local-controller'
+    controller.send_result = {
+        'error': 'IDLE_GUARD_UNSUPPORTED', 'sent': False, 'enter_sent': False,
+    }
+    queue_rows = {}
+    def enqueue(session, prompt, **kwargs):
+        key = kwargs['request_key']
+        queue_rows.setdefault(key, {
+            'status': 'TASK_ACCEPTED', 'task_id': 'queue-remote-1',
+            'session': session, 'queue_position': 0, 'request_key': key,
+        })
+        return {**queue_rows[key], 'deduplicated': len(queue_rows) == 1}
+    tools.handlers['enqueue_task'] = enqueue
+
+    result = start(tools)
+
+    assert result['status'] == 'TASK_ACCEPTED'
+    assert result['task_id'] == 'queue-remote-1'
+    assert result['dispatched'] is False
+    assert result['next_action'] == 'none'
+    assert len(queue_rows) == 1
+    assert controller.send_calls == []
+
+
+def test_remote_codex_start_fails_closed_when_durable_queue_is_disabled(rig, monkeypatch):
+    tools, _, controller = rig
+    monkeypatch.setenv('TERMINAL_MCP_ENABLE_QUEUE', '0')
+    controller.statuses['codex'] = {
+        'state': 'IDLE', 'agent_type': 'codex', 'node_id': 'remote-codex',
+        'exists': True,
+    }
+    controller.local_node_id = 'local-controller'
+    result = start(tools)
+    assert result['status'] == 'FAILED'
+    assert result['error'] == 'REMOTE_DURABLE_QUEUE_REQUIRED'
+    assert result['dispatched'] is False
+    assert controller.send_calls == []
+
+
+def test_idle_guard_unsupported_receipt_falls_back_to_queue_before_replay(rig):
+    tools, _, controller = rig
+    controller.statuses['codex'] = {'state': 'IDLE', 'agent_type': 'codex'}
+    controller.send_result = {
+        'error': 'IDLE_GUARD_UNSUPPORTED', 'sent': False, 'enter_sent': False,
+    }
+    queue_rows = {}
+    def enqueue(session, prompt, **kwargs):
+        key = kwargs['request_key']
+        queue_rows.setdefault(key, {
+            'status': 'TASK_ACCEPTED', 'task_id': 'queue-fallback-1',
+            'session': session, 'queue_position': 0, 'request_key': key,
+        })
+        return {**queue_rows[key], 'deduplicated': key in queue_rows}
+    tools.handlers['enqueue_task'] = enqueue
+
+    first = start(tools)
+    replay = start(tools)
+
+    assert first['status'] == 'TASK_ACCEPTED'
+    assert first['task_id'] == 'queue-fallback-1'
+    assert replay['task_id'] == first['task_id']
+    assert len(queue_rows) == 1
+    assert len(controller.send_calls) == 1  # guard refusal happened before mutation
