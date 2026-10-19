@@ -174,6 +174,8 @@ class RunJournalStore:
                     tail_lines INTEGER NOT NULL,
                     requested_timeout_seconds REAL NOT NULL,
                     status TEXT NOT NULL,
+                    require_execution INTEGER NOT NULL DEFAULT 0,
+                    execution_observed INTEGER NOT NULL DEFAULT 0,
                     last_observed_state TEXT,
                     input_required INTEGER NOT NULL DEFAULT 0,
                     reason TEXT,
@@ -188,6 +190,16 @@ class RunJournalStore:
                 )
                 """
             )
+            wait_columns = {row["name"] for row in connection.execute(
+                "PRAGMA table_info(wait_continuations)").fetchall()}
+            if "require_execution" not in wait_columns:
+                connection.execute(
+                    "ALTER TABLE wait_continuations ADD COLUMN require_execution "
+                    "INTEGER NOT NULL DEFAULT 0")
+            if "execution_observed" not in wait_columns:
+                connection.execute(
+                    "ALTER TABLE wait_continuations ADD COLUMN execution_observed "
+                    "INTEGER NOT NULL DEFAULT 0")
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_wait_continuations_updated "
                 "ON wait_continuations(updated_at DESC)"
@@ -459,6 +471,8 @@ class RunJournalStore:
             "tail_lines": row["tail_lines"],
             "requested_timeout_seconds": row["requested_timeout_seconds"],
             "status": row["status"],
+            "require_execution": bool(row["require_execution"]),
+            "execution_observed": bool(row["execution_observed"]),
             "last_observed_state": row["last_observed_state"],
             "input_required": bool(row["input_required"]),
             "reason": row["reason"],
@@ -480,6 +494,7 @@ class RunJournalStore:
         desired_states: list[str],
         tail_lines: int,
         requested_timeout_seconds: float,
+        require_execution: bool = False,
         ttl_seconds: float = DEFAULT_WAIT_TTL_SECONDS,
     ) -> dict[str, Any]:
         """Persist continuation coordinates before the first observation.
@@ -518,13 +533,13 @@ class RunJournalStore:
                 """
                 INSERT INTO wait_continuations (
                     resume_token, run_id, target, target_type, desired_states,
-                    tail_lines, requested_timeout_seconds, status, created_at,
+                    tail_lines, requested_timeout_seconds, status, require_execution, created_at,
                     updated_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?)
                 """,
                 (resume_token, run["run_id"], target, target_type,
                  json.dumps(desired_states, separators=(",", ":")), tail_lines,
-                 requested_timeout_seconds, now, now, expires_at),
+                 requested_timeout_seconds, int(require_execution), now, now, expires_at),
             )
             row = connection.execute(
                 "SELECT * FROM wait_continuations WHERE resume_token = ?",
@@ -557,6 +572,7 @@ class RunJournalStore:
         reason: str | None,
         polls: int,
         waited_ms: int,
+        execution_observed: bool = False,
     ) -> dict[str, Any]:
         """Atomically checkpoint one bounded slice; retries never dispatch work.
 
@@ -585,13 +601,14 @@ class RunJournalStore:
                 """
                 UPDATE wait_continuations
                 SET status = ?, last_observed_state = ?, input_required = ?,
+                    execution_observed = MAX(execution_observed, ?),
                     reason = ?, checkpoint_version = ?, polls = polls + ?,
                     waited_ms = waited_ms + ?,
                     pending_return_count = pending_return_count + ?,
                     updated_at = ?, completed_at = ?
                 WHERE resume_token = ?
                 """,
-                (status, last_observed_state, int(input_required),
+                (status, last_observed_state, int(input_required), int(execution_observed),
                  _bounded(reason, MAX_WAIT_REASON_CHARS), version, max(0, int(polls)),
                  max(0, int(waited_ms)), 1 if status == "PENDING" else 0,
                  now, now if completed else None, resume_token),

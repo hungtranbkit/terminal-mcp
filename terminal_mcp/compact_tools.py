@@ -731,6 +731,8 @@ class CompactTerminalTools:
             "resume_token": wait["resume_token"],
             "checkpoint_id": self._checkpoint_id(wait),
             "desired_states": wait["desired_states"],
+            "execution_required": wait.get("require_execution", False),
+            "execution_observed": wait.get("execution_observed", False),
             "last_observed_state": wait["last_observed_state"] or "UNKNOWN",
             # Compatibility aliases from the original response.
             "state": wait["last_observed_state"] or "UNKNOWN",
@@ -776,6 +778,7 @@ class CompactTerminalTools:
         polls = 0
         final: dict[str, Any] = {}
         matched = False
+        execution_observed = bool(wait.get("execution_observed"))
         probe_timed_out = False
         while True:
             remaining = deadline - self.monotonic()
@@ -793,7 +796,11 @@ class CompactTerminalTools:
                 break
             if "error" in final:
                 break
-            if str(final.get("state", "UNKNOWN")).upper() in set(wait["desired_states"]):
+            state = str(final.get("state", "UNKNOWN")).upper()
+            if state in {"RUNNING", "WAITING_INPUT"}:
+                execution_observed = True
+            if (state in set(wait["desired_states"])
+                    and (not wait.get("require_execution") or execution_observed)):
                 matched = True
                 break
             remaining = deadline - self.monotonic()
@@ -811,6 +818,7 @@ class CompactTerminalTools:
             wait["resume_token"], status=status, last_observed_state=state,
             input_required=bool(final.get("input_required", False)), reason=reason,
             polls=polls, waited_ms=waited_ms,
+            execution_observed=execution_observed,
         )
         # Preserve the useful final tail for the legacy MATCHED shape. A
         # PENDING slice deliberately does no extra remote read after its wait
@@ -836,7 +844,8 @@ class CompactTerminalTools:
 
     def wait_for_state(self, target: str, desired_states: list[str], timeout: float = DEFAULT_WAIT_SECONDS,
                        poll_interval: float = 1, tail_lines: int = 20,
-                       _deadline: float | None = None) -> dict[str, Any]:
+                       _deadline: float | None = None,
+                       _require_execution: bool = False) -> dict[str, Any]:
         if (not isinstance(target, str) or not target.strip() or len(target) > _MAX_TARGET_CHARS
                 or redact_text(target) != target):
             return {"status": "FAILED", "error": "INVALID_TARGET"}
@@ -861,6 +870,7 @@ class CompactTerminalTools:
                 target=target.strip(), target_type=kind,
                 desired_states=normalized_states, tail_lines=tail_lines,
                 requested_timeout_seconds=float(timeout),
+                require_execution=_require_execution,
             )
         except Exception as exc:  # noqa: BLE001 -- persistence is mandatory here
             return {"status": "FAILED", "error": "CONTINUATION_PERSIST_FAILED",
@@ -1146,7 +1156,8 @@ class CompactTerminalTools:
         label = self._label_send(target, text, sent, title, metadata)
         waited = self.wait_for_state(target, states, timeout=timeout,
                                      poll_interval=poll_interval,
-                                     tail_lines=tail_lines, _deadline=deadline)
+                                     tail_lines=tail_lines, _deadline=deadline,
+                                     _require_execution=True)
         return self._with_label(
             self._annotate({"status": waited.get("status", "FAILED"),
                             "action": normalized, "send": sent, "wait": waited}, target),
@@ -1290,7 +1301,25 @@ class CompactTerminalTools:
             if saved is not None:
                 if saved.get("request_digest") != digest:
                     return {"status": "FAILED", "error": "IDEMPOTENCY_CONFLICT"}
-                return saved["result"]
+                saved_result = saved["result"]
+                saved_send = saved_result.get("send") if isinstance(saved_result, dict) else None
+                # Migrate a completed old receipt for the known no-input
+                # incompatibility. The unsupported idle guard is proof the
+                # remote client did not send HTTP; hand it to the durable
+                # queue now, using the original request key for deduplication.
+                if (isinstance(saved_send, dict)
+                        and saved_result.get("error") == "DIRECT_SUBMIT_NOT_ACCEPTED"
+                        and saved_send.get("reason") == "IDLE_GUARD_UNSUPPORTED"):
+                    if not queue_submission_enabled():
+                        return {**saved_result, "status": "FAILED",
+                                "error": "REMOTE_DURABLE_QUEUE_REQUIRED",
+                                "next_action": "enable the durable task queue for this remote node; do not resend via send"}
+                    queued = self._start_turn(target, text, title=None, priority=0,
+                                              metadata=None, request_key=key)
+                    audit.store_idempotent_result(cache_key, {
+                        "request_digest": digest, "result": queued})
+                    return queued
+                return saved_result
         if not hasattr(self.controller, "terminal_status"):
             return None
         deadline = self.monotonic() + float(timeout)
@@ -1306,6 +1335,18 @@ class CompactTerminalTools:
             return {"status": "FAILED", "error": before["error"], "dispatched": False}
         if before.get("agent_type") != "codex":
             return None
+        owner_node = before.get("node_id")
+        local_node = getattr(self.controller, "local_node_id", None)
+        if owner_node is not None and local_node is not None and owner_node != local_node:
+            # The atomic idle guard is a local TerminalService guarantee. Do
+            # not pretend an older remote node implements it or silently turn
+            # this into a non-durable send. Remote starts use the existing
+            # persisted queue and its coordinator/readiness gate instead.
+            if queue_submission_enabled():
+                return None
+            return {"status": "FAILED", "error": "REMOTE_DURABLE_QUEUE_REQUIRED",
+                    "node_id": owner_node, "dispatched": False,
+                    "next_action": "enable the durable task queue for this remote node; do not resend via send"}
         base = {"action": "start", "mode": "direct", "session": target,
                 "request_key": key, "idempotency_key": cache_key,
                 "dispatched": False, "client_polling": False}
@@ -1337,6 +1378,15 @@ class CompactTerminalTools:
                                   require_idle=True)
             base = {**base, "send": sent, "submission_id": sent.get("submission_id")}
             if sent.get("status") != "SUBMIT_CONFIRMED":
+                if (sent.get("reason") == "IDLE_GUARD_UNSUPPORTED"
+                        and sent.get("evidence", {}).get("enter_sent") is False):
+                    if queue_submission_enabled():
+                        return finish(self._start_turn(
+                            target, text, title=None, priority=0, metadata=None,
+                            request_key=key))
+                    return finish({**base, "status": "FAILED",
+                                   "error": "REMOTE_DURABLE_QUEUE_REQUIRED",
+                                   "next_action": "enable the durable task queue for this remote node; do not resend via send"})
                 return finish({**base, "status": "FAILED", "error": "DIRECT_SUBMIT_NOT_ACCEPTED",
                                "next_action": "Inspect submission evidence; do not retype the prompt."})
             state = "UNKNOWN"
