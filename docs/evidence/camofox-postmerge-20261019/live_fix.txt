@@ -1,0 +1,5 @@
+1.56s call     test_live_worker_example_com 1.53s call     test_live_worker_type_scroll_on_local_fixture 2 passed, 53 deselected in 3.29s 
+1.44s call     test_live_worker_type_scroll_on_local_fixture 1.29s call     test_live_worker_example_com 2 passed, 53 deselected in 2.91s 
+1.46s call     test_live_worker_type_scroll_on_local_fixture 1.24s call     test_live_worker_example_com 2 passed, 53 deselected in 2.90s 
+1.46s call     test_live_worker_type_scroll_on_local_fixture 1.27s call     test_live_worker_example_com 2 passed, 53 deselected in 2.91s 
+1.52s call     test_live_worker_type_scroll_on_local_fixture 1.43s call     test_live_worker_example_com 2 passed, 53 deselected in 3.20s 

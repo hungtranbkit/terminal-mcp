@@ -92,3 +92,12 @@ m910 had about 1.7–3 GB available RAM and swap was already about 99% used befo
 install. The worker idles at about 150 MB, peaked at 779 MB during the pilot, and
 stops its browser after 2 idle minutes. It is started but **not enabled at boot**.
 Enable it only once the host has more headroom or the owner accepts the cost.
+
+## Remote Terminal MCP nodes (optional SSH forward)
+
+`camofox-tunnel.sh` + `camofox-tunnel.service` install a default-off SSH local
+forward (`127.0.0.1:19377` → m910 `127.0.0.1:9377`) on a Dell/HP node. Use a
+dedicated forward-only key (`camofox-tunnel.sh keygen` prints the restricted
+`authorized_keys` line for m910). Lifecycle and readiness:
+`docs/camofox-browser.md` (Connectivity) and
+`docs/operations/camofox-ops-readiness-20261019.md`.
