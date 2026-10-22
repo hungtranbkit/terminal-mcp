@@ -68,3 +68,15 @@ No port forwarding/public exposure of `127.0.0.1:8766`. The authenticated tunnel
 ## Verification record
 
 2026-10-22: Terminal MCP connected to dell-linux, hp-linux and m910; mac17-macbook-pro, old macbook and Dell Windows offline. Repo issue #77 created. A dedicated Codex session could be **created** but task dispatch **failed** with `IDLE_GUARD_UNSUPPORTED`; no Harp install, live Mac validation, bridge deployment or Terminal MCP bugfix has been verified at this stage. This documentation must not be interpreted as a completed production integration.
+
+## Linux fallback while Mac is offline: Agent Deck
+
+**Harp is macOS-only.** For Linux, [Agent Deck](https://github.com/asheshgoplani/agent-deck) is an *alternative* tmux-aware AI agent TUI (Codex/Claude/etc.), not a Harp port and not a replacement for the Terminal MCP controller. Do not claim any Harp DMG is installed on Linux.
+
+Pinned pilot package: [Agent Deck v1.16.30](https://github.com/asheshgoplani/agent-deck/releases/tag/v1.16.30). Linux amd64 SHA-256 `88d9629488f17734057a7dbf9fcdf640ffb23311bf9e2ebf4d304123ff8b25bc`; Linux arm64 SHA-256 `88a9b4d1ccecbd7081ffd63d62986781553eb1c025e25d7eec2bbc7d0d667027` (release asset digests, verify each downloaded artifact).
+
+For another **Linux** machine, run the repo-local `bash scripts/install_agent_deck_linux.sh`. The script installs a pinned checksum-verified binary into `~/.local/bin/agent-deck`, refuses to overwrite a different existing version, and does **not** change tmux config, create sessions, or use sudo. For a manual pilot, run `~/.local/bin/agent-deck --version`; open `~/.local/bin/agent-deck` interactively via trusted local terminal/SSH only when ready to test the TUI. Do not publish an unauthenticated web UI.
+
+**Real HP Linux pilot (2026-10-22):** existing idle shell `hp-shell-bds-qa-20261020` was used to check `Linux x86_64`, tmux and curl. A pinned v1.16.30 amd64 archive was downloaded from the official release; `sha256sum -c` printed `OK`; binary installed at `/home/kimex/.local/bin/agent-deck`; `agent-deck --version` printed `Agent Deck v1.16.30`; CLI `--help` worked. **TUI not yet launched/validated**. No tmux config changed, no existing tmux sessions adopted, moved or deleted; external tmux sessions remain Terminal MCP's responsibility. m910 was intentionally skipped (RAM ~87%).
+
+**Terminal MCP direct dispatch progress:** on Dell Linux, `turn(start)` had previously failed with `IDLE_GUARD_UNSUPPORTED` but `turn(supervise)` accepted the same repair goal as a *new, once-only* supervised task, receipt `EXECUTION_ACCEPTED`, `RUNNING`, id `dt_be4a28869f3a4dae`. This is a working dispatch **workaround**, not proof the broken `start` path is fixed. A dedicated Codex agent is repairing the issue on an isolated branch; don't label this PR as a production fix until code tests and actual deployed version are verified.
