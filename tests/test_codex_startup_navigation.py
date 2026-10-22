@@ -48,7 +48,7 @@ def launch(tmp_path, monkeypatch, backend, config=None):
 def test_navigate_only_known_non_granting_choices(tmp_path, monkeypatch, kind, selected, expected):
     backend = MenuBackend(kind, selected)
     result = launch(tmp_path, monkeypatch, backend)
-    assert result["state"] == "READY"
+    assert result["state"] == "COMPOSER_READY"
     assert backend.keys == expected
 
 @pytest.mark.parametrize("denial",["pattern"])
@@ -75,7 +75,7 @@ def test_exact_daemon_fallback_is_safe_without_general_terminal_input(tmp_path, 
     config = replace(config, input_policy=replace(config.input_policy, allow_keys=()))
     backend = MenuBackend("daemon", 2)
     result = launch(tmp_path, monkeypatch, backend, config)
-    assert result["state"] == "READY"
+    assert result["state"] == "COMPOSER_READY"
     assert backend.keys == ["Up", "Up", "Enter"]
 
 @pytest.mark.parametrize("mode",["replace_pane","drift"])
@@ -96,7 +96,7 @@ class LateMenuBackend(MenuBackend):
 def test_boot_composer_must_settle_before_ready(tmp_path,monkeypatch):
     backend=LateMenuBackend("daemon",2)
     result=launch(tmp_path,monkeypatch,backend)
-    assert result["state"]=="READY"
+    assert result["state"]=="COMPOSER_READY"
     assert backend.keys==["Up","Up","Enter"]
 
 class UpdateBackend(MenuBackend):
@@ -111,7 +111,7 @@ class UpdateBackend(MenuBackend):
 def test_skip_exact_update_menu_without_running_installer(tmp_path,monkeypatch):
     backend=UpdateBackend("update",0)
     result=launch(tmp_path,monkeypatch,backend)
-    assert result["state"]=="READY"
+    assert result["state"]=="COMPOSER_READY"
     assert backend.keys==["Escape"]
 
 
@@ -120,7 +120,7 @@ def test_scoped_safe_daemon_choice_is_not_general_session_input(tmp_path, monkey
     config = replace(config, session_access=replace(config.session_access, default_input=False))
     backend = MenuBackend("daemon", 0)
     result = launch(tmp_path, monkeypatch, backend, config)
-    assert result["state"] == "READY"
+    assert result["state"] == "COMPOSER_READY"
     assert backend.keys == ["Enter"]
 
 
@@ -129,7 +129,7 @@ def test_startup_open_default_does_not_require_retired_whitelist(tmp_path, monke
     config = replace(config, allowed_session_patterns=("other-*",),
                      input_policy=replace(config.input_policy, allowed_session_patterns=("other-*",)))
     backend = MenuBackend("daemon", 0)
-    assert launch(tmp_path, monkeypatch, backend, config)["state"] == "READY"
+    assert launch(tmp_path, monkeypatch, backend, config)["state"] == "COMPOSER_READY"
     assert backend.keys == ["Enter"]
 
 
@@ -139,7 +139,7 @@ def test_scoped_safe_daemon_choice_does_not_require_general_input_grant(tmp_path
     svc = SessionLifecycleService(configured(tmp_path), backend,
                                   input_authorized=lambda name: next(decisions, False))
     monkeypatch.setattr(svc, "launch_command_for", lambda agent: "codex")
-    assert svc.create("codex-nav-check", "codex", str(tmp_path))["state"] == "READY"
+    assert svc.create("codex-nav-check", "codex", str(tmp_path))["state"] == "COMPOSER_READY"
     assert backend.keys == ["Enter"]
 
 
@@ -180,11 +180,11 @@ def test_composer_alone_does_not_claim_tool_readiness(tmp_path, monkeypatch):
     backend = MenuBackend('daemon', 0)
     backend.ready = True
     result = launch(tmp_path, monkeypatch, backend)
-    assert result['state'] == 'READY'
+    assert result['state'] == 'COMPOSER_READY'
     assert result['composer_ready'] is True
     assert result['tool_ready'] is False
-    assert result['readiness_stage'] == 'TASK_READY'
-    assert result['readiness_status'] == 'READY'
+    assert result['readiness_stage'] == 'COMPOSER_READY'
+    assert result['readiness_status'] == 'COMPOSER_READY'
 
 
 def test_exact_incompatible_daemon_prompt_is_classified_and_selects_only_run_once(tmp_path, monkeypatch):
@@ -244,7 +244,7 @@ def test_supported_codex_gets_scoped_no_daemon_before_resume_args(tmp_path, monk
     svc = SessionLifecycleService(configured(tmp_path), backend)
     monkeypatch.setattr(svc, "launch_command_for", lambda agent: "/bin/codex")
     result = svc.create("codex-nav-check", "codex", str(tmp_path), extra_args=("--resume", "session-id"))
-    assert result["state"] == "READY"
+    assert result["state"] == "COMPOSER_READY"
     assert backend.launch_args == ("--no-daemon", "--resume", "session-id")
 
 

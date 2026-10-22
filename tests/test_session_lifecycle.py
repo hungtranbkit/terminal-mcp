@@ -223,7 +223,7 @@ def test_create_claude_and_codex_use_server_side_allowlisted_launcher(
     assert "error" not in result
     # This test checks launcher selection, not authorization of a fresh tmp cwd.
     # A real installed Codex can correctly stop at a startup/auth/trust gate.
-    assert result["state"] in ("READY", "CREATED", "BLOCKED")
+    assert result["state"] in ("COMPOSER_READY", "CREATED", "BLOCKED")
     if result["state"] == "BLOCKED":
         assert agent_type == "codex"
         assert result["readiness_stage"] == "STARTUP_CHECK"
@@ -396,7 +396,7 @@ def test_codex_selects_only_visible_authorized_non_granting_startup_choice(
 
     result = service.lifecycle.create(name, "codex", str(tmp_path))
 
-    assert result["state"] == "READY"
+    assert result["state"] == "COMPOSER_READY"
     assert result["composer_ready"] is True
     assert result["tool_ready"] is False
     assert state["keys"] == ["Enter"]
@@ -892,6 +892,26 @@ def test_permission_during_initial_preflight_overrides_create_readiness(tmp_path
     assert result['input_required'] is True
     assert result['tool_ready'] is False
     assert result['initial_prompt_result']['sent'] is False
+
+
+def test_composer_ready_create_can_preflight_an_explicit_initial_prompt(tmp_path, monkeypatch):
+    service = TerminalService(_lifecycle_config(tmp_path))
+    sent = []
+    monkeypatch.setattr(service.lifecycle, 'create', lambda *a, **kw: {
+        'session': 'test-codex-composer-ready', 'agent_type': 'codex',
+        'state': 'COMPOSER_READY', 'composer_ready': True, 'tool_ready': False,
+    })
+    monkeypatch.setattr(service, '_await_agent_composer_ready', lambda name: None)
+    monkeypatch.setattr(service, 'terminal_send_text', lambda *a, **kw: sent.append((a, kw)) or {
+        'sent': True, 'enter_sent': True, 'execution_confirmed': False,
+    })
+
+    result = service.terminal_create_session(
+        'test-codex-composer-ready', 'codex', str(tmp_path), initial_prompt='inert prompt')
+
+    assert sent and sent[0][0][1] == 'inert prompt'
+    assert result['state'] == 'COMPOSER_READY'
+    assert result['initial_prompt_result']['execution_confirmed'] is False
 
 
 def test_created_agent_without_live_process_cannot_send_task_into_shell(tmp_path, monkeypatch):
