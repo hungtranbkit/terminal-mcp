@@ -791,6 +791,65 @@ def test_linux_pair_fresh_installer_keeps_dirty_config_and_token_checkout_intact
     assert (checkout / "local.py").read_text() == "operator edit\n"
 
 
+def test_linux_installer_runtime_writes_complete_quoted_unit_without_running_comments(tmp_path):
+    """Exercise the installer body: bash -n cannot catch heredoc expansion."""
+    import os
+    import subprocess
+
+    root = Path(__file__).parents[1]
+    repo = tmp_path / "home$work% with spaces" / "terminal-mcp"
+    source = tmp_path / "verified source"
+    fakebin = tmp_path / "fakebin"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".venv" / "bin").mkdir(parents=True)
+    (source).mkdir()
+    fakebin.mkdir()
+    (source / "pyproject.toml").write_text("[project]\nname='fixture'\n")
+    (repo / "config.yaml").write_text("existing config\n")
+    (repo / "node-agent.token").write_text("protected fixture token\n")
+    (repo / ".venv" / "bin" / "pip").write_text("#!/bin/sh\nexit 0\n")
+    (repo / ".venv" / "bin" / "pip").chmod(0o755)
+    for name in ("systemctl", "loginctl"):
+        tool = fakebin / name
+        tool.write_text("#!/bin/sh\nexit 0\n")
+        tool.chmod(0o755)
+
+    env = dict(os.environ, HOME=str(repo.parent), PATH=f"{fakebin}:{os.environ['PATH']}")
+    result = subprocess.run([
+        "bash", str(root / "deploy" / "install-node-agent.sh"),
+        "--controller", "https://controller.example/path with spaces",
+        "--node-id", "macbook", "--repo-dir", str(repo),
+        "--source-dir", str(source), "--paired",
+    ], env=env, capture_output=True, text=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+    assert "== Node agent installed through approved pairing. ==" in result.stdout
+    assert "command not found" not in result.stderr
+    assert "No such file or directory" not in result.stderr
+    unit = (repo.parent / ".config/systemd/user/terminal-node-agent.service").read_text()
+    unit_repo = str(repo).replace("%", "%%")
+    exec_repo = unit_repo.replace("$", "$$")
+    assert f'WorkingDirectory="{unit_repo}"' in unit
+    assert f'Environment="TERMINAL_MCP_CONFIG={unit_repo}/config.yaml"' in unit
+    assert f'ExecStart="{exec_repo}/.venv/bin/terminal-node-agent"' in unit
+    assert 'path with spaces" --token-file' in unit
+    assert "died with `RuntimeError: can't start new thread`" in unit
+    assert "cgroup's pids.events/memory.events" in unit
+    assert "pids.events/memory.events" in unit
+    assert (repo / "config.yaml").read_text() == "existing config\n"
+    assert (repo / "node-agent.token").read_text() == "protected fixture token\n"
+
+    (fakebin / "systemctl").write_text("#!/bin/sh\n[ \"$2\" != restart ]\n")
+    (fakebin / "systemctl").chmod(0o755)
+    failed_restart = subprocess.run([
+        "bash", str(root / "deploy" / "install-node-agent.sh"),
+        "--controller", "https://controller.example", "--node-id", "macbook",
+        "--repo-dir", str(repo), "--source-dir", str(source), "--paired",
+    ], env=env, capture_output=True, text=True, check=False)
+    assert failed_restart.returncode != 0
+    assert "== Node agent installed through approved pairing. ==" not in failed_restart.stdout
+
+
 def test_dashboard_linux_pairing_requires_https_origin_before_issuing_code(tmp_path, monkeypatch):
     client, _controller, onboarding = _client(tmp_path, monkeypatch)
     response = client.post("/dashboard/api/nodes/onboard/enrollments", json={

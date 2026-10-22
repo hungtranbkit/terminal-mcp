@@ -176,6 +176,18 @@ fi
 # -- 5. systemd unit -----------------------------------------------------------
 UNIT_DIR="$HOME/.config/systemd/user"
 UNIT_PATH="$UNIT_DIR/terminal-node-agent.service"
+systemd_quote() {
+  local value="$1"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//%/%%}
+  printf '"%s"' "$value"
+}
+systemd_exec_quote() {
+  local value="$1"
+  value=${value//\$/\$\$}
+  systemd_quote "$value"
+}
 UNIT_CONTENT=$(cat <<EOF
 [Unit]
 Description=Terminal MCP node agent ($NODE_ID)
@@ -189,9 +201,9 @@ StartLimitBurst=8
 
 [Service]
 Type=simple
-WorkingDirectory=$REPO_DIR
-Environment=TERMINAL_MCP_CONFIG=$REPO_DIR/config.yaml
-ExecStart=$REPO_DIR/.venv/bin/terminal-node-agent --node-id $NODE_ID --controller-url $CONTROLLER_URL --token-file $TOKEN_FILE --host $AGENT_HOST --port $AGENT_PORT --heartbeat-interval-seconds $HEARTBEAT_INTERVAL
+WorkingDirectory=$(systemd_quote "$REPO_DIR")
+Environment=$(systemd_quote "TERMINAL_MCP_CONFIG=$REPO_DIR/config.yaml")
+ExecStart=$(systemd_exec_quote "$REPO_DIR/.venv/bin/terminal-node-agent") --node-id $(systemd_exec_quote "$NODE_ID") --controller-url $(systemd_exec_quote "$CONTROLLER_URL") --token-file $(systemd_exec_quote "$TOKEN_FILE") --host $(systemd_exec_quote "$AGENT_HOST") --port $(systemd_exec_quote "$AGENT_PORT") --heartbeat-interval-seconds $(systemd_exec_quote "$HEARTBEAT_INTERVAL")
 Restart=always
 RestartSec=3
 RestartSteps=6
@@ -204,19 +216,19 @@ RestartMaxDelaySec=60
 # (see docs/CONTROLLER_RUNBOOK.md).
 KillMode=process
 # Sized by SESSION COUNT, not by feel. Each tmux session this node
-# supervises costs 2 tasks -- an `sh` + `cat` pair piping the pane into
+# supervises costs 2 tasks -- an \`sh\` + \`cat\` pair piping the pane into
 # ~/.local/state/terminal-mcp/raw/<session>.log -- plus the tmux server
 # and the agent itself. Budget ~2*sessions + 20.
 #
 # The previous values (512M / 256) were sized for a small fleet and
 # silently became the failure mode on dell-linux at 108 sessions: the
 # cgroup sat at 222/256 tasks, every request that needed a new thread
-# died with `RuntimeError: can't start new thread`, and the node answered
-# `GET /v1/sessions/<name>/status` with HTTP 500. The controller reports
+# died with \`RuntimeError: can't start new thread\`, and the node answered
+# \`GET /v1/sessions/<name>/status\` with HTTP 500. The controller reports
 # that as flaky connectivity, which sends you looking at the network
-# instead of at `pids.events`. 2048 tasks covers ~1000 sessions.
+# instead of at \`pids.events\`. 2048 tasks covers ~1000 sessions.
 #
-# Check headroom with scripts/node-agent-health.sh; a non-zero `max`
+# Check headroom with scripts/node-agent-health.sh; a non-zero \`max\`
 # counter in the cgroup's pids.events/memory.events means you already
 # hit the ceiling.
 MemoryMax=3G
