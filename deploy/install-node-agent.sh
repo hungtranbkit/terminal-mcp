@@ -33,6 +33,7 @@ AGENT_PORT=8790
 AGENT_HOST=127.0.0.1
 HEARTBEAT_INTERVAL=20
 USE_SYSTEMD=1
+PAIRED_MODE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -44,6 +45,7 @@ while [[ $# -gt 0 ]]; do
     --host) AGENT_HOST="$2"; shift 2 ;;
     --heartbeat-interval) HEARTBEAT_INTERVAL="$2"; shift 2 ;;
     --no-systemd) USE_SYSTEMD=0; shift ;;
+    --paired) PAIRED_MODE=1; shift ;;
     -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -102,6 +104,10 @@ elif [[ -f "$ENV_FILE" ]]; then
   unset TOKEN_VALUE
   echo "-> Migrated legacy token into $TOKEN_FILE and removed $ENV_FILE"
 else
+  if [[ "$PAIRED_MODE" -eq 1 ]]; then
+    echo "Error: paired install requires the protected node token file at $TOKEN_FILE" >&2
+    exit 1
+  fi
   TOKEN_VALUE=$("$REPO_DIR/.venv/bin/python" -c "import secrets; print(secrets.token_hex(32))")
   umask 077
   printf "%s" "$TOKEN_VALUE" > "$TOKEN_FILE"
@@ -236,6 +242,12 @@ else
   echo "$UNIT_CONTENT"
   echo "-> Start it manually with:"
   echo "   $REPO_DIR/.venv/bin/terminal-node-agent --node-id $NODE_ID --controller-url $CONTROLLER_URL --host $AGENT_HOST --port $AGENT_PORT"
+fi
+
+if [[ "$PAIRED_MODE" -eq 1 ]]; then
+  echo "== Node agent installed through approved pairing. =="
+  echo "The controller will report Online after heartbeat and execution checks succeed."
+  exit 0
 fi
 
 echo

@@ -144,6 +144,13 @@ def _service(tmp_path: Path, *, config: AppConfig | None = None, tailscale_avail
     detected = ({"available": True, "ip": "100.100.1.1", "hostname": "ctl", "reason": None}
                 if tailscale_available else
                 {"available": False, "ip": None, "hostname": None, "reason": "tailscale_not_installed"})
+    def replace_token(node_id: str, token: str) -> None:
+        if credentials is not None:
+            credentials.replace(node_id, token, reason="approved_pairing_repair")
+            os.environ[f"TERMINAL_MCP_NODE_TOKEN_{node_id.upper().replace('-', '_')}"] = token
+        else:
+            _token_setter(credentials)(node_id, token)
+
     onboarding = OnboardingService(
         config, controller=controller, connection_store=connection_store,
         enrollment_store=EnrollmentStore(tmp_path / "enrollment.db"),
@@ -157,6 +164,7 @@ def _service(tmp_path: Path, *, config: AppConfig | None = None, tailscale_avail
         # freshly-enrolled node's first heartbeat would 401, which is a
         # production behavior the tests must exercise, not paper over.
         token_env_setter=_token_setter(credentials),
+        replace_token_setter=replace_token,
         tailscale_detector=lambda: detected,
     )
     return terminal, controller, connection_store, onboarding
@@ -612,6 +620,139 @@ def test_enrollment_refuses_a_duplicate_node_id(tmp_path):
     with pytest.raises(OnboardingError) as excinfo:
         onboarding.create_enrollment(node_id="win1", profile="minimal")
     assert excinfo.value.code == "NODE_ALREADY_EXISTS" and excinfo.value.status == 409
+
+
+def test_two_pending_codes_cannot_race_into_duplicate_node_replacement(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    _t, controller, _cs, onboarding = _service(tmp_path)
+    enrollments = [onboarding.create_enrollment(node_id="race-node", os_name="linux") for _ in range(2)]
+    def redeem(item):
+        try:
+            return onboarding.consume_enrollment(item["code"], hostname="race-node",
+                                                 addresses={"tailscale_ip": "100.124.8.40"})["node_id"]
+        except OnboardingError as exc:
+            return exc.code
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(redeem, enrollments))
+    assert results.count("race-node") == 1
+    assert results.count("NODE_ALREADY_EXISTS") == 1
+    assert len([node for node in controller.registry.list() if node.id == "race-node"]) == 1
+
+
+def test_repair_enrollment_requires_explicit_approval_and_reuses_existing_node(tmp_path):
+    from terminal_mcp.node_credentials import NodeCredentialStore, OK, REVOKED
+    credentials = NodeCredentialStore(tmp_path / "credentials.db")
+    _t, controller, _cs, onboarding = _service(tmp_path, credentials=credentials)
+    first = onboarding.create_enrollment(node_id="macbook", profile="minimal", os_name="linux")
+    first_result = onboarding.consume_enrollment(first["code"], hostname="ubuntu-mac",
+                                                addresses={"tailscale_ip": "100.124.8.38"})
+    with pytest.raises(OnboardingError) as excinfo:
+        onboarding.create_enrollment(node_id="macbook", profile="minimal", os_name="linux")
+    assert excinfo.value.code == "NODE_ALREADY_EXISTS"
+
+    repair = onboarding.create_enrollment(node_id="macbook", profile="minimal", os_name="linux",
+                                          replace_existing=True, created_by="operator@example.com")
+    result = onboarding.consume_enrollment(repair["code"], hostname="ubuntu-mac",
+                                           addresses={"tailscale_ip": "100.124.8.38"})
+    assert result["node_id"] == "macbook"
+    assert controller.registry.get("macbook") is not None
+    assert len([node for node in controller.registry.list() if node.id == "macbook"]) == 1
+    assert credentials.verify("macbook", result["node_token"]).verdict == OK
+    assert credentials.verify("macbook", first_result["node_token"]).verdict == REVOKED
+    assert first_result["node_token"] not in json.dumps(repair["enrollment"])
+
+
+def test_repair_enrollment_rejects_a_different_hostname(tmp_path):
+    _t, _controller, _cs, onboarding = _service(tmp_path)
+    first = onboarding.create_enrollment(node_id="macbook", profile="minimal", os_name="linux")
+    onboarding.consume_enrollment(first["code"], hostname="ubuntu-mac",
+                                  addresses={"tailscale_ip": "100.124.8.38"})
+    repair = onboarding.create_enrollment(node_id="macbook", profile="minimal", os_name="linux",
+                                          replace_existing=True)
+    with pytest.raises(OnboardingError) as excinfo:
+        onboarding.consume_enrollment(repair["code"], hostname="unrelated-host",
+                                      addresses={"tailscale_ip": "100.124.8.38"})
+    assert excinfo.value.code == "REPAIR_HOST_MISMATCH"
+
+
+def test_repair_enrollment_rejects_a_different_tailnet_address(tmp_path):
+    _t, _controller, _cs, onboarding = _service(tmp_path)
+    first = onboarding.create_enrollment(node_id="macbook", profile="minimal", os_name="linux")
+    onboarding.consume_enrollment(first["code"], hostname="ubuntu-mac",
+                                  addresses={"tailscale_ip": "100.124.8.38"})
+    repair = onboarding.create_enrollment(node_id="macbook", profile="minimal", os_name="linux",
+                                          replace_existing=True)
+    with pytest.raises(OnboardingError) as excinfo:
+        onboarding.consume_enrollment(repair["code"], hostname="ubuntu-mac",
+                                      addresses={"tailscale_ip": "100.124.8.39"})
+    assert excinfo.value.code == "REPAIR_HOST_MISMATCH"
+
+
+def test_linux_pair_command_uses_https_and_keeps_tokens_out_of_operator_output():
+    from terminal_mcp.linux_onboarding import build_linux_pair_command, render_linux_pair_script
+    command = build_linux_pair_command(controller_url="https://controller.example",
+                                       node_id="macbook", enrollment_code=generate_code())
+    assert "https://controller.example/enroll/linux-pair.sh" in command
+    assert "--token" not in command
+    assert "node_token" not in command
+    script = render_linux_pair_script()
+    assert "node_token" in script  # parsed in memory into the 0600 token file
+    assert "--token" not in script
+    assert "ssh " not in script and "authorized_keys" not in script
+    assert "tailscale ip -4" in script
+    assert 'rm -f "$TMP_RESPONSE"' in script
+    assert "--repo-dir \"$HOME/terminal-mcp\" --paired" in script
+    installer = (Path(__file__).parents[1] / "deploy" / "install-node-agent.sh").read_text()
+    assert "loginctl enable-linger" in installer
+    assert "--paired" in installer
+
+
+def test_dashboard_linux_pairing_requires_https_origin_before_issuing_code(tmp_path, monkeypatch):
+    client, _controller, onboarding = _client(tmp_path, monkeypatch)
+    response = client.post("/dashboard/api/nodes/onboard/enrollments", json={
+        "node_id": "ubuntu-test", "os": "linux", "profile": "minimal"})
+    assert response.status_code == 400
+    assert response.json()["error"] == "INVALID_REQUEST"
+    assert onboarding.enrollments.list() == []
+
+
+def test_dashboard_linux_pairing_returns_one_command_without_plaintext_node_token(tmp_path, monkeypatch, caplog):
+    from dataclasses import replace
+    config = _config(tmp_path)
+    config = replace(config, nodes=replace(config.nodes, onboarding=replace(
+        config.nodes.onboarding, bootstrap_origin="https://bootstrap.example.test")))
+    client, controller, onboarding = _client(tmp_path, monkeypatch, config=config)
+    response = client.post("/dashboard/api/nodes/onboard/enrollments", json={
+        "node_id": "ubuntu-test", "os": "linux", "profile": "minimal"})
+    assert response.status_code == 200
+    result = response.json()
+    assert "https://bootstrap.example.test/enroll/linux-pair.sh" in result["quick_install_command"]
+    assert result["code"] in result["quick_install_command"]
+    assert "node_token" not in json.dumps(result)
+    assert "script" not in result
+    http_result = client.post("/dashboard/api/enroll/consume", json={
+        "code": result["code"], "hostname": "ubuntu-test", "platform": "linux",
+        "addresses": {"tailscale_ip": "100.124.8.38"}})
+    assert http_result.status_code == 400
+    assert onboarding.enrollments.get(result["enrollment"]["id"]).status == "pending"
+    secure_result = client.post("https://testserver/dashboard/api/enroll/consume", json={
+        "code": result["code"], "hostname": "ubuntu-test", "platform": "linux",
+        "addresses": {"tailscale_ip": "100.124.8.38"}})
+    assert secure_result.status_code == 200
+    token = secure_result.json()["node_token"]
+    assert len(token) == 64
+    assert controller.registry.get("ubuntu-test") is not None
+    assert token not in caplog.text
+
+
+def test_linux_installer_route_is_public_secret_free_and_no_store(tmp_path, monkeypatch):
+    client, _controller, _onboarding = _client(tmp_path, monkeypatch)
+    response = client.get("/enroll/linux-pair.sh")
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert "PAIRING_CODE" in response.text
+    assert "TMCP-00000-00000-00000" not in response.text
+    assert "node-agent.token" in response.text
 
 
 def test_a_lying_node_cannot_get_its_address_trusted_as_a_tailnet_path(tmp_path):

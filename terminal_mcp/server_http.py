@@ -508,6 +508,11 @@ def main() -> None:
             credentials.adopt(node_id, token)
         except Exception:  # noqa: BLE001 -- never fail an enrollment over bookkeeping
             _log.exception("could not record node %s's token for rotation", node_id)
+
+    def _replace_enrolled_token(node_id: str, token: str) -> None:
+        """Approved repair cuts over credentials without touching sessions."""
+        credentials.replace(node_id, token, reason="approved_pairing_repair")
+        os.environ[node_token_env_var(node_id)] = token
     onboarding = OnboardingService(
         config, controller=controller, connection_store=connection_store,
         enrollment_store=EnrollmentStore(), transport_store=TransportStore(),
@@ -523,6 +528,7 @@ def main() -> None:
         # today is rotatable/revocable without a later adoption step
         # (blg_a3cc401d8275). Same helper shape as dashboard.py's own.
         token_env_setter=_manage_enrolled_token,
+        replace_token_setter=_replace_enrolled_token,
     )
 
     # Same "constructed ONCE, shared by both build_mcp and register_

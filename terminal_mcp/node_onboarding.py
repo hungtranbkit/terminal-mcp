@@ -40,9 +40,11 @@ import secrets
 import shutil
 import socket
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from . import rescue_gateway
 from .enrollment import (
@@ -184,6 +186,7 @@ class OnboardingService:
     def __init__(self, config, *, controller, connection_store, enrollment_store: EnrollmentStore,
                  transport_store: TransportStore, port_allocator: rescue_gateway.RescuePortAllocator,
                  audit=None, token_env_setter: Callable[[str, str], None] | None = None,
+                 replace_token_setter: Callable[[str, str], None] | None = None,
                  tailscale_detector: Callable[[], dict[str, Any]] = detect_controller_tailscale) -> None:
         self.config = config
         self.controller = controller
@@ -194,6 +197,8 @@ class OnboardingService:
         self.audit = audit
         self.resolver = TransportResolver(transport_store)
         self._set_token_env = token_env_setter or (lambda node_id, token: None)
+        self._replace_token = replace_token_setter or self._set_token_env
+        self._consume_lock = threading.RLock()
         self._detect_tailscale = tailscale_detector
 
     # -- config helpers ----------------------------------------------------
@@ -325,7 +330,8 @@ class OnboardingService:
     def create_enrollment(self, *, node_id: str | None, display_name: str | None = None,
                           os_name: str = OS_WINDOWS, profile: str = "minimal",
                           connectivity: dict[str, Any] | None = None, created_by: str | None = None,
-                          hostname_hint: str | None = None) -> dict[str, Any]:
+                          hostname_hint: str | None = None,
+                          replace_existing: bool = False) -> dict[str, Any]:
         if not self.onboarding_config.enabled:
             raise OnboardingError("ONBOARDING_DISABLED", "nodes.onboarding.enabled is false", status=403)
         if os_name not in SUPPORTED_OS:
@@ -337,17 +343,31 @@ class OnboardingService:
             candidate = validate_node_id(candidate)
         except ValueError as exc:
             raise OnboardingError("INVALID_REQUEST", str(exc)) from exc
-        if self.controller.node_status(candidate) is not None:
+        existing = self.controller.registry.get(candidate)
+        if existing is not None and not replace_existing:
             raise OnboardingError("NODE_ALREADY_EXISTS", f"a node named {candidate!r} is already registered",
                                   status=409)
+        if replace_existing and existing is None:
+            raise OnboardingError("NODE_NOT_FOUND", "repair requires an existing registered node", status=404)
+        if replace_existing and os_name != "linux":
+            raise OnboardingError("INVALID_REQUEST", "repair pairing is currently supported for Linux nodes")
         plan = self.plan_connectivity(connectivity)
+        enrollment_connectivity = plan.to_dict()
+        if replace_existing:
+            # This field is server-authored and stripped from every public
+            # enrollment representation. It binds a repair code to the
+            # hostname the controller already knows for this node.
+            enrollment_connectivity["_repair_hostname"] = existing.hostname
+            existing_host = urlparse(existing.endpoint).hostname or ""
+            if is_tailnet_address(existing_host):
+                enrollment_connectivity["_repair_tailscale_ip"] = existing_host
         record, code = self.enrollments.create(
             node_id=candidate, display_name=display_name, os_name=os_name, profile=profile,
-            connectivity=plan.to_dict(), ttl_seconds=self.onboarding_config.enrollment_ttl_seconds,
+            connectivity=enrollment_connectivity, ttl_seconds=self.onboarding_config.enrollment_ttl_seconds,
             created_by=created_by)
         self._audit("node_enrollment_created", node_id=candidate,
                     detail={"enrollment_id": record.id, "profile": profile, "os": os_name,
-                            "connectivity": plan.to_dict()})
+                            "connectivity": plan.to_dict(), "replace_existing": replace_existing})
         _log.info("onboarding: enrollment created node_id=%s profile=%s os=%s expires_at=%s by=%s",
                   candidate, profile, os_name, record.expires_at, created_by)
         return {"enrollment": record.to_dict(), "code": code, "connectivity": plan.to_dict(),
@@ -411,6 +431,20 @@ class OnboardingService:
                         platform: str, addresses: dict[str, Any] | None,
                         rescue_public_key: str | None, request_base_url: str | None,
                         by_handle: bool) -> dict[str, Any]:
+        # The registry has a unique node id but enrollment creation is
+        # intentionally side-effect free. Serialize the final claim/check/
+        # registration so two valid pending codes cannot race into an
+        # implicit replacement.
+        with self._consume_lock:
+            return self._consume_record_locked(
+                record, hostname=hostname, source_ip=source_ip, platform=platform,
+                addresses=addresses, rescue_public_key=rescue_public_key,
+                request_base_url=request_base_url, by_handle=by_handle)
+
+    def _consume_record_locked(self, record, *, hostname: str, source_ip: str | None,
+                        platform: str, addresses: dict[str, Any] | None,
+                        rescue_public_key: str | None, request_base_url: str | None,
+                        by_handle: bool) -> dict[str, Any]:
         """Everything that happens once an enrollment has been claimed --
         shared by the code path and the handle path so the two can never
         diverge on what a node is given.
@@ -429,6 +463,27 @@ class OnboardingService:
             record = consumed
 
         node_id = record.node_id
+        expected_hostname = record.connectivity.get("_repair_hostname")
+        if expected_hostname:
+            current = self.controller.registry.get(node_id)
+            if (current is None or current.hostname.casefold() != str(expected_hostname).casefold()
+                    or str(hostname or "").strip().casefold() != str(expected_hostname).casefold()):
+                self._audit("node_repair_rejected", node_id=node_id,
+                            detail={"reason": "hostname_mismatch", "hostname": hostname})
+                raise OnboardingError("REPAIR_HOST_MISMATCH",
+                                      "this repair code does not match the registered node hostname", status=403)
+            expected_ip = record.connectivity.get("_repair_tailscale_ip")
+            presented_ip = str((addresses or {}).get("tailscale_ip") or "").strip()
+            if expected_ip and presented_ip != expected_ip:
+                self._audit("node_repair_rejected", node_id=node_id,
+                            detail={"reason": "tailnet_address_mismatch", "hostname": hostname})
+                raise OnboardingError("REPAIR_HOST_MISMATCH",
+                                      "this repair code must be redeemed from the registered tailnet address",
+                                      status=403)
+        elif self.controller.registry.get(node_id) is not None:
+            raise OnboardingError("NODE_ALREADY_EXISTS",
+                                  "node was registered after this code was created; approve a repair code instead",
+                                  status=409)
         addresses = addresses or {}
         plan = ConnectivityPlan(
             tailscale=bool(record.connectivity.get("tailscale")),
@@ -485,7 +540,10 @@ class OnboardingService:
                                    hostname=hostname or node_id, token_file=token_file)
         self.controller.register_remote_node(node_id, display_name=record.display_name,
                                              hostname=hostname or node_id, endpoint=endpoint, token=token)
-        self._set_token_env(node_id, token)
+        if expected_hostname:
+            self._replace_token(node_id, token)
+        else:
+            self._set_token_env(node_id, token)
 
         ssh_key, ssh_key_reason = read_controller_ssh_public_key(self.onboarding_config)
         tailscale_payload = self._tailscale_payload(plan)

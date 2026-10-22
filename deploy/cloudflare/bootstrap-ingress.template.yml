@@ -29,7 +29,7 @@
 # now neither could: the edge 404'd the request and the install died with
 # no error anywhere the operator could see.
 #
-#   the helper   downloadSetupScript() GETs /enroll/windows-setup.ps1 from
+  #   the helper   downloadSetupScript() GETs /enroll/windows-setup.ps1 from
 #                the origin it was paired with -- which, on a public
 #                deployment, is this hostname. A live run on 2026-09-15
 #                redeemed successfully, reported installing_service, then
@@ -101,7 +101,7 @@ ingress:
   # The generic setup script, under both paths that serve it. Byte
   # identical on either, GET only, and carrying no secret -- see the header.
   - hostname: ${BOOTSTRAP_HOSTNAME}
-    path: ^/(w|enroll/windows-setup\.ps1)$
+    path: ^/(w|enroll/windows-setup\.ps1|enroll/linux-pair\.sh)$
     service: ${CONTROLLER_ORIGIN}
 
   # The node-agent bundle, so an onboarded node can install the agent that

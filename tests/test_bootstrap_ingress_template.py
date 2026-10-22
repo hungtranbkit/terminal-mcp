@@ -24,7 +24,7 @@ TEMPLATE = Path(__file__).resolve().parent.parent / "deploy" / "cloudflare" / \
 # Every path the template allows, as a regex the tunnel would apply.
 ALLOWED_PATTERNS = (
     r"^/dashboard/api/enroll/(consume|redeem|progress)$",
-    r"^/(w|enroll/windows-setup\.ps1)$",
+    r"^/(w|enroll/windows-setup\.ps1|enroll/linux-pair\.sh)$",
     r"^/dashboard/api/nodes/[A-Za-z0-9_-]{1,64}/agent-bundle$",
     r"^/dashboard/api/nodes/[A-Za-z0-9_-]{1,64}/heartbeat$",
     r"^/health/(live|ready)$",
@@ -198,17 +198,18 @@ def test_the_setup_script_is_reachable_under_both_paths_it_is_served_on(template
     """The helper GETs /enroll/windows-setup.ps1; the Win + R command GETs
     /w. They are the same bytes from the same route, and BOTH had to be
     allowed -- allowing one would have fixed exactly half the flow."""
-    assert r"^/(w|enroll/windows-setup\.ps1)$" in template
-    pattern = r"^/(w|enroll/windows-setup\.ps1)$"
-    for path in ("/w", "/enroll/windows-setup.ps1"):
+    assert r"^/(w|enroll/windows-setup\.ps1|enroll/linux-pair\.sh)$" in template
+    pattern = r"^/(w|enroll/windows-setup\.ps1|enroll/linux-pair\.sh)$"
+    for path in ("/w", "/enroll/windows-setup.ps1", "/enroll/linux-pair.sh"):
         assert re.match(pattern, path), path
 
 
 def test_the_setup_script_rule_is_not_a_prefix_door():
     """/enroll/... must not become a way to reach anything else added under
     that prefix later."""
-    pattern = r"^/(w|enroll/windows-setup\.ps1)$"
+    pattern = r"^/(w|enroll/windows-setup\.ps1|enroll/linux-pair\.sh)$"
     for path in ("/enroll/", "/enroll/consume", "/enroll/windows-setup.ps1.bak",
+                 "/enroll/linux-pair.sh.bak",
                  "/enroll/windows-setup.ps1/../../mcp", "/w/", "/ws",
                  "/enroll/windows-setupXps1"):
         assert not re.match(pattern, path), path
@@ -216,7 +217,7 @@ def test_the_setup_script_rule_is_not_a_prefix_door():
 
 def test_the_dot_in_the_script_name_is_escaped():
     """An unescaped '.' would also match /enroll/windows-setupZps1."""
-    pattern = r"^/(w|enroll/windows-setup\.ps1)$"
+    pattern = r"^/(w|enroll/windows-setup\.ps1|enroll/linux-pair\.sh)$"
     assert not re.match(pattern, "/enroll/windows-setupZps1")
 
 

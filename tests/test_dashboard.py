@@ -1478,6 +1478,7 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         # Windows Run dialog truncates at ~259 characters and the
         # quick-install one-liner does not fit with the long path.
         "/w": {"GET", "HEAD"},
+        "/enroll/linux-pair.sh": {"GET", "HEAD"},
         # Project Backlog (planning layer). Read is _read_guard'ed; every
         # write is _mutation_guard'ed AND path-gated by the service.
         # The panel PAGE itself (a view, like /dashboard/tasks) plus its
