@@ -4641,7 +4641,7 @@ class TerminalService:
         result["binding"] = binding_result
 
         if initial_prompt:
-            may_preflight = (result.get("state") == "READY" or
+            may_preflight = (result.get("state") == "READY" or result.get("composer_ready") is True or
                              (agent_type in {"codex", "claude"} and result.get("state") == "CREATED"
                               and (result.get("agent_process_ready") is True or
                                    result.get("composer_ready") is True)))

@@ -530,14 +530,25 @@ class RemoteNodeClient:
                   idempotency_key: str | None = None, origin: str | None = None, trace_id: str | None = None,
                   parent_turn_id: str | None = None, depth: int = 0) -> dict[str, Any]:
         if require_idle:
-            # Older node agents ignore unknown request fields. Never silently
-            # drop an idle-only guard across that compatibility boundary.
-            return {"error": "IDLE_GUARD_UNSUPPORTED", "sent": False, "enter_sent": False}
-        return self._request("POST", f"/v1/sessions/{urllib.parse.quote(session)}/send", body={
+            # A distinct endpoint makes support explicit: old agents cannot
+            # silently ignore the guard and receive an unguarded send.
+            path = f"/v1/sessions/{urllib.parse.quote(session)}/send-guarded"
+        else:
+            path = f"/v1/sessions/{urllib.parse.quote(session)}/send"
+        body = {
             "text": text, "press_enter": press_enter, "dry_run": dry_run,
             "prompt_response": prompt_response, "idempotency_key": idempotency_key,
             "origin": origin, "trace_id": trace_id, "parent_turn_id": parent_turn_id, "depth": depth,
-        })
+        }
+        try:
+            return self._request("POST", path, body=body)
+        except NodeClientError as exc:
+            # Compatibility remains fail-closed until the owning node agent
+            # has the atomic guarded-send route. Never retry on /send.
+            if require_idle and exc.http_status == 404:
+                return {"error": "IDLE_GUARD_UNSUPPORTED", "sent": False,
+                        "enter_sent": False}
+            raise
 
     def send_keys(self, session: str, keys: list[str], confirm_sensitive: bool = False) -> dict[str, Any]:
         return self._request("POST", f"/v1/sessions/{urllib.parse.quote(session)}/send-keys",

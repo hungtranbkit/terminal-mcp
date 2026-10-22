@@ -426,12 +426,16 @@ class SessionLifecycleService:
         if agent_type in {"codex", "claude"}:
             task_ready = agent_type == "codex" and state == "READY"
             result.update(
-                state="READY" if task_ready else "CREATED", agent_process_ready=state == "READY",
+                state="COMPOSER_READY" if task_ready else "CREATED", agent_process_ready=state == "READY",
                 composer_ready=task_ready,
                 tool_ready=False,
-                readiness_stage="TASK_READY" if task_ready else "TOOL_PREFLIGHT_REQUIRED",
-                readiness_status="READY" if task_ready else "WAITING_INPUT",
-                next_action=("Session can receive a task; tool and OS permissions remain governed by their existing approval policy." if task_ready else "Wait for startup to settle or resolve the reported startup blocker."),
+                readiness_stage="COMPOSER_READY" if task_ready else "TOOL_PREFLIGHT_REQUIRED",
+                readiness_status="COMPOSER_READY" if task_ready else "WAITING_INPUT",
+                next_action=(
+                    "The composer can receive input; tool execution and OS permissions remain "
+                    "unverified and governed by their existing approval policy."
+                    if task_ready else "Wait for startup to settle or resolve the reported startup blocker."
+                ),
             )
         if startup_actions:
             result["startup_actions"] = startup_actions

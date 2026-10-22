@@ -86,6 +86,8 @@ def test_compact_terminal_turn_schema_exposes_strict_delete_confirmation():
                 if tool.name == "terminal_turn")
     confirm = tool.input_schema["properties"]["confirm"]
     assert {row.get("type") for row in confirm["anyOf"]} == {"boolean", "null"}
+    args = tool.input_schema["properties"]["args"]
+    assert {row.get("type") for row in args["anyOf"]} == {"object", "null"}
 
 
 def test_an_explicitly_passed_controller_is_still_the_one_used(built):

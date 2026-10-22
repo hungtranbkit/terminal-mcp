@@ -195,13 +195,43 @@ def test_real_disposable_tmux_direct_start_and_replay(tmp_path, tmux_session_fac
     assert hashlib.sha256(PROMPT.encode()).hexdigest() in pane
 
 
-def test_remote_guard_refuses_before_any_http_request(monkeypatch):
-    from terminal_mcp.node_client import RemoteNodeClient
+def test_remote_guard_uses_guarded_endpoint_and_never_uses_legacy_send(monkeypatch):
+    from terminal_mcp.node_client import NodeClientError, RemoteNodeClient
     client = RemoteNodeClient("http://node.test:8790", "inert-test-token")
-    monkeypatch.setattr(client, '_request', lambda *a, **kw: pytest.fail('must not send HTTP'))
+    calls = []
+
+    def request(method, path, *, params=None, body=None, timeout_seconds=None):
+        calls.append((method, path, body))
+        if path.endswith("/send-guarded"):
+            raise NodeClientError("old node agent", http_status=404)
+        pytest.fail("must not fall back to an unguarded endpoint")
+
+    monkeypatch.setattr(client, '_request', request)
     result = client.send_text('codex', 'inert', True, require_idle=True)
     assert result['error'] == 'IDLE_GUARD_UNSUPPORTED'
     assert result['sent'] is False
+    assert calls == [('POST', '/v1/sessions/codex/send-guarded', {
+        'text': 'inert', 'press_enter': True, 'dry_run': False,
+        'prompt_response': False, 'idempotency_key': None,
+        'origin': None, 'trace_id': None, 'parent_turn_id': None, 'depth': 0,
+    })]
+
+
+def test_remote_guarded_send_preserves_idempotency_and_uses_owner_endpoint(monkeypatch):
+    from terminal_mcp.node_client import RemoteNodeClient
+    client = RemoteNodeClient("http://node.test:8790", "inert-test-token")
+    calls = []
+
+    def request(method, path, *, params=None, body=None, timeout_seconds=None):
+        calls.append((method, path, body))
+        return {'delivery_state': 'SUBMIT_CONFIRMED', 'enter_sent': True}
+
+    monkeypatch.setattr(client, '_request', request)
+    result = client.send_text('codex', 'inert', True, require_idle=True,
+                              idempotency_key='one-start')
+    assert result['delivery_state'] == 'SUBMIT_CONFIRMED'
+    assert calls[0][0:2] == ('POST', '/v1/sessions/codex/send-guarded')
+    assert calls[0][2]['idempotency_key'] == 'one-start'
 
 
 def test_explicit_idempotency_key_takes_precedence_over_legacy_request_key(rig):
