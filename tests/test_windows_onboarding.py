@@ -701,10 +701,94 @@ def test_linux_pair_command_uses_https_and_keeps_tokens_out_of_operator_output()
     assert "ssh " not in script and "authorized_keys" not in script
     assert "tailscale ip -4" in script
     assert 'rm -f "$TMP_RESPONSE"' in script
-    assert "--repo-dir \"$HOME/terminal-mcp\" --paired" in script
+    assert '--repo-dir "$HOME/terminal-mcp" --source-dir "$SOURCE_DIR" --paired' in script
     installer = (Path(__file__).parents[1] / "deploy" / "install-node-agent.sh").read_text()
     assert "loginctl enable-linger" in installer
     assert "--paired" in installer
+    assert 'pip install --quiet "$SOURCE_DIR"' in installer
+
+
+def test_linux_pair_bootstrap_refreshes_trusted_source_without_touching_checkout():
+    from terminal_mcp.linux_onboarding import build_linux_pair_command, render_linux_pair_script
+
+    script = render_linux_pair_script()
+    command = build_linux_pair_command(controller_url="https://controller.example",
+                                       node_id="macbook", enrollment_code=generate_code())
+    assert "set -o pipefail; curl" in command
+    assert "refs/heads/main" in script
+    assert "worktree add --quiet --detach" in script
+    assert ' show "$UPSTREAM_COMMIT:deploy/install-node-agent.sh"' in script
+    assert ' hash-object "$FRESH_INSTALLER"' in script
+    assert "install-node-agent.sh" in script
+    assert "--source-dir" in script
+    assert "does not support this pairing flow yet; pairing was not attempted" in script
+    assert "git reset" not in script and "git stash" not in script
+    assert "config.yaml" not in script
+
+
+def test_linux_pair_bootstrap_download_errors_do_not_print_pairing_secrets():
+    from terminal_mcp.linux_onboarding import render_linux_pair_script
+
+    script = render_linux_pair_script()
+    assert "curl --fail --silent --show-error --proto '=https' --tlsv1.2" in script
+    assert "PAIRING_CODE" in script
+    assert 'unset PAIRING_CODE PAYLOAD' in script
+    assert 'echo "$PAIRING_CODE"' not in script
+    assert 'echo "$PAYLOAD"' not in script
+
+
+def test_linux_pair_command_fails_when_bootstrap_download_fails(tmp_path):
+    import os
+    import subprocess
+    from terminal_mcp.linux_onboarding import build_linux_pair_command
+
+    code = generate_code()
+    command = build_linux_pair_command(controller_url="https://controller.example",
+                                       node_id="macbook", enrollment_code=code)
+    assert command.startswith("set -o pipefail; curl ")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    failing_curl = bin_dir / "curl"
+    failing_curl.write_text("#!/bin/sh\nexit 22\n")
+    failing_curl.chmod(0o755)
+    env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}")
+    result = subprocess.run(["bash", "-c", command], env=env, capture_output=True, text=True, check=False)
+    assert result.returncode != 0
+    assert code not in result.stdout + result.stderr
+
+
+def test_linux_pair_fresh_installer_keeps_dirty_config_and_token_checkout_intact(tmp_path):
+    import subprocess
+    from terminal_mcp.linux_onboarding import render_linux_pair_script
+
+    script = render_linux_pair_script()
+    assert 'worktree add --quiet --detach "$SOURCE_DIR" "$UPSTREAM_COMMIT"' in script
+    assert '--repo-dir "$HOME/terminal-mcp" --source-dir "$SOURCE_DIR"' in script
+    assert '\ngit reset ' not in script and '\ngit checkout ' not in script and '\ngit stash ' not in script
+    assert 'echo "$node_token"' not in script
+    assert 'echo "$PAIRING_CODE"' not in script
+
+    checkout = tmp_path / "checkout"
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    subprocess.run(["git", "-C", str(checkout), "config", "user.email", "qa@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(checkout), "config", "user.name", "QA"], check=True)
+    (checkout / "config.yaml").write_text("committed config\n")
+    (checkout / "agent.py").write_text("old source\n")
+    subprocess.run(["git", "-C", str(checkout), "add", "config.yaml", "agent.py"], check=True)
+    subprocess.run(["git", "-C", str(checkout), "commit", "-qm", "old source"], check=True)
+    (checkout / "agent.py").write_text("fresh source\n")
+    subprocess.run(["git", "-C", str(checkout), "commit", "-qam", "fresh source"], check=True)
+    fresh_commit = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+    (checkout / "config.yaml").write_text("operator's dirty config\n")
+    (checkout / "node-agent.token").write_text("existing protected token\n")
+    (checkout / "local.py").write_text("operator edit\n")
+    temp_source = tmp_path / "fresh-source"
+    subprocess.run(["git", "-C", str(checkout), "worktree", "add", "-q", "--detach",
+                    str(temp_source), fresh_commit], check=True)
+    assert (temp_source / "agent.py").read_text() == "fresh source\n"
+    assert (checkout / "config.yaml").read_text() == "operator's dirty config\n"
+    assert (checkout / "node-agent.token").read_text() == "existing protected token\n"
+    assert (checkout / "local.py").read_text() == "operator edit\n"
 
 
 def test_dashboard_linux_pairing_requires_https_origin_before_issuing_code(tmp_path, monkeypatch):

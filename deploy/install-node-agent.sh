@@ -16,6 +16,7 @@
 #
 # Optional:
 #   --repo-dir DIR         Where to clone/use the terminal-mcp repo (default: ~/terminal-mcp)
+#   --source-dir DIR       Package source to install (default: --repo-dir; pairing uses a verified temp worktree)
 #   --repo-url URL         Git remote to clone from (default: unset -- if --repo-dir doesn't
 #                           already contain a checkout, you'll be told to clone it yourself)
 #   --port PORT             Node agent's own listen port (default: 8790)
@@ -28,6 +29,7 @@ set -euo pipefail
 CONTROLLER_URL=""
 NODE_ID=""
 REPO_DIR="$HOME/terminal-mcp"
+SOURCE_DIR=""
 REPO_URL=""
 AGENT_PORT=8790
 AGENT_HOST=127.0.0.1
@@ -40,6 +42,7 @@ while [[ $# -gt 0 ]]; do
     --controller) CONTROLLER_URL="$2"; shift 2 ;;
     --node-id) NODE_ID="$2"; shift 2 ;;
     --repo-dir) REPO_DIR="$2"; shift 2 ;;
+    --source-dir) SOURCE_DIR="$2"; shift 2 ;;
     --repo-url) REPO_URL="$2"; shift 2 ;;
     --port) AGENT_PORT="$2"; shift 2 ;;
     --host) AGENT_HOST="$2"; shift 2 ;;
@@ -78,15 +81,30 @@ else
   exit 1
 fi
 
+# The pairing bootstrap can provide a verified, detached upstream worktree
+# for the package source while keeping this checkout as the durable home for
+# config, tokens, and local state.
+if [[ -z "$SOURCE_DIR" ]]; then SOURCE_DIR="$REPO_DIR"; fi
+if [[ ! -f "$SOURCE_DIR/pyproject.toml" ]]; then
+  echo "Error: source directory has no pyproject.toml: $SOURCE_DIR" >&2
+  exit 1
+fi
+
 # -- 2. Python venv + install -------------------------------------------------
 cd "$REPO_DIR"
 if [[ ! -d .venv ]]; then
   echo "-> Creating .venv"
   python3 -m venv .venv
 fi
-echo "-> Installing terminal-mcp (pip install -e .)"
+echo "-> Installing terminal-mcp from $SOURCE_DIR"
 ./.venv/bin/pip install --quiet --upgrade pip
-./.venv/bin/pip install --quiet -e .
+if [[ "$SOURCE_DIR" == "$REPO_DIR" ]]; then
+  ./.venv/bin/pip install --quiet -e "$SOURCE_DIR"
+else
+  # A pairing source worktree is temporary; install a wheel so the venv does
+  # not keep an editable reference to a path removed by the bootstrap trap.
+  ./.venv/bin/pip install --quiet "$SOURCE_DIR"
+fi
 
 # -- 3. This node's own token -------------------------------------------------
 ENV_FILE="$REPO_DIR/node-agent.env"  # legacy migration source only
