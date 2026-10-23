@@ -1298,6 +1298,113 @@ def test_wizard_asks_for_the_minimum_and_nothing_more():
     assert form.index('id="anProfiles"') < form.index('id="anAdvanced"')
 
 
+def test_fresh_linux_add_does_not_offer_or_send_repair_mode():
+    page = _nodes_page()
+    linux_choice = page[page.index("button.addEventListener('click', () => {", page.index("addNodeWizardBtn")):
+                        page.index("document.getElementById('anGenerateBtn')")]
+    create_handler = page[page.index("document.getElementById('anGenerateBtn').addEventListener"):
+                          page.index("// One clipboard helper", page.index("document.getElementById('anGenerateBtn').addEventListener"))]
+
+    assert "document.getElementById('anRepairConsent').hidden = true" in linux_choice
+    assert "replace_existing: anOs === 'linux' && document.getElementById('anRepairApproved').checked" not in create_handler
+    assert "anRepairNodeId === nodeId" in create_handler
+    assert "enrollmentRequest.replace_existing = true" in create_handler
+
+
+def test_repair_flow_is_bound_to_existing_node_and_requires_checkbox_action():
+    page = _nodes_page()
+    repair_handler = page[page.index("if (repairButton) repairButton.addEventListener"):
+                          page.index("document.getElementById('testConnBtn')", page.index("if (repairButton) repairButton.addEventListener"))]
+
+    assert "anRepairNodeId = nodeId" in repair_handler
+    assert "anRepairApproved').checked = false" in repair_handler
+    assert "anRepairConsent').hidden = false" in repair_handler
+
+
+def test_add_node_browser_sends_fresh_add_then_explicit_existing_node_repair():
+    import json
+    from urllib.parse import urlsplit
+
+    sync_playwright = pytest.importorskip("playwright.sync_api").sync_playwright
+    from terminal_mcp.dashboard import NODES_ADMIN_HTML
+
+    node = {"id": "existing-linux", "display_name": "Existing Linux", "hostname": "ubuntu",
+            "platform": "linux", "endpoint": "http://127.0.0.1:8790", "session_backend": "tmux",
+            "status": "online", "capacity_status": "healthy", "draining": False,
+            "cpu_percent": 10, "ram_percent": 20, "tmux_session_count": 1}
+    create_requests = []
+
+    def route_api(route):
+        request = route.request
+        parsed = urlsplit(request.url)
+        if parsed.path == "/dashboard/api/nodes" and request.method == "GET":
+            data = {"nodes": [node]}
+        elif parsed.path == "/dashboard/api/sessions":
+            data = {"sessions": []}
+        elif parsed.path == "/dashboard/api/nodes/onboard/profiles":
+            data = {"enabled": True, "profiles": [], "connectivity": {}}
+        elif parsed.path == "/dashboard/api/nodes/onboard/enrollments" and request.method == "GET":
+            data = {"enrollments": []}
+        elif parsed.path == "/dashboard/api/nodes/onboard/enrollments" and request.method == "POST":
+            create_requests.append(json.loads(request.post_data or "{}"))
+            route.fulfill(status=400, content_type="application/json", body='{"detail":"fixture request captured"}')
+            return
+        elif parsed.path == "/dashboard/api/node":
+            data = {"node": node, "sessions": []}
+        else:
+            data = {}
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(data))
+
+    with sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch(
+                headless=True, args=["--no-sandbox", "--no-zygote", "--single-process", "--disable-gpu"])
+        except Exception as exc:  # noqa: BLE001 -- host without a runnable Chromium
+            pytest.skip(f"chromium unavailable: {exc}")
+        page = browser.new_page()
+        page.route("http://127.0.0.1/**", route_api)
+        html = NODES_ADMIN_HTML.replace("<head>", '<head><base href="http://127.0.0.1/">', 1)
+        page.set_content(html, wait_until="domcontentloaded")
+
+        page.get_by_role("button", name="+ Add Node").click()
+        page.locator('#addNodePanel button[data-os="linux"]').click()
+        assert not page.locator("#anRepairConsent").is_visible()
+        page.locator("#anNodeId").fill("brand-new")
+        with page.expect_response(lambda response: response.request.method == "POST"
+                                  and urlsplit(response.url).path == "/dashboard/api/nodes/onboard/enrollments"):
+            page.locator("#anGenerateBtn").click()
+        assert len(create_requests) == 1
+        assert create_requests[0]["node_id"] == "brand-new"
+        assert "replace_existing" not in create_requests[0]
+
+        page.locator('.node-card[data-node-id="existing-linux"]').click()
+        page.locator("#repairPairBtn").wait_for(state="visible")
+        page.locator("#repairPairBtn").click()
+        page.locator("#anRepairConsent").wait_for(state="visible")
+        assert not page.locator("#anRepairApproved").is_checked()
+
+        # Changing the prefilled registered ID invalidates repair mode.
+        page.locator("#anNodeId").fill("brand-new-after-repair")
+        assert not page.locator("#anRepairConsent").is_visible()
+        with page.expect_response(lambda response: response.request.method == "POST"
+                                  and urlsplit(response.url).path == "/dashboard/api/nodes/onboard/enrollments"):
+            page.locator("#anGenerateBtn").click()
+        assert create_requests[1]["node_id"] == "brand-new-after-repair"
+        assert "replace_existing" not in create_requests[1]
+
+        page.locator("#repairPairBtn").click()
+        page.locator("#anRepairConsent").wait_for(state="visible")
+        assert not page.locator("#anRepairApproved").is_checked()
+        page.locator("#anRepairApproved").check()
+        with page.expect_response(lambda response: response.request.method == "POST"
+                                  and urlsplit(response.url).path == "/dashboard/api/nodes/onboard/enrollments"):
+            page.locator("#anGenerateBtn").click()
+        assert len(create_requests) == 3
+        assert create_requests[2]["node_id"] == "existing-linux"
+        assert create_requests[2]["replace_existing"] is True
+        browser.close()
+
+
 def test_wizard_downloads_via_blob_never_a_url_carrying_the_code():
     """A code in a query string lands in browser history, proxy logs and
     the controller's own access log. The download is a Blob built from the

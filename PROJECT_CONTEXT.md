@@ -1,5 +1,13 @@
 # PROJECT_CONTEXT.md
 
+## 2026-10-23 — Issue #80 Add Node fresh-add vs repair consent
+
+- In `terminal_mcp/dashboard.py` (`NODES_ADMIN_HTML`), fresh Linux add no longer presents the existing-node replacement checkbox or sends `replace_existing`. Repair mode is entered only by the Repair connection action rendered for a registered Linux node. Its checkbox starts unchecked and must be affirmatively checked. Changing the prefilled node ID clears repair mode and hides/unchecks consent. Server validation in `node_onboarding.py` remains authoritative and still requires the node to exist.
+- Regression coverage in `tests/test_windows_onboarding.py`: static constraints plus a real Playwright/Chromium flow over the actual dashboard HTML with intercepted API fixtures. It checks fresh add request shape, invalidation when changing the repair target, and explicit consent before a repair request. Red phase: both static assertions failed before the UI fix. Production code path only; no schema/API change.
+- Verification: `tests/test_windows_onboarding.py tests/test_dashboard.py tests/test_dashboard_node_grouping.py tests/test_dashboard_nav_browser_smoke.py` with pinned test dependencies and Playwright -> **268 passed, 4 skipped, 79 deselected**. Final strengthened Browser regression rerun -> **1 passed**. Skips are PowerShell unavailable; deselections follow test configuration. No production API calls that mutate state.
+- Production runtime comparison: opened a new task-only tab for `https://terminal-dashboard.mesflow.net/dashboard/nodes`; Cloudflare Access redirected to sign-in (`auth_status=NONE`), so the production dashboard DOM was not available for comparison. Closed only the tab created for this check. No login attempt, deployment, restart, or node operation.
+- Delivery: committed/pushed to the existing Issue #80 branch/PR #81; record resulting SHA in the task report. Deploy gate remains closed pending authorized dashboard access and the normal reviewed rollout; do not restart production.
+
 ## 2026-10-23 — Issue #80 Linux pairing (live acceptance passed; PR #81 follow-up fixes)
 
 - Work remains isolated in `/home/dell/workspace/.terminal-mcp-worktrees/issue-80-linux-pairing`, branch `feat/issue-80-linux-pairing`. The earlier installer hardening fetches trusted `origin` `refs/heads/main` into a detached temporary worktree, verifies the installer blob and `--source-dir`/`--paired` support before consuming the single-use code, preserves the existing checkout's config and local edits, and installs the temporary source non-editably. Enrollment stays HTTPS and token writes remain atomic with mode 0600.

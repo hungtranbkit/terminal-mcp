@@ -6655,7 +6655,8 @@ NODES_ADMIN_HTML = """<!doctype html>
         await anOpen();
         anOs = 'linux';
         document.getElementById('anNodeId').value = nodeId;
-        document.getElementById('anRepairApproved').checked = true;
+        anRepairNodeId = nodeId;
+        document.getElementById('anRepairApproved').checked = false;
         document.getElementById('anRepairConsent').hidden = false;
         document.getElementById('anProfiles').hidden = true;
         document.getElementById('anAdvanced').hidden = true;
@@ -6781,6 +6782,7 @@ NODES_ADMIN_HTML = """<!doctype html>
     let anProfile = 'minimal';
     let anOs = 'windows';
     let anGenerated = null;      // the one create-enrollment response, held only in this tab
+    let anRepairNodeId = null;   // set only by the registered node's Repair connection action
 
     function anShow(step) {
       for (const id of ['anStepOs', 'anStepForm', 'anStepDone']) {
@@ -6867,6 +6869,8 @@ NODES_ADMIN_HTML = """<!doctype html>
       anPanel.hidden = false;
       anGenerated = null;
       anOs = 'windows';
+      anRepairNodeId = null;
+      document.getElementById('anNodeId').value = '';
       document.getElementById('anRepairApproved').checked = false;
       document.getElementById('anRepairConsent').hidden = true;
       anShow('anStepOs');
@@ -6891,7 +6895,9 @@ NODES_ADMIN_HTML = """<!doctype html>
     for (const button of anPanel.querySelectorAll('.an-os')) {
       button.addEventListener('click', () => {
         anOs = button.dataset.os;
-        document.getElementById('anRepairConsent').hidden = anOs !== 'linux';
+        // Linux fresh-add is the default. Repair consent is exposed only
+        // by the per-node Repair connection action in loadDetail().
+        document.getElementById('anRepairConsent').hidden = true;
         document.getElementById('anProfiles').hidden = anOs === 'linux';
         document.getElementById('anAdvanced').hidden = anOs === 'linux';
         document.getElementById('anNodeId').placeholder = anOs === 'linux' ? 'macbook' : 'win-work';
@@ -6905,6 +6911,14 @@ NODES_ADMIN_HTML = """<!doctype html>
       });
     }
 
+    document.getElementById('anNodeId').addEventListener('input', (event) => {
+      if (anRepairNodeId && event.target.value.trim() !== anRepairNodeId) {
+        anRepairNodeId = null;
+        document.getElementById('anRepairApproved').checked = false;
+        document.getElementById('anRepairConsent').hidden = true;
+      }
+    });
+
     document.getElementById('anGenerateBtn').addEventListener('click', async () => {
       const button = document.getElementById('anGenerateBtn');
       const nodeId = document.getElementById('anNodeId').value.trim();
@@ -6915,10 +6929,14 @@ NODES_ADMIN_HTML = """<!doctype html>
       }
       button.disabled = true;
       anSetMsg('anFormMsg', 'Đang tạo setup...', '');
+      const repairApproved = anOs === 'linux' && anRepairNodeId === nodeId
+        && document.getElementById('anRepairApproved').checked;
+      const enrollmentRequest = { node_id: nodeId, os: anOs, profile: anOs === 'linux' ? 'minimal' : anProfile,
+        connectivity };
+      if (repairApproved) enrollmentRequest.replace_existing = true;
       const result = await api('/dashboard/api/nodes/onboard/enrollments', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ node_id: nodeId, os: anOs, profile: anOs === 'linux' ? 'minimal' : anProfile,
-          connectivity, replace_existing: anOs === 'linux' && document.getElementById('anRepairApproved').checked }),
+        body: JSON.stringify(enrollmentRequest),
       });
       button.disabled = false;
       if (!result.ok) {
