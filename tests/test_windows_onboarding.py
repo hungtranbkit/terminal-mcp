@@ -831,11 +831,15 @@ def test_linux_installer_runtime_writes_complete_quoted_unit_without_running_com
     exec_repo = unit_repo.replace("$", "$$")
     assert f'WorkingDirectory="{unit_repo}"' in unit
     assert f'Environment="TERMINAL_MCP_CONFIG={unit_repo}/config.yaml"' in unit
+    home_path = str(repo.parent).replace("%", "%%")
+    assert (f'Environment="PATH={home_path}/.local/bin:/usr/local/sbin:/usr/local/bin:'
+            '/usr/sbin:/usr/bin:/sbin:/bin"') in unit
     assert f'ExecStart="{exec_repo}/.venv/bin/terminal-node-agent"' in unit
     assert 'path with spaces" --token-file' in unit
     assert "died with `RuntimeError: can't start new thread`" in unit
     assert "cgroup's pids.events/memory.events" in unit
     assert "pids.events/memory.events" in unit
+    assert "KillMode=process" in unit
     assert (repo / "config.yaml").read_text() == "existing config\n"
     assert (repo / "node-agent.token").read_text() == "protected fixture token\n"
 

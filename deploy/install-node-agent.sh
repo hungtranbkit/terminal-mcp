@@ -203,6 +203,7 @@ StartLimitBurst=8
 Type=simple
 WorkingDirectory=$(systemd_quote "$REPO_DIR")
 Environment=$(systemd_quote "TERMINAL_MCP_CONFIG=$REPO_DIR/config.yaml")
+Environment=$(systemd_quote "PATH=$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 ExecStart=$(systemd_exec_quote "$REPO_DIR/.venv/bin/terminal-node-agent") --node-id $(systemd_exec_quote "$NODE_ID") --controller-url $(systemd_exec_quote "$CONTROLLER_URL") --token-file $(systemd_exec_quote "$TOKEN_FILE") --host $(systemd_exec_quote "$AGENT_HOST") --port $(systemd_exec_quote "$AGENT_PORT") --heartbeat-interval-seconds $(systemd_exec_quote "$HEARTBEAT_INTERVAL")
 Restart=always
 RestartSec=3

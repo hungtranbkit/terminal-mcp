@@ -404,6 +404,37 @@ def test_an_agent_refuses_a_delivered_token_that_is_not_the_announced_one(monkey
     assert credential.current == "first-token"
 
 
+def test_rotated_token_post_uses_user_agent_without_logging_credentials(monkeypatch, caplog):
+    import urllib.request
+
+    token = "original-private-node-token"
+    fresh = "replacement-private-node-token"
+    credential = AgentCredential(token)
+    captured = []
+
+    class _Response:
+        def read(self):
+            return json.dumps({"token": fresh}).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def capture(request, timeout):
+        captured.append(request)
+        return _Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", capture)
+    assert _collect_rotated_token(controller_url="http://ctl", node_id=NODE, credential=credential,
+                                  hint={"available": True,
+                                        "token_id": node_credentials.token_fingerprint(fresh)}) is True
+    assert captured[0].get_header("User-agent") == "TerminalMCP-node-agent/0.13"
+    assert captured[0].get_header("Authorization") == f"Bearer {token}"
+    assert token not in caplog.text and fresh not in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # the routes, end to end
 # ---------------------------------------------------------------------------
