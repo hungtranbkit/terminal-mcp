@@ -7,7 +7,7 @@
 - Permanent Cloudflare fix in `terminal_mcp/node_agent.py`: every node-agent controller POST (heartbeat and rotated-token refresh) is built through `_controller_post_request`, with explicit `User-Agent: TerminalMCP-node-agent/0.13`, JSON content type and auth attached by callers. Regression tests capture both requests and assert credentials never enter logs.
 - Permanent systemd PATH fix in `deploy/install-node-agent.sh`: generated user service gets a quoted explicit PATH beginning with the installer user's `$HOME/.local/bin`, followed by standard system bin directories. Existing unit settings including `KillMode=process` and escaped Markdown backticks are preserved. Runtime test checks the generated PATH and retained kill mode.
 - Verification on current source: focused files `tests/test_node_agent.py tests/test_token_rotation.py tests/test_windows_onboarding.py` -> **161 passed, 4 skipped** (PowerShell unavailable); Bash runtime installer test included in that suite, `bash -n deploy/install-node-agent.sh`, and `git diff --check` passed. No GitHub Actions run, service restart, deployment, or live token change.
-- PR #81 remains the delivery target: `https://github.com/hungtranbkit/terminal-mcp/pull/81`. Follow-up code commit/push is pending; final commit SHA will be recorded here. Keep this branch/worktree isolated and leave deployment for verified rollout.
+- PR #81 remains the delivery target: `https://github.com/hungtranbkit/terminal-mcp/pull/81`. Follow-up code commit `c1b710a7f339fe2cb3db209ad8610c1a1bb1c7b3` is pushed to `feat/issue-80-linux-pairing`. Keep this branch/worktree isolated and leave deployment for verified rollout.
 
 ## 2026-10-17 — Codex folder-trust first-dispatch regression (merged; HP rollout blocked by release drift)
 
