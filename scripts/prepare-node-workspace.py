@@ -45,8 +45,14 @@ def owned_workspace(home: Path) -> Path:
 
 def allow_workspace(config_path: Path, workspace: Path) -> None:
     text = config_path.read_text(encoding="utf-8")
-    if not re.search(r"(?m)^session_lifecycle:\s*$", text):
-        raise ValueError("session_lifecycle block is missing")
+    if not re.search(r"(?m)^session_lifecycle:\\s*$", text):
+        # A pristine config.example.yaml comments out session_lifecycle.
+        # Add the smallest active block so first pairing can create sessions.
+        active = ("\nsession_lifecycle:\n  enabled: true\n"
+                  "  allowed_cwd_roots:\n    - " + str(workspace) + "\n")
+        atomic_text(config_path, text.rstrip() + "\n" + active,
+                    mode=stat.S_IMODE(config_path.stat().st_mode))
+        return
     start = re.search(r"(?m)^session_lifecycle:\s*$", text).end()
     next_top = re.search(r"(?m)^\S", text[start:])
     end = start + next_top.start() if next_top else len(text)
