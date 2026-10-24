@@ -50,7 +50,7 @@ from .windows_onboarding import (SCRIPT_VERSION as SETUP_SCRIPT_VERSION,
                                  SETUP_SCRIPT_SHORT_PATH, build_quick_install_command,
                                  list_profiles, quick_install_fits_run_dialog,
                                  render_setup_script, script_fingerprint)
-from .linux_onboarding import build_linux_pair_command, render_linux_pair_script
+from .linux_onboarding import build_linux_pair_command, linux_diagnostic_commands, render_linux_pair_script
 from .fleet_service import ControllerFleetSync, FleetService, auth_status_for_node
 from .controller import ControllerService, build_default_controller
 from .node_client import NodeClientError, RemoteNodeClient
@@ -6889,7 +6889,10 @@ NODES_ADMIN_HTML = """<!doctype html>
     }
 
     document.getElementById('addNodeWizardBtn').addEventListener('click', anOpen);
-    document.getElementById('anCloseBtn').addEventListener('click', () => { anPanel.hidden = true; });
+    document.getElementById('anCloseBtn').addEventListener('click', () => {
+      anPanel.hidden = true;
+      anPurgeCode('');
+    });
     document.getElementById('anBackBtn').addEventListener('click', () => anShow('anStepOs'));
 
     for (const button of anPanel.querySelectorAll('.an-os')) {
@@ -7164,7 +7167,13 @@ NODES_ADMIN_HTML = """<!doctype html>
     // behind and the one an operator can actually act on.
     const AN_STALL_AFTER_MS = 30000;
     const AN_STALL_HARD_AFTER_MS = 90000;
-    let anWatch = null;   // {id, nodeId, startedAt, lastStage, lastChangeAt}
+    let anWatch = null;   // {id, nodeId, os, startedAt, lastStage, lastChangeAt, readyAt}
+    // A Linux node is "Online" only once the controller has its heartbeat:
+    // the installer's `ready` proves the local agent answers, not that the
+    // controller hears it. Two minutes covers several 20s heartbeats.
+    const AN_ONLINE_AFTER_READY_MS = 120000;
+    let anNodeStatus = '';
+    let anNodeHealth = '';
 
     function anFmtDuration(ms) {
       const secs = Math.max(0, Math.round(ms / 1000));
@@ -7193,10 +7202,11 @@ NODES_ADMIN_HTML = """<!doctype html>
       } catch (error) { return null; }
     }
 
-    function anBeginWatch(enrollmentId, nodeId, pairingExpiresAt) {
+    function anBeginWatch(enrollmentId, nodeId, pairingExpiresAt, os) {
       const now = Date.now();
-      anWatch = {id: enrollmentId, nodeId: nodeId || '', startedAt: now,
-                 lastStage: '', lastChangeAt: now,
+      anNodeStatus = '';
+      anWatch = {id: enrollmentId, nodeId: nodeId || '', os: os || 'windows', startedAt: now,
+                 lastStage: '', lastChangeAt: now, readyAt: 0,
                  pairingExpiresAt: pairingExpiresAt || 0};
       anSaveWatch();
       anRenderLive(null);
@@ -7237,10 +7247,28 @@ NODES_ADMIN_HTML = """<!doctype html>
       const serverSecs = Number((current && current.progress_elapsed_seconds) || 0);
       const sinceStart = serverSecs > 0 ? serverSecs * 1000 : (now - anWatch.startedAt);
       live.hidden = false;
+      const linux = anWatch.os === 'linux';
 
+      if (stage === 'ready' && linux && anNodeStatus !== 'online') {
+        const waited = now - (anWatch.readyAt || now);
+        const late = waited > AN_ONLINE_AFTER_READY_MS;
+        live.className = 'an-live' + (late ? ' stalled' : '');
+        stageEl.textContent = late
+          ? `Đã cài xong nhưng controller chưa nhận heartbeat từ ${anWatch.nodeId}`
+          : `Đã cài xong — chờ heartbeat đầu tiên từ ${anWatch.nodeId}…`;
+        metaEl.textContent = `đã ${anFmtDuration(sinceStart)} · trạng thái node: ${anNodeStatus || 'chưa có'}`
+          + (anNodeHealth ? ` (${anNodeHealth})` : '');
+        const explain = late || anNodeStatus === 'degraded';
+        hintEl.hidden = !explain;
+        if (explain) hintEl.textContent = anNodeHealthHint();
+        actions.hidden = true;
+        return;
+      }
       if (stage === 'ready') {
         live.className = 'an-live done';
-        stageEl.textContent = `${(current && current.progress_label) || 'Hoàn tất'} — máy đã cài xong.`;
+        stageEl.textContent = linux
+          ? `Online ✓ — node ${anWatch.nodeId} đã kết nối và gửi heartbeat.`
+          : `${(current && current.progress_label) || 'Hoàn tất'} — máy đã cài xong.`;
         metaEl.textContent = `Tổng thời gian ${anFmtDuration(sinceStart)}.`;
         hintEl.hidden = true;
         actions.hidden = true;
@@ -7249,6 +7277,18 @@ NODES_ADMIN_HTML = """<!doctype html>
       if (stage === 'failed') {
         live.className = 'an-live failed';
         stageEl.textContent = `${(current && current.progress_label) || 'Cài đặt thất bại'}`;
+        if (linux) {
+          // Pending means the code was never spent: the same command can
+          // simply run again once the cause is fixed.
+          const reusable = current && current.status === 'pending';
+          metaEl.textContent = `Dừng sau ${anFmtDuration(sinceStart)}. Terminal trên máy Linux in ra lỗi và các lệnh kiểm tra.`;
+          hintEl.hidden = false;
+          hintEl.textContent = reusable
+            ? 'Mã chưa bị dùng: sửa lỗi rồi chạy lại đúng lệnh đó.'
+            : 'Node đã đăng ký nhưng agent chưa chạy ổn: sửa lỗi, rồi mở node này → Repair connection để lấy mã mới.';
+          actions.hidden = true;
+          return;
+        }
         metaEl.textContent = `Dừng sau ${anFmtDuration(sinceStart)}. Xem cửa sổ PowerShell trên máy đó để biết bước nào lỗi.`;
         hintEl.hidden = true;
         actions.hidden = false;
@@ -7263,7 +7303,7 @@ NODES_ADMIN_HTML = """<!doctype html>
         stageEl.textContent = 'Mã cài đặt đã hết hạn — Tạo lại';
         metaEl.textContent = `Hết hạn sau ${anFmtDuration(sinceStart)} chờ. Bấm Tạo lại để tạo mã mới.`;
         hintEl.hidden = true;
-        actions.hidden = false;
+        actions.hidden = linux;
         if (anProgressTimer) { clearInterval(anProgressTimer); anProgressTimer = null; }
         return;
       }
@@ -7274,11 +7314,13 @@ NODES_ADMIN_HTML = """<!doctype html>
       live.className = 'an-live' + (stalled ? ' stalled' : '');
       stageEl.textContent = stage
         ? `${(current && current.progress_label) || stage}…`
-        : (quiet ? 'Chưa thấy helper kết nối' : 'Đang chờ helper trên máy Windows…');
+        : linux
+          ? (quiet ? 'Chưa thấy máy Linux báo về' : 'Pending — đang chờ chạy lệnh trên máy Linux…')
+          : (quiet ? 'Chưa thấy helper kết nối' : 'Đang chờ helper trên máy Windows…');
       const bits = [`đã ${anFmtDuration(sinceStart)}`];
       bits.push(stage
         ? `cập nhật lần cuối ${anFmtDuration(sinceChange)} trước`
-        : 'helper chưa báo về bước nào');
+        : (linux ? 'máy chưa báo về bước nào' : 'helper chưa báo về bước nào'));
       if (anWatch.nodeId) bits.push(`node ${anWatch.nodeId}`);
       // How long the pairing itself has left. It is the thing that dies
       // first, and the operator cannot see it anywhere else.
@@ -7290,14 +7332,39 @@ NODES_ADMIN_HTML = """<!doctype html>
       // The warning names the physical things the operator has to do,
       // which is what nobody can guess from a silent screen.
       hintEl.hidden = !stalled;
-      if (stalled) {
+      if (stalled && linux) {
+        hintEl.textContent = 'Kiểm tra: lệnh đã được dán vào terminal của máy Linux; Tailscale đang kết nối '
+          + '(tailscale status); máy đó mở được controller (curl -fsSI <controller>/enroll/linux-pair.sh).';
+      } else if (stalled) {
         hintEl.textContent = veryQuiet
           ? 'Helper chưa liên hệ máy chủ — kiểm tra SmartScreen/UAC hoặc chạy lại. '
             + 'Mở file vừa tải trên máy Windows, chọn More info → Run anyway nếu bị chặn, rồi bấm Yes.'
           : 'Chưa thấy helper kết nối. Mở file vừa tải trên máy đó và bấm Yes khi Windows hỏi '
             + 'quyền Administrator.';
       }
-      actions.hidden = !stalled;
+      actions.hidden = !stalled || linux;
+    }
+
+    async function anPollNodeStatus() {
+      const result = await api('/dashboard/api/nodes');
+      if (!result.ok) return;
+      const node = (result.data.nodes || []).find((n) => (n.id || n.node_id) === anWatch.nodeId);
+      anNodeStatus = node ? String(node.status || '') : '';
+      anNodeHealth = node ? String(node.health_state || '') : '';
+    }
+
+    // Online needs a fresh heartbeat AND a passing execution probe, so a
+    // heartbeat alone shows as degraded. Say which half is missing.
+    function anNodeHealthHint() {
+      if (anNodeHealth === 'AUTH_EXPIRED/UNAUTHORIZED') {
+        return 'Controller từ chối token của node — mở node này → Repair connection để cấp lại.';
+      }
+      if (anNodeStatus === 'degraded') {
+        return 'Heartbeat đã tới nhưng controller chưa chạy được lệnh trên node: kiểm tra agent lắng nghe '
+          + 'trên địa chỉ Tailscale cổng 8790 (curl /v1/health bên dưới) và tailscale ping từ controller.';
+      }
+      return 'Agent chạy trên máy đó nhưng heartbeat chưa tới controller. '
+        + 'Chạy các lệnh kiểm tra bên dưới (journalctl cho biết lỗi HTTP của heartbeat).';
     }
 
     async function anPollProgress() {
@@ -7314,11 +7381,31 @@ NODES_ADMIN_HTML = """<!doctype html>
         if (anProgressTimer) { clearInterval(anProgressTimer); anProgressTimer = null; }
         return;
       }
+      // Once the controller has consumed the code there is nothing left in
+      // this tab worth keeping: drop the command that carries it.
+      if (row.status !== 'pending') anPurgeCode('Mã đã được dùng — lệnh đã bị xoá khỏi trang này.');
       const stage = row.progress_stage || '';
       if (stage !== anWatch.lastStage) {
         anWatch.lastStage = stage;
         anWatch.lastChangeAt = Date.now();
+        if (stage === 'ready') anWatch.readyAt = Date.now();
         anSaveWatch();
+      }
+      if (anWatch.os === 'linux') {
+        if (stage === 'ready') await anPollNodeStatus();
+        if (!anWatch) return;
+        anRenderLive(row);
+        const online = stage === 'ready' && anNodeStatus === 'online';
+        const gaveUp = stage === 'ready' && Date.now() - anWatch.readyAt > 10 * AN_ONLINE_AFTER_READY_MS;
+        // failed with an unspent code is not final: the operator reruns
+        // the same command, so keep listening until it expires.
+        const deadFailure = stage === 'failed' && row.status !== 'pending';
+        if (online || gaveUp || deadFailure) {
+          if (anProgressTimer) { clearInterval(anProgressTimer); anProgressTimer = null; }
+          try { localStorage.removeItem(AN_WATCH_KEY); } catch (error) { /* ignore */ }
+          loadAll();
+        }
+        return;
       }
       anRenderLive(row);
       if (stage === 'ready' || stage === 'failed') {
@@ -7326,6 +7413,56 @@ NODES_ADMIN_HTML = """<!doctype html>
         try { localStorage.removeItem(AN_WATCH_KEY); } catch (error) { /* ignore */ }
         loadAll();
       }
+    }
+
+    // The command embeds the one-time code. It leaves the DOM and this
+    // tab's memory as soon as it cannot be used (expired, consumed) or the
+    // panel closes; nothing ever wrote it to storage or a URL.
+    function anPurgeCode(reason) {
+      if (anGenerated) { anGenerated.code = null; anGenerated.quick_install_command = null; }
+      const cmdEl = document.getElementById('anQuickCmd');
+      if (cmdEl && cmdEl.value) {
+        cmdEl.value = '';
+        cmdEl.placeholder = reason || '';
+        cmdEl.disabled = true;
+        document.getElementById('anCopyCmdBtn').disabled = true;
+      }
+    }
+
+    // Failure guide plus the secret-free checks to run on the node. The
+    // commands come from the controller (linux_diagnostic_commands), so the
+    // dashboard and the script's own error output name the same checks.
+    function anRenderLinuxTrouble(commands) {
+      const host = document.getElementById('anTrouble');
+      host.replaceChildren();
+      const guide = document.createElement('ul');
+      for (const text of [
+        'Tailscale is not connected: run tailscale up on that machine, then run the same command again.',
+        'Missing curl/git/python3/tmux: install them with apt, then run the same command again.',
+        'ENROLLMENT_EXPIRED / ALREADY_USED: the code is dead; click Regenerate for a new command.',
+        'NODE_ALREADY_EXISTS: choose another name, or open that node → Repair connection.',
+        'Installed but not Online: run the checks below; journalctl shows the heartbeat HTTP status.',
+      ]) {
+        const item = document.createElement('li');
+        item.textContent = text;
+        guide.append(item);
+      }
+      const label = document.createElement('div');
+      label.className = 'muted';
+      label.textContent = 'Checks on the Linux machine (contain no secrets):';
+      const box = document.createElement('textarea');
+      box.className = 'an-cmd';
+      box.id = 'anDiagCmd';
+      box.readOnly = true;
+      box.rows = Math.max(3, commands.length);
+      box.spellcheck = false;
+      box.value = commands.join('\\n');
+      const copy = document.createElement('button');
+      copy.className = 'icon-btn';
+      copy.type = 'button';
+      copy.textContent = '📋 Copy check commands';
+      copy.addEventListener('click', async () => anFlash(copy, (await anCopy(box.value)) ? 'Đã copy ✓' : '✕'));
+      host.append(guide, label, box, copy);
     }
 
     function anRenderDone() {
@@ -7373,8 +7510,7 @@ NODES_ADMIN_HTML = """<!doctype html>
         const expiryEl = document.getElementById('anExpiry');
         if (left <= 0) {
           expiryEl.textContent = 'Lệnh đã hết hạn — bấm Tạo lại.';
-          cmdEl.disabled = true;
-          copyBtn.disabled = true;
+          anPurgeCode('Lệnh đã hết hạn và đã bị xoá khỏi trang này.');
           regenBtn.hidden = false;
           // The CTA stays on screen and says it has expired, rather than
           // minting a handle against an enrollment the controller will
@@ -7388,6 +7524,7 @@ NODES_ADMIN_HTML = """<!doctype html>
         expiryEl.textContent = `Lệnh có hiệu lực khoảng 15 phút — còn ${mins}:${String(secs).padStart(2, '0')}. Dùng một lần.`;
       }
       cmdEl.disabled = false;
+      cmdEl.placeholder = '';
       copyBtn.disabled = false;
       regenBtn.hidden = true;
       document.getElementById('anLive').hidden = true;
@@ -7426,8 +7563,11 @@ NODES_ADMIN_HTML = """<!doctype html>
           row.append(strong, code);
           fine.append(row);
         }
-        document.getElementById('anTrouble').textContent =
-          'Tailscale chưa sẵn sàng: kết nối tailnet rồi chạy lại lệnh. Mã hết hạn hoặc đã dùng: tạo mã mới.';
+        anRenderLinuxTrouble(anGenerated.diagnostic_commands || []);
+        // Pending from the moment the command exists: the script reports
+        // every stage, so there is something to watch before anyone acts.
+        anBeginWatch(anGenerated.enrollment.id, anGenerated.enrollment.node_id,
+                     expiresAt.getTime(), 'linux');
         return;
       }
 
@@ -7516,7 +7656,9 @@ NODES_ADMIN_HTML = """<!doctype html>
       const ok = await anCopy(anGenerated.quick_install_command || '');
       if (ok) {
         anFlash(button, 'Đã copy ✓');
-        anSetMsg('anDoneMsg', 'Trên máy Windows: Win + R → Ctrl + V → Enter → Yes.', 'ok');
+        anSetMsg('anDoneMsg', anOs === 'linux'
+          ? 'Trên máy Linux: mở terminal → dán lệnh → Enter.'
+          : 'Trên máy Windows: Win + R → Ctrl + V → Enter → Yes.', 'ok');
       } else {
         // Never leave them stuck: select the box so Ctrl+C still works.
         const box = document.getElementById('anQuickCmd');
@@ -7681,7 +7823,7 @@ NODES_ADMIN_HTML = """<!doctype html>
     });
 
     document.getElementById('anCopyCodeBtn').addEventListener('click', async (event) => {
-      if (!anGenerated) return;
+      if (!anGenerated || !anGenerated.code) return;
       const button = event.currentTarget;
       const ok = await anCopy(anGenerated.code);
       anFlash(button, ok ? 'Đã copy ✓' : '✕');
@@ -7693,6 +7835,7 @@ NODES_ADMIN_HTML = """<!doctype html>
       if (anExpiryTimer) { clearInterval(anExpiryTimer); anExpiryTimer = null; }
       if (anDetectTimer) { clearInterval(anDetectTimer); anDetectTimer = null; }
       anEndWatch();         // stops polling AND forgets the resume marker
+      anPurgeCode('');
       anGenerated = null;   // the only copy in this tab, dropped on close
       loadAll();
     });
@@ -19077,6 +19220,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                     controller_url=controller_url, node_id=node_id, enrollment_code=created["code"])
                 created["install_script_path"] = "/enroll/linux-pair.sh"
                 created["controller_url"] = controller_url
+                created["diagnostic_commands"] = linux_diagnostic_commands()
                 return created
             script = render_setup_script(
                 enrollment_code=created["code"], controller_url=controller_url, node_id=node_id,

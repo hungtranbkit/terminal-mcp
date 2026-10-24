@@ -108,6 +108,34 @@ def _read_installer() -> str:
     return NODE_AGENT_INSTALLER.read_text(encoding="utf-8")
 
 
+def _render_installer_unit() -> str:
+    """The unit the installer actually writes, rendered by running it with
+    --no-systemd against a throwaway checkout. Reading the script's source
+    instead would miss lines emitted by printf and any shell expansion."""
+    import os
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as root:
+        repo = Path(root) / "terminal-mcp"
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".venv" / "bin").mkdir(parents=True)
+        (repo / "pyproject.toml").write_text("[project]\n")
+        (repo / "config.yaml").write_text("fixture\n")
+        (repo / "node-agent.token").write_text("fixture\n")
+        pip = repo / ".venv" / "bin" / "pip"
+        pip.write_text("#!/bin/sh\nexit 0\n")
+        pip.chmod(0o755)
+        result = subprocess.run(
+            ["bash", str(Path(__file__).resolve().parents[1] / "deploy" / "install-node-agent.sh"),
+             "--controller", "https://controller.example", "--node-id", "fixture",
+             "--repo-dir", str(repo), "--host", "100.64.0.1", "--no-systemd"],
+            env=dict(os.environ, HOME=root), capture_output=True, text=True, check=True)
+    lines = result.stdout.splitlines()
+    start = next(i for i, line in enumerate(lines) if "unit content that WOULD" in line)
+    end = next(i for i, line in enumerate(lines) if line.startswith("-> Start it manually"))
+    return "\n".join(lines[start + 1:end])
+
+
 def _installer_unit_sections() -> dict[str, list[str]]:
     """Splits the systemd unit embedded in the installer into its real
     sections. Only a line that is exactly a section header counts -- a
@@ -116,7 +144,7 @@ def _installer_unit_sections() -> dict[str, list[str]]:
     never mistaken for a declaration."""
     sections: dict[str, list[str]] = {}
     current: str | None = None
-    for raw in _read_installer().splitlines():
+    for raw in _render_installer_unit().splitlines():
         line = raw.strip()
         if line.startswith("[") and line.endswith("]"):
             current = line[1:-1]

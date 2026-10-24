@@ -10,8 +10,9 @@ import pytest
 
 
 def _render_unit(script: str, repo_dir: Path, output: Path) -> None:
-    funcs = script.split("systemd_quote() {", 1)[1].split("UNIT_CONTENT=$(cat <<EOF", 1)[0]
-    template = script.split("UNIT_CONTENT=$(cat <<EOF", 1)[1].split("\nEOF\n)", 1)[0]
+    # Source the installer's *actual* quoting helpers and render_unit().
+    start = script.index("systemd_quote() {")
+    end = script.index("\nUNIT_STATIC\n}\n", script.index("render_unit() {")) + len("\nUNIT_STATIC\n}\n")
     values = {
         "REPO_DIR": str(repo_dir),
         "NODE_ID": "nec1",
@@ -22,13 +23,7 @@ def _render_unit(script: str, repo_dir: Path, output: Path) -> None:
         "HEARTBEAT_INTERVAL": "20",
         "HOME": str(repo_dir.parent),
     }
-    # Source *actual* helper functions and unit template from installer.
-    source = (
-        "set -euo pipefail\n"
-        + "systemd_quote() {" + funcs
-        + "UNIT_CONTENT=$(cat <<EOF" + template + "\nEOF\n)\n"
-        + 'printf "%s\\n" "$UNIT_CONTENT" > "$OUTFILE"\n'
-    )
+    source = "set -euo pipefail\n" + script[start:end] + 'render_unit > "$OUTFILE"\n'
     result = subprocess.run(["bash", "-c", source], text=True, capture_output=True,
                             env={**os.environ, **values, "OUTFILE": str(output)}, timeout=10)
     assert result.returncode == 0, result.stderr

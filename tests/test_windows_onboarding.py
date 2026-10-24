@@ -809,10 +809,17 @@ def test_linux_installer_runtime_writes_complete_quoted_unit_without_running_com
     (repo / "node-agent.token").write_text("protected fixture token\n")
     (repo / ".venv" / "bin" / "pip").write_text("#!/bin/sh\nexit 0\n")
     (repo / ".venv" / "bin" / "pip").chmod(0o755)
+    # Paired mode prepares the node workspace with the venv's python.
+    (repo / ".venv" / "bin" / "python").write_text("#!/bin/sh\nexit 0\n")
+    (repo / ".venv" / "bin" / "python").chmod(0o755)
+    (source / "scripts").mkdir()
+    (source / "scripts" / "prepare-node-workspace.py").write_text("")
     for name in ("systemctl", "loginctl"):
         tool = fakebin / name
         tool.write_text("#!/bin/sh\nexit 0\n")
         tool.chmod(0o755)
+    # The installer refuses a unit systemd did not load.
+    (fakebin / "systemctl").write_text('#!/bin/sh\n[ "$2" = show ] && echo loaded\nexit 0\n')
 
     env = dict(os.environ, HOME=str(repo.parent), PATH=f"{fakebin}:{os.environ['PATH']}")
     result = subprocess.run([
@@ -829,7 +836,8 @@ def test_linux_installer_runtime_writes_complete_quoted_unit_without_running_com
     unit = (repo.parent / ".config/systemd/user/terminal-node-agent.service").read_text()
     unit_repo = str(repo).replace("%", "%%")
     exec_repo = unit_repo.replace("$", "$$")
-    assert f'WorkingDirectory="{unit_repo}"' in unit
+    # A single path for systemd: quotes would be literal characters.
+    assert f'WorkingDirectory={unit_repo}\n' in unit
     assert f'Environment="TERMINAL_MCP_CONFIG={unit_repo}/config.yaml"' in unit
     home_path = str(repo.parent).replace("%", "%%")
     assert (f'Environment="PATH={home_path}/.local/bin:/usr/local/sbin:/usr/local/bin:'
@@ -843,7 +851,7 @@ def test_linux_installer_runtime_writes_complete_quoted_unit_without_running_com
     assert (repo / "config.yaml").read_text() == "existing config\n"
     assert (repo / "node-agent.token").read_text() == "protected fixture token\n"
 
-    (fakebin / "systemctl").write_text("#!/bin/sh\n[ \"$2\" != restart ]\n")
+    (fakebin / "systemctl").write_text('#!/bin/sh\n[ "$2" = show ] && { echo loaded; exit 0; }\n[ "$2" != restart ]\n')
     (fakebin / "systemctl").chmod(0o755)
     failed_restart = subprocess.run([
         "bash", str(root / "deploy" / "install-node-agent.sh"),
@@ -1987,3 +1995,283 @@ def test_create_route_returns_the_candidate_list(tmp_path, monkeypatch):
     assert body["controller_url"] == body["controller_urls"][0]
     for url in body["controller_urls"]:
         assert url in body["script"], "every candidate must reach the machine"
+
+
+# ---------------------------------------------------------------------------
+# Linux pairing: the pasted command, end to end, against fakes
+# ---------------------------------------------------------------------------
+
+_FAKE_CURL = r'''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["CURL_ARGV_LOG"], "a") as log:
+    log.write(json.dumps(args) + "\n")
+url = next(a for a in args if a.startswith(("https://", "http://")))
+out = args[args.index("-o") + 1] if "-o" in args else None
+body = sys.stdin.read() if "@-" in args else ""
+if body:
+    with open(os.environ["CURL_STDIN_LOG"], "a") as log:
+        log.write(body.strip() + "\n")
+if url.endswith("/enroll/linux-pair.sh"):
+    sys.stdout.write(open(os.environ["FAKE_SCRIPT"]).read()); sys.exit(0)
+if url.endswith("/dashboard/api/enroll/progress"):
+    sys.exit(0)
+if url.endswith("/dashboard/api/enroll/consume"):
+    error = os.environ.get("FAKE_CONSUME_ERROR")
+    payload = {"error": error} if error else {"node_id": "macbook", "node_token": "ab" * 32}
+    open(out, "w").write(json.dumps(payload))
+    sys.exit(22 if error else 0)
+if url.endswith("/v1/health"):
+    sys.exit(int(os.environ.get("FAKE_HEALTH_RC", "0")))
+sys.exit(7)
+'''
+
+_FAKE_INSTALLER = '''#!/usr/bin/env bash
+# fixture installer: accepts --source-dir and --paired
+printf '%s\\n' "$@" > "$INSTALLER_ARGS_LOG"
+'''
+
+
+def _linux_pair_fixture(tmp_path):
+    import shutil
+    from terminal_mcp.linux_onboarding import render_linux_pair_script
+
+    real_git = shutil.which("git")
+    upstream = tmp_path / "upstream"
+    (upstream / "deploy").mkdir(parents=True)
+    (upstream / "deploy" / "install-node-agent.sh").write_text(_FAKE_INSTALLER)
+    for cmd in (["init", "-q", "-b", "main"], ["config", "user.email", "qa@example.invalid"],
+                ["config", "user.name", "QA"], ["add", "."], ["commit", "-qm", "fixture"]):
+        subprocess.run([real_git, "-C", str(upstream), *cmd], check=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    subprocess.run([real_git, "clone", "-q", str(upstream), str(home / "terminal-mcp")], check=True)
+    (home / "terminal-mcp" / "config.yaml").write_text("operator's dirty config\n")
+
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir()
+    tools = {
+        "curl": _FAKE_CURL,
+        "git": ('#!/bin/sh\ncase " $* " in\n'
+                '  *" remote get-url origin "*) echo https://github.com/hungtranbkit/terminal-mcp.git; exit 0;;\n'
+                '  *" fetch "*) exec "$REAL_GIT" -C "$HOME/terminal-mcp" fetch --quiet "$FIXTURE_UPSTREAM" main;;\n'
+                'esac\nexec "$REAL_GIT" "$@"\n'),
+        "tailscale": '#!/bin/sh\n[ "$1 $2" = "ip -4" ] && echo 100.124.8.38\n',
+        "systemctl": "#!/bin/sh\nexit 0\n",
+        "tmux": "#!/bin/sh\nexit 0\n",
+        "sleep": "#!/bin/sh\nexit 0\n",
+    }
+    for name, body in tools.items():
+        (fakebin / name).write_text(body)
+        (fakebin / name).chmod(0o755)
+    script = tmp_path / "linux-pair.sh"
+    script.write_text(render_linux_pair_script())
+    pair_tmp = tmp_path / "tmp"
+    pair_tmp.mkdir()
+    env = dict(os.environ, HOME=str(home), TMPDIR=str(pair_tmp), REAL_GIT=real_git,
+               FIXTURE_UPSTREAM=str(upstream), FAKE_SCRIPT=str(script),
+               PATH=f"{fakebin}:{os.environ['PATH']}",
+               CURL_ARGV_LOG=str(tmp_path / "curl-argv.log"),
+               CURL_STDIN_LOG=str(tmp_path / "curl-stdin.log"),
+               INSTALLER_ARGS_LOG=str(tmp_path / "installer-args.log"))
+    env.pop("TMCP_PAIRING_CODE", None)
+    return env, home, pair_tmp
+
+
+def _stages(tmp_path):
+    log = tmp_path / "curl-stdin.log"
+    lines = log.read_text().splitlines() if log.exists() else []
+    return [json.loads(line)["stage"] for line in lines if '"stage"' in line]
+
+
+def _run_pair(command, env):
+    return subprocess.run(["bash", "-c", command], env=env, capture_output=True, text=True,
+                          check=False, timeout=120)
+
+
+@pytest.mark.parametrize("legacy_positional", [False, True])
+def test_linux_pair_command_runs_end_to_end_without_code_in_any_argv(tmp_path, legacy_positional):
+    import shlex
+    from terminal_mcp.linux_onboarding import build_linux_pair_command
+
+    code = generate_code()
+    env, home, pair_tmp = _linux_pair_fixture(tmp_path)
+    command = build_linux_pair_command(controller_url="https://controller.example",
+                                       node_id="macbook", enrollment_code=code)
+    bash_args = shlex.split(command.split("|", 1)[1])
+    assert code not in bash_args[bash_args.index("bash"):]   # env assignment, not bash argv
+    if legacy_positional:
+        # Commands copied before the env hand-over keep working.
+        command = command.replace(f"TMCP_PAIRING_CODE={shlex.quote(code)} bash -s -- ", "bash -s -- ")
+        command += " " + shlex.quote(code)
+
+    result = _run_pair(command, env)
+
+    assert result.returncode == 0, result.stderr
+    assert _stages(tmp_path) == ["starting", "downloading", "registering", "installing_service", "ready"]
+    argv_log = (tmp_path / "curl-argv.log").read_text()
+    stdin_log = (tmp_path / "curl-stdin.log").read_text()
+    assert code not in argv_log           # every curl got the code on stdin
+    assert code in stdin_log
+    assert code not in result.stdout + result.stderr
+    assert "ab" * 32 not in result.stdout + result.stderr + argv_log
+    token = home / "terminal-mcp" / "node-agent.token"
+    assert token.read_text() == "ab" * 32
+    assert token.stat().st_mode & 0o777 == 0o600
+    installer_args = (tmp_path / "installer-args.log").read_text().splitlines()
+    assert "--paired" in installer_args
+    assert installer_args[installer_args.index("--host") + 1] == "100.124.8.38"
+    assert installer_args[installer_args.index("--port") + 1] == "8790"
+    assert (home / "terminal-mcp" / "config.yaml").read_text() == "operator's dirty config\n"
+    assert list(pair_tmp.iterdir()) == []   # temporary worktree removed
+    assert "healthy" in result.stdout
+
+
+def test_linux_pair_reports_failure_with_diagnostics_when_agent_never_turns_healthy(tmp_path):
+    from terminal_mcp.linux_onboarding import build_linux_pair_command
+
+    code = generate_code()
+    env, _home, _pair_tmp = _linux_pair_fixture(tmp_path)
+    env["FAKE_HEALTH_RC"] = "7"
+    result = _run_pair(build_linux_pair_command(controller_url="https://controller.example",
+                                                node_id="macbook", enrollment_code=code), env)
+
+    assert result.returncode == 6
+    assert _stages(tmp_path)[-2:] == ["installing_service", "failed"]
+    assert "journalctl --user -u terminal-node-agent" in result.stderr
+    assert "curl -fsS http://100.124.8.38:8790/v1/health" in result.stderr
+    assert "Repair connection" in result.stderr
+    assert code not in result.stdout + result.stderr
+
+
+def test_linux_pair_maps_a_dead_code_to_actionable_guidance(tmp_path):
+    from terminal_mcp.linux_onboarding import build_linux_pair_command
+
+    code = generate_code()
+    env, home, _pair_tmp = _linux_pair_fixture(tmp_path)
+    env["FAKE_CONSUME_ERROR"] = "ENROLLMENT_EXPIRED"
+    result = _run_pair(build_linux_pair_command(controller_url="https://controller.example",
+                                                node_id="macbook", enrollment_code=code), env)
+
+    assert result.returncode == 4
+    assert "Pairing failed (ENROLLMENT_EXPIRED)" in result.stderr
+    assert "Generate a fresh one" in result.stderr
+    assert _stages(tmp_path)[-1] == "failed"
+    assert not (home / "terminal-mcp" / "node-agent.token").exists()
+    assert not (tmp_path / "installer-args.log").exists()
+    assert code not in result.stdout + result.stderr
+
+
+def test_linux_pair_rejects_a_malformed_code_without_contacting_the_controller(tmp_path):
+    from terminal_mcp.linux_onboarding import render_linux_pair_script
+
+    env, _home, _pair_tmp = _linux_pair_fixture(tmp_path)
+    env["TMCP_PAIRING_CODE"] = "not-a-code"
+    result = subprocess.run(["bash", "-s", "--", "https://controller.example", "macbook"],
+                            input=render_linux_pair_script(), env=env, capture_output=True,
+                            text=True, check=False)
+    assert result.returncode == 2
+    assert not (tmp_path / "curl-argv.log").exists()
+
+
+def test_linux_pair_reports_missing_tailscale_as_a_rerunnable_failure(tmp_path):
+    from terminal_mcp.linux_onboarding import build_linux_pair_command
+
+    env, _home, _pair_tmp = _linux_pair_fixture(tmp_path)
+    (Path(env["PATH"].split(":")[0]) / "tailscale").write_text("#!/bin/sh\nexit 1\n")
+    result = _run_pair(build_linux_pair_command(controller_url="https://controller.example",
+                                                node_id="macbook", enrollment_code=generate_code()), env)
+    assert result.returncode == 3
+    assert "Tailscale is not connected" in result.stderr
+    assert _stages(tmp_path) == ["starting", "failed"]
+
+
+def test_linux_installer_never_renders_the_unit_through_an_expanding_heredoc():
+    installer = (Path(__file__).parents[1] / "deploy" / "install-node-agent.sh").read_text()
+    code_lines = [line for line in installer.splitlines() if not line.lstrip().startswith("#")]
+    assert not any(re.search(r"\$\(cat <<\s*[A-Za-z_]", line) for line in code_lines)
+    assert "cat <<'UNIT_STATIC'" in installer
+    assert '\\`' not in installer          # no hand-escaped backticks left to forget
+    assert 'render_unit > "$UNIT_PATH.new"' in installer
+
+
+def test_dashboard_linux_pairing_response_carries_secret_free_diagnostics(tmp_path, monkeypatch):
+    from dataclasses import replace
+    config = _config(tmp_path)
+    config = replace(config, nodes=replace(config.nodes, onboarding=replace(
+        config.nodes.onboarding, bootstrap_origin="https://bootstrap.example.test")))
+    client, _controller, _onboarding = _client(tmp_path, monkeypatch, config=config)
+    created = client.post("/dashboard/api/nodes/onboard/enrollments", json={
+        "node_id": "ubuntu-test", "os": "linux", "profile": "minimal"}).json()
+    commands = created["diagnostic_commands"]
+    assert any("journalctl --user -u terminal-node-agent" in c for c in commands)
+    assert any("/v1/health" in c for c in commands)
+    assert created["code"] not in json.dumps(commands)
+    assert f"TMCP_PAIRING_CODE={created['code']} bash -s -- " in created["quick_install_command"]
+    # The status list the dashboard polls never re-serves the code.
+    listing = client.get("/dashboard/api/nodes/onboard/enrollments")
+    assert listing.headers["cache-control"] == "no-store"
+    assert created["code"] not in listing.text
+    row = next(r for r in listing.json()["enrollments"] if r["id"] == created["enrollment"]["id"])
+    assert row["status"] == "pending"
+
+
+def test_dashboard_linux_pairing_refuses_cross_site_and_disabled_mutations(tmp_path, monkeypatch):
+    from dataclasses import replace
+    config = _config(tmp_path)
+    config = replace(config, nodes=replace(config.nodes, onboarding=replace(
+        config.nodes.onboarding, bootstrap_origin="https://bootstrap.example.test")))
+    client, _controller, onboarding = _client(tmp_path, monkeypatch, config=config)
+    body = {"node_id": "ubuntu-test", "os": "linux", "profile": "minimal"}
+    cross_site = client.post("/dashboard/api/nodes/onboard/enrollments", json=body,
+                             headers={"Origin": "https://evil.example"})
+    assert cross_site.status_code == 403
+    assert cross_site.json()["error"] == "ORIGIN_NOT_ALLOWED"
+    assert "code" not in cross_site.json()
+    assert onboarding.enrollments.list() == []
+
+    disabled = replace(config, dashboard=replace(config.dashboard, mutations_enabled=False))
+    locked, _c, locked_onboarding = _client(tmp_path / "locked", monkeypatch, config=disabled)
+    response = locked.post("/dashboard/api/nodes/onboard/enrollments", json=body)
+    assert response.status_code == 403
+    assert locked_onboarding.enrollments.list() == []
+
+
+def test_dashboard_linux_pairing_ui_watches_until_online_and_purges_the_code(tmp_path, monkeypatch):
+    client, _controller, _onboarding = _client(tmp_path, monkeypatch)
+    page = client.get("/dashboard/nodes").text
+    assert "anBeginWatch(anGenerated.enrollment.id, anGenerated.enrollment.node_id,\n                     expiresAt.getTime(), 'linux');" in page
+    assert "anPollNodeStatus" in page and "anNodeStatus === 'online'" in page
+    assert "Pending — đang chờ chạy lệnh trên máy Linux" in page
+    # The code leaves the page on expiry, on consumption and on close.
+    assert page.count("anPurgeCode(") >= 5
+    assert "if (row.status !== 'pending') anPurgeCode(" in page
+    assert "📋 Copy check commands" in page
+    # The watch marker that survives a reload never holds the code.
+    watch_literal = page[page.index("anWatch = {id: enrollmentId"):].split("};", 1)[0]
+    assert "code" not in watch_literal.replace("nodeId", "")
+
+
+def test_dashboard_nodes_page_scripts_are_valid_javascript(tmp_path, monkeypatch):
+    import shutil
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    client, _controller, _onboarding = _client(tmp_path, monkeypatch)
+    page = client.get("/dashboard/nodes").text
+    scripts = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", page, flags=re.S)
+    assert scripts
+    for index, source in enumerate(scripts):
+        path = tmp_path / f"inline-{index}.js"
+        path.write_text(source)
+        checked = subprocess.run([node, "--check", str(path)], capture_output=True, text=True)
+        assert checked.returncode == 0, checked.stderr
+
+
+def test_dashboard_linux_pairing_explains_a_heartbeat_without_execution(tmp_path, monkeypatch):
+    """Online needs heartbeat AND execution probe; degraded must say why."""
+    client, _controller, _onboarding = _client(tmp_path, monkeypatch)
+    page = client.get("/dashboard/nodes").text
+    assert "anNodeHealth = node ? String(node.health_state || '') : '';" in page
+    assert "Repair connection để cấp lại" in page
+    assert "'Trên máy Linux: mở terminal → dán lệnh → Enter.'" in page

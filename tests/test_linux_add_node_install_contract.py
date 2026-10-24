@@ -19,7 +19,10 @@ def test_add_node_linux_command_fetches_current_verified_installer():
     )
     assert "https://terminal-bootstrap.mesflow.net/enroll/linux-pair.sh" in cmd
     assert "bash -s --" in cmd
-    assert "nec1 TMCP-ABCDE-ABCDE-ABCDE" in cmd
+    # The code reaches bash through its environment, never its argv.
+    assert ("TMCP_PAIRING_CODE=TMCP-ABCDE-ABCDE-ABCDE bash -s -- "
+            "https://terminal-bootstrap.mesflow.net nec1") in cmd
+    assert cmd.rstrip().endswith(" nec1")
 
     script = render_linux_pair_script()
     # The public script is not bound to any pairing code. Fetch trusted HEAD,
@@ -35,7 +38,7 @@ def test_add_node_linux_command_fetches_current_verified_installer():
 
 def test_live_wizard_installer_includes_systemd_validity_guards():
     installer = (Path(__file__).resolve().parents[1] / "deploy" / "install-node-agent.sh").read_text()
-    assert 'WorkingDirectory=${REPO_DIR//%/%%}' in installer
+    assert 'printf \'WorkingDirectory=%s\\n\' "${REPO_DIR//%/%%}"' in installer
     assert 'WorkingDirectory=$(systemd_quote "$REPO_DIR")' not in installer
     assert 'UNIT_LOAD_STATE="$(systemctl --user show terminal-node-agent.service' in installer
     assert installer.index('UNIT_LOAD_STATE=') < installer.index('systemctl --user enable terminal-node-agent.service')
