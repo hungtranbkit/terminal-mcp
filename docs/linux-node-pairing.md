@@ -5,7 +5,13 @@ enrollment code after an authorized dashboard action. The returned command
 downloads a generic installer over trusted HTTPS and passes the code only to
 that local process. The installer checks Linux/systemd, required tools, the
 trusted Terminal MCP HTTPS checkout, and a connected Tailscale IPv4 address
-before redeeming the code.
+before redeeming the code. On Ubuntu/Debian, missing `git`, `python3`,
+`tmux`, and `python3-venv` are installed automatically via `apt-get` (using
+`sudo` with an interactive authorization prompt if needed). Dependencies are
+checked **before** consuming the one-time pairing code: if apt or administrator
+access fails, the code remains unused and the installer reports the recovery
+steps. `bash` and `curl` must already exist to launch the dashboard command;
+Tailscale still requires an explicit user login to the tailnet.
 
 The controller returns the node bearer credential only in the HTTPS consume
 response. The installer writes it atomically to `~/terminal-mcp/node-agent.token`

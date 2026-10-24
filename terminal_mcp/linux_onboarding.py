@@ -38,9 +38,59 @@ fi
 if [[ "$(uname -s)" != Linux ]] || ! command -v systemctl >/dev/null; then
   echo "This installer requires Linux with systemd." >&2; exit 2
 fi
-for tool in curl git python3 tmux; do
-  command -v "$tool" >/dev/null 2>&1 || { echo "Missing $tool. Install it, then run the pairing command again." >&2; exit 2; }
+# -- 0. Bootstrap packages BEFORE redeeming the single-use code.
+# Bash and curl are prerequisites for the initial dashboard command.
+missing_packages=()
+for tool in git python3 tmux; do
+  command -v "$tool" >/dev/null 2>&1 || missing_packages+=("$tool")
 done
+# Debian/Ubuntu may provide python3 without python3-venv.
+if command -v python3 >/dev/null 2>&1; then
+  venv_probe="$(mktemp -d)"
+  if ! python3 -m venv "$venv_probe/check" >/dev/null 2>&1; then
+    missing_packages+=("python3-venv")
+  fi
+  rm -rf -- "$venv_probe"
+else
+  missing_packages+=("python3-venv")
+fi
+if (( ${#missing_packages[@]} > 0 )); then
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "Missing packages: ${missing_packages[*]}. Automatic install supports Debian/Ubuntu (apt-get) only; install them manually and rerun setup." >&2
+    exit 2
+  fi
+  echo "Installing missing Terminal MCP dependencies: ${missing_packages[*]}"
+  apt_prefix=(env DEBIAN_FRONTEND=noninteractive)
+  if (( EUID != 0 )); then
+    if ! command -v sudo >/dev/null 2>&1; then
+      echo "Missing sudo; install ${missing_packages[*]} with an administrator account and rerun setup." >&2
+      exit 2
+    fi
+    # curl | bash uses stdin for the script. Never let sudo consume it:
+    # use cached sudo authentication or the controlling terminal.
+    if ! sudo -n -v 2>/dev/null; then
+      if [[ ! -r /dev/tty ]] || ! sudo -v </dev/tty; then
+        echo "Administrator authorization unavailable. Install ${missing_packages[*]} manually, then rerun setup." >&2
+        exit 2
+      fi
+    fi
+    apt_prefix=(sudo env DEBIAN_FRONTEND=noninteractive)
+  fi
+  if ! "${apt_prefix[@]}" apt-get update -qq || ! "${apt_prefix[@]}" apt-get install -y --no-install-recommends "${missing_packages[@]}"; then
+    echo "Package installation failed. Resolve apt/dpkg and rerun setup; pairing code was not consumed." >&2
+    exit 2
+  fi
+fi
+for tool in curl git python3 tmux; do
+  command -v "$tool" >/dev/null 2>&1 || { echo "Missing $tool after package installation; pairing code was not consumed." >&2; exit 2; }
+done
+venv_probe="$(mktemp -d)"
+if ! python3 -m venv "$venv_probe/check" >/dev/null 2>&1; then
+  rm -rf -- "$venv_probe"
+  echo "Python venv is unavailable; install the matching python3-venv package and rerun setup. Pairing code was not consumed." >&2
+  exit 2
+fi
+rm -rf -- "$venv_probe"
 if ! command -v tailscale >/dev/null || ! tailscale ip -4 >/dev/null 2>&1; then
   echo "Tailscale is not connected. Join this machine to the controller's tailnet, then run the same pairing command again." >&2
   exit 3
