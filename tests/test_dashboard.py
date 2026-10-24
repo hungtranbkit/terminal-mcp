@@ -1725,6 +1725,11 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         # Unprefixed alias kept for the operator bookmark that predates the
         # /dashboard prefix; read-only, same handler.
         "/ops/novaretail-dispatch": {"GET", "HEAD"},
+        # Repo Kanban (repo_kanban_dashboard.py): boards committed in each
+        # repo. Read-only by design -- there is no POST at all.
+        "/dashboard/repo-kanban": {"GET", "HEAD"},
+        "/dashboard/api/repo-kanban/projects": {"GET", "HEAD"},
+        "/dashboard/api/repo-kanban/board": {"GET", "HEAD"},
         # Phase-based project teams (d47ce85). Screen and detail read are
         # GET/HEAD; every state change is its own explicit POST.
         "/dashboard/projects": {"GET", "HEAD"},
