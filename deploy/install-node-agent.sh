@@ -140,6 +140,14 @@ if [[ ! -f "$REPO_DIR/config.yaml" ]]; then
   echo "   Review it (allowed_session_patterns, session_lifecycle.allowed_cwd_roots) before starting the service."
   cp "$REPO_DIR/config.example.yaml" "$REPO_DIR/config.yaml"
 fi
+# Add Node's managed workspace is node-local: never inherit /home/dell
+# as the default working directory on an unrelated Linux node. Persist
+# exact-path trust for the owned workspace only; do not auto-trust projects
+# outside it and do not turn off per-command/tool permission checks.
+if [[ "$PAIRED_MODE" -eq 1 ]]; then
+  echo "-> Preparing the node's ~/workspace and scoped Codex/Claude project trust"
+  "$REPO_DIR/.venv/bin/python" "$SOURCE_DIR/scripts/prepare-node-workspace.py" --config "$REPO_DIR/config.yaml"
+fi
 
 # `hostname -I` lists every address on every interface in no particular
 # order -- on a machine with more than one NIC this can put a
