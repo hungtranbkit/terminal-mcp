@@ -6941,8 +6941,22 @@ NODES_ADMIN_HTML = """<!doctype html>
       button.disabled = false;
       if (!result.ok) {
         const detail = result.data.detail || result.data.error || 'Lỗi';
-        anSetMsg('anFormMsg', result.data.error === 'NODE_ALREADY_EXISTS'
-          ? `Đã có node tên "${nodeId}". Chọn tên khác, hoặc xoá node cũ trước.` : detail, 'error');
+        if (result.data.error === 'NODE_ALREADY_EXISTS') {
+          anSetMsg('anFormMsg', 'Node "' + nodeId + '" đã được đăng ký. Không xóa node hiện có; mở chi tiết để tiếp tục cài đặt hoặc sửa kết nối.', 'error');
+          const goExisting = document.createElement('button');
+          goExisting.type = 'button';
+          goExisting.textContent = 'Mở node ' + nodeId;
+          goExisting.addEventListener('click', async () => {
+            anPanel.hidden = true;
+            selectedNodeId = nodeId;
+            renderCards();
+            await loadDetail(nodeId);
+            document.getElementById('detail').scrollIntoView({ behavior: 'smooth', block: 'start' });
+          });
+          document.getElementById('anFormMsg').append(' ', goExisting);
+        } else {
+          anSetMsg('anFormMsg', detail, 'error');
+        }
         return;
       }
       anGenerated = result.data;
