@@ -32,6 +32,7 @@ apt-get() {
 }
 env() {
   [[ "$1" == "DEBIAN_FRONTEND=noninteractive" ]] && shift
+  [[ "$1" == "apt-get" ]] && shift
   apt-get "$@"
 }
 sudo() {
