@@ -77,3 +77,16 @@ def test_paired_installer_invokes_setup_only_in_paired_mode():
     installer = (Path(__file__).resolve().parents[1] / "deploy/install-node-agent.sh").read_text()
     assert 'if [[ "$PAIRED_MODE" -eq 1 ]]; then' in installer
     assert '"$SOURCE_DIR/scripts/prepare-node-workspace.py" --config "$REPO_DIR/config.yaml"' in installer
+
+
+def test_pristine_repo_example_enables_managed_session_workspace(tmp_path):
+    import yaml
+    example = (Path(__file__).resolve().parents[1] / "config.example.yaml").read_text()
+    result, config = run_setup(tmp_path, example)
+    assert result.returncode == 0, result.stderr
+    parsed = yaml.safe_load(config.read_text())
+    assert parsed["session_lifecycle"]["enabled"] is True
+    assert parsed["session_lifecycle"]["allowed_cwd_roots"][0] == str(tmp_path / "workspace")
+    again, _ = run_setup(tmp_path, example, repeat=True)
+    assert again.returncode == 0, again.stderr
+    assert yaml.safe_load(config.read_text()) == parsed
