@@ -35,7 +35,7 @@ def safe(s, pressure):
         if rc or "Ask Codex to do anything" not in screen or any(x in screen for x in ("Trust this folder?","Press enter to confirm","Would you like to run the following command?")):return False,"no-empty-composer"
     else:return False,"agent-active-or-unknown"
     rc,ch=cmd("ps","--ppid",pid,"-o","comm=")
-    if rc:return False,"child-check-failed"
+    if rc not in (0,1):return False,"child-check-failed"
     kids=set(ch.splitlines()) if ch else set()
     allowed=set() if process!="codex" else {"codex-code-mode","MainThread","node_repl","npm exec chrome"}
     if kids-allowed:return False,"active-children"
