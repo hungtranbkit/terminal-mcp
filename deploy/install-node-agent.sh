@@ -250,8 +250,12 @@ CPUWeight=500
 # IMPORTANT: do not use ProtectSystem/ProtectHome/ReadWritePaths here.
 # They create a user namespace under systemd --user; tmux children then see
 # root-owned SSH config as nobody and OpenSSH refuses to start.
+# Codex Linux sandbox needs mount-family syscalls in its unprivileged
+# sandbox. Without @mount, systemd kills the child with SIGSYS (exit 159):
+# Codex opens but cannot execute read-only tools (verified on nec1).
+# Keep NoNewPrivileges=yes, no CAP_SYS_ADMIN grant, and no public SSH.
 NoNewPrivileges=yes
-SystemCallFilter=@system-service
+SystemCallFilter=@system-service @mount
 
 [Install]
 WantedBy=default.target
