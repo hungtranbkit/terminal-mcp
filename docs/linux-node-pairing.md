@@ -38,3 +38,22 @@ nor the bearer token is written to application logs.
 
 The Linux flow is the first platform implementation. The Add Node wizard keeps
 Windows on its current onboarding flow; macOS remains unavailable in the UI.
+
+## Managed Linux workspace and first-run trust
+
+A freshly paired Linux node prepares **$HOME/workspace** (owner-owned, not a
+symlink or group/world writable) and adds it as the first
+`session_lifecycle.allowed_cwd_roots` entry on that node, leaving other
+configured roots unchanged. Dashboard/Terminal MCP session creation with an
+empty working directory now defaults to this node-local workspace. Selecting
+`~/workspace` explicitly also works on paired Linux nodes. No controller
+workspace path is copied from another machine.
+
+Only that exact path is marked trusted using Codex's per-project
+`trust_level = "trusted"` and Claude's per-project
+`hasTrustDialogAccepted = true`. Existing other projects remain unchanged;
+explicitly untrusted projects, symlinked paths, and unsafe ownership/mode
+fail closed. Subsequent installer runs are idempotent. This is project-folder
+trust, **not** automatic command approval, YOLO mode, permission bypass,
+or permission to run hooks from an unrelated repository. CLI first-run theme,
+authentication and tool approvals may still require normal user interaction.
