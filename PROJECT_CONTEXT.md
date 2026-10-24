@@ -29,6 +29,12 @@
   - Config `~/.config/tmcp-repo-kanban-staging/config.yaml`: terminal read/input off, dashboard mutations off, sentinel session pattern.
   - State `~/.local/state/tmcp-repo-kanban-staging`, holding a read-only snapshot of HP's `session_registry.db` taken 2026-10-24.
   - Stop: `systemctl --user stop tmcp-repo-kanban-staging`.
+- **Browser QA (HP, Playwright image v1.64.0, serialized via browser-qa-slot, reverse tunnel to Dell staging):**
+  - At 6f41402 it FAILED on phone horizontal overflow of ~103 px from the wide session/QA tables.
+  - Fixed in 77b497e (scroll wrappers, overflow-wrap).
+  - Rerun at 77b497e: **PASS 4/4** (Chromium + WebKit × 1366×768 / 390×844), 76 checks: list, board, owner filter, `?project=` note, 404 probe, Startup Pixel static `docs/kanban/index.html`.
+  - Evidence on Dell: `~/.local/share/tmcp-qa-runs/repo-kanban-77b497e/` (json + 12 PNG).
+  - Draft PR #89.
 - **Production unchanged:** HP `terminal-dashboard.mesflow.net` (:8766, release 4b9c44d). Deploy only after owner approval. The production config then needs `repo_kanban.repos` with HP-local paths and a fetch timer.
 
 ## 2026-10-23 — Issue #80 Add Node fresh-add vs repair consent

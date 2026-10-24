@@ -60,7 +60,7 @@ table{border-collapse:collapse;font-size:12px}td,th{border-top:1px solid var(--l
 (function () {
   'use strict';
   var COLUMN_TITLES = { RUNNING: 'Đang chạy', NEW: 'Mới', REVIEW: 'Chờ review / merge', BLOCKED: 'Bị chặn', DONE: 'Xong' };
-  var QA_TITLES = { AT_HEAD: 'PASS @ head', DOCS_AHEAD: 'PASS (chỉ thêm docs)', STALE: 'QA cũ', FAIL: 'QA FAIL', NONE: 'chưa QA' };
+  var QA_TITLES = { AT_HEAD: 'PASS @ head', DOCS_AHEAD: 'PASS (chỉ thêm docs)', STALE: 'cũ (code đổi sau PASS)', FAIL: 'FAIL', NONE: 'chưa có' };
   function el(tag, attrs, children) {
     var node = document.createElement(tag);
     Object.keys(attrs || {}).forEach(function (key) {
