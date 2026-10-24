@@ -92,6 +92,8 @@ DASHBOARD_NAV = NavSurface(
         # place to look after asking ChatGPT to start something.
         NavItem("live", "Đang chạy", "/dashboard/live"),
         NavItem("projects", "Projects", "/dashboard/projects"),
+        # Task boards committed in each repo (docs/kanban/*.json), all repos.
+        NavItem("repo-kanban", "Repo Kanban", "/dashboard/repo-kanban"),
         NavItem("agents", "Agents", "/dashboard/agents"),
         NavItem("tasks", "Global Tasks", "/dashboard/tasks"),
         NavItem("sessions", "Sessions", "/dashboard/sessions"),

@@ -1,0 +1,25 @@
+{
+  "repo": "hungtranbkit/terminal-mcp",
+  "updated": "2026-10-24",
+  "integrationBranch": "main",
+  "preview": "Staging Repo Kanban: Dell loopback 127.0.0.1:8786 (tmcp-repo-kanban-staging); production terminal-dashboard.mesflow.net unchanged",
+  "rules": [
+    "Không deploy production khi chưa duyệt",
+    "Không GitHub Actions",
+    "Không merge main"
+  ],
+  "cards": [
+    {
+      "id": "REPO-KANBAN",
+      "title": "Repo Kanban đa repo trong dashboard (đọc docs/kanban/*.json đã commit, ghép session registry)",
+      "owner": "Claude",
+      "status": "REVIEW",
+      "branch": "feat/repo-tasks-kanban-20261024",
+      "prs": [],
+      "issues": [],
+      "evidence": "tests/test_repo_kanban.py 10/10; test_dashboard + global_nav + project_dashboard 222 PASS; staging :8786",
+      "next": "Owner review PR; deploy production chỉ khi được duyệt",
+      "updated": "2026-10-24"
+    }
+  ]
+}

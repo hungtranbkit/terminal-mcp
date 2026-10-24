@@ -264,6 +264,20 @@ supervisor:
 # no repo_write/repo_checkout/repo_commit tool, and every mutating git
 # subcommand is refused by repo_read.READ_ONLY_GIT_SUBCOMMANDS. The real
 # boundary is allowed_roots, not the flag.
+repo_kanban:
+  # Read-only multi-repo task boards (/dashboard/repo-kanban). Each repo
+  # commits docs/kanban/board.json (+ live.json from its sync tool); this
+  # controller reads them from `ref` with `git show`, never from a worktree,
+  # and joins sessions from the session registry by git remote + branch.
+  # Contract: docs/repo-kanban.md. Paths must sit inside repo_read's roots.
+  enabled: true
+  repos: []
+  #  - id: startup-pixel
+  #    name: Startup Pixel
+  #    path: /home/dell/workspace/startup-pixel-game-dev
+  #    ref: origin/integration/world-designer-alpha-art-rc-20261022
+  #    project: startup-pixel        # optional /dashboard/projects slug
+
 repo_read:
   enabled: true
 
