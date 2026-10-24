@@ -41,7 +41,8 @@ main{max-width:1600px;margin:0 auto;padding:16px}h1{font-size:20px;margin:0 0 4p
 .filters{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px}.filters button{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:999px;padding:4px 12px;cursor:pointer}
 .filters button[aria-pressed="true"]{background:var(--ink);color:var(--bg)}
 .board{display:grid;grid-template-columns:repeat(5,minmax(230px,1fr));gap:12px}
-@media (max-width:900px){.board{grid-template-columns:1fr}}
+@media (max-width:900px){.board{grid-template-columns:minmax(0,1fr)}}
+.project,.card,.meta,.small{overflow-wrap:anywhere}.tablewrap{max-width:100%;overflow-x:auto}
 .col small{color:var(--muted);font-weight:400}.card{margin:0 0 10px;padding:10px}.card p{margin:6px 0}
 .card header{display:flex;justify-content:space-between;gap:8px}.title{font-weight:500}
 .small{font-size:12px}.label{display:block;color:var(--muted);font-size:11px;text-transform:uppercase}
@@ -188,12 +189,12 @@ table{border-collapse:collapse;font-size:12px}td,th{border-top:1px solid var(--l
     if (body.sessions.length) {
       var table = el('table', {}, [el('tr', {}, ['Session', 'Node', 'Agent', 'Trạng thái', 'Nhánh', 'Hoạt động'].map(function (h) { return el('th', { text: h }); }))]);
       body.sessions.forEach(function (s) { table.append(el('tr', {}, [s.session_name, s.node_id, s.agent_type, s.status + (s.state ? ' / ' + s.state : ''), s.branch, s.last_activity_at].map(function (v) { return el('td', { text: v || '—' }); }))); });
-      content.append(el('h2', { text: 'Session trên repo này' }), table);
+      content.append(el('h2', { text: 'Session trên repo này' }), el('div', { className: 'tablewrap' }, [table]));
     }
     if (body.qa_runs.length) {
       var runs = el('table', {}, [el('tr', {}, ['Run', 'Commit', 'Kết quả', 'Xong lúc'].map(function (h) { return el('th', { text: h }); }))]);
       body.qa_runs.forEach(function (r) { runs.append(el('tr', {}, [r.id, r.commit.slice(0, 7), r.passed ? 'PASS' : 'FAIL' + (r.failed_step ? ' (' + r.failed_step + ')' : ''), r.completed_at].map(function (v) { return el('td', { text: v || '—' }); }))); });
-      content.append(el('h2', { text: 'Lượt QA gần nhất' }), runs);
+      content.append(el('h2', { text: 'Lượt QA gần nhất' }), el('div', { className: 'tablewrap' }, [runs]));
     }
   }
 
