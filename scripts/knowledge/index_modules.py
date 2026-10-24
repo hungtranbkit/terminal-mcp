@@ -104,7 +104,7 @@ GROUPS: dict[str, list[str]] = {
     "node_onboarding": ["node_agent.py", "node_onboarding.py", "node_profile.py",
                         "remote_connect.py", "lan_discovery.py",
                         "bootstrap_protocol.py", "helper_artifact.py",
-                        "rescue_gateway.py"],
+                        "rescue_gateway.py", "linux_onboarding.py"],
     "windows": ["windows_backend.py", "windows_agent.py", "windows_onboarding.py",
                 "windows_visible_console.py"],
     "http_api": ["server.py", "server_http.py", "health.py", "contract.py",

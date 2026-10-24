@@ -313,7 +313,9 @@ class Enrollment:
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id, "node_id": self.node_id, "display_name": self.display_name,
-            "os": self.os, "profile": self.profile, "connectivity": dict(self.connectivity),
+            "os": self.os, "profile": self.profile,
+            "connectivity": {key: value for key, value in self.connectivity.items()
+                             if not str(key).startswith("_")},
             "status": self.status, "code_display": self.code_display,
             "created_at": self.created_at, "expires_at": self.expires_at,
             "created_by": self.created_by, "consumed_at": self.consumed_at,

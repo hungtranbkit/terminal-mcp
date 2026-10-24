@@ -413,6 +413,31 @@ async def test_heartbeat_loop_survives_unreachable_controller():
     assert scope.cancelled_caught
 
 
+@pytest.mark.anyio
+async def test_heartbeat_post_uses_explicit_controller_user_agent(monkeypatch, caplog):
+    import urllib.error
+    import terminal_mcp.node_agent as node_agent
+
+    requests = []
+
+    def fail_after_capture(request, timeout):
+        requests.append(request)
+        raise urllib.error.URLError("fixture network failure")
+
+    monkeypatch.setattr(node_agent.urllib.request, "urlopen", fail_after_capture)
+    token = "heartbeat-secret-token"
+    with anyio.move_on_after(0.1):
+        await node_agent._heartbeat_loop(
+            node_id="test-node", terminal=TerminalService(_config_for_loop_test()),
+            controller_url="http://controller.invalid", token=token,
+            workspace_root="/", interval_seconds=100.0,
+        )
+
+    assert len(requests) == 1
+    assert requests[0].get_header("User-agent") == "TerminalMCP-node-agent/0.13"
+    assert token not in caplog.text
+
+
 def _config_for_loop_test() -> AppConfig:
     return AppConfig(
         permissions=PermissionsConfig(True, True), allowed_session_patterns=("agent-*",),

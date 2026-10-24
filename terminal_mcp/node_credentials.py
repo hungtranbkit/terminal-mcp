@@ -205,6 +205,38 @@ class NodeCredentialStore:
             return existing
         return self._insert(node_id, token, status=ACTIVE, moment=moment, activated=True)
 
+    def replace(self, node_id: str, token: str, *, reason: str = "approved_pairing_repair",
+                now: datetime | None = None) -> Credential:
+        """Atomically revoke every old token and activate a repair token."""
+        node_id = self._validate(node_id)
+        moment = now or _now()
+        digest = token_hash(token)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute("SELECT * FROM node_credentials WHERE token_hash = ?",
+                                         (digest,)).fetchone()
+                if row is not None:
+                    if row["node_id"] != node_id:
+                        raise ValueError("token is already managed by a different node")
+                    connection.execute("COMMIT")
+                    return _row_to_credential(row)
+                connection.execute(
+                    "UPDATE node_credentials SET status = ?, revoked_at = ?, revoked_reason = "
+                    "? WHERE node_id = ? AND status != ?",
+                    (REVOKED, _iso(moment), str(reason)[:200], node_id, REVOKED))
+                connection.execute(
+                    "INSERT INTO node_credentials (token_hash,node_id,token_id,status,created_at,activated_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (digest, node_id, token_fingerprint(token), ACTIVE, _iso(moment), _iso(moment)))
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+        record = self._by_hash(digest)
+        assert record is not None
+        return record
+
     def rotate(self, node_id: str, *, grace_seconds: int | None = DEFAULT_GRACE_SECONDS,
                now: datetime | None = None, new_token: str | None = None) -> tuple[Credential, str]:
         """Mint a new ACTIVE token and move the current one to GRACE.

@@ -144,6 +144,13 @@ def _service(tmp_path: Path, *, config: AppConfig | None = None, tailscale_avail
     detected = ({"available": True, "ip": "100.100.1.1", "hostname": "ctl", "reason": None}
                 if tailscale_available else
                 {"available": False, "ip": None, "hostname": None, "reason": "tailscale_not_installed"})
+    def replace_token(node_id: str, token: str) -> None:
+        if credentials is not None:
+            credentials.replace(node_id, token, reason="approved_pairing_repair")
+            os.environ[f"TERMINAL_MCP_NODE_TOKEN_{node_id.upper().replace('-', '_')}"] = token
+        else:
+            _token_setter(credentials)(node_id, token)
+
     onboarding = OnboardingService(
         config, controller=controller, connection_store=connection_store,
         enrollment_store=EnrollmentStore(tmp_path / "enrollment.db"),
@@ -157,6 +164,7 @@ def _service(tmp_path: Path, *, config: AppConfig | None = None, tailscale_avail
         # freshly-enrolled node's first heartbeat would 401, which is a
         # production behavior the tests must exercise, not paper over.
         token_env_setter=_token_setter(credentials),
+        replace_token_setter=replace_token,
         tailscale_detector=lambda: detected,
     )
     return terminal, controller, connection_store, onboarding
@@ -614,6 +622,286 @@ def test_enrollment_refuses_a_duplicate_node_id(tmp_path):
     assert excinfo.value.code == "NODE_ALREADY_EXISTS" and excinfo.value.status == 409
 
 
+def test_two_pending_codes_cannot_race_into_duplicate_node_replacement(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    _t, controller, _cs, onboarding = _service(tmp_path)
+    enrollments = [onboarding.create_enrollment(node_id="race-node", os_name="linux") for _ in range(2)]
+    def redeem(item):
+        try:
+            return onboarding.consume_enrollment(item["code"], hostname="race-node",
+                                                 addresses={"tailscale_ip": "100.124.8.40"})["node_id"]
+        except OnboardingError as exc:
+            return exc.code
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(redeem, enrollments))
+    assert results.count("race-node") == 1
+    assert results.count("NODE_ALREADY_EXISTS") == 1
+    assert len([node for node in controller.registry.list() if node.id == "race-node"]) == 1
+
+
+def test_repair_enrollment_requires_explicit_approval_and_reuses_existing_node(tmp_path):
+    from terminal_mcp.node_credentials import NodeCredentialStore, OK, REVOKED
+    credentials = NodeCredentialStore(tmp_path / "credentials.db")
+    _t, controller, _cs, onboarding = _service(tmp_path, credentials=credentials)
+    first = onboarding.create_enrollment(node_id="macbook", profile="minimal", os_name="linux")
+    first_result = onboarding.consume_enrollment(first["code"], hostname="ubuntu-mac",
+                                                addresses={"tailscale_ip": "100.124.8.38"})
+    with pytest.raises(OnboardingError) as excinfo:
+        onboarding.create_enrollment(node_id="macbook", profile="minimal", os_name="linux")
+    assert excinfo.value.code == "NODE_ALREADY_EXISTS"
+
+    repair = onboarding.create_enrollment(node_id="macbook", profile="minimal", os_name="linux",
+                                          replace_existing=True, created_by="operator@example.com")
+    result = onboarding.consume_enrollment(repair["code"], hostname="ubuntu-mac",
+                                           addresses={"tailscale_ip": "100.124.8.38"})
+    assert result["node_id"] == "macbook"
+    assert controller.registry.get("macbook") is not None
+    assert len([node for node in controller.registry.list() if node.id == "macbook"]) == 1
+    assert credentials.verify("macbook", result["node_token"]).verdict == OK
+    assert credentials.verify("macbook", first_result["node_token"]).verdict == REVOKED
+    assert first_result["node_token"] not in json.dumps(repair["enrollment"])
+
+
+def test_repair_enrollment_rejects_a_different_hostname(tmp_path):
+    _t, _controller, _cs, onboarding = _service(tmp_path)
+    first = onboarding.create_enrollment(node_id="macbook", profile="minimal", os_name="linux")
+    onboarding.consume_enrollment(first["code"], hostname="ubuntu-mac",
+                                  addresses={"tailscale_ip": "100.124.8.38"})
+    repair = onboarding.create_enrollment(node_id="macbook", profile="minimal", os_name="linux",
+                                          replace_existing=True)
+    with pytest.raises(OnboardingError) as excinfo:
+        onboarding.consume_enrollment(repair["code"], hostname="unrelated-host",
+                                      addresses={"tailscale_ip": "100.124.8.38"})
+    assert excinfo.value.code == "REPAIR_HOST_MISMATCH"
+
+
+def test_repair_enrollment_rejects_a_different_tailnet_address(tmp_path):
+    _t, _controller, _cs, onboarding = _service(tmp_path)
+    first = onboarding.create_enrollment(node_id="macbook", profile="minimal", os_name="linux")
+    onboarding.consume_enrollment(first["code"], hostname="ubuntu-mac",
+                                  addresses={"tailscale_ip": "100.124.8.38"})
+    repair = onboarding.create_enrollment(node_id="macbook", profile="minimal", os_name="linux",
+                                          replace_existing=True)
+    with pytest.raises(OnboardingError) as excinfo:
+        onboarding.consume_enrollment(repair["code"], hostname="ubuntu-mac",
+                                      addresses={"tailscale_ip": "100.124.8.39"})
+    assert excinfo.value.code == "REPAIR_HOST_MISMATCH"
+
+
+def test_linux_pair_command_uses_https_and_keeps_tokens_out_of_operator_output():
+    from terminal_mcp.linux_onboarding import build_linux_pair_command, render_linux_pair_script
+    command = build_linux_pair_command(controller_url="https://controller.example",
+                                       node_id="macbook", enrollment_code=generate_code())
+    assert "https://controller.example/enroll/linux-pair.sh" in command
+    assert "--token" not in command
+    assert "node_token" not in command
+    script = render_linux_pair_script()
+    assert "node_token" in script  # parsed in memory into the 0600 token file
+    assert "--token" not in script
+    assert "ssh " not in script and "authorized_keys" not in script
+    assert "tailscale ip -4" in script
+    assert 'rm -f "$TMP_RESPONSE"' in script
+    assert '--repo-dir "$HOME/terminal-mcp" --source-dir "$SOURCE_DIR" --paired' in script
+    installer = (Path(__file__).parents[1] / "deploy" / "install-node-agent.sh").read_text()
+    assert "loginctl enable-linger" in installer
+    assert "--paired" in installer
+    assert 'pip install --quiet "$SOURCE_DIR"' in installer
+
+
+def test_linux_pair_bootstrap_refreshes_trusted_source_without_touching_checkout():
+    from terminal_mcp.linux_onboarding import build_linux_pair_command, render_linux_pair_script
+
+    script = render_linux_pair_script()
+    command = build_linux_pair_command(controller_url="https://controller.example",
+                                       node_id="macbook", enrollment_code=generate_code())
+    assert "set -o pipefail; curl" in command
+    assert "refs/heads/main" in script
+    assert "worktree add --quiet --detach" in script
+    assert ' show "$UPSTREAM_COMMIT:deploy/install-node-agent.sh"' in script
+    assert ' hash-object "$FRESH_INSTALLER"' in script
+    assert "install-node-agent.sh" in script
+    assert "--source-dir" in script
+    assert "does not support this pairing flow yet; pairing was not attempted" in script
+    assert "git reset" not in script and "git stash" not in script
+    assert "config.yaml" not in script
+
+
+def test_linux_pair_bootstrap_download_errors_do_not_print_pairing_secrets():
+    from terminal_mcp.linux_onboarding import render_linux_pair_script
+
+    script = render_linux_pair_script()
+    assert "curl --fail --silent --show-error --proto '=https' --tlsv1.2" in script
+    assert "PAIRING_CODE" in script
+    assert 'unset PAIRING_CODE PAYLOAD' in script
+    assert 'echo "$PAIRING_CODE"' not in script
+    assert 'echo "$PAYLOAD"' not in script
+
+
+def test_linux_pair_command_fails_when_bootstrap_download_fails(tmp_path):
+    import os
+    import subprocess
+    from terminal_mcp.linux_onboarding import build_linux_pair_command
+
+    code = generate_code()
+    command = build_linux_pair_command(controller_url="https://controller.example",
+                                       node_id="macbook", enrollment_code=code)
+    assert command.startswith("set -o pipefail; curl ")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    failing_curl = bin_dir / "curl"
+    failing_curl.write_text("#!/bin/sh\nexit 22\n")
+    failing_curl.chmod(0o755)
+    env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}")
+    result = subprocess.run(["bash", "-c", command], env=env, capture_output=True, text=True, check=False)
+    assert result.returncode != 0
+    assert code not in result.stdout + result.stderr
+
+
+def test_linux_pair_fresh_installer_keeps_dirty_config_and_token_checkout_intact(tmp_path):
+    import subprocess
+    from terminal_mcp.linux_onboarding import render_linux_pair_script
+
+    script = render_linux_pair_script()
+    assert 'worktree add --quiet --detach "$SOURCE_DIR" "$UPSTREAM_COMMIT"' in script
+    assert '--repo-dir "$HOME/terminal-mcp" --source-dir "$SOURCE_DIR"' in script
+    assert '\ngit reset ' not in script and '\ngit checkout ' not in script and '\ngit stash ' not in script
+    assert 'echo "$node_token"' not in script
+    assert 'echo "$PAIRING_CODE"' not in script
+
+    checkout = tmp_path / "checkout"
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    subprocess.run(["git", "-C", str(checkout), "config", "user.email", "qa@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(checkout), "config", "user.name", "QA"], check=True)
+    (checkout / "config.yaml").write_text("committed config\n")
+    (checkout / "agent.py").write_text("old source\n")
+    subprocess.run(["git", "-C", str(checkout), "add", "config.yaml", "agent.py"], check=True)
+    subprocess.run(["git", "-C", str(checkout), "commit", "-qm", "old source"], check=True)
+    (checkout / "agent.py").write_text("fresh source\n")
+    subprocess.run(["git", "-C", str(checkout), "commit", "-qam", "fresh source"], check=True)
+    fresh_commit = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+    (checkout / "config.yaml").write_text("operator's dirty config\n")
+    (checkout / "node-agent.token").write_text("existing protected token\n")
+    (checkout / "local.py").write_text("operator edit\n")
+    temp_source = tmp_path / "fresh-source"
+    subprocess.run(["git", "-C", str(checkout), "worktree", "add", "-q", "--detach",
+                    str(temp_source), fresh_commit], check=True)
+    assert (temp_source / "agent.py").read_text() == "fresh source\n"
+    assert (checkout / "config.yaml").read_text() == "operator's dirty config\n"
+    assert (checkout / "node-agent.token").read_text() == "existing protected token\n"
+    assert (checkout / "local.py").read_text() == "operator edit\n"
+
+
+def test_linux_installer_runtime_writes_complete_quoted_unit_without_running_comments(tmp_path):
+    """Exercise the installer body: bash -n cannot catch heredoc expansion."""
+    import os
+    import subprocess
+
+    root = Path(__file__).parents[1]
+    repo = tmp_path / "home$work% with spaces" / "terminal-mcp"
+    source = tmp_path / "verified source"
+    fakebin = tmp_path / "fakebin"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".venv" / "bin").mkdir(parents=True)
+    (source).mkdir()
+    fakebin.mkdir()
+    (source / "pyproject.toml").write_text("[project]\nname='fixture'\n")
+    (repo / "config.yaml").write_text("existing config\n")
+    (repo / "node-agent.token").write_text("protected fixture token\n")
+    (repo / ".venv" / "bin" / "pip").write_text("#!/bin/sh\nexit 0\n")
+    (repo / ".venv" / "bin" / "pip").chmod(0o755)
+    for name in ("systemctl", "loginctl"):
+        tool = fakebin / name
+        tool.write_text("#!/bin/sh\nexit 0\n")
+        tool.chmod(0o755)
+
+    env = dict(os.environ, HOME=str(repo.parent), PATH=f"{fakebin}:{os.environ['PATH']}")
+    result = subprocess.run([
+        "bash", str(root / "deploy" / "install-node-agent.sh"),
+        "--controller", "https://controller.example/path with spaces",
+        "--node-id", "macbook", "--repo-dir", str(repo),
+        "--source-dir", str(source), "--paired",
+    ], env=env, capture_output=True, text=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+    assert "== Node agent installed through approved pairing. ==" in result.stdout
+    assert "command not found" not in result.stderr
+    assert "No such file or directory" not in result.stderr
+    unit = (repo.parent / ".config/systemd/user/terminal-node-agent.service").read_text()
+    unit_repo = str(repo).replace("%", "%%")
+    exec_repo = unit_repo.replace("$", "$$")
+    assert f'WorkingDirectory="{unit_repo}"' in unit
+    assert f'Environment="TERMINAL_MCP_CONFIG={unit_repo}/config.yaml"' in unit
+    home_path = str(repo.parent).replace("%", "%%")
+    assert (f'Environment="PATH={home_path}/.local/bin:/usr/local/sbin:/usr/local/bin:'
+            '/usr/sbin:/usr/bin:/sbin:/bin"') in unit
+    assert f'ExecStart="{exec_repo}/.venv/bin/terminal-node-agent"' in unit
+    assert 'path with spaces" --token-file' in unit
+    assert "died with `RuntimeError: can't start new thread`" in unit
+    assert "cgroup's pids.events/memory.events" in unit
+    assert "pids.events/memory.events" in unit
+    assert "KillMode=process" in unit
+    assert (repo / "config.yaml").read_text() == "existing config\n"
+    assert (repo / "node-agent.token").read_text() == "protected fixture token\n"
+
+    (fakebin / "systemctl").write_text("#!/bin/sh\n[ \"$2\" != restart ]\n")
+    (fakebin / "systemctl").chmod(0o755)
+    failed_restart = subprocess.run([
+        "bash", str(root / "deploy" / "install-node-agent.sh"),
+        "--controller", "https://controller.example", "--node-id", "macbook",
+        "--repo-dir", str(repo), "--source-dir", str(source), "--paired",
+    ], env=env, capture_output=True, text=True, check=False)
+    assert failed_restart.returncode != 0
+    assert "== Node agent installed through approved pairing. ==" not in failed_restart.stdout
+
+
+def test_dashboard_linux_pairing_requires_https_origin_before_issuing_code(tmp_path, monkeypatch):
+    client, _controller, onboarding = _client(tmp_path, monkeypatch)
+    response = client.post("/dashboard/api/nodes/onboard/enrollments", json={
+        "node_id": "ubuntu-test", "os": "linux", "profile": "minimal"})
+    assert response.status_code == 400
+    assert response.json()["error"] == "INVALID_REQUEST"
+    assert onboarding.enrollments.list() == []
+
+
+def test_dashboard_linux_pairing_returns_one_command_without_plaintext_node_token(tmp_path, monkeypatch, caplog):
+    from dataclasses import replace
+    config = _config(tmp_path)
+    config = replace(config, nodes=replace(config.nodes, onboarding=replace(
+        config.nodes.onboarding, bootstrap_origin="https://bootstrap.example.test")))
+    client, controller, onboarding = _client(tmp_path, monkeypatch, config=config)
+    response = client.post("/dashboard/api/nodes/onboard/enrollments", json={
+        "node_id": "ubuntu-test", "os": "linux", "profile": "minimal"})
+    assert response.status_code == 200
+    result = response.json()
+    assert "https://bootstrap.example.test/enroll/linux-pair.sh" in result["quick_install_command"]
+    assert result["code"] in result["quick_install_command"]
+    assert "node_token" not in json.dumps(result)
+    assert "script" not in result
+    http_result = client.post("/dashboard/api/enroll/consume", json={
+        "code": result["code"], "hostname": "ubuntu-test", "platform": "linux",
+        "addresses": {"tailscale_ip": "100.124.8.38"}})
+    assert http_result.status_code == 400
+    assert onboarding.enrollments.get(result["enrollment"]["id"]).status == "pending"
+    secure_result = client.post("https://testserver/dashboard/api/enroll/consume", json={
+        "code": result["code"], "hostname": "ubuntu-test", "platform": "linux",
+        "addresses": {"tailscale_ip": "100.124.8.38"}})
+    assert secure_result.status_code == 200
+    token = secure_result.json()["node_token"]
+    assert len(token) == 64
+    assert controller.registry.get("ubuntu-test") is not None
+    assert token not in caplog.text
+
+
+def test_linux_installer_route_is_public_secret_free_and_no_store(tmp_path, monkeypatch):
+    client, _controller, _onboarding = _client(tmp_path, monkeypatch)
+    response = client.get("/enroll/linux-pair.sh")
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert "PAIRING_CODE" in response.text
+    assert "TMCP-00000-00000-00000" not in response.text
+    assert "node-agent.token" in response.text
+
+
 def test_a_lying_node_cannot_get_its_address_trusted_as_a_tailnet_path(tmp_path):
     """A node claiming a tailnet IP that is not in 100.64.0.0/10 gets it
     filed as LAN. The overlay path is a trust boundary, not a label the
@@ -1008,6 +1296,113 @@ def test_wizard_asks_for_the_minimum_and_nothing_more():
     # Connectivity is behind Advanced, not on the first screen.
     assert '<details id="anAdvanced"' in page
     assert form.index('id="anProfiles"') < form.index('id="anAdvanced"')
+
+
+def test_fresh_linux_add_does_not_offer_or_send_repair_mode():
+    page = _nodes_page()
+    linux_choice = page[page.index("button.addEventListener('click', () => {", page.index("addNodeWizardBtn")):
+                        page.index("document.getElementById('anGenerateBtn')")]
+    create_handler = page[page.index("document.getElementById('anGenerateBtn').addEventListener"):
+                          page.index("// One clipboard helper", page.index("document.getElementById('anGenerateBtn').addEventListener"))]
+
+    assert "document.getElementById('anRepairConsent').hidden = true" in linux_choice
+    assert "replace_existing: anOs === 'linux' && document.getElementById('anRepairApproved').checked" not in create_handler
+    assert "anRepairNodeId === nodeId" in create_handler
+    assert "enrollmentRequest.replace_existing = true" in create_handler
+
+
+def test_repair_flow_is_bound_to_existing_node_and_requires_checkbox_action():
+    page = _nodes_page()
+    repair_handler = page[page.index("if (repairButton) repairButton.addEventListener"):
+                          page.index("document.getElementById('testConnBtn')", page.index("if (repairButton) repairButton.addEventListener"))]
+
+    assert "anRepairNodeId = nodeId" in repair_handler
+    assert "anRepairApproved').checked = false" in repair_handler
+    assert "anRepairConsent').hidden = false" in repair_handler
+
+
+def test_add_node_browser_sends_fresh_add_then_explicit_existing_node_repair():
+    import json
+    from urllib.parse import urlsplit
+
+    sync_playwright = pytest.importorskip("playwright.sync_api").sync_playwright
+    from terminal_mcp.dashboard import NODES_ADMIN_HTML
+
+    node = {"id": "existing-linux", "display_name": "Existing Linux", "hostname": "ubuntu",
+            "platform": "linux", "endpoint": "http://127.0.0.1:8790", "session_backend": "tmux",
+            "status": "online", "capacity_status": "healthy", "draining": False,
+            "cpu_percent": 10, "ram_percent": 20, "tmux_session_count": 1}
+    create_requests = []
+
+    def route_api(route):
+        request = route.request
+        parsed = urlsplit(request.url)
+        if parsed.path == "/dashboard/api/nodes" and request.method == "GET":
+            data = {"nodes": [node]}
+        elif parsed.path == "/dashboard/api/sessions":
+            data = {"sessions": []}
+        elif parsed.path == "/dashboard/api/nodes/onboard/profiles":
+            data = {"enabled": True, "profiles": [], "connectivity": {}}
+        elif parsed.path == "/dashboard/api/nodes/onboard/enrollments" and request.method == "GET":
+            data = {"enrollments": []}
+        elif parsed.path == "/dashboard/api/nodes/onboard/enrollments" and request.method == "POST":
+            create_requests.append(json.loads(request.post_data or "{}"))
+            route.fulfill(status=400, content_type="application/json", body='{"detail":"fixture request captured"}')
+            return
+        elif parsed.path == "/dashboard/api/node":
+            data = {"node": node, "sessions": []}
+        else:
+            data = {}
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(data))
+
+    with sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch(
+                headless=True, args=["--no-sandbox", "--no-zygote", "--single-process", "--disable-gpu"])
+        except Exception as exc:  # noqa: BLE001 -- host without a runnable Chromium
+            pytest.skip(f"chromium unavailable: {exc}")
+        page = browser.new_page()
+        page.route("http://127.0.0.1/**", route_api)
+        html = NODES_ADMIN_HTML.replace("<head>", '<head><base href="http://127.0.0.1/">', 1)
+        page.set_content(html, wait_until="domcontentloaded")
+
+        page.get_by_role("button", name="+ Add Node").click()
+        page.locator('#addNodePanel button[data-os="linux"]').click()
+        assert not page.locator("#anRepairConsent").is_visible()
+        page.locator("#anNodeId").fill("brand-new")
+        with page.expect_response(lambda response: response.request.method == "POST"
+                                  and urlsplit(response.url).path == "/dashboard/api/nodes/onboard/enrollments"):
+            page.locator("#anGenerateBtn").click()
+        assert len(create_requests) == 1
+        assert create_requests[0]["node_id"] == "brand-new"
+        assert "replace_existing" not in create_requests[0]
+
+        page.locator('.node-card[data-node-id="existing-linux"]').click()
+        page.locator("#repairPairBtn").wait_for(state="visible")
+        page.locator("#repairPairBtn").click()
+        page.locator("#anRepairConsent").wait_for(state="visible")
+        assert not page.locator("#anRepairApproved").is_checked()
+
+        # Changing the prefilled registered ID invalidates repair mode.
+        page.locator("#anNodeId").fill("brand-new-after-repair")
+        assert not page.locator("#anRepairConsent").is_visible()
+        with page.expect_response(lambda response: response.request.method == "POST"
+                                  and urlsplit(response.url).path == "/dashboard/api/nodes/onboard/enrollments"):
+            page.locator("#anGenerateBtn").click()
+        assert create_requests[1]["node_id"] == "brand-new-after-repair"
+        assert "replace_existing" not in create_requests[1]
+
+        page.locator("#repairPairBtn").click()
+        page.locator("#anRepairConsent").wait_for(state="visible")
+        assert not page.locator("#anRepairApproved").is_checked()
+        page.locator("#anRepairApproved").check()
+        with page.expect_response(lambda response: response.request.method == "POST"
+                                  and urlsplit(response.url).path == "/dashboard/api/nodes/onboard/enrollments"):
+            page.locator("#anGenerateBtn").click()
+        assert len(create_requests) == 3
+        assert create_requests[2]["node_id"] == "existing-linux"
+        assert create_requests[2]["replace_existing"] is True
+        browser.close()
 
 
 def test_wizard_downloads_via_blob_never_a_url_carrying_the_code():

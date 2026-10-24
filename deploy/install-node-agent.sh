@@ -16,6 +16,7 @@
 #
 # Optional:
 #   --repo-dir DIR         Where to clone/use the terminal-mcp repo (default: ~/terminal-mcp)
+#   --source-dir DIR       Package source to install (default: --repo-dir; pairing uses a verified temp worktree)
 #   --repo-url URL         Git remote to clone from (default: unset -- if --repo-dir doesn't
 #                           already contain a checkout, you'll be told to clone it yourself)
 #   --port PORT             Node agent's own listen port (default: 8790)
@@ -28,22 +29,26 @@ set -euo pipefail
 CONTROLLER_URL=""
 NODE_ID=""
 REPO_DIR="$HOME/terminal-mcp"
+SOURCE_DIR=""
 REPO_URL=""
 AGENT_PORT=8790
 AGENT_HOST=127.0.0.1
 HEARTBEAT_INTERVAL=20
 USE_SYSTEMD=1
+PAIRED_MODE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --controller) CONTROLLER_URL="$2"; shift 2 ;;
     --node-id) NODE_ID="$2"; shift 2 ;;
     --repo-dir) REPO_DIR="$2"; shift 2 ;;
+    --source-dir) SOURCE_DIR="$2"; shift 2 ;;
     --repo-url) REPO_URL="$2"; shift 2 ;;
     --port) AGENT_PORT="$2"; shift 2 ;;
     --host) AGENT_HOST="$2"; shift 2 ;;
     --heartbeat-interval) HEARTBEAT_INTERVAL="$2"; shift 2 ;;
     --no-systemd) USE_SYSTEMD=0; shift ;;
+    --paired) PAIRED_MODE=1; shift ;;
     -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -76,15 +81,30 @@ else
   exit 1
 fi
 
+# The pairing bootstrap can provide a verified, detached upstream worktree
+# for the package source while keeping this checkout as the durable home for
+# config, tokens, and local state.
+if [[ -z "$SOURCE_DIR" ]]; then SOURCE_DIR="$REPO_DIR"; fi
+if [[ ! -f "$SOURCE_DIR/pyproject.toml" ]]; then
+  echo "Error: source directory has no pyproject.toml: $SOURCE_DIR" >&2
+  exit 1
+fi
+
 # -- 2. Python venv + install -------------------------------------------------
 cd "$REPO_DIR"
 if [[ ! -d .venv ]]; then
   echo "-> Creating .venv"
   python3 -m venv .venv
 fi
-echo "-> Installing terminal-mcp (pip install -e .)"
+echo "-> Installing terminal-mcp from $SOURCE_DIR"
 ./.venv/bin/pip install --quiet --upgrade pip
-./.venv/bin/pip install --quiet -e .
+if [[ "$SOURCE_DIR" == "$REPO_DIR" ]]; then
+  ./.venv/bin/pip install --quiet -e "$SOURCE_DIR"
+else
+  # A pairing source worktree is temporary; install a wheel so the venv does
+  # not keep an editable reference to a path removed by the bootstrap trap.
+  ./.venv/bin/pip install --quiet "$SOURCE_DIR"
+fi
 
 # -- 3. This node's own token -------------------------------------------------
 ENV_FILE="$REPO_DIR/node-agent.env"  # legacy migration source only
@@ -102,6 +122,10 @@ elif [[ -f "$ENV_FILE" ]]; then
   unset TOKEN_VALUE
   echo "-> Migrated legacy token into $TOKEN_FILE and removed $ENV_FILE"
 else
+  if [[ "$PAIRED_MODE" -eq 1 ]]; then
+    echo "Error: paired install requires the protected node token file at $TOKEN_FILE" >&2
+    exit 1
+  fi
   TOKEN_VALUE=$("$REPO_DIR/.venv/bin/python" -c "import secrets; print(secrets.token_hex(32))")
   umask 077
   printf "%s" "$TOKEN_VALUE" > "$TOKEN_FILE"
@@ -152,6 +176,18 @@ fi
 # -- 5. systemd unit -----------------------------------------------------------
 UNIT_DIR="$HOME/.config/systemd/user"
 UNIT_PATH="$UNIT_DIR/terminal-node-agent.service"
+systemd_quote() {
+  local value="$1"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//%/%%}
+  printf '"%s"' "$value"
+}
+systemd_exec_quote() {
+  local value="$1"
+  value=${value//\$/\$\$}
+  systemd_quote "$value"
+}
 UNIT_CONTENT=$(cat <<EOF
 [Unit]
 Description=Terminal MCP node agent ($NODE_ID)
@@ -165,9 +201,10 @@ StartLimitBurst=8
 
 [Service]
 Type=simple
-WorkingDirectory=$REPO_DIR
-Environment=TERMINAL_MCP_CONFIG=$REPO_DIR/config.yaml
-ExecStart=$REPO_DIR/.venv/bin/terminal-node-agent --node-id $NODE_ID --controller-url $CONTROLLER_URL --token-file $TOKEN_FILE --host $AGENT_HOST --port $AGENT_PORT --heartbeat-interval-seconds $HEARTBEAT_INTERVAL
+WorkingDirectory=$(systemd_quote "$REPO_DIR")
+Environment=$(systemd_quote "TERMINAL_MCP_CONFIG=$REPO_DIR/config.yaml")
+Environment=$(systemd_quote "PATH=$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+ExecStart=$(systemd_exec_quote "$REPO_DIR/.venv/bin/terminal-node-agent") --node-id $(systemd_exec_quote "$NODE_ID") --controller-url $(systemd_exec_quote "$CONTROLLER_URL") --token-file $(systemd_exec_quote "$TOKEN_FILE") --host $(systemd_exec_quote "$AGENT_HOST") --port $(systemd_exec_quote "$AGENT_PORT") --heartbeat-interval-seconds $(systemd_exec_quote "$HEARTBEAT_INTERVAL")
 Restart=always
 RestartSec=3
 RestartSteps=6
@@ -180,19 +217,19 @@ RestartMaxDelaySec=60
 # (see docs/CONTROLLER_RUNBOOK.md).
 KillMode=process
 # Sized by SESSION COUNT, not by feel. Each tmux session this node
-# supervises costs 2 tasks -- an `sh` + `cat` pair piping the pane into
+# supervises costs 2 tasks -- an \`sh\` + \`cat\` pair piping the pane into
 # ~/.local/state/terminal-mcp/raw/<session>.log -- plus the tmux server
 # and the agent itself. Budget ~2*sessions + 20.
 #
 # The previous values (512M / 256) were sized for a small fleet and
 # silently became the failure mode on dell-linux at 108 sessions: the
 # cgroup sat at 222/256 tasks, every request that needed a new thread
-# died with `RuntimeError: can't start new thread`, and the node answered
-# `GET /v1/sessions/<name>/status` with HTTP 500. The controller reports
+# died with \`RuntimeError: can't start new thread\`, and the node answered
+# \`GET /v1/sessions/<name>/status\` with HTTP 500. The controller reports
 # that as flaky connectivity, which sends you looking at the network
-# instead of at `pids.events`. 2048 tasks covers ~1000 sessions.
+# instead of at \`pids.events\`. 2048 tasks covers ~1000 sessions.
 #
-# Check headroom with scripts/node-agent-health.sh; a non-zero `max`
+# Check headroom with scripts/node-agent-health.sh; a non-zero \`max\`
 # counter in the cgroup's pids.events/memory.events means you already
 # hit the ceiling.
 MemoryMax=3G
@@ -236,6 +273,12 @@ else
   echo "$UNIT_CONTENT"
   echo "-> Start it manually with:"
   echo "   $REPO_DIR/.venv/bin/terminal-node-agent --node-id $NODE_ID --controller-url $CONTROLLER_URL --host $AGENT_HOST --port $AGENT_PORT"
+fi
+
+if [[ "$PAIRED_MODE" -eq 1 ]]; then
+  echo "== Node agent installed through approved pairing. =="
+  echo "The controller will report Online after heartbeat and execution checks succeed."
+  exit 0
 fi
 
 echo

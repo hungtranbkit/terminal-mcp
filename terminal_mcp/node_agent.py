@@ -69,6 +69,7 @@ from .node_models import PLATFORM_LINUX, canonical_platform
 from .webterm import WebTerminalProcess, pump_websocket
 
 _log = logging.getLogger(__name__)
+_CONTROLLER_USER_AGENT = "TerminalMCP-node-agent/0.13"
 
 
 def detect_platform() -> str:
@@ -1196,6 +1197,19 @@ async def watch_for_shutdown(app: Starlette, server: "uvicorn.Server", *,
     server.should_exit = True
 
 
+def _controller_post_request(url: str, body: bytes) -> urllib.request.Request:
+    """Build controller POSTs with the explicit Terminal MCP client identity.
+
+    Cloudflare rejects urllib's default Python User-Agent on the public
+    controller origin. Heartbeat and token-refresh requests share this
+    helper; callers attach credentials without exposing them in logs.
+    """
+    request = urllib.request.Request(url, data=body, method="POST")
+    request.add_header("User-Agent", _CONTROLLER_USER_AGENT)
+    request.add_header("Content-Type", "application/json")
+    return request
+
+
 def _collect_rotated_token(*, controller_url: str, node_id: str, credential: AgentCredential,
                            hint: dict, timeout: float = 10.0) -> bool:
     """Fetch the replacement token the controller says is waiting.
@@ -1212,9 +1226,8 @@ def _collect_rotated_token(*, controller_url: str, node_id: str, credential: Age
     """
     path = str(hint.get("collect_path") or f"/dashboard/api/nodes/{node_id}/token/refresh")
     url = f"{controller_url.rstrip('/')}{path}"
-    request = urllib.request.Request(url, data=b"{}", method="POST")
+    request = _controller_post_request(url, b"{}")
     request.add_header("Authorization", f"Bearer {credential.current}")
-    request.add_header("Content-Type", "application/json")
     with urllib.request.urlopen(request, timeout=timeout) as response:
         payload = json.loads(response.read().decode() or "{}")
     fresh = str(payload.get("token") or "")
@@ -1282,9 +1295,8 @@ async def _heartbeat_loop(*, node_id: str, terminal: TerminalService, controller
                 "platform": platform, "session_backend": session_backend,
                 "shell_capabilities": list(shell_capabilities), "wsl_available": wsl_available,
             }).encode()
-            request = urllib.request.Request(url, data=body, method="POST")
+            request = _controller_post_request(url, body)
             request.add_header("Authorization", f"Bearer {credential.current}")
-            request.add_header("Content-Type", "application/json")
             # A captured authenticated heartbeat must not be reusable to keep a
             # dead node falsely online.  The controller persists consumed nonces.
             request.add_header(HEADER_TIMESTAMP, str(time.time()))

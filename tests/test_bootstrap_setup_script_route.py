@@ -137,7 +137,7 @@ def test_a_machine_needs_no_access_cookie_for_it(tmp_path):
 
 ALLOWED = (
     r"^/dashboard/api/enroll/(consume|redeem|progress)$",
-    r"^/(w|enroll/windows-setup\.ps1)$",
+    r"^/(w|enroll/windows-setup\.ps1|enroll/linux-pair\.sh)$",
     # The node-agent bundle: machine-facing, but authenticated by the
     # node's own bearer token rather than anonymous like the others.
     r"^/dashboard/api/nodes/[A-Za-z0-9_-]{1,64}/agent-bundle$",

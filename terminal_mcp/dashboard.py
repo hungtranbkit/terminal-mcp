@@ -50,6 +50,7 @@ from .windows_onboarding import (SCRIPT_VERSION as SETUP_SCRIPT_VERSION,
                                  SETUP_SCRIPT_SHORT_PATH, build_quick_install_command,
                                  list_profiles, quick_install_fits_run_dialog,
                                  render_setup_script, script_fingerprint)
+from .linux_onboarding import build_linux_pair_command, render_linux_pair_script
 from .fleet_service import ControllerFleetSync, FleetService, auth_status_for_node
 from .controller import ControllerService, build_default_controller
 from .node_client import NodeClientError, RemoteNodeClient
@@ -6166,6 +6167,7 @@ NODES_ADMIN_HTML = """<!doctype html>
     .an-big-btn[aria-busy="true"] { cursor:progress }
     .an-note { font-size:11px; margin-top:8px }
     .an-helper { margin-top:10px; padding:14px; border:1px solid #6ee7a0; border-radius:10px; background:#12331f }
+    .an-helper.linux-hidden { display:none }
     .an-helper .an-big { color:#8ef0b8 }
     .an-live { margin-top:10px; padding:9px 12px; border-radius:8px; background:#12243d; border:1px solid var(--accent);
                font-size:12px; display:flex; gap:10px; align-items:center }
@@ -6239,7 +6241,7 @@ NODES_ADMIN_HTML = """<!doctype html>
         <div class="an-hint">Chọn hệ điều hành của máy bạn muốn thêm.</div>
         <div class="an-os-grid">
           <button class="an-os" type="button" data-os="windows"><span class="an-os-icon">🪟</span><span>Windows</span><span class="muted">10 / 11 / Server</span></button>
-          <button class="an-os" type="button" data-os="linux" disabled><span class="an-os-icon">🐧</span><span>Linux</span><span class="muted">dùng Connect Node</span></button>
+          <button class="an-os" type="button" data-os="linux"><span class="an-os-icon">🐧</span><span>Linux</span><span class="muted">Ubuntu / systemd</span></button>
           <button class="an-os" type="button" data-os="macos" disabled><span class="an-os-icon">🍎</span><span>macOS</span><span class="muted">dùng Connect Node</span></button>
         </div>
       </div>
@@ -6250,6 +6252,10 @@ NODES_ADMIN_HTML = """<!doctype html>
         <div class="cx-row">
           <label class="cx-field">Node name<input type="text" id="anNodeId" placeholder="win-work" autocomplete="off"></label>
         </div>
+        <label id="anRepairConsent" class="an-hint" hidden style="margin-top:10px">
+          <input id="anRepairApproved" type="checkbox" style="margin-top:3px">
+          <span>I approve replacing the connection for this existing node. The repair code is bound to its registered hostname; its sessions are preserved.</span>
+        </label>
         <div id="anProfiles" class="an-profiles"></div>
         <details id="anAdvanced" class="an-advanced">
           <summary>Advanced (connectivity)</summary>
@@ -6282,7 +6288,6 @@ NODES_ADMIN_HTML = """<!doctype html>
           <div class="cx-row" style="margin-top:10px">
             <button class="icon-btn an-primary an-big-btn" id="anHelperBtn" type="button"
                     aria-describedby="anHelperWhy" aria-busy="true" aria-disabled="true" disabled>Cài và kết nối máy này</button>
-            <button class="icon-btn" id="anRegenBtn" type="button" hidden>Tạo lại</button>
             <button class="icon-btn" id="anDoneBtn" type="button">Đã xong</button>
           </div>
           <div class="d-msg" id="anHelperMsg" role="status" aria-live="polite"></div>
@@ -6303,6 +6308,10 @@ NODES_ADMIN_HTML = """<!doctype html>
               </div>
             </div>
           </div>
+        </div>
+
+        <div class="cx-row" style="margin-top:8px">
+          <button class="icon-btn" id="anRegenBtn" type="button" hidden>Tạo mã mới</button>
         </div>
 
         <!-- Everything below is the fallback: the copy/paste Win + R path
@@ -6626,6 +6635,7 @@ NODES_ADMIN_HTML = """<!doctype html>
           <div class="d-actions">
             <button id="refreshDetailBtn" type="button">⟳ Refresh</button>
             <button id="testConnBtn" type="button"${isLocal ? ' disabled title="Node local luôn kết nối"' : ''}>Test connection</button>
+            ${!isLocal && node.platform === 'linux' ? '<button id="repairPairBtn" type="button">Repair connection</button>' : ''}
             <button id="drainBtn" type="button">${node.draining ? 'Resume (nhận session mới)' : 'Drain (ngừng nhận session mới)'}</button>
           </div>
         </div>
@@ -6640,6 +6650,21 @@ NODES_ADMIN_HTML = """<!doctype html>
         <div id="nodeTransports"></div>`;
       renderOnboardingSection(nodeId);
       document.getElementById('refreshDetailBtn').addEventListener('click', () => loadDetail(nodeId));
+      const repairButton = document.getElementById('repairPairBtn');
+      if (repairButton) repairButton.addEventListener('click', async () => {
+        await anOpen();
+        anOs = 'linux';
+        document.getElementById('anNodeId').value = nodeId;
+        anRepairNodeId = nodeId;
+        document.getElementById('anRepairApproved').checked = false;
+        document.getElementById('anRepairConsent').hidden = false;
+        document.getElementById('anProfiles').hidden = true;
+        document.getElementById('anAdvanced').hidden = true;
+        anPanel.querySelector('#anStepForm > .an-hint').textContent =
+          'Ubuntu/Linux dùng Tailscale và systemd. Mã có hiệu lực 15 phút, dùng một lần.';
+        anShow('anStepForm');
+        anPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
       document.getElementById('testConnBtn').addEventListener('click', async () => {
         const msg = document.getElementById('detailMsg');
         msg.textContent = 'Đang kiểm tra...'; msg.className = 'd-msg';
@@ -6755,7 +6780,9 @@ NODES_ADMIN_HTML = """<!doctype html>
     const anPanel = document.getElementById('addNodePanel');
     let anCatalog = null;        // last /onboard/profiles payload
     let anProfile = 'minimal';
+    let anOs = 'windows';
     let anGenerated = null;      // the one create-enrollment response, held only in this tab
+    let anRepairNodeId = null;   // set only by the registered node's Repair connection action
 
     function anShow(step) {
       for (const id of ['anStepOs', 'anStepForm', 'anStepDone']) {
@@ -6841,6 +6868,11 @@ NODES_ADMIN_HTML = """<!doctype html>
     async function anOpen() {
       anPanel.hidden = false;
       anGenerated = null;
+      anOs = 'windows';
+      anRepairNodeId = null;
+      document.getElementById('anNodeId').value = '';
+      document.getElementById('anRepairApproved').checked = false;
+      document.getElementById('anRepairConsent').hidden = true;
       anShow('anStepOs');
       const result = await api('/dashboard/api/nodes/onboard/profiles');
       if (!result.ok) {
@@ -6862,14 +6894,30 @@ NODES_ADMIN_HTML = """<!doctype html>
 
     for (const button of anPanel.querySelectorAll('.an-os')) {
       button.addEventListener('click', () => {
-        if (button.dataset.os !== 'windows') return;
-        anRenderProfiles();
-        anRenderConnectivity();
+        anOs = button.dataset.os;
+        // Linux fresh-add is the default. Repair consent is exposed only
+        // by the per-node Repair connection action in loadDetail().
+        document.getElementById('anRepairConsent').hidden = true;
+        document.getElementById('anProfiles').hidden = anOs === 'linux';
+        document.getElementById('anAdvanced').hidden = anOs === 'linux';
+        document.getElementById('anNodeId').placeholder = anOs === 'linux' ? 'macbook' : 'win-work';
+        anPanel.querySelector('#anStepForm > .an-hint').textContent = anOs === 'linux'
+          ? 'Ubuntu/Linux dùng Tailscale và systemd. Mã có hiệu lực 15 phút, dùng một lần.'
+          : 'Máy Windows này sẽ tự đăng ký, tự bật SSH và tự hoạt động lại sau khi khởi động lại.';
+        if (anOs === 'windows') { anRenderProfiles(); anRenderConnectivity(); }
         anSetMsg('anFormMsg', '');
         anShow('anStepForm');
         document.getElementById('anNodeId').focus();
       });
     }
+
+    document.getElementById('anNodeId').addEventListener('input', (event) => {
+      if (anRepairNodeId && event.target.value.trim() !== anRepairNodeId) {
+        anRepairNodeId = null;
+        document.getElementById('anRepairApproved').checked = false;
+        document.getElementById('anRepairConsent').hidden = true;
+      }
+    });
 
     document.getElementById('anGenerateBtn').addEventListener('click', async () => {
       const button = document.getElementById('anGenerateBtn');
@@ -6881,9 +6929,14 @@ NODES_ADMIN_HTML = """<!doctype html>
       }
       button.disabled = true;
       anSetMsg('anFormMsg', 'Đang tạo setup...', '');
+      const repairApproved = anOs === 'linux' && anRepairNodeId === nodeId
+        && document.getElementById('anRepairApproved').checked;
+      const enrollmentRequest = { node_id: nodeId, os: anOs, profile: anOs === 'linux' ? 'minimal' : anProfile,
+        connectivity };
+      if (repairApproved) enrollmentRequest.replace_existing = true;
       const result = await api('/dashboard/api/nodes/onboard/enrollments', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ node_id: nodeId, os: 'windows', profile: anProfile, connectivity }),
+        body: JSON.stringify(enrollmentRequest),
       });
       button.disabled = false;
       if (!result.ok) {
@@ -7268,6 +7321,24 @@ NODES_ADMIN_HTML = """<!doctype html>
       const copyBtn = document.getElementById('anCopyCmdBtn');
       cmdEl.value = anGenerated.quick_install_command || '';
 
+      if (anOs === 'linux') {
+        document.querySelector('.an-helper').classList.add('linux-hidden');
+        document.querySelector('.an-manual').open = true;
+        const linuxSteps = document.querySelector('#anQuickBox .an-steps');
+        linuxSteps.replaceChildren();
+        const linuxStep = document.createElement('li');
+        linuxStep.textContent = 'On the Ubuntu machine, open a terminal and paste this one command. Tailscale must be connected.';
+        linuxSteps.append(linuxStep);
+        document.getElementById('anDownloadBtn').hidden = true;
+        document.getElementById('anCopyCodeBtn').hidden = true;
+        document.getElementById('anCopyCmdBtn').textContent = '📋 Copy Linux pairing command';
+      } else {
+        document.querySelector('.an-helper').classList.remove('linux-hidden');
+        document.getElementById('anDownloadBtn').hidden = false;
+        document.getElementById('anCopyCodeBtn').hidden = false;
+        document.getElementById('anCopyCmdBtn').textContent = '📋 Copy lệnh cài đặt';
+      }
+
       // A command longer than the Run dialog accepts would be silently
       // truncated on paste -- say so rather than let them find out.
       const note = document.getElementById('anPlatformNote');
@@ -7276,7 +7347,7 @@ NODES_ADMIN_HTML = """<!doctype html>
         notes.push('Lệnh dài hơn giới hạn của hộp Win + R — dùng cách thủ công bên dưới.');
       }
       if (!/Win/i.test(navigator.platform || '')) {
-        notes.push('Chạy lệnh này trên máy Windows cần thêm.');
+        if (anOs === 'windows') notes.push('Chạy lệnh này trên máy Windows cần thêm.');
       }
       note.textContent = notes.join(' ');
       note.hidden = notes.length === 0;
@@ -7314,13 +7385,37 @@ NODES_ADMIN_HTML = """<!doctype html>
       // is never removed from here on: anDecideCta only chooses which of
       // the three live meanings it carries.
       if (anDetectTimer) { clearInterval(anDetectTimer); anDetectTimer = null; }
-      anSetCtaMode('checking');
-      anDecideCta();
+      if (anOs === 'windows') {
+        anSetCtaMode('checking');
+        anDecideCta();
+      }
       // The status panel stays dark until the operator actually uses the
       // CTA -- generating a code is not yet an install to watch.
       if (anExpiryTimer) clearInterval(anExpiryTimer);
       tick();
       anExpiryTimer = setInterval(tick, 1000);
+
+      if (anOs === 'linux') {
+        anSetMsg('anDoneMsg', 'Dán lệnh trên máy Ubuntu. Tailscale phải đang kết nối; chi tiết lỗi sẽ hiện trong terminal.', '');
+        const fine = document.getElementById('anFine');
+        fine.replaceChildren();
+        for (const [label, value] of [
+          ['Node', anGenerated.enrollment.node_id],
+          ['Controller', anGenerated.controller_url],
+          ['Code expiry', new Date(anGenerated.enrollment.expires_at).toLocaleTimeString()],
+        ]) {
+          const row = document.createElement('div');
+          const strong = document.createElement('b');
+          strong.textContent = label + ': ';
+          const code = document.createElement('code');
+          code.textContent = value;
+          row.append(strong, code);
+          fine.append(row);
+        }
+        document.getElementById('anTrouble').textContent =
+          'Tailscale chưa sẵn sàng: kết nối tailnet rồi chạy lại lệnh. Mã hết hạn hoặc đã dùng: tạo mã mới.';
+        return;
+      }
 
       anSetMsg('anDoneMsg', '');
       const fine = document.getElementById('anFine');
@@ -13508,6 +13603,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         except Exception:  # noqa: BLE001
             _log.exception("could not record node %s's token for rotation -- "
                            "it will authenticate via the legacy env var", node_id)
+
+    def _replace_node_token(node_id: str, token: str) -> None:
+        credentials.replace(node_id, token, reason="approved_pairing_repair")
+        os.environ[node_token_env_var(node_id)] = token
     if onboarding is None:
         # SAME private-temp-file discipline as connection_store/queue/pm
         # above: an ad-hoc caller (every test that does not pass one)
@@ -13526,6 +13625,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                             terminal.config.nodes.onboarding.rescue.port_range_end)),
             audit=terminal.audit,
             token_env_setter=_manage_node_token,
+            replace_token_setter=_replace_node_token,
         )
 
     def _origin_allowed(request: Request) -> bool:
@@ -18946,14 +19046,24 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         connectivity = body.get("connectivity") if isinstance(body.get("connectivity"), dict) else {}
 
         def _compute() -> dict:
-            created = onboarding.create_enrollment(
-                node_id=body.get("node_id"), display_name=body.get("display_name"),
-                os_name=(body.get("os") or "windows"), profile=(body.get("profile") or "minimal"),
-                connectivity=connectivity, created_by=(identity.email if identity else None),
-                hostname_hint=body.get("hostname"))
-            node_id = created["enrollment"]["node_id"]
+            os_name = body.get("os") or "windows"
             controller_urls = onboarding.controller_urls(request_base_url=_request_base_url(request))
             controller_url = controller_urls[0]
+            if os_name == "linux" and not controller_url.startswith("https://"):
+                raise ValueError("Configure nodes.onboarding.bootstrap_origin as a trusted HTTPS URL before Linux pairing")
+            created = onboarding.create_enrollment(
+                node_id=body.get("node_id"), display_name=body.get("display_name"),
+                os_name=os_name, profile=(body.get("profile") or "minimal"),
+                connectivity=connectivity, created_by=(identity.email if identity else None),
+                hostname_hint=body.get("hostname"),
+                replace_existing=(body.get("replace_existing") is True))
+            node_id = created["enrollment"]["node_id"]
+            if created["enrollment"]["os"] == "linux":
+                created["quick_install_command"] = build_linux_pair_command(
+                    controller_url=controller_url, node_id=node_id, enrollment_code=created["code"])
+                created["install_script_path"] = "/enroll/linux-pair.sh"
+                created["controller_url"] = controller_url
+                return created
             script = render_setup_script(
                 enrollment_code=created["code"], controller_url=controller_url, node_id=node_id,
                 display_name=created["enrollment"]["display_name"], profile=created["enrollment"]["profile"],
@@ -19113,12 +19223,19 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if not code or not hostname:
             return JSONResponse({"error": "INVALID_REQUEST", "detail": "code and hostname are required"},
                                 status_code=400, headers={"Cache-Control": "no-store"})
+        platform = str(body.get("platform") or "windows")[:32].lower()
+        # Uvicorn trusts forwarded scheme only from the local TLS proxy;
+        # never trust an arbitrary caller-supplied X-Forwarded-Proto.
+        if platform in ("linux", "macos") and request.url.scheme != "https":
+            return JSONResponse({"error": "HTTPS_REQUIRED",
+                                 "detail": "Linux/macOS pairing credentials are returned only over HTTPS"},
+                                status_code=400, headers={"Cache-Control": "no-store"})
         addresses = body.get("addresses") if isinstance(body.get("addresses"), dict) else {}
 
         def _compute() -> dict:
             return onboarding.consume_enrollment(
                 code, hostname=hostname, source_ip=source,
-                platform=str(body.get("platform") or "windows")[:32],
+                platform=platform,
                 addresses=addresses, rescue_public_key=body.get("rescue_public_key"),
                 agent_version=str(body.get("script_version") or "")[:64] or None,
                 request_base_url=_request_base_url(request))
@@ -19337,6 +19454,17 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             "X-Terminal-Mcp-Setup-Version": SETUP_SCRIPT_VERSION,
             "X-Terminal-Mcp-Setup-Sha256": script_fingerprint(text),
             "Content-Disposition": 'attachment; filename="windows-setup.ps1"',
+        })
+
+    @server.custom_route("/enroll/linux-pair.sh", methods=["GET"], include_in_schema=False)
+    async def enroll_linux_pair_script(request: Request) -> Response:
+        """Secret-free Linux installer; the one-time code is a runtime arg."""
+        if not terminal.config.nodes.onboarding.enabled:
+            return PlainTextResponse("Terminal MCP node onboarding is disabled on this controller.\n",
+                                     status_code=403)
+        return PlainTextResponse(render_linux_pair_script(), media_type="text/plain; charset=utf-8", headers={
+            "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": 'attachment; filename="terminal-mcp-linux-pair.sh"',
         })
 
     # ---------------------------------------------------------------- Project Backlog
