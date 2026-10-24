@@ -1,5 +1,31 @@
 # PROJECT_CONTEXT.md
 
+## 2026-10-24 — Add Node (Linux): pending→online status, code hygiene, health check (branch pushed, not deployed)
+
+- State found: PR #81 was **merged** 2026-10-24T00:18Z (squash `7189318`). Main then gained direct `[skip ci]` commits from another session (tmux/venv apt bootstrap before consuming the code, unquoted `WorkingDirectory`, `SystemCallFilter=@system-service @mount`, LoadState check, paired-mode `scripts/prepare-node-workspace.py`). All of those were preserved. Branch `feat/add-node-linux-status-hygiene` is based on `origin/main` `4b9c44d`, built in worktree `/home/dell/workspace/.terminal-mcp-worktrees/issue-80-mac-registration-claude`.
+- `terminal_mcp/linux_onboarding.py`:
+  - **Code handling.** The pair command hands the code to bash as `TMCP_PAIRING_CODE=… bash -s -- <origin> <node>`, so it never appears in a world-readable argv. Every curl receives its payload on stdin (`--data-binary @-`). The old positional third argument is still accepted.
+  - **Progress reporting.** The script reports `starting → downloading → registering → installing_service → ready|failed` best-effort, using the existing `/dashboard/api/enroll/progress` route (same allowlisted path, no new route). Reporting is skipped silently while python3 is absent, before the apt bootstrap installs it.
+  - **Health check.** After the installer runs, the script waits up to 60s for `systemctl --user is-active` plus `GET http://<ts-ip>:8790/v1/health`, and exits 6 otherwise.
+  - **Failure output.** Consume errors map to concrete actions. Any failure prints secret-free diagnostic commands. `linux_diagnostic_commands()` is the shared list the dashboard shows.
+- `deploy/install-node-agent.sh`: the unit is rendered by `render_unit()` from QUOTED heredocs plus printf, never through `$(cat <<EOF …)`, which executed backticks in comments on the MacBook. It is written atomically via `.new` + `mv`. Output is byte-identical to main's, including for paths with spaces, `%` and `$`; `systemd-analyze verify` passes in tests.
+- `terminal_mcp/dashboard.py` (`NODES_ADMIN_HTML`), Linux path:
+  - **Status.** The watch starts at Generate and shows Pending, then the script's stages. On `ready` it polls `/dashboard/api/nodes` until composite `status == online`; online needs a fresh heartbeat AND a passing execution probe. Degraded shows `health_state` with a hint (token rejected → Repair connection; execution down → agent/Tailscale checks).
+  - **Code purge.** `anPurgeCode()` clears the command and code from the DOM and from `anGenerated` on expiry, on consumption (`row.status !== 'pending'`), on close and on Done. The localStorage watch marker holds only the enrollment id/node/os/timestamps.
+  - **UI.** A failure guide and a copyable diagnostics block. The copy success text is now OS-aware (it used to say Win+R for Linux).
+  - **Response.** The create response adds `diagnostic_commands`.
+- Tests:
+  - New in `tests/test_windows_onboarding.py`: an end-to-end run of the exact pasted command against fakes, in both env and legacy positional forms, asserting the code is in no curl argv, the stage sequence, a 0600 token, installer args, and temp worktree cleanup. Also: health-failure diagnostics, dead-code guidance, malformed code, missing Tailscale, the no-expanding-heredoc guard, diagnostics in the response, the list never returning the code, cross-origin (`ORIGIN_NOT_ALLOWED`) and mutations-disabled refusals, UI wiring, `node --check` on every inline script of `/dashboard/nodes`, and degraded explanation.
+  - Updated: `tests/test_deploy_scripts.py` now parses the *rendered* unit; `tests/test_node_agent_unit_generation.py` sources `render_unit()`; `tests/test_linux_add_node_install_contract.py` follows the env-form command and printf `WorkingDirectory`; `tests/test_bootstrap_helper.py` counts the Linux watch.
+  - **Pre-existing main breakage fixed:** `test_linux_installer_runtime_writes_complete_quoted_unit_without_running_comments` failed on `origin/main` (fixture lacked `.venv/bin/python`, `scripts/prepare-node-workspace.py`, and a `LoadState=loaded` answer, and asserted the old quoted `WorkingDirectory`).
+- Verification:
+  - Red proof: 8 new tests failed on the unmodified PR head.
+  - Final: 24 relevant files → **792 passed, 6 skipped** (PowerShell/Go unavailable), 0 failed. `bash -n` and `git diff --check` clean. Run with `XDG_STATE_HOME=<scratch>` and `PYTHONPATH=<worktree>`.
+  - Real-browser smoke (local Chrome, loopback-only throwaway server on `127.0.0.1:18799` from test fixtures with a simulated node): Pending → stages → command purged at registering → Online ✓ (heartbeat + probe), degraded hint shown (heartbeat only), and close purges the command. Server stopped and tab closed afterwards.
+  - Not done: a live run on a real Linux node through the production controller.
+- Deployment: none. No restart of HP/Dell services, no live tokens or nodes touched. The pair script runs the installer from `origin/main`, so installer changes reach nodes only after merge; the dashboard/script changes need a controller rollout through the normal reviewed release.
+- Next: review and merge the PR; roll out to the HP controller with a rollback ready; then pair one fresh Ubuntu node from the dashboard and confirm Pending → Online with a shell plus Codex smoke on it.
+
 ## 2026-10-23 — Issue #80 Add Node fresh-add vs repair consent
 
 - In `terminal_mcp/dashboard.py` (`NODES_ADMIN_HTML`), fresh Linux add no longer presents the existing-node replacement checkbox or sends `replace_existing`. Repair mode is entered only by the Repair connection action rendered for a registered Linux node. Its checkbox starts unchecked and must be affirmatively checked. Changing the prefilled node ID clears repair mode and hides/unchecks consent. Server validation in `node_onboarding.py` remains authoritative and still requires the node to exist.
@@ -15,7 +41,7 @@
 - Permanent Cloudflare fix in `terminal_mcp/node_agent.py`: every node-agent controller POST (heartbeat and rotated-token refresh) is built through `_controller_post_request`, with explicit `User-Agent: TerminalMCP-node-agent/0.13`, JSON content type and auth attached by callers. Regression tests capture both requests and assert credentials never enter logs.
 - Permanent systemd PATH fix in `deploy/install-node-agent.sh`: generated user service gets a quoted explicit PATH beginning with the installer user's `$HOME/.local/bin`, followed by standard system bin directories. Existing unit settings including `KillMode=process` and escaped Markdown backticks are preserved. Runtime test checks the generated PATH and retained kill mode.
 - Verification on current source: focused files `tests/test_node_agent.py tests/test_token_rotation.py tests/test_windows_onboarding.py` -> **161 passed, 4 skipped** (PowerShell unavailable); Bash runtime installer test included in that suite, `bash -n deploy/install-node-agent.sh`, and `git diff --check` passed. No GitHub Actions run, service restart, deployment, or live token change.
-- PR #81 remains the delivery target: `https://github.com/hungtranbkit/terminal-mcp/pull/81`. Follow-up code commit `c1b710a7f339fe2cb3db209ad8610c1a1bb1c7b3` is pushed to `feat/issue-80-linux-pairing`. Keep this branch/worktree isolated and leave deployment for verified rollout.
+- PR #81 (`https://github.com/hungtranbkit/terminal-mcp/pull/81`) is MERGED (2026-10-24, squash `7189318`); see the 2026-10-24 entry above for follow-ups.
 
 ## 2026-10-17 — Codex folder-trust first-dispatch regression (merged; HP rollout blocked by release drift)
 

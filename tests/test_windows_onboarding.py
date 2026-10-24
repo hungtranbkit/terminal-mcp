@@ -809,10 +809,17 @@ def test_linux_installer_runtime_writes_complete_quoted_unit_without_running_com
     (repo / "node-agent.token").write_text("protected fixture token\n")
     (repo / ".venv" / "bin" / "pip").write_text("#!/bin/sh\nexit 0\n")
     (repo / ".venv" / "bin" / "pip").chmod(0o755)
+    # Paired mode prepares the node workspace with the venv's python.
+    (repo / ".venv" / "bin" / "python").write_text("#!/bin/sh\nexit 0\n")
+    (repo / ".venv" / "bin" / "python").chmod(0o755)
+    (source / "scripts").mkdir()
+    (source / "scripts" / "prepare-node-workspace.py").write_text("")
     for name in ("systemctl", "loginctl"):
         tool = fakebin / name
         tool.write_text("#!/bin/sh\nexit 0\n")
         tool.chmod(0o755)
+    # The installer refuses a unit systemd did not load.
+    (fakebin / "systemctl").write_text('#!/bin/sh\n[ "$2" = show ] && echo loaded\nexit 0\n')
 
     env = dict(os.environ, HOME=str(repo.parent), PATH=f"{fakebin}:{os.environ['PATH']}")
     result = subprocess.run([
@@ -829,7 +836,8 @@ def test_linux_installer_runtime_writes_complete_quoted_unit_without_running_com
     unit = (repo.parent / ".config/systemd/user/terminal-node-agent.service").read_text()
     unit_repo = str(repo).replace("%", "%%")
     exec_repo = unit_repo.replace("$", "$$")
-    assert f'WorkingDirectory="{unit_repo}"' in unit
+    # A single path for systemd: quotes would be literal characters.
+    assert f'WorkingDirectory={unit_repo}\n' in unit
     assert f'Environment="TERMINAL_MCP_CONFIG={unit_repo}/config.yaml"' in unit
     home_path = str(repo.parent).replace("%", "%%")
     assert (f'Environment="PATH={home_path}/.local/bin:/usr/local/sbin:/usr/local/bin:'
@@ -843,7 +851,7 @@ def test_linux_installer_runtime_writes_complete_quoted_unit_without_running_com
     assert (repo / "config.yaml").read_text() == "existing config\n"
     assert (repo / "node-agent.token").read_text() == "protected fixture token\n"
 
-    (fakebin / "systemctl").write_text("#!/bin/sh\n[ \"$2\" != restart ]\n")
+    (fakebin / "systemctl").write_text('#!/bin/sh\n[ "$2" = show ] && { echo loaded; exit 0; }\n[ "$2" != restart ]\n')
     (fakebin / "systemctl").chmod(0o755)
     failed_restart = subprocess.run([
         "bash", str(root / "deploy" / "install-node-agent.sh"),
