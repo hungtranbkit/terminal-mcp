@@ -1357,6 +1357,10 @@ class QueueStore:
             task_rows = connection.execute(
                 "SELECT * FROM queue_tasks WHERE session = ? ORDER BY position ASC", (session,),
             ).fetchall()
+        return self._lane_snapshot(lane_row, task_rows)
+
+    def _lane_snapshot(self, lane_row, task_rows) -> dict[str, Any]:
+        session = lane_row["session"]
         tasks = [QueueTask.from_row(row).to_dict() for row in task_rows]
         # Phase 2: PRECHECK/READY/BLOCKED/FAILED all count as "the lane's
         # current task" too, not just the Phase 1 in-flight set -- same
@@ -1550,10 +1554,27 @@ class QueueStore:
         return {"dry_run": dry_run, "candidates": len(rows), "planned": len(planned),
                 "unresolved": unresolved, "by_project": by_project}
 
-    def list_all_lanes(self) -> list[dict[str, Any]]:
+    def pending_counts(self, statuses: tuple[str, ...]) -> dict[str, int]:
+        """One read-only snapshot; never acquire the queue writer lock."""
+        placeholders = ",".join("?" for _ in statuses)
         with self._connection() as connection:
-            sessions = [row["session"] for row in connection.execute("SELECT session FROM queue_lanes").fetchall()]
-        return [self.lane_status(session) for session in sessions]
+            rows = connection.execute(
+                "SELECT l.session, COUNT(t.id) AS pending FROM queue_lanes l "
+                "LEFT JOIN queue_tasks t ON t.session = l.session "
+                f"AND t.status IN ({placeholders}) GROUP BY l.session", statuses).fetchall()
+        return {row["session"]: row["pending"] for row in rows}
+
+    def list_all_lanes(self) -> list[dict[str, Any]]:
+        # The queue loop and dashboard both poll this inventory. Reading it
+        # must not write 278 historical lanes or compete with real dispatch.
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            lanes = connection.execute("SELECT * FROM queue_lanes").fetchall()
+            tasks = connection.execute("SELECT * FROM queue_tasks ORDER BY position ASC").fetchall()
+        by_session: dict[str, list] = {}
+        for task in tasks:
+            by_session.setdefault(task["session"], []).append(task)
+        return [self._lane_snapshot(lane, by_session.get(lane["session"], [])) for lane in lanes]
 
     def live_task_rows(self, *, since: str, limit: int = 500) -> list[dict[str, Any]]:
         """Recent or still-open task rows for the Live Session Monitor.

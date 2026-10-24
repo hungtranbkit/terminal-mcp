@@ -166,7 +166,9 @@ def register_health(server: MCPServer, terminal: TerminalService, supervisor=Non
         # forward later. Per-process (HTTP and STDIO each report only
         # their own counters, reset on restart) -- see metrics.py's module
         # docstring for the full scope/rationale.
-        body: dict[str, Any] = {"counters": metrics.snapshot()}
+        from .read_fanout import READ_FANOUT
+        body: dict[str, Any] = {"counters": metrics.snapshot(),
+                                "controller_reads": READ_FANOUT.snapshot()}
         governor = getattr(terminal, "request_governor", None)
         if governor is not None:
             body["llm_governor"] = await anyio.to_thread.run_sync(governor.status)

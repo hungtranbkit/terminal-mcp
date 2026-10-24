@@ -120,6 +120,9 @@ def test_health_metrics_endpoint_reports_counter_snapshot(tmp_path):
     body = response.json()
     assert body["counters"]["delivery.text_sent"] >= 1
     assert "supervisor.policy_blocked" in body["counters"]
+    assert body["controller_reads"]["limit"] == 16
+    assert body["controller_reads"]["per_node_limit"] == 2
+    assert body["controller_reads"]["queued"] == 0
     assert "supervisor" not in body  # no SupervisorService was registered
 
 
