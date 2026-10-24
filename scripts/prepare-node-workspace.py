@@ -12,14 +12,16 @@ import os
 from pathlib import Path
 import re
 import stat
+import tempfile
 import tomllib
 
 
 def atomic_text(path: Path, value: str, *, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".workspace-new")
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), mode)
+    fd, tmp_name = tempfile.mkstemp(prefix="." + path.name + ".workspace-", dir=path.parent)
+    temporary = Path(tmp_name)
     try:
+        os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(value)
         os.replace(temporary, path)
