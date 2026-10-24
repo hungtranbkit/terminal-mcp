@@ -5165,8 +5165,8 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       </div>
       <div>
         <label for="csCwd">Working directory (tuỳ chọn)</label>
-        <input type="text" id="csCwd" maxlength="512" placeholder="để trống = mặc định" autocomplete="off">
-        <div class="cs-hint">Phải nằm trong thư mục được phép cấu hình sẵn trên server.</div>
+        <input type="text" id="csCwd" maxlength="512" placeholder="Để trống = workspace mặc định của node" autocomplete="off">
+        <div class="cs-hint">Linux thêm qua Add Node mặc định dùng ~/workspace trên node đó (tự tạo và chỉ trust workspace này lần đầu). Có thể nhập thư mục khác nếu node cho phép.</div>
       </div>
       <div>
         <label for="csGrant">Quyền truy cập cho bạn</label>
