@@ -84,10 +84,8 @@ def test_one_node_raising_never_loses_the_others():
     assert answers["bad"][0] is False and isinstance(answers["bad"][1], RuntimeError)
 
 
-def test_a_single_node_is_run_inline_rather_than_in_a_pool():
-    """The overwhelmingly common single-host deployment must not pay for a
-    thread pool, and must not have its local TerminalService touched from a
-    different thread than it always was."""
+def test_a_single_node_uses_the_same_bounded_worker_path():
+    """Single-host deployments must obey the same deadline as a fleet."""
     seen: list[int] = []
 
     def call():
@@ -96,7 +94,7 @@ def test_a_single_node_is_run_inline_rather_than_in_a_pool():
 
     answers = _fanout([("only", call)], budget_seconds=1.0, label="test")
     assert answers == {"only": (True, "ok")}
-    assert seen == [threading.get_ident()]
+    assert len(seen) == 1  # Single-node calls must also honor the deadline.
 
 
 # ---------------------------------------------------------------------------

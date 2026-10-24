@@ -17,7 +17,6 @@ include node_id/node_name để debug" -- never a breaking shape change).
 """
 from __future__ import annotations
 
-import concurrent.futures
 import logging
 import tempfile
 import time
@@ -66,78 +65,14 @@ _LOGGER = logging.getLogger(__name__)
 #: node was slow that second, and a router whose whole synchronous budget is
 #: 12s therefore spent all of it listing and dispatched zero ticks. A fan-out
 #: is naturally max(node) rather than sum(node), and this bounds even that.
-DEFAULT_FLEET_FANOUT_BUDGET_SECONDS = 6.0
-
-#: Never fan out with fewer threads than this, and never more: one thread per
-#: node is the whole point, and a fleet of three does not want a pool of
-#: thirty-two sitting idle.
-_MIN_FANOUT_WORKERS = 1
-_MAX_FANOUT_WORKERS = 16
+DEFAULT_FLEET_FANOUT_BUDGET_SECONDS = 5.0
 
 
-def _fanout(work, *, budget_seconds: float | None, label: str):
-    """Run one callable per node concurrently, bounded by ONE wall clock.
-
-    `work` is a sequence of (key, callable) pairs. Returns
-    {key: (ok, value_or_exception)} -- a key whose callable had not finished
-    when the budget ran out comes back as (False, TimeoutError(...)) rather
-    than being waited on, because the caller's own deadline is the thing this
-    exists to protect. The unfinished future is abandoned, not cancelled: a
-    node round-trip already in flight will complete harmlessly in its thread
-    and its result is simply not used.
-
-    SERIAL IS THE BUG THIS REPLACES. Fanning out does not make any single node
-    faster; it stops the SLOWEST node from being added to every other node's
-    time. That is the difference between a bounded routing decision and one
-    whose cost is the sum of the fleet.
-    """
-    items = list(work)
-    if not items:
-        return {}
-    if len(items) == 1:
-        # One node is the overwhelmingly common single-host deployment. A
-        # thread pool for it would be pure overhead and would also change the
-        # thread the local TerminalService is touched from, so it is run
-        # inline exactly as it always was.
-        key, call = items[0]
-        try:
-            return {key: (True, call())}
-        except Exception as exc:  # noqa: BLE001 -- normalised for the caller
-            return {key: (False, exc)}
-    workers = max(_MIN_FANOUT_WORKERS, min(_MAX_FANOUT_WORKERS, len(items)))
-    deadline = time.monotonic() + float(
-        budget_seconds if budget_seconds is not None else DEFAULT_FLEET_FANOUT_BUDGET_SECONDS)
-    results: dict[Any, tuple[bool, Any]] = {}
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers,
-                                                     thread_name_prefix=f"fleet-{label}")
-    try:
-        pending = {executor.submit(call): key for key, call in items}
-        while pending:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            done, _not_done = concurrent.futures.wait(
-                list(pending), timeout=remaining,
-                return_when=concurrent.futures.FIRST_COMPLETED)
-            if not done:
-                break
-            for future in done:
-                key = pending.pop(future)
-                try:
-                    results[key] = (True, future.result())
-                except Exception as exc:  # noqa: BLE001 -- one node never breaks the fan-out
-                    results[key] = (False, exc)
-        for future, key in pending.items():
-            future.cancel()
-            results[key] = (False, TimeoutError(
-                f"node did not answer within the {budget_seconds or DEFAULT_FLEET_FANOUT_BUDGET_SECONDS}s "
-                f"fleet {label} budget"))
-    finally:
-        # Never block on an abandoned in-flight node call: shutdown(wait=True)
-        # here would re-introduce exactly the unbounded wait the budget exists
-        # to remove.
-        executor.shutdown(wait=False, cancel_futures=True)
-    return results
+def _fanout(work, *, budget_seconds: float | None, label: str, scope=None):
+    from .read_fanout import READ_FANOUT
+    return READ_FANOUT.run(work, budget_seconds=(
+        DEFAULT_FLEET_FANOUT_BUDGET_SECONDS if budget_seconds is None else budget_seconds),
+        label=label, scope=scope)
 
 
 @dataclass
@@ -1817,7 +1752,7 @@ class ControllerService:
         remaining = max(MIN_BOUNDED_NODE_PROBE_SECONDS, budget - (time.monotonic() - started))
         answers = _fanout(
             [(node_id, self._session_lister(client, remaining)) for node_id, client in askable],
-            budget_seconds=remaining, label="sessions")
+            budget_seconds=remaining, label="sessions", scope=self)
         for node_id, _client in askable:
             node = by_id[node_id]
             ok, value = answers.get(node_id, (False, TimeoutError("no answer")))
@@ -1917,7 +1852,7 @@ class ControllerService:
                 cached[node.id] = self.node_health._cached(node)
                 continue
             work.append((node.id, self._node_evaluator(node, client)))
-        answers = _fanout(work, budget_seconds=budget_seconds, label="health")
+        answers = _fanout(work, budget_seconds=budget_seconds, label="health", scope=self)
         result: list[Node] = []
         for node in registered:
             if node.id in cached:

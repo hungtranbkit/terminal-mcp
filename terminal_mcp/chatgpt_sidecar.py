@@ -427,9 +427,10 @@ class Backend:
                 raise BackendUnavailable(
                     f"BACKEND_BUSY: the terminal-mcp controller at {self.url} accepted the "
                     f"connection but did not answer within {self.timeout_seconds:.0f}s. It is "
-                    f"almost certainly QUEUED behind the provider concurrency limit, not down. "
-                    f"Do NOT retry immediately -- a retry enqueues another task behind the same "
-                    f"limit. Wait, or use action=task to check the work already dispatched."
+                    f"not proof of provider saturation: controller contention, slow nodes, or "
+                    f"provider admission may be responsible; check /health/metrics. "
+                    f"Do NOT retry mutations blindly: their outcome may be unknown. "
+                    f"Check action=task first; back off with jitter for read-only retries."
                 ) from exc
             raise BackendUnavailable(
                 f"the terminal-mcp controller at {self.url} is not reachable "

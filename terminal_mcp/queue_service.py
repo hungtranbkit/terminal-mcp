@@ -655,7 +655,7 @@ class QueueService:
         pending_count}` for every lane that has ever had a task. A
         session with no lane at all (never queued anything) simply has
         no key here; callers use `.get(name, 0)`, never a bare index."""
-        return {lane["session"]: self.count_pending(lane["tasks"]) for lane in self.store.list_all_lanes()}
+        return self.store.pending_counts(self.PENDING_STATUSES)
 
     def deletion_references(self, session: str) -> list[dict[str, Any]]:
         """Non-terminal queue ownership that makes killing a lane unsafe.
