@@ -91,7 +91,8 @@ class FakeTerminal:
                                               agent_cleanup=policy or AgentCleanupConfig(enabled=True, dry_run=False)),
             permissions=SimpleNamespace(admin_sessions=()))
         self.deletes = []
-        self.audit = SimpleNamespace(record=lambda **kw: None)
+        self.audit_events = []
+        self.audit = SimpleNamespace(record=lambda **kw: self.audit_events.append(kw))
 
     def _session_delete_runtime_blocker(self, name, info):
         return "SESSION_ATTACHED" if info is not None and info.attached else None
@@ -196,6 +197,30 @@ def test_dry_run_closes_nothing_and_reports_candidates(repo, tmp_path):
     report = reconciler(term, tmp_path).run(dry_run=True)
     assert report["dry_run"] is True and report["close_candidates"] == ["dry-agent"]
     assert report["closed"] == [] and term.deletes == []
+    assert any(event["result"] == "DRY_RUN" and event["session"] == "dry-agent"
+               for event in term.audit_events)
+
+
+def test_scrollback_capture_failure_fails_closed_and_is_audited(repo, tmp_path):
+    wt = add_worktree(repo, "task-no-scrollback", commit=True, merge=True)
+    term = FakeTerminal([Info("no-scrollback-agent", "claude", str(wt))])
+
+    captures = 0
+
+    def fail_final_capture(name, lines):
+        nonlocal captures
+        captures += 1
+        if captures <= 2:  # classification must still be able to verify the idle pane
+            return AGENT_IDLE_TAIL
+        raise OSError("scrollback store unavailable")
+
+    term.tmux.capture_lines = fail_final_capture
+    report = reconciler(term, tmp_path).run()
+    assert report["closed"] == []
+    assert report["refused"][0]["refused"] == "SCROLLBACK_CAPTURE_FAILED"
+    assert term.deletes == []
+    assert any(event["result"] == "BLOCKED" and event["reason"] == "SCROLLBACK_CAPTURE_FAILED"
+               for event in term.audit_events)
 
 
 def test_reconcile_is_idempotent(repo, tmp_path):
@@ -215,6 +240,8 @@ def test_preflight_refusal_preserves_the_session(repo, tmp_path):
     report = rec.run()
     assert report["closed"] == [] and report["refused"][0]["refused"] == "SESSION_HAS_ACTIVE_RUN"
     assert term.deletes == []
+    assert any(event["result"] == "BLOCKED" and event["reason"] == "SESSION_HAS_ACTIVE_RUN"
+               for event in term.audit_events)
 
 
 def test_max_closes_per_run_bounds_a_pass(repo, tmp_path):

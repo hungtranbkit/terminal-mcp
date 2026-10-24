@@ -36,3 +36,35 @@ def test_preflight_accepts_qualified_session_references(tmp_path):
     queue.enqueue("remote-session", "tiny task")
     result = deletion_preflight("node-a/remote-session", queue=queue, run_journal=journal)
     assert result["error"] == "SESSION_HAS_ACTIVE_TASK"
+
+
+def test_preflight_refuses_a_session_pinned_by_supervisor_watch(tmp_path):
+    queue, journal = _services(tmp_path)
+
+    class Supervisor:
+        @staticmethod
+        def list_watches():
+            return {"watches": [
+                {"kind": "session", "target": "node-a/remote-session", "enabled": False},
+                {"kind": "binding", "target": "same-name", "enabled": True},
+            ]}
+
+    result = deletion_preflight("node-a/remote-session", queue=queue, run_journal=journal,
+                                supervisor=Supervisor())
+    assert result["error"] == "SESSION_PINNED_BY_SUPERVISOR_WATCH"
+    assert result["references"]["supervisor_watches"] == [
+        {"watch_key": None, "enabled": False}]
+
+
+def test_preflight_fails_closed_when_supervisor_watch_inventory_is_unavailable(tmp_path):
+    queue, journal = _services(tmp_path)
+
+    class Supervisor:
+        @staticmethod
+        def list_watches():
+            raise OSError("watch store unavailable")
+
+    result = deletion_preflight("candidate", queue=queue, run_journal=journal,
+                                supervisor=Supervisor())
+    assert result["error"] == "SUPERVISOR_WATCH_LOOKUP_FAILED"
+    assert result["session"] == "candidate"

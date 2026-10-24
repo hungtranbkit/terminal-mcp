@@ -813,8 +813,9 @@ class SessionReconciler:
 
     def run(self, *, dry_run: bool | None = None) -> dict[str, Any]:
         """One pass. dry_run=None follows policy.dry_run. Observations and
-        timers are recorded even in a dry run (that is what makes the dry
-        run's grace accounting honest); checkpoints and closes are not."""
+        timers and candidate decisions are audited even in a dry run (that
+        is what makes the grace accounting and retention behavior
+        explainable); checkpoints and closes are not."""
         policy = self.policy
         dry = policy.dry_run if dry_run is None else bool(dry_run)
         with self._lock:
@@ -822,6 +823,13 @@ class SessionReconciler:
             closed: list[dict[str, Any]] = []
             refused: list[dict[str, Any]] = []
             checkpoints: list[dict[str, Any]] = []
+            if dry:
+                for row in report["sessions"]:
+                    if row["lifecycle_state"] == CLEANUP_ELIGIBLE:
+                        self.terminal.audit.record(
+                            action="reconcile_agent_session", session=row["session"],
+                            result="DRY_RUN", reason=f"{CLEANUP_ELIGIBLE}:{row['classification']}",
+                            actor=ACTOR)
             for row in report["sessions"]:
                 if dry or not (row["lifecycle_state"] in (RECOVERY_REQUIRED, CLEANUP_ELIGIBLE)
                                or _checkpoint_blocked(row.get("lifecycle"))):
@@ -873,9 +881,18 @@ class SessionReconciler:
                     pre = self._preflight(name)
                     if "error" in pre:
                         self.store.put(fresh_record)
+                        self.terminal.audit.record(action="reconcile_agent_session", session=name,
+                                                   result="BLOCKED", reason=pre["error"], actor=ACTOR)
                         refused.append({**self._annotate(fresh, fresh_record), "refused": pre["error"]})
                         continue
                 scrollback = self._capture(name)
+                if scrollback is None:
+                    self.terminal.audit.record(action="reconcile_agent_session", session=name,
+                                               result="BLOCKED", reason="SCROLLBACK_CAPTURE_FAILED",
+                                               actor=ACTOR)
+                    refused.append({**self._annotate(fresh, fresh_record),
+                                    "refused": "SCROLLBACK_CAPTURE_FAILED"})
+                    continue
                 result = self.terminal.terminal_delete_session(name, confirm=True, requested_by=ACTOR)
                 if "error" in result:  # an already-gone session is success-shaped
                     self.store.put(fresh_record)

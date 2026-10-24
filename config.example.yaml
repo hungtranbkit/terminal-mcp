@@ -107,13 +107,15 @@ supervisor:
 #   # sessions are never touched.
 #   agent_cleanup:
 #     enabled: false
-#     dry_run: true                       # log candidates only
+#     dry_run: true                       # retain sessions; append candidate decisions to audit log
 #     idle_hours: 2
 #     interval_seconds: 900
 #     max_closes_per_run: 10
 #     agent_commands: [claude, codex]
 #     close_clean_primary_checkouts: false
 #     scrollback_dir: ~/tmux-reaped
+#     # A real close also requires a successful fresh scrollback capture;
+#     # an unavailable audit/context backup blocks deletion and is logged.
 #     recovery_grace_minutes: 30           # 5..1440; non-agent service cleanup grace
 #     checkpoint_dirty_work: true
 #     checkpoint_max_untracked_mb: 200     # larger untracked snapshot -> BLOCKED
