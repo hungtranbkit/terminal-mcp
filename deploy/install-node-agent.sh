@@ -196,9 +196,14 @@ systemd_exec_quote() {
   value=${value//\$/\$\$}
   systemd_quote "$value"
 }
-UNIT_CONTENT=$(cat <<EOF
-[Unit]
-Description=Terminal MCP node agent ($NODE_ID)
+# Rendered by a function, never by an unquoted `$(cat <<EOF ...)`: that
+# runs every backtick and $(...) in these comments as a command (seen live
+# on the MacBook, 2026-10-23), and `bash -n` cannot see it. Static text
+# sits in QUOTED heredocs; the dynamic lines go through printf and the
+# systemd quoting helpers above.
+render_unit() {
+  printf '[Unit]\nDescription=Terminal MCP node agent (%s)\n' "$NODE_ID"
+  cat <<'UNIT_STATIC'
 After=default.target
 # StartLimit* belong to [Unit], NOT [Service]. systemd parses them only
 # here; left in [Service] it logs "Unknown key ... ignoring" and the
@@ -213,10 +218,16 @@ Type=simple
 # Quotes here are interpreted as literal path characters by systemd and
 # cause LoadState=bad-setting, preventing the node agent from starting.
 # Spaces are supported literally; escape systemd % specifiers only.
-WorkingDirectory=${REPO_DIR//%/%%}
-Environment=$(systemd_quote "TERMINAL_MCP_CONFIG=$REPO_DIR/config.yaml")
-Environment=$(systemd_quote "PATH=$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-ExecStart=$(systemd_exec_quote "$REPO_DIR/.venv/bin/terminal-node-agent") --node-id $(systemd_exec_quote "$NODE_ID") --controller-url $(systemd_exec_quote "$CONTROLLER_URL") --token-file $(systemd_exec_quote "$TOKEN_FILE") --host $(systemd_exec_quote "$AGENT_HOST") --port $(systemd_exec_quote "$AGENT_PORT") --heartbeat-interval-seconds $(systemd_exec_quote "$HEARTBEAT_INTERVAL")
+UNIT_STATIC
+  printf 'WorkingDirectory=%s\n' "${REPO_DIR//%/%%}"
+  printf 'Environment=%s\n' "$(systemd_quote "TERMINAL_MCP_CONFIG=$REPO_DIR/config.yaml")"
+  printf 'Environment=%s\n' "$(systemd_quote "PATH=$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")"
+  printf 'ExecStart=%s --node-id %s --controller-url %s --token-file %s --host %s --port %s --heartbeat-interval-seconds %s\n' \
+    "$(systemd_exec_quote "$REPO_DIR/.venv/bin/terminal-node-agent")" "$(systemd_exec_quote "$NODE_ID")" \
+    "$(systemd_exec_quote "$CONTROLLER_URL")" "$(systemd_exec_quote "$TOKEN_FILE")" \
+    "$(systemd_exec_quote "$AGENT_HOST")" "$(systemd_exec_quote "$AGENT_PORT")" \
+    "$(systemd_exec_quote "$HEARTBEAT_INTERVAL")"
+  cat <<'UNIT_STATIC'
 Restart=always
 RestartSec=3
 RestartSteps=6
@@ -229,19 +240,19 @@ RestartMaxDelaySec=60
 # (see docs/CONTROLLER_RUNBOOK.md).
 KillMode=process
 # Sized by SESSION COUNT, not by feel. Each tmux session this node
-# supervises costs 2 tasks -- an \`sh\` + \`cat\` pair piping the pane into
+# supervises costs 2 tasks -- an `sh` + `cat` pair piping the pane into
 # ~/.local/state/terminal-mcp/raw/<session>.log -- plus the tmux server
 # and the agent itself. Budget ~2*sessions + 20.
 #
 # The previous values (512M / 256) were sized for a small fleet and
 # silently became the failure mode on dell-linux at 108 sessions: the
 # cgroup sat at 222/256 tasks, every request that needed a new thread
-# died with \`RuntimeError: can't start new thread\`, and the node answered
-# \`GET /v1/sessions/<name>/status\` with HTTP 500. The controller reports
+# died with `RuntimeError: can't start new thread`, and the node answered
+# `GET /v1/sessions/<name>/status` with HTTP 500. The controller reports
 # that as flaky connectivity, which sends you looking at the network
-# instead of at \`pids.events\`. 2048 tasks covers ~1000 sessions.
+# instead of at `pids.events`. 2048 tasks covers ~1000 sessions.
 #
-# Check headroom with scripts/node-agent-health.sh; a non-zero \`max\`
+# Check headroom with scripts/node-agent-health.sh; a non-zero `max`
 # counter in the cgroup's pids.events/memory.events means you already
 # hit the ceiling.
 MemoryMax=3G
@@ -267,12 +278,14 @@ SystemCallFilter=@system-service @mount
 
 [Install]
 WantedBy=default.target
-EOF
-)
+UNIT_STATIC
+}
 
 if [[ "$USE_SYSTEMD" -eq 1 ]]; then
   mkdir -p "$UNIT_DIR"
-  echo "$UNIT_CONTENT" > "$UNIT_PATH"
+  # Atomic: a unit that fails to render must not replace a working one.
+  render_unit > "$UNIT_PATH.new"
+  mv -f "$UNIT_PATH.new" "$UNIT_PATH"
   echo "-> Wrote $UNIT_PATH"
   systemctl --user daemon-reload
   # Validate the unit before enabling or restarting it. A malformed unit
@@ -294,7 +307,7 @@ if [[ "$USE_SYSTEMD" -eq 1 ]]; then
   loginctl enable-linger "$USER" 2>/dev/null || echo "   (could not enable-linger automatically -- run 'loginctl enable-linger $USER' as root/sudo so this survives logout)"
 else
   echo "-> --no-systemd given: unit content that WOULD have been written to $UNIT_PATH:"
-  echo "$UNIT_CONTENT"
+  render_unit
   echo "-> Start it manually with:"
   echo "   $REPO_DIR/.venv/bin/terminal-node-agent --node-id $NODE_ID --controller-url $CONTROLLER_URL --host $AGENT_HOST --port $AGENT_PORT"
 fi

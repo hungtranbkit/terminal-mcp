@@ -606,8 +606,10 @@ def test_the_status_panel_is_not_gated_on_a_reported_stage():
 def test_the_panel_opens_when_the_cta_acts_not_when_progress_arrives():
     page = _page()
     assert "function anBeginWatch(" in page
-    # Both CTA meanings start the watch.
-    assert page.count("anBeginWatch(anGenerated.enrollment.id") == 2
+    # Both Windows CTA meanings start the watch; Linux, whose pasted script
+    # reports every stage itself, starts it when the command is generated.
+    assert page.count("anBeginWatch(anGenerated.enrollment.id") == 3
+    assert page.count("expiresAt.getTime(), 'linux');") == 1
     assert "live.hidden = false;" in _status_js()
 
 
