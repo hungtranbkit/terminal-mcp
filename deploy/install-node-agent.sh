@@ -201,7 +201,11 @@ StartLimitBurst=8
 
 [Service]
 Type=simple
-WorkingDirectory=$(systemd_quote "$REPO_DIR")
+# WorkingDirectory= is a *single path*, not an ExecStart-style argument.
+# Quotes here are interpreted as literal path characters by systemd and
+# cause LoadState=bad-setting, preventing the node agent from starting.
+# Spaces are supported literally; escape systemd % specifiers only.
+WorkingDirectory=${REPO_DIR//%/%%}
 Environment=$(systemd_quote "TERMINAL_MCP_CONFIG=$REPO_DIR/config.yaml")
 Environment=$(systemd_quote "PATH=$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 ExecStart=$(systemd_exec_quote "$REPO_DIR/.venv/bin/terminal-node-agent") --node-id $(systemd_exec_quote "$NODE_ID") --controller-url $(systemd_exec_quote "$CONTROLLER_URL") --token-file $(systemd_exec_quote "$TOKEN_FILE") --host $(systemd_exec_quote "$AGENT_HOST") --port $(systemd_exec_quote "$AGENT_PORT") --heartbeat-interval-seconds $(systemd_exec_quote "$HEARTBEAT_INTERVAL")
@@ -259,6 +263,14 @@ if [[ "$USE_SYSTEMD" -eq 1 ]]; then
   echo "$UNIT_CONTENT" > "$UNIT_PATH"
   echo "-> Wrote $UNIT_PATH"
   systemctl --user daemon-reload
+  # Validate the unit before enabling or restarting it. A malformed unit
+  # must not replace a previously working service.
+  UNIT_LOAD_STATE="$(systemctl --user show terminal-node-agent.service --property=LoadState --value 2>/dev/null || true)"
+  if [[ "$UNIT_LOAD_STATE" != "loaded" ]]; then
+    echo "Error: generated terminal-node-agent.service did not load (LoadState=$UNIT_LOAD_STATE)." >&2
+    echo "  systemd-analyze --user verify $UNIT_PATH" >&2
+    exit 1
+  fi
   systemctl --user enable terminal-node-agent.service
   # `enable --now` only STARTS the unit if it wasn't already running -- a
   # re-run of this script (e.g. to change --host) that rewrites an
