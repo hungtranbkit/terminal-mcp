@@ -45,7 +45,7 @@ def owned_workspace(home: Path) -> Path:
 
 def allow_workspace(config_path: Path, workspace: Path) -> None:
     text = config_path.read_text(encoding="utf-8")
-    if not re.search(r"(?m)^session_lifecycle:\\s*$", text):
+    if not re.search(r"(?m)^session_lifecycle:\s*$", text):
         # A pristine config.example.yaml comments out session_lifecycle.
         # Add the smallest active block so first pairing can create sessions.
         active = ("\nsession_lifecycle:\n  enabled: true\n"
