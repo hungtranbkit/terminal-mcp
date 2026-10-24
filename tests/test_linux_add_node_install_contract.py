@@ -41,3 +41,12 @@ def test_live_wizard_installer_includes_systemd_validity_guards():
     assert installer.index('UNIT_LOAD_STATE=') < installer.index('systemctl --user enable terminal-node-agent.service')
     assert installer.index('UNIT_LOAD_STATE=') < installer.index('systemctl --user restart terminal-node-agent.service')
     assert "KillMode=process" in installer
+
+
+def test_duplicate_registered_node_links_to_existing_detail_instead_of_delete():
+    dashboard = (Path(__file__).resolve().parents[1] / "terminal_mcp" / "dashboard.py").read_text()
+    assert "NODE_ALREADY_EXISTS" in dashboard
+    assert "goExisting.textContent = 'Mở node ' + nodeId;" in dashboard
+    assert "await loadDetail(nodeId);" in dashboard
+    assert "Không xóa node hiện có" in dashboard
+    assert "xoá node cũ trước" not in dashboard
