@@ -49,6 +49,10 @@ def test_generated_unit_working_directory_is_valid(tmp_path: Path, dirname: str)
     assert f"WorkingDirectory={str(repo).replace('%', '%%')}" in text
     assert 'WorkingDirectory="' not in text
     assert "KillMode=process" in text
+    # Codex execution needs mount-family syscalls inside its own Linux
+    # sandbox. A stricter unit caused SIGSYS exit 159 even for read-only pwd.
+    assert "SystemCallFilter=@system-service @mount" in text
+    assert "NoNewPrivileges=yes" in text
     if shutil.which("systemd-analyze"):
         check = subprocess.run(["systemd-analyze", "verify", str(unit)],
                                capture_output=True, text=True, timeout=10)
