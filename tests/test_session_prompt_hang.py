@@ -377,3 +377,82 @@ def test_config_rejects_unsafe_trust_roots(tmp_path):
                         f"  codex_trust_roots: {bad}\n")
         with pytest.raises(ValueError, match="codex_trust_roots"):
             load_config(path)
+
+
+# -- (3b) a slow remote create is never reported as an unreachable node -----------
+
+class _SlowCreateClient:
+    """Forwards to the real local client, but the create answer arrives late."""
+
+    def __init__(self, inner, *, created: bool):
+        self._inner, self._created = inner, created
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def create_session(self, *args, **kwargs):
+        from terminal_mcp.node_client import NodeClientError
+        if self._created:
+            self._inner.create_session(*args, **kwargs)
+        raise NodeClientError("POST /v1/sessions -> TimeoutError: timed out")
+
+
+@pytest.fixture
+def owned_session_name():
+    import uuid
+    from tests.conftest import tmux_cmd
+    name = f"ctrl-slow-create-{uuid.uuid4().hex[:8]}"
+    yield name
+    subprocess.run([*tmux_cmd(), "kill-session", "-t", name], check=False, capture_output=True)
+
+
+@pytest.mark.parametrize("created", [True, False])
+def test_timed_out_create_is_reconciled_with_the_node(tmp_path, created, owned_session_name):
+    from tests.test_controller import _controller, _heartbeat_local
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    node_id = controller.local_node_id
+    controller._clients[node_id] = _SlowCreateClient(controller._clients[node_id], created=created)
+    result = controller.terminal_create_session(owned_session_name, "shell", str(tmp_path), node=node_id)
+    assert result.get("error") != "NODE_UNREACHABLE"
+    if created:
+        assert result["state"] == "CREATED_UNCONFIRMED" and result["session_created"] is True
+        assert "never recreate" in result["next_action"]
+        assert controller.resolve_session(owned_session_name)["node_id"] == node_id
+    else:
+        assert result["error"] == "CREATE_OUTCOME_UNKNOWN"
+        assert "Never recreate blindly" in result["next_action"]
+
+
+def test_connect_failure_is_still_unreachable(tmp_path):
+    from terminal_mcp.node_client import NodeClientError
+    from tests.test_controller import _controller, _heartbeat_local
+    controller, _service = _controller(tmp_path)
+    _heartbeat_local(controller)
+    node_id = controller.local_node_id
+
+    class Refused(_SlowCreateClient):
+        def create_session(self, *a, **kw):
+            raise NodeClientError("POST /v1/sessions -> URLError: [Errno 111] Connection refused")
+
+    controller._clients[node_id] = Refused(controller._clients[node_id], created=False)
+    assert controller.terminal_create_session("ctrl-refused", "shell", str(tmp_path),
+                                              node=node_id)["error"] == "NODE_UNREACHABLE"
+
+
+def test_no_daemon_probe_timeout_is_not_cached(monkeypatch):
+    from terminal_mcp import lifecycle
+    calls = []
+
+    def run(*a, **kw):
+        calls.append(1)
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired("codex", 3)
+        return SimpleNamespace(returncode=0, stdout="      --no-daemon\n", stderr="")
+
+    lifecycle._codex_supports_no_daemon.cache_clear()
+    monkeypatch.setattr(lifecycle.subprocess, "run", run)
+    assert lifecycle._codex_supports_no_daemon("codex-x") is False   # loaded node: timed out
+    assert lifecycle._codex_supports_no_daemon("codex-x") is True    # retried, then cached
+    assert lifecycle._codex_supports_no_daemon("codex-x") is True and len(calls) == 2
+    lifecycle._codex_supports_no_daemon.cache_clear()
