@@ -697,7 +697,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
         result = await anyio.to_thread.run_sync(lambda: client.capture(name, start_line))
         return JSONResponse(result)
 
-    async def session_send(request: Request) -> JSONResponse:
+    async def session_send(request: Request, *, require_idle: bool = False) -> JSONResponse:
         if (blocked := require_auth(request)) is not None:
             return blocked
         name = request.path_params["name"]
@@ -710,9 +710,12 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
             idempotency_key=body.get("idempotency_key"),
             prompt_response=bool(body.get("prompt_response", False)), origin=body.get("origin"),
             trace_id=body.get("trace_id"), parent_turn_id=body.get("parent_turn_id"),
-            depth=int(body.get("depth") or 0),
+            depth=int(body.get("depth") or 0), require_idle=require_idle,
         ))
         return JSONResponse(result)
+
+    async def session_send_guarded(request: Request) -> JSONResponse:
+        return await session_send(request, require_idle=True)
 
     async def session_send_keys(request: Request) -> JSONResponse:
         if (blocked := require_auth(request)) is not None:
@@ -1129,6 +1132,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
         Route("/v1/sessions/{name}/tail", session_tail, methods=["GET"]),
         Route("/v1/sessions/{name}/capture", session_capture, methods=["GET"]),
         Route("/v1/sessions/{name}/send", session_send, methods=["POST"]),
+        Route("/v1/sessions/{name}/send-guarded", session_send_guarded, methods=["POST"]),
         Route("/v1/sessions/{name}/send-keys", session_send_keys, methods=["POST"]),
         Route("/v1/input-context", input_context, methods=["GET"]),
         Route("/v1/sessions/{name}/detach", detach_session, methods=["POST"]),

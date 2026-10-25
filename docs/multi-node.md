@@ -647,6 +647,11 @@ PowerShell-remoting bootstrap (see above).
   execution, no tmux socket access from outside that one process. This is
   the same reason `terminal_move_session` doesn't sync files itself (see
   above).
+- Idle-only direct submissions use the separate
+  `POST /v1/sessions/{name}/send-guarded` route. The owning node performs
+  the idle check and send under its pane lease. A node agent without this
+  route is reported as `IDLE_GUARD_UNSUPPORTED`; the controller never falls
+  back to the unguarded `/send` route.
 - Every existing permission/whitelist/grant check in `TerminalService`
   applies identically whether a call arrives locally or was routed through
   the controller — routing is a thin wrapper, never a second
