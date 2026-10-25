@@ -1,5 +1,59 @@
 # PROJECT_CONTEXT.md
 
+## 2026-10-25 — Session prompt hangs: managed Codex trust, named prompts, guarded remote send, spaced markers (PR #95, DEPLOYED)
+
+- **Branches/PR**: source `fix/session-prompt-hang-20261025` (on main `4b9c44d`) → draft PR #95. Deployed tree `deploy/session-prompt-hang-on-b3de57c-20261025` @ `52408a765156c6bbf59b43e339ad937a4c1afb66` = HP's live base `b3de57c` (draft PR #92 contention fix) + the same commits. Deploying main-based code to HP would have dropped #92, so do not.
+- **Root causes (verified live)**:
+  1. Codex 0.162 keys folder trust on the **repo root** (main checkout for a linked worktree). Parent-directory trust (`~/workspace`, `~`) does not cover a git repo, so every fresh managed repo/worktree opened on a modal.
+  2. The 120-col trust modal wraps, and `codex_folder_trust_prompt` matched within single rows. The 80-col update menu had no status detector. Both read RUNNING/UNKNOWN.
+  3. `RemoteNodeClient` refused every `require_idle` send before any HTTP request (`IDLE_GUARD_UNSUPPORTED`). This hit `dell-codex-terminalmcp-agentdeck-impl-20261024`, which was **not touched**.
+  4. `find_marker` required `TMCP-DONE:<id>` with no space. `dt_9907a6a3c68f445b` printed `TMCP-DONE: dt_…` and failed at the continuation limit.
+  5. Found during E2E: under load, a remote create answered after the controller's 10 s read timeout. The node still created the session, but the controller reported NODE_UNREACHABLE.
+  6. Found during E2E: `_codex_supports_no_daemon` was `lru_cache`d, so one `--help` timeout pinned "no --no-daemon" for the agent's lifetime.
+- **Code**:
+  - `terminal_mcp/codex_trust.py` (new) is called from `lifecycle.create`, which covers create, restart and resume.
+    - It only acts under `session_lifecycle.codex_trust_roots`; empty means off.
+    - Refusals: the root itself, `$HOME`, `/`; any symlink; non-owned paths; world-writable roots; roots group-writable by anything except the user's own private group (dell `~/workspace` is 775 with private group `dell`); an existing non-"trusted" entry; a broken or symlinked config.
+    - Writes happen under a lock, with a re-read and atomic replace; the file mode is kept and new entries are appended.
+    - The config is resolved as `CODEX_HOME` or `pw_dir/.codex`.
+    - It never touches approval or sandbox settings. The receipt reports `codex_trust`.
+  - `adapters.classify_input_prompt` names `CODEX_FOLDER_TRUST`, `CODEX_SANDBOX_APPROVAL` (with the command), `CODEX_UPDATE_MENU`, `TOOL_PERMISSION` and `HOOK_REVIEW`.
+    - Status carries `input_prompt`.
+    - Direct tasks keep the stable `wait_reason` values `SESSION_INPUT[_BEFORE_DISPATCH]`; the reason reads `KIND: detail`, and the view adds `input_prompt_kind` plus a specific `next_action`. Nothing is auto-answered.
+  - The `/v1/sessions/{name}/send-guarded` route is taken unchanged from draft #79 (`d3db7c5`). Its `COMPOSER_READY` rename is not included. An old agent answers 404, which is reported as IDLE_GUARD_UNSUPPORTED; there is no fallback.
+  - The marker regex is `TMCP-(DONE|BLOCKED):[ \t]*<id>`.
+  - Controller `_reconcile_timed_out_create`: a read timeout yields `CREATED_UNCONFIRMED` or `CREATE_OUTCOME_UNKNOWN`; a connect failure stays NODE_UNREACHABLE.
+  - The no-daemon probe caches definitive answers only.
+  - The deploy tree also claims `read_fanout.py` in `scripts/knowledge/index_modules.py`; #92 had left `test_efficiency_benchmark` red.
+- **Config**: dell `~/.config/terminal-mcp/runtime-config.yaml` now has `session_lifecycle.codex_trust_roots: [/home/dell/workspace]`. Old code ignores the key, which was verified. HP needs no config, because trust runs node-side.
+- **Tests** (local only, no GitHub Actions):
+  - `tests/test_session_prompt_hang.py`: 35 tests, using real codex 0.162 captures in `tests/fixtures/codex_0162_*`.
+  - Focused set on the deploy tree: **446 passed**.
+  - Broad adjacent run: ~10k tests.
+    - Every failure was attributed: 1 mine, now fixed (issue52 `wait_reason`); 3 baseline-red on `b3de57c` (module map, fixed in deploy); 5 load flakes that pass alone; 1 baseline-red `test_windows_onboarding::test_linux_installer_runtime_writes_complete_quoted_unit_without_running_comments`.
+    - Note that the box had load average ~15–20 from other lanes.
+- **Deployment (2026-10-25 11:58 ICT, CONFIRMED)**:
+  - dell `terminal-node-agent` runs `~/.cache/terminal-mcp/release-52408a765156` via drop-in `zzz-session-prompt-hang-52408a765156.conf`. It is layered over the confirmed `zz-session-prompt-hang-d40b969e4276.conf` (release-d40b969e4276) and the older `zz-readiness-76ebad5754f4.conf`.
+  - HP `terminal-mcp-http` and `terminal-mcp-chatgpt-v1` run `release-52408a765156` via `zzzzzzzzzzzz-session-prompt-hang-52408a7.conf`, layered over `zzzzzzzzzzz-session-prompt-hang-d40b969.conf` and `zzzzzzzzzz-p0-contention-20261024.conf` (b3de57c). `/version` reports `52408a7…`.
+  - Scripts: `~/.cache/terminal-mcp/rollout-{dell-node,hp}-<sha>.sh`. Each applies the drop-in, restarts, checks, then auto-rolls back unless a `.ack` appears within 900 s. The first d40b969 attempt auto-rolled back while unattended; a re-run was confirmed.
+  - tmux session lists were identical before and after every restart (KillMode=process). Running HP task `dt_e08f574069824e4a` (nec1) stayed RUNNING.
+  - Backups: dell `~/.local/state/terminal-mcp/backup-session-prompt-hang-20261025-*` (drop-ins tgz, runtime-config, codex config, tmux list, health). HP `~/.local/state/terminal-mcp/backup-session-prompt-hang-20261025-083122` (drop-ins tgz, `direct_tasks.db`, tmux list, version).
+  - **Rollback**: remove the newest drop-in, then `systemctl --user daemon-reload`, then restart the unit(s). That falls back one layer, to d40b969. Remove both session-prompt-hang drop-ins to return to the pre-task 76ebad5 (dell) / b3de57c (HP). Optionally drop `codex_trust_roots`.
+- **Live E2E evidence**, HP `/mcp` → dell node, on fresh never-trusted repos and worktrees:
+  - create returned READY with trust REGISTERED, written to the config 3 s before the pane launched; there was no trust prompt and the launch included `--no-daemon`.
+  - The guarded `start` of a bounded `pwd` returned TASK_STARTED/RUNNING with `enter_count` 1. A replay with the same key returned the same receipt, and the prompt appears in the pane exactly once.
+  - The supervised marker task `dt_07a32b70b0e74dfe`: Codex printed `TMCP-DONE: <id>` and the task went DONE.
+  - `dt_9907a6a3c68f445b` is now **DONE** (`late_completion=true`).
+  - Restart (delete, then create): READY + ALREADY_TRUSTED, with a single config entry.
+  - A real sandbox approval showed as WAITING_INPUT `CODEX_SANDBOX_APPROVAL: … touch approval-probe.txt`. The owner approved it from the dashboard (`Down`, `Enter`, audited identity) and Codex resumed and finished.
+- **Open / next**:
+  - **HP root FS is 100% full** (~1.5 GB free and falling; 55 GB images, 20 GB volumes, 30 GB workspaces). It caused `disk I/O error` on `nodes.db` and dell showed offline from 11:10 to 11:33. I pruned only the unused Docker build cache (3.4 GB). The owner must decide on images and volumes and find the writer.
+  - Bare-name `start` can return `STATUS_PROBE_TIMEOUT` (honest, nothing sent) because resolution scans the fleet inside the wait slice. Node-qualified targets (`dell-linux/<name>`) succeed. This needs a controller fix (PR #92 area).
+  - Codex's update menu still blocks unattended starts unless the startup-input policy permits Escape. It is now reported as WAITING_INPUT `CODEX_UPDATE_MENU`. Setting `check_for_update_on_startup=false` in `~/.codex/config.toml` is an owner decision.
+  - Four inert trust entries for deleted test repos remain in dell `~/.codex/config.toml` (`tmcp-smoke-repo-20261025`, `tmcp-e2e{,2,3}-repo-20261025`).
+  - Other nodes (m910, nec1, mac) still run old agents. A guarded start to them answers IDLE_GUARD_UNSUPPORTED until they are upgraded.
+  - Merge #95, then reconcile #79 (its guard part is superseded) and #92.
+
 ## 2026-10-23 — Issue #80 Add Node fresh-add vs repair consent
 
 - In `terminal_mcp/dashboard.py` (`NODES_ADMIN_HTML`), fresh Linux add no longer presents the existing-node replacement checkbox or sends `replace_existing`. Repair mode is entered only by the Repair connection action rendered for a registered Linux node. Its checkbox starts unchecked and must be affirmatively checked. Changing the prefilled node ID clears repair mode and hides/unchecks consent. Server validation in `node_onboarding.py` remains authoritative and still requires the node to exist.
