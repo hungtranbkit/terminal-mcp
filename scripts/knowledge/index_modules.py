@@ -107,7 +107,7 @@ GROUPS: dict[str, list[str]] = {
                         "rescue_gateway.py", "linux_onboarding.py"],
     "windows": ["windows_backend.py", "windows_agent.py", "windows_onboarding.py",
                 "windows_visible_console.py"],
-    "http_api": ["server.py", "server_http.py", "health.py", "contract.py",
+    "http_api": ["server.py", "server_http.py", "health.py", "read_fanout.py", "contract.py",
                  "logging_setup.py", "schema.py", "maintenance.py"],
     "mcp_surface": ["mcp_app.py"],
     "repo_read": ["repo_read.py", "repo_service.py", "repo_tools.py"],
