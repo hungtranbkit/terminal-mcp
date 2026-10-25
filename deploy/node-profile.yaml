@@ -149,6 +149,12 @@ skill_packs:
     min_version: "1.84.1.0"
     required: false
     install_hint: "see docs/GSTACK_INTEGRATION.md -- operator-run, pinned to a commit"
+  - id: ecc
+    provider: ecc
+    description: Everything Claude Code project-local workflow skills.
+    hosts: [claude, codex]
+    required: false
+    install_hint: "see docs/ECC_INTEGRATION.md -- preflight and dry-run first"
 
 auth:
   - id: claude_auth

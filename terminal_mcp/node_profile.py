@@ -377,13 +377,17 @@ def check_skill_pack(entry: dict[str, Any]) -> Check:
     well. This is reported so a project that has enabled a stage can see
     whether the node it routes to can serve it.
     """
-    from .skill_provider import STATUS_DRIFT, STATUS_READY, GstackProvider
+    from .skill_provider import STATUS_DRIFT, STATUS_READY, EccProvider, GstackProvider
 
     pack_id = entry["id"]
-    if entry.get("provider") != "gstack":
+    provider_name = entry.get("provider")
+    if provider_name == "gstack":
+        provider = GstackProvider(minimum_version=entry.get("min_version"))
+    elif provider_name == "ecc":
+        provider = EccProvider()
+    else:
         return Check(pack_id, "skill_pack", UNKNOWN, False,
-                     detail=f"no reader for provider {entry.get('provider')!r}")
-    provider = GstackProvider(minimum_version=entry.get("min_version"))
+                     detail=f"no reader for provider {provider_name!r}")
     hosts = tuple(entry.get("hosts") or ("claude",))
     reports = {host: provider.status(host) for host in hosts}
     ready = sorted(host for host, status in reports.items() if status.status == STATUS_READY)

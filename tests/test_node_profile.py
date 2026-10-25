@@ -289,3 +289,20 @@ def test_the_shipped_profile_declares_gstack_as_optional():
     assert "gstack" in packs
     assert packs["gstack"].get("required") is False
     assert packs["gstack"].get("min_version")          # pinned, not floating
+
+
+def test_ecc_pack_is_reported_optional_when_project_skill_exists(monkeypatch, tmp_path):
+    skill = tmp_path / ".agents" / "skills" / "verification-loop"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: verification-loop\n---\n")
+    monkeypatch.chdir(tmp_path)
+    check = np.check_skill_pack({"id": "ecc", "provider": "ecc", "hosts": ["codex"]})
+    assert check.status == np.PASS
+    assert check.required is False
+
+
+def test_the_shipped_profile_declares_ecc_as_optional():
+    profile = np.load_profile()
+    packs = {entry["id"]: entry for entry in profile.get("skill_packs", [])}
+    assert packs["ecc"]["required"] is False
+    assert packs["ecc"]["hosts"] == ["claude", "codex"]
