@@ -150,7 +150,7 @@ GROUPS.setdefault('work_ui', []).extend(['dispatch_settings_dashboard.py', 'nova
 
 # Keep the package completeness gate current with the direct-session runtime.
 GROUPS['direct_tasks'] = ['direct_contract.py', 'direct_task.py', 'shell_dispatch.py',
-                         'task_labels.py', 'task_lookup.py']
+                         'task_finalizer.py', 'task_labels.py', 'task_lookup.py']
 GROUPS['headless'] = ['headless.py', 'headless_cleanup.py']
 GROUPS['queue'].append('queue_policy.py')
 GROUPS['session_ops'].append('session_admission.py')
