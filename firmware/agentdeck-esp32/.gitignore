@@ -1,0 +1,6 @@
+.pio/
+include/config.local.h
+server/config.local.json
+*.pem
+*.key
+__pycache__/

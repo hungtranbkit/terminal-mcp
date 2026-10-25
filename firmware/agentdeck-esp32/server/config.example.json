@@ -1,0 +1,11 @@
+{
+  "bind": "127.0.0.1",
+  "port": 8443,
+  "certificate": "/absolute/path/server.pem",
+  "private_key": "/absolute/path/server.key",
+  "database": "/home/operator/.local/share/terminal-mcp/direct_tasks.db",
+  "token": "REPLACE_WITH_RANDOM_DEVICE_ONLY_TOKEN",
+  "targets": {
+    "agent-1": {"target": "EXACT_SUPERVISOR_TARGET", "machine": "Desk", "session": "Builder"}
+  }
+}
