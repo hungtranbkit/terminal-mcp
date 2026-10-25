@@ -381,10 +381,152 @@ def codex_folder_trust_prompt(lines: list[str]) -> bool:
     """Recognize Codex's folder trust modal even when its composer remains visible."""
     # Like other modal detectors, limit evidence to the current pane bottom:
     # scrollback can retain a completed first-run prompt after it was answered.
-    text = "\n".join(line.strip() for line in lines if line.strip())
-    text = "\n".join(text.splitlines()[-12:]).casefold()
-    return ("folder settings can run code automatically" in text
-            and "trust and continue" in text and "quit" in text)
+    # Codex hard-wraps the modal to the pane width ("... Folder settings" /
+    # "can run code automatically" at 120 columns), so phrases are matched on
+    # the collapsed text, never per row.
+    rows = [line.strip() for line in lines if line.strip()][-12:]
+    text = " ".join(" ".join(rows).split()).casefold()
+    return ("trust and continue" in text and "quit" in text
+            and ("folder settings can run code automatically" in text
+                 or "trust this folder?" in text))
+
+
+def codex_update_menu(lines: list[str]) -> bool:
+    """Codex's startup "Update available" menu at the current pane bottom."""
+    rows = [line.strip() for line in lines if line.strip()][-12:]
+    text = " ".join(" ".join(rows).split()).casefold()
+    return ("update available" in text and "1. update now" in text
+            and "2. skip" in text and "esc skip" in text)
+
+
+# A provider usage/quota limit the agent CLI printed instead of working.
+# Anchored at row start (after the CLI's own glyphs) so prose that merely
+# mentions a limit does not match.
+USAGE_LIMIT_NOTICE = re.compile(
+    r"^[ \t■⎿●⏺•✗⚠]*(?:You've hit your (?:usage )?limit|You have hit your (?:usage )?limit"
+    r"|Claude(?: AI)? usage limit reached|\d+-hour limit reached|Weekly limit reached"
+    r"|Rate limit reached|Usage limit reached|Quota exceeded)\b.*$",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def usage_limit_notice(lines: list[str], rows: int = 10) -> str | None:
+    """The usage-limit notice among the bottom rows, i.e. the agent's latest
+    answer was "limit reached" rather than work. Older scrollback is ignored
+    so a limit that was hit and later lifted by a new turn does not count."""
+    kept = [line for line in lines if line.strip()][-rows:]
+    found = None
+    for match in USAGE_LIMIT_NOTICE.finditer("\n".join(kept)):
+        found = " ".join(match.group(0).split()).lstrip("■⎿●⏺•✗⚠ ")
+    return found[:300] if found else None
+
+
+def _bottom_text(lines: list[str], rows: int = 16) -> str:
+    kept = [line.strip() for line in lines if line.strip()][-rows:]
+    return " ".join(" ".join(kept).split()).casefold()
+
+
+def codex_model_migration_prompt(lines: list[str]) -> bool:
+    """Codex's "just got an upgrade. Introducing <model>" choice at startup."""
+    text = _bottom_text(lines)
+    return "1. try new model" in text and "2. use existing model" in text
+
+
+def codex_rate_limit_switch_prompt(lines: list[str]) -> bool:
+    """Codex's "Approaching rate limits / Switch to <model> ...?" menu."""
+    text = _bottom_text(lines)
+    return "for lower credit usage?" in text and "keep current model" in text
+
+
+def claude_autocompact_prompt(lines: list[str]) -> bool:
+    """Claude Code's "We recommend compacting earlier" settings dialog."""
+    text = _bottom_text(lines, 20)
+    return "we recommend compacting earlier" in text and "esc not now" in text
+
+
+def claude_rate_limit_menu(lines: list[str]) -> bool:
+    """Claude Code's usage-limit menu ("Stop and wait for limit to reset")."""
+    return "stop and wait for limit to reset" in _bottom_text(lines)
+
+
+def codex_sandbox_approval_prompt(lines: list[str]) -> str | None:
+    """The command (or "") a live Codex sandbox approval menu asks about.
+
+    This is command approval under the session's sandbox/approval policy --
+    unrelated to folder trust, and never answered by Terminal MCP: only the
+    owner's own explicit choice in the session resolves it.
+    """
+    rows = [line.strip() for line in lines if line.strip()][-20:]
+    text = "\n".join(rows).casefold()
+    if not (re.search(r"would you like to (?:run the following command|make the following edits)\?", text)
+            and re.search(r"(?m)^(?:[›❯>]\s*)?1\.\s*yes, proceed\b", text)
+            and "esc to cancel" in text):
+        return None
+    for row in rows:
+        if row.startswith("$ "):
+            return row[2:].strip()[:200]
+    return ""
+
+
+#: Structured kinds of a live input prompt, each with the one action that
+#: resolves it. None of these is ever answered automatically.
+INPUT_PROMPT_ACTIONS = {
+    "CODEX_FOLDER_TRUST": (
+        "Codex asks whether to trust this folder (separate from command approval). If the "
+        "repository is a Terminal MCP managed workspace, restart the session so trust is "
+        "registered before launch; otherwise the owner answers the dialog in the session."),
+    "CODEX_SANDBOX_APPROVAL": (
+        "Codex asks for sandbox approval to run a command. The owner must approve or deny it "
+        "in the session; Terminal MCP never answers it. Supervision resumes after the answer."),
+    "CODEX_UPDATE_MENU": (
+        "Codex offers a CLI update before it starts. The owner chooses in the session "
+        "(Skip is non-granting) or sets check_for_update_on_startup = false; Terminal MCP "
+        "never selects Update now."),
+    "CODEX_MODEL_MIGRATION": (
+        "Codex offers a model switch at startup. The owner chooses in the session; the model "
+        "is never changed automatically. A fresh session without the notice is the fallback."),
+    "CODEX_RATE_LIMIT_SWITCH": (
+        "Codex is approaching its rate limit and offers a cheaper model. The owner chooses in "
+        "the session; Terminal MCP never changes the model. Dispatch elsewhere meanwhile."),
+    "CLAUDE_AUTOCOMPACT_PROMPT": (
+        "Claude Code asks whether to change its autocompact threshold (a settings change). "
+        "The owner chooses in the session (Esc = not now); never answered automatically."),
+    "CLAUDE_RATE_LIMIT_MENU": (
+        "Claude Code hit its usage limit and asks how to proceed. The owner chooses in the "
+        "session; never upgrade or buy usage automatically. Dispatch elsewhere until reset."),
+    "TOOL_PERMISSION": (
+        "A tool permission dialog is open. The owner must review it in the session; never "
+        "select Always allow."),
+    "HOOK_REVIEW": (
+        "The agent asks to review hooks. The owner must review them or explicitly continue "
+        "without trusting; never choose Trust all."),
+}
+
+
+def classify_input_prompt(lines: list[str]) -> dict[str, str] | None:
+    """Name the live prompt so a waiting session says WHY and what unblocks it."""
+    command = codex_sandbox_approval_prompt(lines)
+    if command is not None:
+        detail = f"Codex requests approval to run `{command}`" if command else "Codex requests approval"
+        kind = "CODEX_SANDBOX_APPROVAL"
+    elif codex_folder_trust_prompt(lines):
+        kind, detail = "CODEX_FOLDER_TRUST", "Codex folder trust dialog is open"
+    elif codex_update_menu(lines):
+        kind, detail = "CODEX_UPDATE_MENU", "Codex update menu is open"
+    elif codex_model_migration_prompt(lines):
+        kind, detail = "CODEX_MODEL_MIGRATION", "Codex model migration choice is open"
+    elif codex_rate_limit_switch_prompt(lines):
+        kind, detail = "CODEX_RATE_LIMIT_SWITCH", "Codex rate-limit model switch menu is open"
+    elif claude_autocompact_prompt(lines):
+        kind, detail = "CLAUDE_AUTOCOMPACT_PROMPT", "Claude Code autocompact settings dialog is open"
+    elif claude_rate_limit_menu(lines):
+        kind, detail = "CLAUDE_RATE_LIMIT_MENU", "Claude Code usage-limit menu is open"
+    elif tool_permission_prompt(lines):
+        kind, detail = "TOOL_PERMISSION", "tool permission dialog is open"
+    elif "hooks need review" in " ".join(line.strip() for line in lines[-16:]).casefold():
+        kind, detail = "HOOK_REVIEW", "hooks review dialog is open"
+    else:
+        return None
+    return {"kind": kind, "detail": detail, "next_action": INPUT_PROMPT_ACTIONS[kind]}
 
 
 _WAITING_PATTERNS = tuple(

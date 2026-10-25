@@ -575,6 +575,7 @@ class ControllerService:
         # from a complete one -- see the SESSION_NOT_FOUND block below for the
         # real failure that produced.
         unprobed: list[dict[str, str]] = []
+        online: list[tuple[Any, Any]] = []
         for node in self.list_nodes():
             if node.status != NODE_ONLINE:
                 unprobed.append({"node_id": node.id, "reason": f"node status={node.status}"})
@@ -583,15 +584,42 @@ class ControllerService:
             if client is None:
                 unprobed.append({"node_id": node.id, "reason": "no client configured for this node"})
                 continue
+            online.append((node, client))
+        listings: dict[str, Any] = {}
+        if deadline is not None and online:
+            # Bounded callers (wait/resume/direct start) ask every node at
+            # once: probed one after another, a single slow node consumed the
+            # whole slice and turned every bare-name lookup into a timeout.
+            remaining = deadline - time.monotonic()
+            if remaining <= MIN_BOUNDED_NODE_PROBE_SECONDS:
+                return {"error": "RESOLUTION_TIMEOUT", "session": session}
+            per_node = min(MAX_BOUNDED_NODE_PROBE_SECONDS, remaining)
+            pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(8, len(online)), thread_name_prefix="resolve-session")
+            try:
+                futures = {node.id: pool.submit(client.list_sessions, timeout_seconds=per_node)
+                           for node, client in online}
+                concurrent.futures.wait(futures.values(), timeout=per_node + 0.25)
+            finally:
+                # Never wait for a node that ignores its own transport timeout.
+                pool.shutdown(wait=False, cancel_futures=True)
+            for node_id, future in futures.items():
+                if not future.done():
+                    listings[node_id] = NodeClientError("session listing exceeded the bounded slice")
+                elif future.exception() is not None:
+                    listings[node_id] = future.exception()
+                else:
+                    listings[node_id] = future.result()
+        for node, client in online:
             try:
                 if deadline is None:
                     listing = client.list_sessions()
                 else:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= MIN_BOUNDED_NODE_PROBE_SECONDS:
-                        return {"error": "RESOLUTION_TIMEOUT", "session": session}
-                    listing = client.list_sessions(timeout_seconds=min(
-                        MAX_BOUNDED_NODE_PROBE_SECONDS, remaining))
+                    listing = listings[node.id]
+                    if isinstance(listing, NodeClientError):
+                        raise listing
+                    if isinstance(listing, BaseException):
+                        raise NodeClientError(str(listing))
             except NodeClientError as exc:
                 unprobed.append({"node_id": node.id, "reason": f"session listing failed: {exc}"})
                 continue
@@ -1675,6 +1703,28 @@ class ControllerService:
             result["node_id"] = node_id
         return result
 
+    @staticmethod
+    def _reconcile_timed_out_create(client: Any, node_id: str, name: str, agent_type: str,
+                                    detail: str) -> dict[str, Any]:
+        try:
+            observed = client.status(name, timeout_seconds=5)
+        except NodeClientError as exc:
+            observed = {"error": f"{exc}"}
+        if isinstance(observed, dict) and observed.get("exists") is True:
+            return {"session": name, "agent_type": agent_type, "node_id": node_id,
+                    "state": "CREATED_UNCONFIRMED", "session_created": True,
+                    "cwd": observed.get("cwd"), "observed_state": observed.get("state"),
+                    "input_required": observed.get("input_required"),
+                    "input_prompt": observed.get("input_prompt"),
+                    "detail": f"create answer timed out ({detail}); the session exists on the node",
+                    "next_action": ("Inspect the session before sending; it exists, so never "
+                                    "recreate it. Startup readiness was not observed.")}
+        return {"error": "CREATE_OUTCOME_UNKNOWN", "session": name, "node_id": node_id,
+                "detail": f"create answer timed out ({detail}); follow-up status: "
+                          f"{(observed or {}).get('error') or (observed or {}).get('reason')}",
+                "next_action": ("List the node's sessions before retrying; the node may still "
+                                "be creating it. Never recreate blindly.")}
+
     def terminal_create_session(self, name: str, agent_type: str = "shell", cwd: str | None = None, *,
                                 node: str = "auto", platform: str | None = None, initial_prompt: str | None = None,
                                 grant_mode: str = "none", binding: str | None = None,
@@ -1750,7 +1800,15 @@ class ControllerService:
                                            show_on_desktop=show_on_desktop)
         except NodeClientError as exc:
             self._note_transport_failure(node_id, client, exc)
-            return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": str(exc)}
+            if exc.http_status is not None or "TimeoutError" not in str(exc):
+                return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": str(exc)}
+            # The request reached the node and only the answer was late: a
+            # loaded node can finish the create (prelaunch trust, startup
+            # readiness) after this client gives up. Never call that
+            # unreachable -- ask the node whether the session now exists.
+            result = self._reconcile_timed_out_create(client, node_id, name, agent_type, str(exc))
+            if "error" in result:
+                return result
         if isinstance(result, dict) and "error" not in result:
             node_row = self.registry.get(node_id)
             result.setdefault("node_id", node_id)

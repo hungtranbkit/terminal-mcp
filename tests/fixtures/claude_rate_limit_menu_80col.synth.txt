@@ -1,0 +1,10 @@
+⏺ Reading 3 files…
+
+  ⎿  Claude usage limit reached. Your limit will reset at 3pm (Asia/Saigon).
+
+ What do you want to do?
+
+ ❯ 1. Stop and wait for limit to reset
+   2. Upgrade your plan
+
+ Enter to confirm · Esc to cancel

@@ -723,6 +723,10 @@ class SessionLifecycleConfig:
     # Codex CLI's current, audited YOLO flag. Shared by create and
     # registry-reopen; never assembled by individual callers.
     codex_yolo: bool = False
+    # Managed-workspace roots whose fresh repos/worktrees get Codex folder
+    # trust registered before launch (codex_trust.py). Empty = off. This is
+    # folder trust only; it never changes command/sandbox approval.
+    codex_trust_roots: tuple[str, ...] = ()
     create_ready_timeout_seconds: float = 5.0
     default_grant_mode: str = "none"
     # Admission control. A node with no ceiling does not fail loudly when
@@ -2823,11 +2827,17 @@ def _load_session_lifecycle_config(raw: object) -> SessionLifecycleConfig:
         raise ValueError("session_lifecycle.codex_yolo must be a boolean")
     if os.environ.get("TERMINAL_MCP_CODEX_YOLO") is not None:
         codex_yolo_raw = os.environ["TERMINAL_MCP_CODEX_YOLO"].strip().lower() == "true"
+    trust_roots_raw = raw.get("codex_trust_roots", [])
+    if (not isinstance(trust_roots_raw, list)
+            or not all(isinstance(r, str) and os.path.isabs(r) and os.path.normpath(r) != "/"
+                       for r in trust_roots_raw)):
+        raise ValueError("session_lifecycle.codex_trust_roots must be a list of absolute, non-root paths")
     return SessionLifecycleConfig(
         enabled=enabled, allowed_cwd_roots=tuple(roots), protected_sessions=protected_set,
         launch_commands=tuple(sorted(launch_raw.items())), create_ready_timeout_seconds=timeout,
         default_grant_mode=grant_mode, resume_capable_agent_types=tuple(resume_capable_raw),
-        codex_yolo=codex_yolo_raw, max_sessions=max_sessions,
+        codex_yolo=codex_yolo_raw, codex_trust_roots=tuple(os.path.normpath(r) for r in trust_roots_raw),
+        max_sessions=max_sessions,
         maintenance_reserve_sessions=maintenance_reserve,
         maintenance_session_prefixes=tuple(maintenance_prefixes),
         allow_put_file=allow_put_file, max_put_file_bytes=max_put_file_bytes,

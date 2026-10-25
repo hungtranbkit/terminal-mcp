@@ -1,0 +1,41 @@
+{
+  "repo": "hungtranbkit/terminal-mcp",
+  "updated": "2026-10-25",
+  "integrationBranch": "main",
+  "preview": "Staging Repo Kanban: Dell loopback 127.0.0.1:8786 (tmcp-repo-kanban-staging); production terminal-dashboard.mesflow.net unchanged",
+  "rules": [
+    "Không deploy production khi chưa duyệt",
+    "Không GitHub Actions",
+    "Không merge main"
+  ],
+  "cards": [
+    {
+      "id": "REPO-KANBAN",
+      "title": "Repo Kanban đa repo trong dashboard (đọc docs/kanban/*.json đã commit, ghép session registry)",
+      "owner": "Claude",
+      "status": "REVIEW",
+      "branch": "feat/repo-tasks-kanban-20261024",
+      "prs": [
+        89
+      ],
+      "issues": [],
+      "evidence": "tests/test_repo_kanban.py 10/10; dashboard/nav/project suites 222 PASS; HP browser QA 4/4 (Chromium+WebKit × laptop/phone, 76 checks) @ 77b497e; staging Dell 127.0.0.1:8786",
+      "next": "Owner review draft PR #89; deploy production chỉ khi được duyệt (cần repo_kanban.repos trên HP + timer git fetch)",
+      "updated": "2026-10-24"
+    },
+    {
+      "id": "SESSION-PROMPT-HANG",
+      "title": "Session prompts → silent hangs: prelaunch managed Codex trust, named WAITING_INPUT prompts, guarded remote send, spaced TMCP-DONE marker, timed-out create reconcile",
+      "owner": "Claude",
+      "status": "REVIEW",
+      "branch": "fix/session-prompt-hang-20261025",
+      "prs": [
+        95
+      ],
+      "issues": [],
+      "evidence": "tests/test_session_prompt_hang.py + focused 446 PASS on deploy tree 52408a7; deployed+CONFIRMED dell node agent + HP controller (release-52408a765156); live E2E HP→dell: fresh worktree READY+trust REGISTERED, guarded start TASK_STARTED enter_count=1 replay-safe, marker 'TMCP-DONE: id' → DONE, dt_9907a6a3c68f445b late DONE, restart ALREADY_TRUSTED",
+      "next": "Owner review/merge PR #95; reconcile #79/#92; HP disk 100% full (owner); upgrade m910/nec1/mac agents for /send-guarded",
+      "updated": "2026-10-25"
+    }
+  ]
+}

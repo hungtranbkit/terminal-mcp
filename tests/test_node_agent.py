@@ -18,6 +18,7 @@ import anyio
 import pytest
 from starlette.testclient import TestClient
 
+from terminal_mcp.audit import AuditStore
 from terminal_mcp.config import (
     AppConfig, InputPolicyConfig, PermissionsConfig, SessionKnowledgeConfig, SessionLifecycleConfig,
 )
@@ -58,7 +59,8 @@ def agent_client(tmp_path):
     # never leak a test session name ("agent-grant") into real
     # production state (found live -- since cleaned up).
     from terminal_mcp.grants import SessionGrantStore
-    terminal = TerminalService(_config(tmp_path), grants=SessionGrantStore(tmp_path / "grants.db"))
+    terminal = TerminalService(_config(tmp_path), audit=AuditStore(tmp_path / "audit.db"),
+                               grants=SessionGrantStore(tmp_path / "grants.db"))
     app = build_node_agent(node_id="test-node", terminal=terminal, token=TOKEN, workspace_root=str(tmp_path))
     created: list[str] = []
     client = TestClient(app)
@@ -218,6 +220,30 @@ def test_full_session_lifecycle_round_trip(agent_client):
 
     killed_list = agent_client.get("/v1/killed-sessions", headers=_auth())
     assert killed_list.status_code == 200
+
+
+def test_guarded_send_route_runs_through_owner_atomic_idle_guard(agent_client):
+    create = agent_client.post("/v1/sessions", headers=_auth(),
+                               json={"name": "agent-guarded", "agent_type": "shell", "cwd": None})
+    assert create.status_code == 200
+    agent_client.created.append("agent-guarded")
+
+    response = agent_client.post(
+        "/v1/sessions/agent-guarded/send-guarded", headers=_auth(),
+        json={"text": "echo guarded-send-ok", "press_enter": True,
+              "idempotency_key": "agent-guarded-once"},
+    )
+    replay = agent_client.post(
+        "/v1/sessions/agent-guarded/send-guarded", headers=_auth(),
+        json={"text": "echo guarded-send-ok", "press_enter": True,
+              "idempotency_key": "agent-guarded-once"},
+    )
+
+    assert response.status_code == 200
+    assert response.json().get("delivery_state") == "SUBMIT_CONFIRMED"
+    assert response.json().get("enter_sent") is True
+    assert replay.status_code == 200
+    assert replay.json() == response.json()
 
 
 def test_registry_reopen_round_trip_after_an_unexpected_drop(agent_client):
