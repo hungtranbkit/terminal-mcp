@@ -20,7 +20,6 @@ from __future__ import annotations
 import time
 import re
 import subprocess
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 
@@ -36,7 +35,9 @@ AGENT_TYPES = ("shell", "claude", "codex")
 CREATE_POLL_INTERVAL_SECONDS = 0.2
 
 
-@lru_cache(maxsize=64)
+_NO_DAEMON_SUPPORT: dict[str, bool] = {}
+
+
 def _codex_supports_no_daemon(command: str) -> bool:
     """Use the installed CLI's own help as the capability check.
 
@@ -44,13 +45,22 @@ def _codex_supports_no_daemon(command: str) -> bool:
     Codex daemon's feature settings and is never inferred from a version
     string, which may not match a wrapper or vendor build.
     """
+    if command in _NO_DAEMON_SUPPORT:
+        return _NO_DAEMON_SUPPORT[command]
     try:
         result = subprocess.run([command, "--help"], capture_output=True,
                                 text=True, timeout=3, check=False)
     except (OSError, subprocess.SubprocessError):
+        # Not cached: a --help that timed out on a loaded node (seen live)
+        # must not pin "no --no-daemon" for the agent's whole lifetime.
         return False
     help_text = f"{result.stdout or ''}\n{result.stderr or ''}"
-    return result.returncode == 0 and re.search(r"(?m)^\s*--no-daemon(?:\s|$)", help_text) is not None
+    supported = result.returncode == 0 and re.search(r"(?m)^\s*--no-daemon(?:\s|$)", help_text) is not None
+    _NO_DAEMON_SUPPORT[command] = supported
+    return supported
+
+
+_codex_supports_no_daemon.cache_clear = _NO_DAEMON_SUPPORT.clear  # type: ignore[attr-defined]
 
 
 def _codex_readiness(lines: list[str]) -> tuple[str, str | None]:
