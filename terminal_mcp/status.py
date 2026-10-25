@@ -183,6 +183,9 @@ def detect_agent_ui_state(output: str) -> tuple[str | None, str]:
 
 def detect_waiting_input(output: str) -> tuple[bool, str]:
     lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if (prompt := adapters.classify_input_prompt(lines)) is not None and prompt["kind"] in (
+            "CODEX_SANDBOX_APPROVAL", "CODEX_FOLDER_TRUST", "CODEX_UPDATE_MENU"):
+        return True, f"{prompt['kind']}: {prompt['detail']}; requires an explicit owner decision"
     if adapters.tool_permission_prompt(lines):
         return True, "tool approval requires an explicit owner decision; no automatic permission grant"
     if adapters.codex_folder_trust_prompt(lines):

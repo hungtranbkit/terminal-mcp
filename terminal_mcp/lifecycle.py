@@ -25,7 +25,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import AppConfig
-from .adapters import codex_folder_trust_prompt, tool_permission_prompt
+from .adapters import codex_folder_trust_prompt, codex_sandbox_approval_prompt, tool_permission_prompt
+from .codex_trust import ensure_trust
 from .launcher_resolution import resolve_launcher
 from .permissions import SENSITIVE_SESSION_WORDS, valid_new_session_name, session_input_denied_by_pattern
 from .session_backend import SessionBackend
@@ -61,6 +62,8 @@ def _codex_readiness(lines: list[str]) -> tuple[str, str | None]:
     """
     if tool_permission_prompt(lines):
         return "BLOCKED_PERMISSION", "CODEX_TOOL_PERMISSION_REQUIRED"
+    if codex_sandbox_approval_prompt(lines) is not None:
+        return "BLOCKED_PERMISSION", "CODEX_SANDBOX_APPROVAL"
     if codex_folder_trust_prompt(lines):
         return "BLOCKED", "CODEX_TRUST_PROMPT"
     # Pane capture includes scrollback. Classify only the current bottom
@@ -247,6 +250,12 @@ class SessionLifecycleService:
         command = self.launch_command_for(agent_type)
         if agent_type != "shell" and not command:
             return {"error": "LAUNCHER_NOT_CONFIGURED", "agent_type": agent_type, "state": "FAILED"}
+        codex_trust = None
+        if agent_type == "codex" and self.config.session_lifecycle.codex_trust_roots:
+            # Folder trust for a managed workspace is decided by the operator's
+            # root list, so record it before launch instead of leaving the
+            # session on a modal nobody may answer. Never sandbox approval.
+            codex_trust = ensure_trust(resolved_cwd, self.config.session_lifecycle.codex_trust_roots)
         launch_args = extra_args
         if (agent_type == "codex" and command and "--no-daemon" not in extra_args
                 and _codex_supports_no_daemon(command)):
@@ -339,8 +348,12 @@ class SessionLifecycleService:
                                     "Use Codex --no-daemon or choose only option 1, 'Run without daemon this time'; "
                                     "do not restart shared settings."),
                                 "CODEX_TRUST_PROMPT": (
-                                    "Owner must decide whether this exact workspace is trusted; "
-                                    "do not auto-trust it."),
+                                    "Owner must decide whether this exact repository is trusted, or add "
+                                    "its managed workspace to session_lifecycle.codex_trust_roots and "
+                                    "restart the session; never answer the dialog automatically."),
+                                "CODEX_SANDBOX_APPROVAL": (
+                                    "Owner must approve or deny the command in the session; this is "
+                                    "sandbox approval, not folder trust, and is never auto-approved."),
                                 "CODEX_HOOK_PROMPT": (
                                     "Owner must review the hook change; never auto-approve it."),
                                 "CODEX_HOOK_REVIEW_MENU": (
@@ -360,6 +373,7 @@ class SessionLifecycleService:
                                     if blocked_reason == "CODEX_STARTUP_MENU" else None),
                                 "session_id": info.session_id, "pane_id": info.pane_id,
                                 "pane_current_command": info.pane_current_command,
+                                **({"codex_trust": codex_trust} if codex_trust else {}),
                             }
                         if readiness == "READY":
                             snapshot = tuple(line.strip() for line in lines[-12:])
@@ -414,6 +428,7 @@ class SessionLifecycleService:
                         "blocked_reason": "CODEX_READINESS_TIMEOUT",
                         "session_id": info.session_id, "pane_id": info.pane_id,
                         "pane_current_command": info.pane_current_command,
+                        **({"codex_trust": codex_trust} if codex_trust else {}),
                     }
                 break
             time.sleep(CREATE_POLL_INTERVAL_SECONDS)
@@ -435,6 +450,8 @@ class SessionLifecycleService:
             )
         if startup_actions:
             result["startup_actions"] = startup_actions
+        if codex_trust:
+            result["codex_trust"] = codex_trust
         # Only surfaced when actually requested -- never a new, always-
         # present field an existing (tmux-only, or headless-by-default
         # Windows) caller would need to start ignoring.

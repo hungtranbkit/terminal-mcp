@@ -19,7 +19,7 @@ from .composer import (COMPOSER_DRAFT, COMPOSER_EMPTY, COMPOSER_UNKNOWN,
                        ComposerSnapshot, draft_contains, read_composer)
 from .adapters import (DELIVERY_NOT_ACTIVATED, DELIVERY_ACTIVATION_UNCERTAIN, DELIVERY_BLOCKED, DELIVERY_ERROR, DELIVERY_STALLED, DELIVERY_SUBMIT_CONFIRMED, DELIVERY_TEXT_SENT,
                        DELIVERY_UNKNOWN, TARGET_COMPOSER, TARGET_WAITING, SHELL_COMMANDS, _sent_text_echoed,
-                       enter_is_safe_after_command_change, normalize_command, select_adapter,
+                       classify_input_prompt, enter_is_safe_after_command_change, normalize_command, select_adapter,
                        to_legacy_submit_status)
 from .audit import AuditStore
 from .bindings import Binding, BindingStore, valid_binding_name
@@ -1582,6 +1582,9 @@ class TerminalService:
                 # response unchanged, same as every other field here).
                 "cwd": info.pane_current_path or None,
             }
+            if input_required and (prompt := classify_input_prompt(output.splitlines())) is not None:
+                # Structured WHY + the one action that unblocks it.
+                payload["input_prompt"] = prompt
             # P0 HOTFIX (task: "P0 WINDOWS SESSION STATE-LOSS / STALE
             # STREAM", item 7's own health-metadata requirement): only
             # ever present for a backend that actually supervises a real

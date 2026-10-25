@@ -381,10 +381,83 @@ def codex_folder_trust_prompt(lines: list[str]) -> bool:
     """Recognize Codex's folder trust modal even when its composer remains visible."""
     # Like other modal detectors, limit evidence to the current pane bottom:
     # scrollback can retain a completed first-run prompt after it was answered.
-    text = "\n".join(line.strip() for line in lines if line.strip())
-    text = "\n".join(text.splitlines()[-12:]).casefold()
-    return ("folder settings can run code automatically" in text
-            and "trust and continue" in text and "quit" in text)
+    # Codex hard-wraps the modal to the pane width ("... Folder settings" /
+    # "can run code automatically" at 120 columns), so phrases are matched on
+    # the collapsed text, never per row.
+    rows = [line.strip() for line in lines if line.strip()][-12:]
+    text = " ".join(" ".join(rows).split()).casefold()
+    return ("trust and continue" in text and "quit" in text
+            and ("folder settings can run code automatically" in text
+                 or "trust this folder?" in text))
+
+
+def codex_update_menu(lines: list[str]) -> bool:
+    """Codex's startup "Update available" menu at the current pane bottom."""
+    rows = [line.strip() for line in lines if line.strip()][-12:]
+    text = " ".join(" ".join(rows).split()).casefold()
+    return ("update available" in text and "1. update now" in text
+            and "2. skip" in text and "esc skip" in text)
+
+
+def codex_sandbox_approval_prompt(lines: list[str]) -> str | None:
+    """The command (or "") a live Codex sandbox approval menu asks about.
+
+    This is command approval under the session's sandbox/approval policy --
+    unrelated to folder trust, and never answered by Terminal MCP: only the
+    owner's own explicit choice in the session resolves it.
+    """
+    rows = [line.strip() for line in lines if line.strip()][-20:]
+    text = "\n".join(rows).casefold()
+    if not (re.search(r"would you like to (?:run the following command|make the following edits)\?", text)
+            and re.search(r"(?m)^(?:[›❯>]\s*)?1\.\s*yes, proceed\b", text)
+            and "esc to cancel" in text):
+        return None
+    for row in rows:
+        if row.startswith("$ "):
+            return row[2:].strip()[:200]
+    return ""
+
+
+#: Structured kinds of a live input prompt, each with the one action that
+#: resolves it. None of these is ever answered automatically.
+INPUT_PROMPT_ACTIONS = {
+    "CODEX_FOLDER_TRUST": (
+        "Codex asks whether to trust this folder (separate from command approval). If the "
+        "repository is a Terminal MCP managed workspace, restart the session so trust is "
+        "registered before launch; otherwise the owner answers the dialog in the session."),
+    "CODEX_SANDBOX_APPROVAL": (
+        "Codex asks for sandbox approval to run a command. The owner must approve or deny it "
+        "in the session; Terminal MCP never answers it. Supervision resumes after the answer."),
+    "CODEX_UPDATE_MENU": (
+        "Codex offers a CLI update before it starts. The owner chooses in the session "
+        "(Skip is non-granting) or sets check_for_update_on_startup = false; Terminal MCP "
+        "never selects Update now."),
+    "TOOL_PERMISSION": (
+        "A tool permission dialog is open. The owner must review it in the session; never "
+        "select Always allow."),
+    "HOOK_REVIEW": (
+        "The agent asks to review hooks. The owner must review them or explicitly continue "
+        "without trusting; never choose Trust all."),
+}
+
+
+def classify_input_prompt(lines: list[str]) -> dict[str, str] | None:
+    """Name the live prompt so a waiting session says WHY and what unblocks it."""
+    command = codex_sandbox_approval_prompt(lines)
+    if command is not None:
+        detail = f"Codex requests approval to run `{command}`" if command else "Codex requests approval"
+        kind = "CODEX_SANDBOX_APPROVAL"
+    elif codex_folder_trust_prompt(lines):
+        kind, detail = "CODEX_FOLDER_TRUST", "Codex folder trust dialog is open"
+    elif codex_update_menu(lines):
+        kind, detail = "CODEX_UPDATE_MENU", "Codex update menu is open"
+    elif tool_permission_prompt(lines):
+        kind, detail = "TOOL_PERMISSION", "tool permission dialog is open"
+    elif "hooks need review" in " ".join(line.strip() for line in lines[-16:]).casefold():
+        kind, detail = "HOOK_REVIEW", "hooks review dialog is open"
+    else:
+        return None
+    return {"kind": kind, "detail": detail, "next_action": INPUT_PROMPT_ACTIONS[kind]}
 
 
 _WAITING_PATTERNS = tuple(
