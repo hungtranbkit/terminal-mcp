@@ -50,7 +50,10 @@ TURN_PANE_ACTIONS = ("inspect", "send", "send_wait", "wait", "resume", "start",
                      # Supervised direct tasks (direct_task.py): an agent turn
                      # ending (IDLE) is not the task ending.
                      "supervise", "supervise_status", "supervise_complete",
-                     "supervise_cancel")
+                     "supervise_cancel",
+                     # Task finalizer (task_finalizer.py): settle stale tasks
+                     # on evidence -- QA, review, session -- not on silence.
+                     "supervise_finalize")
 # How many QueueEngine ticks one `start` call may spend driving the lane from
 # QUEUED to actually dispatched. The engine makes at most ONE transition per
 # tick on purpose (claim -> coordinator gate -> dispatch), so a handful is the
@@ -503,6 +506,9 @@ class CompactTerminalTools:
         self.run_journal = run_journal
         # DirectTaskSupervisor, injected by mcp_app. None disables supervise*.
         self.direct_tasks: Any = None
+        # task_finalizer.TaskFinalizer, injected by mcp_app. None disables
+        # supervise_finalize.
+        self.finalizer: Any = None
         # SessionReconciler.lifecycle_for, injected by mcp_app. Annotates
         # inspect rows with the agent-session lifecycle state.
         self.lifecycle_lookup: Callable[[str], Any] | None = None
@@ -1285,6 +1291,9 @@ class CompactTerminalTools:
         - supervise_complete: `task_id`; args.outcome DONE|BLOCKED, args.reason.
         - supervise_cancel: `task_id`; args.reason.
         """
+        if action == "supervise_finalize":
+            return {**self._finalize_turn(task_id, args if isinstance(args, dict) else {}),
+                    "action": action}
         if self.direct_tasks is None:
             return {"status": "FAILED", "error": "ACTION_UNAVAILABLE", "action": action}
         args = args if isinstance(args, dict) else {}
@@ -1332,6 +1341,42 @@ class CompactTerminalTools:
             result = self.direct_tasks.cancel(task_id or "", reason=args.get("reason"))
         return {**result, "action": action}
 
+
+    def _finalize_turn(self, task_id: str | None, args: dict[str, Any]) -> dict[str, Any]:
+        """`supervise_finalize`: args.op is one of
+        - reconcile (default): `task_id`; settle it from session + QA + review.
+        - sweep: every due unsettled task once (args.limit, default 50).
+        - qa: `task_id`; args.verdict PASS|FAIL, args.reviewer, args.evidence [refs].
+        - review: `task_id`; args.verdict OBSOLETE, args.reviewer, args.reason.
+        - link_issue: `task_id`; args.repo "owner/name", args.issue_number.
+        args.apply_github=true is required before any issue is closed; an
+        issue is never opened or reopened."""
+        finalizer = getattr(self, "finalizer", None)
+        if finalizer is None:
+            return {"status": "FAILED", "error": "ACTION_UNAVAILABLE"}
+        op = str(args.get("op") or "reconcile")
+        apply_github = args.get("apply_github") is True
+        if op == "sweep":
+            limit = args.get("limit", 50)
+            if isinstance(limit, bool) or not isinstance(limit, int) or not 0 < limit <= 200:
+                return {"status": "FAILED", "error": "INVALID_LIMIT", "allowed": "1..200"}
+            return finalizer.sweep(limit=limit, apply_github=apply_github)
+        if not task_id:
+            return {"status": "FAILED", "error": "TASK_ID_REQUIRED"}
+        if op == "reconcile":
+            return finalizer.reconcile(task_id, apply_github=apply_github)
+        if op == "qa":
+            evidence = args.get("evidence")
+            return finalizer.record_qa(task_id, verdict=args.get("verdict"), reviewer=args.get("reviewer"),
+                                       evidence=evidence if isinstance(evidence, list) else [],
+                                       summary=args.get("summary"))
+        if op == "review":
+            return finalizer.record_review(task_id, verdict=args.get("verdict"),
+                                           reviewer=args.get("reviewer"), reason=args.get("reason"))
+        if op == "link_issue":
+            return finalizer.link_issue(task_id, repo=args.get("repo"), number=args.get("issue_number"))
+        return {"status": "FAILED", "error": "INVALID_OP",
+                "allowed": ["reconcile", "sweep", "qa", "review", "link_issue"]}
 
     def _codex_direct_start(self, target: str, text: str, *, timeout: float,
                             request_key: str | None,

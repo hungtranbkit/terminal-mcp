@@ -92,7 +92,8 @@ _DIRECT_ACTION_SCHEMA_HELP = (
     "idempotency_key), headless_status/list/checkpoint/cancel/cleanup. "
     "Direct Terminal MCP action. Normal public actions: start (idle local Codex, confirmed RUNNING or error), inspect, send, send_wait, wait, resume, "
     "supervise (long task continued server-side until explicit DONE), supervise_status, "
-    "supervise_complete, supervise_cancel, "
+    "supervise_complete, supervise_cancel, supervise_finalize (args.op reconcile|sweep|qa|review|link_issue; "
+    "DONE_VERIFIED needs QA evidence), "
     "list_sessions, list_nodes, create_session, delete_session, task_status, task_batch_status, "
     "browser_verify, browser_screenshot, browser_status, browser_stop. "
     "Tracked work: create_session (no initial_prompt) -> supervise(text, title, idempotency_key) "
@@ -374,6 +375,17 @@ def build_mcp(service: TerminalService | None = None,
     except Exception:  # noqa: BLE001 -- never block startup; supervise* reports unavailable
         direct_tasks = None
     compact_tools.direct_tasks = direct_tasks
+    if direct_tasks is not None:
+        try:
+            from .lease import ResourceLockStore
+            from .task_finalizer import FinalizerStore, GitHubIssues, TaskFinalizer
+            compact_tools.finalizer = TaskFinalizer(
+                direct_tasks.store, FinalizerStore(),
+                status=direct_tasks._status, tail=direct_tasks._tail,
+                locks=ResourceLockStore(terminal.leases.path) if getattr(terminal, "leases", None) else None,
+                github=GitHubIssues())
+        except Exception:  # noqa: BLE001 -- supervise_finalize reports unavailable
+            _LOGGER.exception("task finalizer unavailable")
     compact_tools.headless = None
     if os.name == "posix":
         from .headless import HeadlessManager
@@ -883,6 +895,13 @@ Direct actions:
                 not resent). Each task carries next_action and receipts.
   supervise_status/supervise_complete/supervise_cancel  (task_id; status also
                 takes idempotency_key or target)
+  supervise_finalize  settle a stale task on evidence: args.op reconcile
+                (task_id) | sweep (args.limit) | qa (verdict PASS|FAIL, reviewer,
+                evidence refs) | review (verdict OBSOLETE, reviewer, reason) |
+                link_issue (repo, issue_number). States WAITING_INPUT, BLOCKED,
+                FAILED, QA_PENDING, DONE_VERIFIED; an idle composer is never
+                DONE. Issues close only with args.apply_github=true: completed
+                needs DONE_VERIFIED + QA evidence, not_planned needs a review.
   list_sessions/list, list_nodes/nodes
   create_session/create, delete_session/delete (confirm=true, or args={"confirm": true})
   session_lifecycle (read-only classification), session_reconcile (dry run by default)
