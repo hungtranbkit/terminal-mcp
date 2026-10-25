@@ -127,14 +127,17 @@ def test_supervised_task_reports_named_prompt_then_resumes_after_explicit_approv
     _run(sup, clock, 10)
     task = sup.get(task_id, refresh=False)["task"]
     assert task["state"] == "WAITING_INPUT"
-    assert task["wait_reason"] == "CODEX_SANDBOX_APPROVAL"
+    assert task["wait_reason"] == "SESSION_INPUT"     # stable value kept
+    assert task["input_prompt_kind"] == "CODEX_SANDBOX_APPROVAL"
+    assert task["reason"].startswith("CODEX_SANDBOX_APPROVAL: ")
     assert "touch approval-probe.txt" in task["reason"]
     assert task["next_action"] == adapters.INPUT_PROMPT_ACTIONS["CODEX_SANDBOX_APPROVAL"]
     assert len(pane.sent) == 1, "nothing may be typed over an approval prompt"
     pane.waiting_input = False   # the owner answered in the session
     pane.busy = 2
     _run(sup, clock, 1)
-    assert sup.get(task_id, refresh=False)["task"]["state"] == "RUNNING"
+    resumed = sup.get(task_id, refresh=False)["task"]
+    assert resumed["state"] == "RUNNING" and resumed["input_prompt_kind"] is None
 
 
 # -- (3) guarded remote submission ----------------------------------------------
