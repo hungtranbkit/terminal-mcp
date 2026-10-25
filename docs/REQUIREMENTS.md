@@ -6723,3 +6723,18 @@ the PR for issue #52):
   are clamped and reported (`tail_lines_clamped`), schema text says so.
 
 Regression suite: `tests/test_issue52_supervised_dispatch.py`.
+
+
+---
+
+## Issue #96 — Distributed Resource Fabric, P0 lease primitive
+
+**Status: IMPLEMENTED_NOT_LIVE_VERIFIED (isolated library, not integrated with scheduler/node agent/dashboard, feature inactive).** This milestone deliberately does not claim a resource mesh, P2P links, shared RAM, worker enforcement or distributed compute.
+
+- New `terminal_mcp/resource_fabric.py` defines `NodeOffer` (timestamped owner-allocatable CPU in millicores and RAM bytes) and `ResourceLeaseStore` (controller-local SQLite transactional admission).
+- Reserves/renews/releases TTL-bounded CPU/RAM leases by `(task_id,node_id)`; `BEGIN IMMEDIATE` serializes competing writers, preventing double-reservation of published allocatable budgets on one controller; retries are idempotent, and changes to resource amount fail closed.
+- Missing, unhealthy and stale offers cannot admit new work; `snapshot()` reports availability without treating unknown/stale nodes as free. Resource offers are not automatically collected or verified from host agents.
+- Not yet integrated with the production task queue, controller, scheduler, node agent, service discovery, network mesh or dashboard. No remote-resource execution, peer transfer, GPU or distributed memory is implemented by this slice.
+- Local focused regression `tests/test_resource_fabric.py`: 7 passed in an isolated Python/pytest harness before GitHub upload. GitHub or production CI and deployment verification still required.
+- Operational invariants: controller-local SQLite only (never put database on NFS); node-side admission/enforcement and a release/reconcile handshake are required **before** wiring leases to dispatch. All public listeners and forced session cleanup remain prohibited.
+- Next P0 steps (tracked by Issue #96): safe node resource measurement after owner reservation; authenticated peer link health; integration with existing execution-health and capability router behind default-off flag; dashboard summaries; real two-node acceptance; review and rollback gate. P1+ distributed storage and compute remain plans.
