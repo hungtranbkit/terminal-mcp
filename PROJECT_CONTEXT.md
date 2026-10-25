@@ -1,5 +1,30 @@
 # PROJECT_CONTEXT.md
 
+## 2026-10-26 — Task finalizer (branch `feat/task-finalizer-20261026`, stacked on PR #95, NOT deployed)
+
+- **Why**: on 2026-10-26 the live HP `direct_tasks.db` held 25 FAILED, 27 BLOCKED and 1 RUNNING tasks, many of them days old.
+  - Many FAILED rows meant only "could not observe" (`SESSION_RUNTIME_MISSING`, `NODE_UNREACHABLE`, `STATUS_PROBE_TIMEOUT`) or `CONTINUATION_LIMIT_REACHED`.
+  - A supervisor DONE only means the agent printed the marker.
+  - Nothing released the task's locks or settled its issue.
+- **Module**: `terminal_mcp/task_finalizer.py`.
+  - `decide()` is pure. It returns exactly one of RUNNING / WAITING_INPUT / BLOCKED / FAILED / QA_PENDING / DONE_VERIFIED.
+  - `FinalizerStore` is SQLite at `~/.local/state/terminal-mcp/task_finalizer.db` (override `TERMINAL_MCP_FINALIZER_DB`), table `task_finalizations`.
+  - `TaskFinalizer` provides reconcile, sweep, record_qa, record_review and link_issue.
+  - `GitHubIssues` wraps `gh` and only reads state or closes; it never opens or reopens.
+- **Invariants to preserve**:
+  - An idle composer is never DONE (IDLE without marker → FAILED once the continuation budget is spent).
+  - DONE_VERIFIED needs QA PASS + reviewer + ≥1 evidence ref.
+  - A late `TMCP-DONE` rescues observation-failed rows (→ QA_PENDING).
+  - Transient errors back off (60 s·2^n, cap 1 h) for at most 5 attempts, then FAILED UNOBSERVABLE. FAILED and DONE_VERIFIED are final.
+  - `ResourceLockStore.release_all(task_id)` runs on BLOCKED/FAILED/QA_PENDING/DONE_VERIFIED; locks are kept for WAITING_INPUT.
+  - An issue closes `completed` only for DONE_VERIFIED + QA evidence, and `not_planned` only with an OBSOLETE review, both only with `apply_github=true`. An already-closed issue is untouched.
+- **API**: `terminal_turn(action="supervise_finalize", task_id=…, args={"op": reconcile|sweep|qa|review|link_issue, …})`. It is wired in `mcp_app.py` and documented in the tool help. There is no background loop: a sweep runs only when called.
+- **Tests**: `tests/test_task_finalizer.py` (19). The related set passed: 812 tests. `index_modules.py` claims the module and the knowledge state was regenerated.
+- **Not done**:
+  - No deploy, so there was no live reconcile of the HP rows.
+  - Links between tasks and issues must be recorded with `link_issue`; there is no automatic inference.
+  - No Kanban/UI changes.
+
 ## 2026-10-26 — P0 menus, bare-name preflight, single fallback (PR #95 commit `6efafde`, NOT deployed)
 
 - **Why**: issue #80/#93 follow-up. Sessions hung on menus nobody named, and bare-name `start` failed `STATUS_PROBE_TIMEOUT` before sending.
