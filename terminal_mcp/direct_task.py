@@ -24,7 +24,7 @@ automatically, because the target may have accepted the first submission.
 
 Explicit completion is either a client call (``supervise_complete``) or a
 marker line printed by the target: ``TMCP-DONE:<task_id>`` or
-``TMCP-BLOCKED:<task_id> <reason>``. The instruction text sent to an agent
+``TMCP-BLOCKED:<task_id> <reason>`` (spaces/tabs after the colon are accepted). The instruction text sent to an agent
 deliberately never contains the contiguous marker, so a prompt echoed in the
 pane can never complete its own task.
 
@@ -48,7 +48,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .adapters import codex_folder_trust_prompt
+from .adapters import INPUT_PROMPT_ACTIONS, classify_input_prompt, codex_folder_trust_prompt
 from .redaction import redact_text
 
 _log = logging.getLogger(__name__)
@@ -136,6 +136,22 @@ _WEAK_RUNNING = re.compile(r"tmux activity age is \d+s")
 _NODE_ERRORS = ("NODE", "REMOTE", "UNREACHABLE", "OFFLINE", "TUNNEL", "CONNECT", "TIMEOUT")
 
 
+def _input_wait(observed: dict[str, Any], output: str | None, default: str) -> dict[str, Any]:
+    """wait_reason/reason for a pane that waits for a human.
+
+    A named prompt (folder trust vs sandbox command approval vs tool
+    permission) becomes the wait_reason itself, so the task says exactly what
+    is open and what unblocks it instead of a generic SESSION_INPUT.
+    """
+    prompt = observed.get("input_prompt")
+    if not isinstance(prompt, dict) and output:
+        prompt = classify_input_prompt(output.splitlines())
+    kind = prompt.get("kind") if isinstance(prompt, dict) else None
+    if kind not in INPUT_PROMPT_ACTIONS:
+        return {"wait_reason": default, "reason": _clip(observed.get("reason"))}
+    return {"wait_reason": kind, "reason": _clip(prompt.get("detail") or observed.get("reason"))}
+
+
 def default_direct_task_path() -> Path:
     state_home = os.environ.get("XDG_STATE_HOME")
     base = Path(state_home).expanduser() if state_home else Path.home() / ".local" / "state"
@@ -177,7 +193,9 @@ def continuation_prompt(task_id: str, number: int, limit: int) -> str:
 def find_marker(output: str, task_id: str) -> tuple[str, str] | None:
     """Latest explicit outcome marker for ``task_id`` in ``output``."""
     pattern = re.compile(
-        _MARKER_PREFIX + r"TMCP-(DONE|BLOCKED):" + re.escape(task_id)
+        # Agents often print "TMCP-DONE: <id>" (a space after the colon, as
+        # in prose); that is still the explicit marker for this exact id.
+        _MARKER_PREFIX + r"TMCP-(DONE|BLOCKED):[ \t]*" + re.escape(task_id)
         + r"(?![0-9A-Za-z_])[ \t:\-–—]*(.*)$", re.MULTILINE)
     text = output or ""
     found = None
@@ -689,6 +707,8 @@ class DirectTaskSupervisor:
     def _view(self, task: dict[str, Any]) -> dict[str, Any]:
         state = task["state"]
         next_action = _NEXT_ACTIONS.get(state, "inspect")
+        if state == "WAITING_INPUT" and task.get("wait_reason") in INPUT_PROMPT_ACTIONS:
+            next_action = INPUT_PROMPT_ACTIONS[task["wait_reason"]]
         if state == "STUCK_COMPOSER" and (task.get("recovery_attempts") or 0) >= MAX_RECOVERY_ATTEMPTS:
             next_action = ("bounded Enter-only recovery is exhausted: press Enter in the session "
                            "or supervise_cancel. Never resend the text.")
@@ -934,9 +954,8 @@ class DirectTaskSupervisor:
                     and codex_folder_trust_prompt((output or "").splitlines()))):
             # Never type into a dialog -- in particular never let our Enter
             # answer a hooks-review/trust menu. Nothing was sent.
-            return self.store.update(task["task_id"], **base, state="WAITING_INPUT",
-                                     wait_reason="SESSION_INPUT_BEFORE_DISPATCH", idle_since=None,
-                                     reason=_clip(observed.get("reason")))
+            return self.store.update(task["task_id"], **base, state="WAITING_INPUT", idle_since=None,
+                                     **_input_wait(observed, output, "SESSION_INPUT_BEFORE_DISPATCH"))
         if turn_state == "RUNNING":
             # Busy with something else: wait for it rather than queueing
             # text into a working agent.
@@ -978,9 +997,8 @@ class DirectTaskSupervisor:
                 accepted_at=now, wait_reason=None, idle_since=None, reason=None,
                 last_dispatch_at=now if turn_state != "RUNNING" else task.get("last_dispatch_at"))
         if turn_state == "WAITING_INPUT":
-            return self.store.update(task["task_id"], **base, state="WAITING_INPUT",
-                                     wait_reason="SESSION_INPUT", idle_since=None,
-                                     reason=_clip(observed.get("reason")))
+            return self.store.update(task["task_id"], **base, state="WAITING_INPUT", idle_since=None,
+                                     **_input_wait(observed, output, "SESSION_INPUT"))
         if now - sent_at >= DISPATCH_ACK_DEADLINE_SECONDS:
             # Hold ownership: an uncertain dispatch may have executed. A timeout
             # must neither free the target nor authorize a duplicate send/cleanup.
@@ -1033,9 +1051,8 @@ class DirectTaskSupervisor:
 
     def _supervise_running(self, task, base, turn_state, observed, now):
         if turn_state == "WAITING_INPUT":
-            return self.store.update(task["task_id"], **base, state="WAITING_INPUT",
-                                     wait_reason="SESSION_INPUT", idle_since=None,
-                                     reason=_clip(observed.get("reason")))
+            return self.store.update(task["task_id"], **base, state="WAITING_INPUT", idle_since=None,
+                                     **_input_wait(observed, None, "SESSION_INPUT"))
         if task["state"] == "WAITING_INPUT" and task.get("wait_reason") == "AWAITING_EXPLICIT_COMPLETION":
             return self.store.update(task["task_id"], **base)
         if task["state"] in ("WAITING_INPUT", "STUCK_COMPOSER", "DISPATCH_UNCERTAIN"):
