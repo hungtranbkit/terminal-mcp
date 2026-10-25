@@ -24,7 +24,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import AppConfig
-from .adapters import codex_folder_trust_prompt, codex_sandbox_approval_prompt, tool_permission_prompt
+from .adapters import (codex_folder_trust_prompt, codex_model_migration_prompt,
+                       codex_rate_limit_switch_prompt, codex_sandbox_approval_prompt,
+                       tool_permission_prompt)
 from .codex_trust import ensure_trust
 from .launcher_resolution import resolve_launcher
 from .permissions import SENSITIVE_SESSION_WORDS, valid_new_session_name, session_input_denied_by_pattern
@@ -84,6 +86,10 @@ def _codex_readiness(lines: list[str]) -> tuple[str, str | None]:
     if ("update now" in text and "2. skip" in text
             and "3. skip until next version" in text and "esc skip" in text):
         return "BLOCKED", "CODEX_UPDATE_MENU"
+    if codex_model_migration_prompt(lines):
+        return "BLOCKED", "CODEX_MODEL_MIGRATION"
+    if codex_rate_limit_switch_prompt(lines):
+        return "BLOCKED", "CODEX_RATE_LIMIT_SWITCH"
     if ("run without daemon this time" in text
             and "restart with these settings" in text
             and "cancel" in text):
@@ -321,7 +327,11 @@ class SessionLifecycleService:
                         step = _authorized_startup_step(lines)
                         if step:
                             reason, key = step
-                            safe_daemon_fallback = (reason == "CODEX_STARTUP_MENU"
+                            # Both are explicitly owner-approved, non-granting
+                            # choices: run without the daemon once, or skip a
+                            # CLI update (Escape = Skip; Update now is never
+                            # chosen). Neither changes model, trust or approvals.
+                            safe_daemon_fallback = (reason in ("CODEX_STARTUP_MENU", "CODEX_UPDATE_MENU")
                                 and valid_new_session_name(name)
                                 and not session_input_denied_by_pattern(name, self.config)
                                 and not any(word in name.casefold() for word in SENSITIVE_SESSION_WORDS))
@@ -346,7 +356,9 @@ class SessionLifecycleService:
                                         self.tmux.send_keys(name, [key])
                                         startup_key_count += 1
                                         startup_actions.append({"menu": reason, "key": key})
-                                        if key == "Enter":
+                                        if key in ("Enter", "Escape"):
+                                            # One answer per menu: a menu that
+                                            # survives it is reported, not retried.
                                             startup_choices.add(reason)
                                         time.sleep(CREATE_POLL_INTERVAL_SECONDS)
                                         continue
@@ -364,6 +376,15 @@ class SessionLifecycleService:
                                 "CODEX_SANDBOX_APPROVAL": (
                                     "Owner must approve or deny the command in the session; this is "
                                     "sandbox approval, not folder trust, and is never auto-approved."),
+                                "CODEX_UPDATE_MENU": (
+                                    "Codex kept showing its update menu after Skip; the owner chooses in "
+                                    "the session or sets check_for_update_on_startup = false."),
+                                "CODEX_MODEL_MIGRATION": (
+                                    "Owner must choose the model in the session; Terminal MCP never "
+                                    "changes the model. Dispatch to another node/agent meanwhile."),
+                                "CODEX_RATE_LIMIT_SWITCH": (
+                                    "Owner must decide whether to switch to the cheaper model; never "
+                                    "chosen automatically. Dispatch to another node/agent meanwhile."),
                                 "CODEX_HOOK_PROMPT": (
                                     "Owner must review the hook change; never auto-approve it."),
                                 "CODEX_HOOK_REVIEW_MENU": (

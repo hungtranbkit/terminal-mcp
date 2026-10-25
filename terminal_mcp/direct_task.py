@@ -48,7 +48,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .adapters import INPUT_PROMPT_ACTIONS, classify_input_prompt, codex_folder_trust_prompt
+from .adapters import (INPUT_PROMPT_ACTIONS, USAGE_LIMIT_NOTICE, classify_input_prompt,
+                       codex_folder_trust_prompt)
 from .redaction import redact_text
 
 _log = logging.getLogger(__name__)
@@ -112,14 +113,8 @@ _MARKER_PREFIX = r"^[ \t●⏺•◦·*\-–—│|`]*"
 MARKER_REASON_MAX_LINES = 6
 # A row that starts something new, so it cannot continue a wrapped reason.
 _REASON_STOP = re.compile(r"^\s*(?:[●⏺•❯›»>■⎿╭╰│┃║─]|TMCP-)")
-# A provider usage/quota limit the agent CLI printed instead of working.
-# Anchored at row start (after the CLI's own glyphs) so prose that merely
-# mentions a limit does not match.
-_USAGE_LIMIT = re.compile(
-    r"^[ \t■⎿●⏺•✗⚠]*(?:You've hit your (?:usage )?limit|You have hit your (?:usage )?limit"
-    r"|Claude(?: AI)? usage limit reached|\d+-hour limit reached|Weekly limit reached"
-    r"|Rate limit reached|Usage limit reached|Quota exceeded)\b.*$",
-    re.IGNORECASE | re.MULTILINE)
+# A provider usage/quota limit notice (shared with the status API).
+_USAGE_LIMIT = USAGE_LIMIT_NOTICE
 _AGENT_HINTS = ("claude", "codex")
 _COMMAND_IN_REASON = re.compile(r"current command is '([^']+)'")
 _COMPOSER_MARKER = re.compile(r"^[│┃║]?\s*[❯›»>](?:\s|$)")

@@ -410,6 +410,70 @@ AGENT_REQUIRED: dict[str, tuple[str, ...]] = {
     "harness_start": ("task_id",),
 }
 
+#: Direct-start budgets: bare-name resolution, the pre-send status read (one
+#: slow node under load answers in 3-6s), and each post-send poll.
+DIRECT_RESOLVE_SECONDS = 8.0
+DIRECT_PREFLIGHT_STATUS_SECONDS = 8.0
+DIRECT_POLL_STATUS_SECONDS = 2.0
+
+#: Primary outcomes proven to have typed nothing, so one fallback dispatch
+#: cannot duplicate the task. Anything after a send was attempted qualifies
+#: only through a guard refusal in FALLBACK_SAFE_SEND_REASONS.
+FALLBACK_SAFE_ERRORS = frozenset({
+    "DIRECT_TARGET_NOT_IDLE", "STATUS_PROBE_TIMEOUT", "NODE_UNREACHABLE", "NODE_NOT_FOUND",
+    "SESSION_NOT_FOUND", "SESSION_LOCATION_UNKNOWN", "DIRECT_STATUS_UNAVAILABLE",
+})
+FALLBACK_SAFE_SEND_REASONS = (
+    "IDLE_GUARD_UNSUPPORTED", "TARGET_NOT_IDLE", "TARGET_AWAITING_APPROVAL", "TARGET_BUSY",
+    "ACCESS_DENIED", "INPUT_DISABLED", "GRANT_REQUIRED", "PANE_IN_COPY_MODE", "IDENTITY_MISMATCH",
+)
+
+
+def _fallback_safe(result: dict[str, Any]) -> bool:
+    if result.get("dispatched") or result.get("submitted"):
+        return False
+    error = result.get("error")
+    if error in FALLBACK_SAFE_ERRORS and "send" not in result:
+        return True
+    if error == "DIRECT_SUBMIT_NOT_ACCEPTED":
+        send = result.get("send") if isinstance(result.get("send"), dict) else {}
+        evidence = send.get("evidence") if isinstance(send.get("evidence"), dict) else {}
+        reason = str(send.get("reason") or "")
+        return (evidence.get("enter_sent") is not True and not evidence.get("enter_count")
+                and reason.startswith(FALLBACK_SAFE_SEND_REASONS))
+    return False
+
+
+def _target_blocker(status: dict[str, Any]) -> dict[str, Any]:
+    """Read-only WHY a target cannot take a task now: WAITING_INPUT (a named
+    prompt the owner must answer), BLOCKED (e.g. provider usage limit) or the
+    observed busy state -- each with the one action that unblocks it."""
+    prompt = status.get("input_prompt") if isinstance(status.get("input_prompt"), dict) else None
+    if status.get("exists") is False:
+        return {"task_state": "UNKNOWN", "blocked_reason": "SESSION_NOT_FOUND",
+                "next_action": "The session does not exist; create it or name another target."}
+    if status.get("allowed") is False:
+        return {"task_state": "BLOCKED", "blocked_reason": "ACCESS_DENIED",
+                "next_action": "This session does not accept input from this caller."}
+    if prompt is not None or status.get("input_required") or status.get("state") == "WAITING_INPUT":
+        return {"task_state": "WAITING_INPUT",
+                "blocked_reason": (prompt or {}).get("kind") or "INPUT_PROMPT",
+                **({"input_prompt": prompt} if prompt else {}),
+                "next_action": (prompt or {}).get("next_action") or (
+                    "The session shows a prompt that needs an owner decision; answer it in the "
+                    "session. Terminal MCP never answers it automatically.")}
+    if status.get("blocked_reason"):
+        usage = status.get("usage_limit") if isinstance(status.get("usage_limit"), dict) else {}
+        return {"task_state": "BLOCKED", "blocked_reason": status["blocked_reason"],
+                **({"usage_limit": usage} if usage else {}),
+                "next_action": usage.get("next_action") or "Resolve the named blocker first."}
+    state = str(status.get("state") or "UNKNOWN")
+    return {"task_state": state, "blocked_reason": "TARGET_BUSY" if state == "RUNNING" else "TARGET_STATE_UNVERIFIED",
+            "next_action": ("The session is working on another turn; wait for IDLE or use a fallback target."
+                            if state == "RUNNING" else
+                            "The session state could not be verified as idle; inspect it before sending.")}
+
+
 _BLOCKED_ERRORS = {
     "ACCESS_DENIED", "ACTION_NOT_ALLOWED", "BINDING_INPUT_DISABLED",
     "BINDING_NOT_PINNED", "GRANT_REQUIRED", "IDENTITY_MISMATCH",
@@ -954,7 +1018,9 @@ class CompactTerminalTools:
         # historical queue opt-in. Never enqueue an idle Codex as a fallback.
         if normalized == "start" and target and text:
             direct = self._codex_direct_start(target, text, timeout=timeout,
-                                               request_key=idempotency_key if idempotency_key is not None else request_key)
+                                               request_key=idempotency_key if idempotency_key is not None else request_key,
+                                               fallback_target=(args or {}).get("fallback_target")
+                                               if isinstance(args, dict) else None)
             if direct is not None:
                 if direct.get("status") == "TASK_STARTED":
                     return self._with_label(direct, self._label_send(
@@ -1268,8 +1334,50 @@ class CompactTerminalTools:
 
 
     def _codex_direct_start(self, target: str, text: str, *, timeout: float,
-                            request_key: str | None) -> dict[str, Any] | None:
-        """Immediate Codex startup; None preserves non-Codex legacy behavior.
+                            request_key: str | None,
+                            fallback_target: Any = None) -> dict[str, Any] | None:
+        """Immediate Codex start, plus at most ONE fallback dispatch.
+
+        The fallback is the caller's own named `args.fallback_target` (another
+        node's session, or another agent's): never a target Terminal MCP picks,
+        never a second queue. It runs only when the primary attempt is proven
+        to have typed nothing (see FALLBACK_SAFE_ERRORS); a submitted prompt --
+        even one not yet seen RUNNING -- is never re-dispatched elsewhere.
+        """
+        if fallback_target is not None and (not isinstance(fallback_target, str)
+                or not fallback_target.strip() or len(fallback_target) > 200):
+            return {"status": "FAILED", "error": "INVALID_FALLBACK_TARGET"}
+        started = self.monotonic()
+        primary = self._direct_start_once(target, text, timeout=timeout, request_key=request_key)
+        if (primary is None or not fallback_target or primary.get("status") == "TASK_STARTED"
+                or not _fallback_safe(primary)):
+            return primary
+        fallback_target = fallback_target.strip()
+        if fallback_target in (target, primary.get("resolved_target")):
+            return {**primary, "fallback": {"target": fallback_target, "attempted": False,
+                                            "reason": "fallback target is the primary target"}}
+        key = (request_key or primary.get("request_key") or "") + "|fallback|" + fallback_target
+        remaining = float(timeout) - (self.monotonic() - started)
+        second = self._direct_start_once(
+            fallback_target, text, timeout=min(float(MAX_SEND_WAIT_SECONDS), max(remaining, min(float(timeout), 5.0))),
+            request_key=key, agents=("codex", "claude"))
+        if second is None:
+            second = {"status": "FAILED", "error": "FALLBACK_AGENT_UNSUPPORTED", "session": fallback_target,
+                      "dispatched": False}
+        why = {"target": fallback_target, "attempted": True,
+               "primary_target": target, "primary_error": primary.get("error"),
+               "primary_task_state": primary.get("task_state"), "result": second.get("status")}
+        if second.get("status") == "TASK_STARTED":
+            return {**second, "fallback": why, "primary": primary}
+        return {**primary, "fallback": {**why, "error": second.get("error"),
+                                        "task_state": second.get("task_state")},
+                "next_action": "Neither target accepted the task; nothing was typed into the primary. "
+                               "Resolve the named blockers, then start again with the same key."}
+
+    def _direct_start_once(self, target: str, text: str, *, timeout: float,
+                           request_key: str | None,
+                           agents: tuple[str, ...] = ("codex",)) -> dict[str, Any] | None:
+        """Immediate guarded start; None preserves non-Codex legacy behavior.
 
         The audit reservation is written before input. Its pending result is
         durable too: a crash or concurrent retry can inspect/recover the same
@@ -1294,21 +1402,44 @@ class CompactTerminalTools:
         if not hasattr(self.controller, "terminal_status"):
             return None
         deadline = self.monotonic() + float(timeout)
-        def observe() -> dict[str, Any]:
+        # A bare name is resolved once, up front, with its own share of the
+        # budget: a fleet-wide lookup inside the 2s status slice was the
+        # STATUS_PROBE_TIMEOUT that refused every bare-name start (issue
+        # #93). Resolution is read-only; the qualified name pins one node.
+        resolved = target
+        resolver = getattr(self.controller, "resolve_session", None)
+        if "/" not in target and callable(resolver):
+            budget = max(0.0, min(deadline - self.monotonic(), DIRECT_RESOLVE_SECONDS))
+            located = self._bounded_read(("direct-resolve", target),
+                lambda: resolver(target, timeout_seconds=max(0.001, budget)), budget)
+            if not isinstance(located, dict):
+                located = {"error": "DIRECT_STATUS_UNAVAILABLE"}
+            if located.get("error"):
+                error = located["error"]
+                return {"status": "FAILED", "error": ("STATUS_PROBE_TIMEOUT"
+                        if error == "RESOLUTION_TIMEOUT" else error), "session": target,
+                        "dispatched": False, "hop": "controller resolution",
+                        **{k: located[k] for k in ("node_id", "detail", "unprobed") if k in located}}
+            if located.get("node_id") and located.get("session"):
+                resolved = f"{located['node_id']}/{located['session']}"
+        def observe(limit: float = DIRECT_POLL_STATUS_SECONDS) -> dict[str, Any]:
             remaining = max(0.0, deadline - self.monotonic())
-            return self._bounded_read(("direct-start", target),
-                lambda: self._status(target, timeout_seconds=remaining), min(remaining, 2.0))
+            return self._bounded_read(("direct-start", resolved),
+                lambda: self._status(resolved, timeout_seconds=remaining), min(remaining, limit))
         try:
-            before = observe()
+            before = observe(DIRECT_PREFLIGHT_STATUS_SECONDS)
         except Exception:
             return {"status": "FAILED", "error": "DIRECT_STATUS_UNAVAILABLE", "dispatched": False}
         if before.get("error"):
-            return {"status": "FAILED", "error": before["error"], "dispatched": False}
-        if before.get("agent_type") != "codex":
+            return {"status": "FAILED", "error": before["error"], "session": target,
+                    "dispatched": False, **({"resolved_target": resolved} if resolved != target else {}),
+                    **{k: before[k] for k in ("node_id", "detail") if k in before}}
+        if before.get("agent_type") not in agents:
             return None
         base = {"action": "start", "mode": "direct", "session": target,
                 "request_key": key, "idempotency_key": cache_key,
-                "dispatched": False, "client_polling": False}
+                "dispatched": False, "client_polling": False,
+                **({"resolved_target": resolved} if resolved != target else {})}
         if audit is None:
             return {**base, "status": "FAILED", "error": "DIRECT_AUDIT_UNAVAILABLE"}
         pending = {**base, "status": "FAILED", "error": "DIRECT_DISPATCH_IN_PROGRESS",
@@ -1330,16 +1461,17 @@ class CompactTerminalTools:
                                "task_id": legacy["id"], "task_state": legacy["status"],
                                "next_action": "Inspect the existing queue task; no automatic migration or resend."})
             if (before.get("state") != "IDLE" or before.get("input_required")
-                    or before.get("exists") is False or before.get("allowed") is False):
+                    or before.get("exists") is False or before.get("allowed") is False
+                    or before.get("blocked_reason")):
                 return finish({**base, "status": "FAILED", "error": "DIRECT_TARGET_NOT_IDLE",
-                               "task_state": before.get("state", "UNKNOWN")})
-            sent = self.send_task(target, text, timeout=float(timeout), idempotency_key=cache_key + ":send",
+                               **_target_blocker(before)})
+            sent = self.send_task(resolved, text, timeout=float(timeout), idempotency_key=cache_key + ":send",
                                   require_idle=True)
             base = {**base, "send": sent, "submission_id": sent.get("submission_id")}
             if sent.get("status") != "SUBMIT_CONFIRMED":
                 return finish({**base, "status": "FAILED", "error": "DIRECT_SUBMIT_NOT_ACCEPTED",
                                "next_action": "Inspect submission evidence; do not retype the prompt."})
-            state = "UNKNOWN"
+            state, after = "UNKNOWN", {}
             while self.monotonic() < deadline:
                 after = observe()
                 state = after.get("state", "UNKNOWN")
@@ -1349,8 +1481,14 @@ class CompactTerminalTools:
                     return finish({**base, "status": "TASK_STARTED", "task_state": "RUNNING",
                                    "dispatched": True, "next_action": "none"})
                 self.sleep(min(.25, max(0.0, deadline - self.monotonic())))
+            # Submitted is not started, and never completed: report what the
+            # pane shows (e.g. a sandbox approval opened at once) and keep it
+            # out of fallback -- the prompt is already in this session.
+            blocker = _target_blocker(after) if state != "UNKNOWN" or after.get("input_required") else {}
             return finish({**base, "status": "FAILED", "error": "DIRECT_START_NOT_RUNNING",
-                           "task_state": state, "next_action": "Inspect the submission; acceptance is not proof of a running task. Do not resend."})
+                           "submitted": True, "task_state": state, **blocker,
+                           "next_action": blocker.get("next_action") or (
+                               "Inspect the submission; acceptance is not proof of a running task. Do not resend.")})
         except Exception:
             return finish({**base, "status": "FAILED", "error": "DIRECT_DISPATCH_UNCERTAIN",
                            "next_action": "Inspect the durable submission; do not resend."})

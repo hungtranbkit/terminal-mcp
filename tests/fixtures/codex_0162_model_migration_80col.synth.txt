@@ -1,0 +1,16 @@
+╭──────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.162.0)                   │
+╰──────────────────────────────────────────────╯
+
+> Codex just got an upgrade. Introducing GPT-6 Sol.
+
+  Our latest Sol is more intelligent and more efficient so your usage limits
+  go further. This model is a great daily driver for complex tasks,
+  especially coding.
+
+  Choose how you'd like Codex to proceed.
+
+› 1. Try new model
+  2. Use existing model
+
+  Use ↑/↓ to move, press enter to confirm

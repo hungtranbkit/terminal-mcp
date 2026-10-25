@@ -575,6 +575,7 @@ class ControllerService:
         # from a complete one -- see the SESSION_NOT_FOUND block below for the
         # real failure that produced.
         unprobed: list[dict[str, str]] = []
+        online: list[tuple[Any, Any]] = []
         for node in self.list_nodes():
             if node.status != NODE_ONLINE:
                 unprobed.append({"node_id": node.id, "reason": f"node status={node.status}"})
@@ -583,15 +584,42 @@ class ControllerService:
             if client is None:
                 unprobed.append({"node_id": node.id, "reason": "no client configured for this node"})
                 continue
+            online.append((node, client))
+        listings: dict[str, Any] = {}
+        if deadline is not None and online:
+            # Bounded callers (wait/resume/direct start) ask every node at
+            # once: probed one after another, a single slow node consumed the
+            # whole slice and turned every bare-name lookup into a timeout.
+            remaining = deadline - time.monotonic()
+            if remaining <= MIN_BOUNDED_NODE_PROBE_SECONDS:
+                return {"error": "RESOLUTION_TIMEOUT", "session": session}
+            per_node = min(MAX_BOUNDED_NODE_PROBE_SECONDS, remaining)
+            pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(8, len(online)), thread_name_prefix="resolve-session")
+            try:
+                futures = {node.id: pool.submit(client.list_sessions, timeout_seconds=per_node)
+                           for node, client in online}
+                concurrent.futures.wait(futures.values(), timeout=per_node + 0.25)
+            finally:
+                # Never wait for a node that ignores its own transport timeout.
+                pool.shutdown(wait=False, cancel_futures=True)
+            for node_id, future in futures.items():
+                if not future.done():
+                    listings[node_id] = NodeClientError("session listing exceeded the bounded slice")
+                elif future.exception() is not None:
+                    listings[node_id] = future.exception()
+                else:
+                    listings[node_id] = future.result()
+        for node, client in online:
             try:
                 if deadline is None:
                     listing = client.list_sessions()
                 else:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= MIN_BOUNDED_NODE_PROBE_SECONDS:
-                        return {"error": "RESOLUTION_TIMEOUT", "session": session}
-                    listing = client.list_sessions(timeout_seconds=min(
-                        MAX_BOUNDED_NODE_PROBE_SECONDS, remaining))
+                    listing = listings[node.id]
+                    if isinstance(listing, NodeClientError):
+                        raise listing
+                    if isinstance(listing, BaseException):
+                        raise NodeClientError(str(listing))
             except NodeClientError as exc:
                 unprobed.append({"node_id": node.id, "reason": f"session listing failed: {exc}"})
                 continue
