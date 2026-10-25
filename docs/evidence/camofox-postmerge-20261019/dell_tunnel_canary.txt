@@ -1,0 +1,22 @@
+worktree 4d8f2fe
+== install (default off)
+installed (not started). Start: /tmp/camofox-tunnel-canary/deploy/camofox/camofox-tunnel.sh start ; provider env:
+  TERMINAL_MCP_CAMOFOX_BASE_URL=http://127.0.0.1:19377
+enabled-at-boot: disabled  active: inactive
+tunnel.env 600
+== start
+active: active
+listener 127.0.0.1:19377
+== smoke
+health: ok
+auth: unauthenticated request rejected (401)
+== provider canary (branch code, isolated process)
+{"action": "status", "status": "OK", "auth": "OK", "duration_ms": 167}
+{"action": "create_tab", "status": "OK", "duration_ms": 910}
+{"action": "snapshot", "status": "OK", "duration_ms": 426}
+{"action": "scroll", "status": "OK", "scrolled": false, "reason": "at_edge_or_not_scrollable", "duration_ms": 136}
+{"action": "close_all", "status": "OK", "duration_ms": 100}
+{"action": "create_tab", "status": "ERROR", "error": "CAMOFOX_DOMAIN_NOT_ALLOWED", "duration_ms": 51}
+== teardown
+removed unit and tunnel.env (dedicated key and access key left in place)
+after: listener=0 unit=0 confdir=0 wt=0

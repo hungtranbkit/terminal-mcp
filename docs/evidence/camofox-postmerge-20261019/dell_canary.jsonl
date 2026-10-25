@@ -1,0 +1,7 @@
+dell-Latitude-5511
+{"action": "status", "status": "OK", "duration_ms": 134, "auth": "OK"}
+{"action": "create_tab", "status": "OK", "url": "https://example.com/", "duration_ms": 1203}
+{"action": "snapshot", "status": "OK", "url": "https://example.com/", "snapshot": "- paragraph: This domain is for use in documentation example", "duration_ms": 700}
+{"action": "list_tabs", "status": "OK", "count": 1, "duration_ms": 66}
+{"action": "close_all", "status": "OK", "duration_ms": 72}
+{"action": "create_tab", "status": "ERROR", "error": "URL_PRIVATE_BLOCKED", "duration_ms": 0}

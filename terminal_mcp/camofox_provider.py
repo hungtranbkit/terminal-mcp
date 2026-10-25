@@ -70,6 +70,25 @@ _MAX_TYPE_TEXT = 2_000
 _RETRY_STATUSES = frozenset({502, 503, 504})
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
+#: Upstream v1.18.1 keeps a tab locked for its 30 s handler timeout after a
+#: hung action (seen with screenshots). Calls on that tab inside this window fail fast
+#: with CAMOFOX_TAB_BUSY instead of queueing behind the lock.
+TAB_BUSY_SECONDS = 32.0
+_SCROLL_TIMEOUT = 10.0
+_SCREENSHOT_TIMEOUT = 12.0
+#: Upstream v1.18.1's /scroll (a mouse wheel) hung for its full 30 s on
+#: about 1 in 4 calls in the m910 pilot, scrollable page or not, and always
+#: when a text field had focus. Scrolling therefore uses a constant script
+#: template whose only inputs are two validated integers. It is not an
+#: action -- agents still have no evaluate -- and it reads/scrolls the
+#: document only: no input events, so a focused field is never typed into.
+_SCROLL_SCRIPT = (
+    "(() => {{ const e = document.scrollingElement || document.documentElement;"
+    " const bx = e.scrollLeft, by = e.scrollTop; window.scrollBy({dx}, {dy});"
+    " return {{ bx: bx, by: by, x: e.scrollLeft, y: e.scrollTop,"
+    " maxX: e.scrollWidth - e.clientWidth, maxY: e.scrollHeight - e.clientHeight }}; }})()"
+)
+
 
 class CamofoxError(Exception):
     """A classified failure. `code` is stable and machine-readable."""
@@ -81,6 +100,8 @@ class CamofoxError(Exception):
         self.detail = detail
         self.retryable = retryable
         self.status = status
+        #: Last allowed URL of the tab, for a browser_screenshot fallback.
+        self.fallback_url: str | None = None
 
 
 def _env_bool(raw: str, name: str) -> bool:
@@ -306,7 +327,10 @@ class CamofoxBrowser:
     config: CamofoxConfig
     client: CamofoxClient | None = None
     resolve_dns: bool = True
+    clock: Callable[[], float] = time.monotonic
     _history: list[dict[str, Any]] = field(default_factory=list)
+    _busy_until: dict[tuple[str, str], float] = field(default_factory=dict)
+    _tab_urls: dict[tuple[str, str], str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.client is None:
@@ -363,7 +387,24 @@ class CamofoxBrowser:
                 pass
             raise CamofoxError("CAMOFOX_LANDED_OFF_POLICY",
                                f"tab left the allowed targets ({exc.code}); tab closed") from None
+        # Remember the last allowed URL: the screenshot fallback names it.
+        self._tab_urls[(user, tab_id)] = str(url)
         return scrub(url, 2_048)
+
+    def _check_busy(self, user: str, tab: str) -> None:
+        until = self._busy_until.get((user, tab))
+        if until is None:
+            return
+        remaining = until - self.clock()
+        if remaining <= 0:
+            del self._busy_until[(user, tab)]
+            return
+        raise CamofoxError("CAMOFOX_TAB_BUSY",
+                           f"tab is still locked upstream after a timed-out action; retry in "
+                           f"{int(remaining) + 1}s or close it", retryable=True)
+
+    def _mark_busy(self, user: str, tab: str) -> None:
+        self._busy_until[(user, tab)] = self.clock() + TAB_BUSY_SECONDS
 
     # -- actions ------------------------------------------------------------
 
@@ -413,6 +454,7 @@ class CamofoxBrowser:
     def navigate(self, agent_id: str, tab_id: str, url: str) -> dict[str, Any]:
         user, tab = self._user(agent_id), self._tab(tab_id)
         target = self.check_url(url)
+        self._check_busy(user, tab)
         data = self.client.request("POST", f"/tabs/{tab}/navigate", body={"userId": user, "url": target})
         landed = self._enforce_landing(user, tab, data.get("url"))
         return {"status": "OK", "tab_id": tab, "url": landed, "http_status": data.get("httpStatus")}
@@ -420,6 +462,7 @@ class CamofoxBrowser:
     def snapshot(self, agent_id: str, tab_id: str, offset: int = 0) -> dict[str, Any]:
         user, tab = self._user(agent_id), self._tab(tab_id)
         offset = max(0, int(offset or 0))
+        self._check_busy(user, tab)
         data = self.client.request("GET", f"/tabs/{tab}/snapshot",
                                    query={"userId": user, "offset": offset or None})
         landed = self._enforce_landing(user, tab, data.get("url"))
@@ -432,6 +475,7 @@ class CamofoxBrowser:
               selector: str | None = None) -> dict[str, Any]:
         user, tab = self._user(agent_id), self._tab(tab_id)
         body = {"userId": user, **self._target(ref, selector)}
+        self._check_busy(user, tab)
         data = self.client.request("POST", f"/tabs/{tab}/click", body=body)
         landed = self._enforce_landing(user, tab, data.get("url"))
         return {"status": "OK", "tab_id": tab, "url": landed, "mutations": ["click"]}
@@ -442,6 +486,7 @@ class CamofoxBrowser:
         if not isinstance(text, str) or len(text) > _MAX_TYPE_TEXT:
             raise CamofoxError("CAMOFOX_BAD_REQUEST", f"text is required, at most {_MAX_TYPE_TEXT} chars")
         body = {"userId": user, "text": text, "submit": bool(submit), **self._target(ref, selector)}
+        self._check_busy(user, tab)
         data = self.client.request("POST", f"/tabs/{tab}/type", body=body)
         landed = self._enforce_landing(user, tab, data.get("url"))
         # The typed text itself is not echoed: it may be a credential.
@@ -456,19 +501,53 @@ class CamofoxBrowser:
         body: dict[str, Any] = {"userId": user, "direction": direction}
         if amount is not None:
             body["amount"] = max(1, min(int(amount), 5_000))
-        # A healthy scroll takes well under a second; do not make the agent
-        # wait out upstream's 30 s wheel hang (see the hint in run()).
-        self.client.request("POST", f"/tabs/{tab}/scroll", body=body,
-                            timeout=min(10.0, self.config.request_timeout_seconds))
-        return {"status": "OK", "tab_id": tab, "direction": direction}
+        self._check_busy(user, tab)
+        step = body.get("amount", 500)
+        dx, dy = {"down": (0, step), "up": (0, -step),
+                  "right": (step, 0), "left": (-step, 0)}[direction]
+        try:
+            data = self.client.request(
+                "POST", f"/tabs/{tab}/evaluate",
+                body={"userId": user, "expression": _SCROLL_SCRIPT.format(dx=int(dx), dy=int(dy))},
+                timeout=min(_SCROLL_TIMEOUT, self.config.request_timeout_seconds))
+        except CamofoxError as exc:
+            if exc.code in ("CAMOFOX_TIMEOUT", "CAMOFOX_UPSTREAM_ERROR"):
+                self._mark_busy(user, tab)
+            raise
+        geo = data.get("result") if isinstance(data, dict) else None
+        if not isinstance(geo, dict):
+            raise CamofoxError("CAMOFOX_BAD_RESPONSE", "scroll returned no position")
+        try:
+            x, y = int(geo.get("x", 0)), int(geo.get("y", 0))
+            moved = (x, y) != (int(geo.get("bx", 0)), int(geo.get("by", 0)))
+            max_y = max(0, int(geo.get("maxY", 0)))
+        except (TypeError, ValueError):
+            raise CamofoxError("CAMOFOX_BAD_RESPONSE", "scroll returned no position") from None
+        result = {"status": "OK", "tab_id": tab, "direction": direction, "scrolled": moved,
+                  "position": {"x": x, "y": y, "max_y": max_y}}
+        if not moved:
+            result["reason"] = "at_edge_or_not_scrollable"
+        return result
 
     def screenshot(self, agent_id: str, tab_id: str) -> dict[str, Any]:
         if not self.config.screenshots_enabled:
             raise CamofoxError("SCREENSHOTS_DISABLED",
                                "set TERMINAL_MCP_CAMOFOX_SCREENSHOTS_ENABLED=1 (raw pixels are not redacted)")
         user, tab = self._user(agent_id), self._tab(tab_id)
-        payload, _ctype = self.client.request("GET", f"/tabs/{tab}/screenshot",
-                                              query={"userId": user}, raw=True)
+        self._check_busy(user, tab)
+        try:
+            # Healthy captures take ~0.1 s; upstream sometimes waits 30 s on
+            # fonts. Fail fast and point at the default engine instead.
+            payload, _ctype = self.client.request(
+                "GET", f"/tabs/{tab}/screenshot", query={"userId": user}, raw=True,
+                timeout=min(_SCREENSHOT_TIMEOUT, self.config.request_timeout_seconds))
+        except CamofoxError as exc:
+            if exc.code in ("CAMOFOX_TIMEOUT", "CAMOFOX_UPSTREAM_ERROR"):
+                self._mark_busy(user, tab)
+                last = self._tab_urls.get((user, tab))
+                if last:
+                    exc.fallback_url = last
+            raise
         if not payload.startswith(_PNG_MAGIC):
             raise CamofoxError("CAMOFOX_BAD_RESPONSE", "worker did not return a PNG")
         out_dir = Path(self.config.artifact_dir).expanduser() if self.config.artifact_dir \
@@ -482,6 +561,8 @@ class CamofoxBrowser:
     def close_tab(self, agent_id: str, tab_id: str) -> dict[str, Any]:
         user, tab = self._user(agent_id), self._tab(tab_id)
         self.client.request("DELETE", f"/tabs/{tab}", query={"userId": user})
+        self._busy_until.pop((user, tab), None)
+        self._tab_urls.pop((user, tab), None)
         return {"status": "OK", "tab_id": tab, "closed": True}
 
     def close_all(self, agent_id: str) -> dict[str, Any]:
@@ -491,6 +572,10 @@ class CamofoxBrowser:
         except CamofoxError as exc:
             if exc.code != "CAMOFOX_TAB_NOT_FOUND":
                 raise
+        for key in [k for k in self._busy_until if k[0] == user]:
+            del self._busy_until[key]
+        for key in [k for k in self._tab_urls if k[0] == user]:
+            del self._tab_urls[key]
         return {"status": "OK", "closed_all": True}
 
     # -- dispatch -----------------------------------------------------------
@@ -537,11 +622,16 @@ class CamofoxBrowser:
             result = {"status": "ERROR", "error": exc.code, "detail": scrub(exc.detail, 300)}
             if exc.status is not None:
                 result["http_status"] = exc.status
-            if action == "scroll" and exc.code in ("CAMOFOX_UPSTREAM_ERROR", "CAMOFOX_TIMEOUT"):
-                # Upstream v1.18.1 holds the wheel until its 30 s handler
-                # timeout when the page cannot scroll or an input has focus.
-                result["hint"] = ("upstream wheel timeout: page not scrollable or an input "
-                                  "has focus; scroll before typing")
+            if action in ("scroll", "screenshot") and exc.code in ("CAMOFOX_UPSTREAM_ERROR",
+                                                                  "CAMOFOX_TIMEOUT"):
+                result["hint"] = "upstream action timed out; tab locked upstream for ~30 s"
+            if exc.code in ("CAMOFOX_TAB_BUSY",) or (
+                    exc.code in ("CAMOFOX_UPSTREAM_ERROR", "CAMOFOX_TIMEOUT")
+                    and action in ("scroll", "screenshot")):
+                result["retry_after_seconds"] = int(TAB_BUSY_SECONDS)
+            if exc.fallback_url:
+                result["fallback_call"] = {"tool": "browser_screenshot",
+                                           "url": scrub(exc.fallback_url, 2_048)}
         except (TypeError, ValueError) as exc:
             result = {"status": "ERROR", "error": "CAMOFOX_BAD_REQUEST", "detail": scrub(exc, 300)}
         if result.get("status") == "ERROR":

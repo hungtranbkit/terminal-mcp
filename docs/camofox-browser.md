@@ -26,8 +26,8 @@ direction, amount, offset, allow_mutations)`
 | `snapshot` | agent_id, tab_id, [offset] | accessibility text with refs (`e12`), scrubbed, ≤ `max_snapshot_chars` |
 | `click` | agent_id, tab_id, ref or selector, **allow_mutations** | |
 | `type` | agent_id, tab_id, ref or selector, text, [submit], **allow_mutations** | text is not echoed back |
-| `scroll` | agent_id, tab_id, [direction, amount] | read-only |
-| `screenshot` | agent_id, tab_id | needs `TERMINAL_MCP_CAMOFOX_SCREENSHOTS_ENABLED=1`; returns a local 0600 PNG path |
+| `scroll` | agent_id, tab_id, [direction, amount] | read-only; constant `window.scrollBy` template (not the upstream wheel), returns `scrolled`, `position`, or `reason: at_edge_or_not_scrollable` |
+| `screenshot` | agent_id, tab_id | needs `TERMINAL_MCP_CAMOFOX_SCREENSHOTS_ENABLED=1`; returns a local 0600 PNG path; 12 s fast-fail with a `fallback_call` to `browser_screenshot` |
 | `list_tabs` | agent_id | only that agent's tabs |
 | `close_tab` | agent_id, tab_id | |
 | `close_all` | agent_id | drops the agent's whole browser context |
@@ -36,7 +36,13 @@ Every result carries `status` (`OK`/`ERROR`), `engine: camofox`, `action` and
 `duration_ms`. Errors carry a stable `error` code and
 `fallback: "browser_verify/browser_screenshot remain available"`.
 
-Error codes: `CAMOFOX_DISABLED`, `CAMOFOX_UNAVAILABLE`, `CAMOFOX_TIMEOUT`,
+After a scroll or screenshot times out, upstream keeps that tab locked for about
+30 s. The provider then answers calls on that tab with `CAMOFOX_TAB_BUSY` and
+`retry_after_seconds` (32) at once instead of queueing behind the lock. A failed
+screenshot also carries
+`fallback_call: {"tool": "browser_screenshot", "url": <last allowed tab URL>}`.
+
+Error codes: `CAMOFOX_DISABLED`, `CAMOFOX_TAB_BUSY`, `CAMOFOX_UNAVAILABLE`, `CAMOFOX_TIMEOUT`,
 `CAMOFOX_AUTH_FAILED`, `CAMOFOX_KEY_UNAVAILABLE`, `CAMOFOX_TAB_NOT_FOUND`
 (404/410; also returned for another agent's tab), `CAMOFOX_LIMIT`,
 `CAMOFOX_TAB_LIMIT`, `CAMOFOX_BAD_REQUEST`, `CAMOFOX_BAD_RESPONSE`,
@@ -71,12 +77,22 @@ The worker listens on **127.0.0.1:9377 on m910 only**. There is no public tunnel
 proxy or open port.
 
 - Terminal MCP processes on m910: use the default base URL.
-- Another node: forward the port over SSH and point the provider at the local end:
+- Another node (Dell, HP): use the operator-run, default-off SSH forward in
+  `deploy/camofox/camofox-tunnel.sh`. It listens on 127.0.0.1 only, sets
+  `StrictHostKeyChecking=yes`, and is never enabled at boot unless `--enable` is passed:
 
   ```bash
-  ssh -N -L 127.0.0.1:19377:127.0.0.1:9377 mesflow@<m910-tailscale-ip>
+  deploy/camofox/camofox-tunnel.sh keygen        # prints a forward-only authorized_keys line
+  # owner adds that line on m910 (restrict,port-forwarding,permitopen="127.0.0.1:9377",command="/bin/false")
+  deploy/camofox/camofox-tunnel.sh install --host mesflow@<m910-tailscale-ip>
+  deploy/camofox/camofox-tunnel.sh start && deploy/camofox/camofox-tunnel.sh smoke
   export TERMINAL_MCP_CAMOFOX_BASE_URL=http://127.0.0.1:19377
+  # copy ~/.config/camofox/access.key out of band (chmod 600)
+  deploy/camofox/camofox-tunnel.sh stop | uninstall
   ```
+
+  The forward adds reachability, not authority: the worker still requires the
+  access key.
 
   The access key file must be copied to that node out of band (chmod 600).
   Do not rebind the worker to a non-loopback address.
@@ -126,13 +142,15 @@ registration block in `mcp_app.py`).
 - The worker on m910 is capped at 2 sessions × 2 tabs, 4 tabs global, 1 concurrent
   request per user, 1.4 GB cgroup memory and 150% CPU. Expect `CAMOFOX_LIMIT`
   under contention.
-- Upstream v1.18.1 `scroll` (mouse wheel) hangs until its 30 s handler timeout when
-  the page cannot scroll (e.g. example.com) or after an input has focus; the result
-  is `CAMOFOX_UPSTREAM_ERROR` with a `hint`. Scroll before typing. In the pilot it
-  also hung intermittently on a long page after another tab's screenshot timed out.
-- Upstream screenshots intermittently time out after 30 s ("waiting for fonts to
-  load"): 1 of 5 consecutive raw pilot runs on example.com (evidence). Screenshots
-  stay off by default; treat `CAMOFOX_UPSTREAM_ERROR` as retry-later or fall back
-  to `browser_screenshot`.
+- Upstream v1.18.1 `/scroll` (mouse wheel) hangs for its 30 s handler timeout on
+  about 1 in 4 calls (scrollable or not; always with a focused input), so the
+  provider does not use it. `scroll` runs a constant `window.scrollBy(dx, dy)`
+  template through the worker's evaluate route. The only inputs are two validated
+  integers, there are no input events, and it is not an agent action (agents still
+  have no evaluate). JS scrolling fires `scroll` events but not `wheel` events;
+  a page that only reacts to wheel input will not lazy-load on it.
+- Upstream screenshots intermittently time out ("waiting for fonts to load"):
+  1 of 5 raw runs on 2026-10-19. The provider fails fast at 12 s, marks the tab busy and
+  returns a `browser_screenshot` fallback. Screenshots stay off by default.
 - Tabs idle for 3 minutes and sessions idle for 10 minutes are reaped by the worker. The
   browser process stops after 2 idle minutes and relaunches on demand (about 2 s).
