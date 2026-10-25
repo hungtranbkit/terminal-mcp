@@ -139,9 +139,10 @@ _NODE_ERRORS = ("NODE", "REMOTE", "UNREACHABLE", "OFFLINE", "TUNNEL", "CONNECT",
 def _input_wait(observed: dict[str, Any], output: str | None, default: str) -> dict[str, Any]:
     """wait_reason/reason for a pane that waits for a human.
 
-    A named prompt (folder trust vs sandbox command approval vs tool
-    permission) becomes the wait_reason itself, so the task says exactly what
-    is open and what unblocks it instead of a generic SESSION_INPUT.
+    wait_reason keeps its stable values (SESSION_INPUT[_BEFORE_DISPATCH]); a
+    named prompt (folder trust vs sandbox command approval vs update menu)
+    leads the reason as "KIND: detail", which _view turns into
+    input_prompt_kind and that prompt's own next_action.
     """
     prompt = observed.get("input_prompt")
     if not isinstance(prompt, dict) and output:
@@ -149,7 +150,14 @@ def _input_wait(observed: dict[str, Any], output: str | None, default: str) -> d
     kind = prompt.get("kind") if isinstance(prompt, dict) else None
     if kind not in INPUT_PROMPT_ACTIONS:
         return {"wait_reason": default, "reason": _clip(observed.get("reason"))}
-    return {"wait_reason": kind, "reason": _clip(prompt.get("detail") or observed.get("reason"))}
+    return {"wait_reason": default, "reason": _clip(f"{kind}: {prompt.get('detail') or kind}")}
+
+
+def _input_prompt_kind(task: dict[str, Any]) -> str | None:
+    if task["state"] != "WAITING_INPUT":
+        return None
+    kind = str(task.get("reason") or "").split(":", 1)[0]
+    return kind if kind in INPUT_PROMPT_ACTIONS else None
 
 
 def default_direct_task_path() -> Path:
@@ -707,8 +715,9 @@ class DirectTaskSupervisor:
     def _view(self, task: dict[str, Any]) -> dict[str, Any]:
         state = task["state"]
         next_action = _NEXT_ACTIONS.get(state, "inspect")
-        if state == "WAITING_INPUT" and task.get("wait_reason") in INPUT_PROMPT_ACTIONS:
-            next_action = INPUT_PROMPT_ACTIONS[task["wait_reason"]]
+        prompt_kind = _input_prompt_kind(task)
+        if prompt_kind is not None:
+            next_action = INPUT_PROMPT_ACTIONS[prompt_kind]
         if state == "STUCK_COMPOSER" and (task.get("recovery_attempts") or 0) >= MAX_RECOVERY_ATTEMPTS:
             next_action = ("bounded Enter-only recovery is exhausted: press Enter in the session "
                            "or supervise_cancel. Never resend the text.")
@@ -716,6 +725,7 @@ class DirectTaskSupervisor:
             "task_id": task["task_id"], "target": task["target"], "mode": task["mode"],
             "agent": task.get("agent"),
             "state": state, "wait_reason": task.get("wait_reason"),
+            "input_prompt_kind": prompt_kind,
             "business_complete": state == "DONE",
             "running_confirmed": task.get("accepted_at") is not None,
             "receipt": task.get("receipt") or ("LEGACY_UNVERIFIED" if task["dispatches"] else None),
