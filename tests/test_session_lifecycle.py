@@ -582,7 +582,15 @@ def test_detach_nonexistent_session_reports_not_found(tmp_path):
 
 # -- delete -----------------------------------------------------------------
 
-def test_delete_requires_explicit_confirmation(tmp_path, tmux_session_factory):
+@pytest.fixture
+def clean_delete_git(monkeypatch):
+    # These lifecycle tests run in the developer's checkout. Git safety has
+    # dedicated tests; do not depend on this checkout being clean.
+    monkeypatch.setattr("terminal_mcp.core.probe_git_state", lambda *a, **kw: {"dirty": False})
+
+
+def test_delete_requires_explicit_confirmation(tmp_path, tmux_session_factory, monkeypatch):
+    monkeypatch.setattr("terminal_mcp.core.probe_git_state", lambda *a, **kw: {"dirty": None})
     service = TerminalService(_lifecycle_config(tmp_path))
     name = tmux_session_factory("lifecycle-confirm-required")
     result = service.terminal_delete_session(name, requested_by="tester@example")
@@ -637,7 +645,7 @@ def test_delete_denied_session_does_not_disclose_target(tmp_path, tmux_session_f
     event = service.audit.list(limit=1)[0]
     assert event["session"] is None
 
-def test_delete_terminates_exact_target_only(tmp_path, tmux_session_factory):
+def test_delete_terminates_exact_target_only(tmp_path, tmux_session_factory, clean_delete_git):
     config = _lifecycle_config(tmp_path)
     service = TerminalService(config)
     victim = tmux_session_factory("lifecycle-victim")
@@ -691,7 +699,7 @@ def test_protected_set_always_includes_terminal_mcp_even_if_omitted(tmp_path):
     assert result["error"] == "SESSION_PROTECTED"
 
 
-def test_delete_cleans_up_stale_binding_and_grant(tmp_path, owned_name, tmux_session_factory):
+def test_delete_cleans_up_stale_binding_and_grant(tmp_path, owned_name, tmux_session_factory, clean_delete_git):
     config = _lifecycle_config(tmp_path)
     service = TerminalService(config)
     name = tmux_session_factory(owned_name("cleanup-1"))
@@ -712,7 +720,7 @@ def test_delete_cleans_up_stale_binding_and_grant(tmp_path, owned_name, tmux_ses
     assert grant.read_enabled is False and grant.input_enabled is False
 
 
-def test_delete_disables_supervisor_watch_without_losing_history(tmp_path, owned_name, tmux_session_factory):
+def test_delete_disables_supervisor_watch_without_losing_history(tmp_path, owned_name, tmux_session_factory, clean_delete_git):
     from terminal_mcp.supervisor import SupervisorService, SupervisorStore, watch_key
     config = _lifecycle_config(tmp_path)
     service = TerminalService(config)
@@ -825,7 +833,11 @@ async def test_mcp_tools_registered_for_session_lifecycle(tmp_path):
     config = _lifecycle_config(tmp_path)
     service = TerminalService(config)
     server = build_mcp(service)
-    tool_names = {tool.name for tool in await server.list_tools()}
+    tools = {tool.name: tool for tool in await server.list_tools()}
+    tool_names = set(tools)
+    confirm = tools["terminal_turn"].input_schema["properties"]["confirm"]
+    assert {"type": "boolean"} in confirm["anyOf"]
+    assert "confirm" not in tools["terminal_turn"].input_schema.get("required", [])
     for name in ("terminal_create_session", "terminal_detach_session", "terminal_delete_session"):
         assert name in tool_names
 

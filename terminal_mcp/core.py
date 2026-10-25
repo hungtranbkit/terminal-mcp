@@ -4818,7 +4818,43 @@ class TerminalService:
             self.audit.record(action=action, session=None, result="BLOCKED", reason="ACCESS_DENIED",
                               actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
             return {"error": "ACCESS_DENIED"}
-        if confirm is not True:
+        if name in self.config.session_lifecycle.protected_sessions:
+            self.audit.record(action=action, session=name, result="BLOCKED", reason="SESSION_PROTECTED",
+                              actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
+            return {"error": "SESSION_PROTECTED", "session": name, "deleted": False}
+        # requested_by comes from trusted owner-facing MCP/dashboard or node
+        # wiring. Confirmation applies to this call, never to future deletes.
+        info = None
+        safe_idle = False
+        if requested_by or confirm is True:
+            try:
+                info = self.tmux.get_session(name)
+            except TmuxError as exc:
+                self.audit.record(action=action, session=name, result="BLOCKED", reason="TMUX_ERROR",
+                                  actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
+                return {"error": "TMUX_ERROR", "reason": str(exc), "session": name}
+            if info is not None and (blocker := self._session_delete_runtime_blocker(name, info)) is not None:
+                self.audit.record(action=action, session=name, result="BLOCKED", reason=blocker,
+                                  actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
+                return {"error": blocker, "session": name}
+            if info is not None:
+                try:
+                    output = "\n".join(self.tmux.capture_lines(name, 80))
+                    state, _, _ = classify_status(info, output)
+                except TmuxError as exc:
+                    return {"error": "TMUX_ERROR", "session": name, "deleted": False,
+                            "reason": str(exc)}
+                git = probe_git_state(info.pane_current_path, cache_seconds=0)
+                blocker = ("SESSION_RUNNING" if state == "RUNNING" else
+                           "GIT_DIRTY_CHECKPOINT_REQUIRED" if git.get("dirty") is True else None)
+                if blocker:
+                    self.audit.record(action=action, session=name, result="BLOCKED", reason=blocker,
+                                      actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
+                    return {"error": blocker, "session": name, "deleted": False}
+                safe_idle = state == "IDLE" and git.get("dirty") is False and info.windows == 1
+            else:
+                safe_idle = True  # Already gone: idempotent cleanup.
+        if confirm is not True and not (requested_by and safe_idle):
             self.audit.record(action=action, session=name, result="BLOCKED", reason="CONFIRMATION_REQUIRED",
                               actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
             # `deleted: false` + receipt: nothing was killed and nothing was
@@ -4830,16 +4866,6 @@ class TerminalService:
                     "next_action": ("retry with confirm=true (terminal_delete_session) or "
                                     "terminal_turn(action='delete_session', target=<name>, "
                                     "args={'confirm': true})")}
-        try:
-            info = self.tmux.get_session(name)
-        except TmuxError as exc:
-            self.audit.record(action=action, session=name, result="BLOCKED", reason="TMUX_ERROR",
-                              actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
-            return {"error": "TMUX_ERROR", "reason": str(exc), "session": name}
-        if info is not None and (blocker := self._session_delete_runtime_blocker(name, info)) is not None:
-            self.audit.record(action=action, session=name, result="BLOCKED", reason=blocker,
-                              actor=requested_by, node_id=self.REGISTRY_LOCAL_NODE_ID)
-            return {"error": blocker, "session": name}
         references = self._session_delete_local_references(name)
         result = self.lifecycle.delete(name, protected_sessions=self.config.session_lifecycle.protected_sessions)
         ok = "error" not in result

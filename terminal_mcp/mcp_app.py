@@ -820,7 +820,7 @@ def build_mcp(service: TerminalService | None = None,
                       url: str | None = None, args: dict | None = None,
                       path: str | None = None, content_b64: str | None = None,
                       overwrite: bool = False, mode: str | None = None,
-                      confirm: StrictBool | None = None,
+                      confirm: Annotated[StrictBool | None, Field(description="One-call confirmation for risky delete_session requests; never overrides active work or dirty Git blockers.")] = None,
                       steps: list[dict[str, Any]] | None = None,
                       viewport: dict[str, Any] | None = None,
                       screenshot: str | None = None,
@@ -884,7 +884,7 @@ Direct actions:
   supervise_status/supervise_complete/supervise_cancel  (task_id; status also
                 takes idempotency_key or target)
   list_sessions/list, list_nodes/nodes
-  create_session/create, delete_session/delete (confirm=true, or args={"confirm": true})
+  create_session/create, delete_session/delete (idle owner cleanup is immediate; risky targets require confirm=true, or args={"confirm": true})
   session_lifecycle (read-only classification), session_reconcile (dry run by default)
   task_status/task, task_batch_status/tasks (read-only historical task state)
   browser_verify/browser_screenshot/browser_status/browser_stop
@@ -1322,8 +1322,10 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
     @server.tool()
     def terminal_delete_session(name: str, confirm: bool = False) -> dict:
         """Terminate and remove exactly one tmux session (never affects
-        any other session, never uses tmux kill-server). The configured
-        `confirm` must be true; omission is refused server-side. The
+        any other session, never uses tmux kill-server). An
+        owner-authorized clean idle session needs no extra confirmation. Risky
+        targets require `confirm=true` for this call only. Running work and
+        dirty Git cannot be overridden by confirmation. The
         protected session(s) -- always including "terminal-mcp" itself --
         can never be deleted this way. Idempotent: a session already gone
         returns a success-shaped result, not an error. Cleans up any
