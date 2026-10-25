@@ -1,5 +1,32 @@
 # PROJECT_CONTEXT.md
 
+## 2026-10-26 — P0 menus, bare-name preflight, single fallback (PR #95 commit `6efafde`, NOT deployed)
+
+- **Why**: issue #80/#93 follow-up. Sessions hung on menus nobody named, and bare-name `start` failed `STATUS_PROBE_TIMEOUT` before sending.
+  - The live Claude "We recommend compacting earlier" dialog read RUNNING/UNKNOWN.
+  - The Codex model-migration and rate-limit model-switch menus had no detector.
+  - The direct-start preflight resolved a bare name across the whole fleet inside a 2 s status slice, one node at a time.
+- **Changes**:
+  - `adapters.py`: detectors `codex_model_migration_prompt`, `codex_rate_limit_switch_prompt`, `claude_autocompact_prompt`, `claude_rate_limit_menu`, each in `INPUT_PROMPT_ACTIONS` with an owner action. Also a shared `USAGE_LIMIT_NOTICE` and `usage_limit_notice()` (bottom rows only), which `direct_task._USAGE_LIMIT` now aliases.
+  - `status.py`: these kinds read `WAITING_INPUT`.
+  - `core.py` status payload: an idle pane whose latest answer is a usage-limit notice gets `blocked_reason: AGENT_USAGE_LIMIT` plus `usage_limit`. `state` is unchanged.
+  - `lifecycle.py`:
+    - The Codex update menu is skipped once with Escape (owner-authorized, non-granting), with no general input grant needed. The session-name deny floor still applies, and a menu that survives the skip is reported, not retried.
+    - The model-migration and rate-limit menus BLOCK startup and are never answered.
+  - `compact_tools._codex_direct_start` → `_direct_start_once` plus a wrapper:
+    - A bare name is resolved first (`DIRECT_RESOLVE_SECONDS=8`), then the qualified `node/session` is used for both status and send.
+    - The pre-send status read gets 8 s; each post-send poll gets 2 s.
+    - A not-idle target returns `task_state` WAITING_INPUT/BLOCKED/RUNNING with `blocked_reason` and `next_action` (`_target_blocker`).
+  - **Fallback**: optional caller-named `args.fallback_target`, exactly one attempt, only when the primary provably typed nothing (`FALLBACK_SAFE_ERRORS`, or a send refused by a guard in `FALLBACK_SAFE_SEND_REASONS`). The fallback may be codex or claude.
+    - A primary that reached `SUBMIT_CONFIRMED` but was never seen RUNNING is marked `submitted: true` and is never fallen back or completed.
+    - There is no queue, and no target picked automatically.
+  - `controller.resolve_session`: the bounded path lists online nodes in parallel (≤8 workers, no waiting on stragglers).
+- **Tests** (local, no GitHub Actions):
+  - `tests/test_p0_menus_preflight_fallback.py`: 25 tests. The parallel-resolution test was shown to fail on the old controller.
+  - Fixtures: `claude_autocompact_prompt_80col.txt` is a live capture with the other session's text trimmed. The `*.synth.txt` fixtures are rebuilt from codex 0.162 binary strings, and the test file docstring says so.
+  - The wider related set (812 tests incl. the finalizer branch) passed.
+- **Deploy**: none (not authorized for this task). Prod still runs 52408a7, so bare-name `start` still times out on prod until this is rolled out.
+
 ## 2026-10-25 — Session prompt hangs: managed Codex trust, named prompts, guarded remote send, spaced markers (PR #95, DEPLOYED)
 
 - **Branches/PR**: source `fix/session-prompt-hang-20261025` (on main `4b9c44d`) → draft PR #95. Deployed tree `deploy/session-prompt-hang-on-b3de57c-20261025` @ `52408a765156c6bbf59b43e339ad937a4c1afb66` = HP's live base `b3de57c` (draft PR #92 contention fix) + the same commits. Deploying main-based code to HP would have dropped #92, so do not.
@@ -48,8 +75,7 @@
   - A real sandbox approval showed as WAITING_INPUT `CODEX_SANDBOX_APPROVAL: … touch approval-probe.txt`. The owner approved it from the dashboard (`Down`, `Enter`, audited identity) and Codex resumed and finished.
 - **Open / next**:
   - **HP root FS is 100% full** (~1.5 GB free and falling; 55 GB images, 20 GB volumes, 30 GB workspaces). It caused `disk I/O error` on `nodes.db` and dell showed offline from 11:10 to 11:33. I pruned only the unused Docker build cache (3.4 GB). The owner must decide on images and volumes and find the writer.
-  - Bare-name `start` can return `STATUS_PROBE_TIMEOUT` (honest, nothing sent) because resolution scans the fleet inside the wait slice. Node-qualified targets (`dell-linux/<name>`) succeed. This needs a controller fix (PR #92 area).
-  - Codex's update menu still blocks unattended starts unless the startup-input policy permits Escape. It is now reported as WAITING_INPUT `CODEX_UPDATE_MENU`. Setting `check_for_update_on_startup=false` in `~/.codex/config.toml` is an owner decision.
+  - Bare-name `start` `STATUS_PROBE_TIMEOUT` and the update menu blocking unattended starts are both fixed in code by `6efafde` (section above), not yet deployed. Until then, use `dell-linux/<name>` targets.
   - Four inert trust entries for deleted test repos remain in dell `~/.codex/config.toml` (`tmcp-smoke-repo-20261025`, `tmcp-e2e{,2,3}-repo-20261025`).
   - Other nodes (m910, nec1, mac) still run old agents. A guarded start to them answers IDLE_GUARD_UNSUPPORTED until they are upgraded.
   - Merge #95, then reconcile #79 (its guard part is superseded) and #92.
