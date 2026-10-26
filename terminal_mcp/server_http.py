@@ -21,7 +21,7 @@ from .config import AppConfig, load_config
 from . import endpoint_policy
 from .connection_store import ConnectionStore
 from .enrollment import EnrollmentStore
-from .node_credentials import NodeCredentialStore
+from .node_credentials import NodeCredentialStore, token_fingerprint
 from .node_onboarding import OnboardingService
 from .node_transport import TransportStore
 from .rescue_gateway import RescuePortAllocator
@@ -183,7 +183,36 @@ def endpoint_is_this_host(endpoint: str) -> bool:
     return False
 
 
-def register_remote_nodes(controller, config) -> list[str]:
+def resolve_boot_token(node_id: str, env_token: str | None, *, connection_store=None,
+                       credentials=None) -> tuple[str | None, str]:
+    """Which token a config-declared node boots with: (token, source).
+
+    The env var is the default and stays the default. The saved 0600 token
+    file replaces it only when the credential ledger says the file holds
+    THIS node's ACTIVE token and the env value is not it -- the state a
+    confirmed rotation leaves behind when the EnvironmentFile was never
+    updated. This only chooses between tokens the controller already holds
+    and its own ledger accepts; it never admits a new one. Unmanaged nodes
+    (no ledger rows) keep the legacy env-only behaviour.
+    """
+    if connection_store is None or credentials is None:
+        return env_token, "env"
+    try:
+        if not credentials.is_managed(node_id):
+            return env_token, "env"
+        active_id = credentials.active_token_id(node_id)
+        if env_token and credentials.verify(node_id, env_token).token_id == active_id:
+            return env_token, "env"
+        saved = connection_store.get(node_id)
+        file_token = connection_store.read_token(saved.token_file) if saved and saved.token_file else None
+        if file_token and active_id and credentials.verify(node_id, file_token).token_id == active_id:
+            return file_token, "token_file"
+    except Exception:  # noqa: BLE001 -- precedence is advisory; never block startup on it
+        _log.exception("nodes: could not check %r's token against the credential ledger", node_id)
+    return env_token, "env"
+
+
+def register_remote_nodes(controller, config, *, connection_store=None, credentials=None) -> list[str]:
     """Registers every `nodes.remote` entry on `controller`; returns the ids
     actually registered.
 
@@ -206,7 +235,17 @@ def register_remote_nodes(controller, config) -> list[str]:
                        "A controller listed in its own nodes.remote registers itself as one of its own "
                        "remote nodes; remove this entry from config.yaml.", remote.node_id, remote.endpoint)
             continue
-        token = os.environ.get(remote.token_env)
+        env_token = os.environ.get(remote.token_env)
+        token, source = resolve_boot_token(remote.node_id, env_token, connection_store=connection_store,
+                                           credentials=credentials)
+        if source == "token_file":
+            _log.warning("nodes: %r's %s (fingerprint %s) is not its ACTIVE credential; booting with the "
+                         "rotated token file instead (fingerprint %s). Update the controller's "
+                         "EnvironmentFile so the two agree.", remote.node_id, remote.token_env,
+                         token_fingerprint(env_token) if env_token else "unset", token_fingerprint(token))
+            # Inbound verification and later code read the env var; keep it
+            # in step with what was registered.
+            os.environ[remote.token_env] = token
         if not token:
             _log.warning("nodes: skipping remote node %r -- environment variable %s is not set "
                         "(this node will not be registered until it is)", remote.node_id, remote.token_env)
@@ -423,14 +462,17 @@ def main() -> None:
                                    local_client=LocalNodeClient(terminal),
                                    local_workspace_root=workspace_root,
                                    node_health_config=config.nodes.health)
-    register_remote_nodes(controller, config)
+    # Built before register_remote_nodes so a config-declared node boots
+    # with its ledger-ACTIVE token -- see resolve_boot_token.
+    connection_store = ConnectionStore()
+    credentials = NodeCredentialStore()
+    register_remote_nodes(controller, config, connection_store=connection_store, credentials=credentials)
 
     # ONE explicit, persistent (real default ~/.local/state/terminal-mcp/
     # connections.db) ConnectionStore, same "never fall into the private-
     # temp-file test default" discipline as ControllerService/NodeRegistry
     # just above -- see dashboard.py's register_dashboard docstring for
     # why that fallback exists and must never be the production path.
-    connection_store = ConnectionStore()
     # Re-hydrate any node connected at runtime via the LAN-discovery/
     # remote-connect dashboard feature (LAN SSH, Cloudflare-tunnel SSH, or
     # agent-token) from ITS last run -- task's own "controller restart
@@ -500,7 +542,6 @@ def main() -> None:
     # after a restart with no extra code, and every enroll/revoke/remove
     # lands in the SAME audit log as every other action.
     # Persistent node credentials -- the durable half of rotation/revocation.
-    credentials = NodeCredentialStore()
 
     def _manage_enrolled_token(node_id: str, token: str) -> None:
         os.environ[node_token_env_var(node_id)] = token
