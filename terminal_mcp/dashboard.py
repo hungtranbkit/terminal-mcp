@@ -58,6 +58,7 @@ from .core import TerminalService
 from .ai_usage_service import AiUsageService
 from . import terminal_wall
 from .live_sessions import EXPANDED_TAIL_LINES, MAX_EXPANDED, LiveSessionMonitor
+from .herdr_runtime import adapter_from_env as herdr_adapter_from_env, unified_rows
 from .live_sessions_page import LIVE_SESSIONS_HTML
 from .session_resource import probe_git_state
 from .recovery_engine import RecoveryEngine
@@ -14745,7 +14746,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         controller, audit=terminal.audit, queue_store=_queue_store_for_worktrees(),
         run_journal=run_journal,
         direct_tasks=lambda: getattr(server, "direct_task_supervisor", None),
-        git_probe=probe_git_state)
+        git_probe=probe_git_state,
+        # Herdr pilot: inert (no subprocess) unless HERDR_ENABLED=1 and this
+        # node is in TERMINAL_MCP_HERDR_NODES.
+        herdr=herdr_adapter_from_env(getattr(controller, "local_node_id", "local")))
     server.live_session_monitor = live_monitor
 
     @server.custom_route("/dashboard/live", methods=["GET"], include_in_schema=False)
@@ -14777,6 +14781,30 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             payload = {"error": "LIVE_SESSIONS_FAILED", "detail": str(exc), "sessions": [],
                        "counts": {}}
         payload["expanded_tail_lines"] = EXPANDED_TAIL_LINES
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/runtime-sessions", methods=["GET"], include_in_schema=False)
+    async def dashboard_runtime_sessions(request: Request) -> JSONResponse:
+        """Unified read-only list, source=tmux|herdr. _read_guard like the live
+        view; a broken Herdr shows up as sources.herdr.status=degraded and the
+        tmux rows are still served."""
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+
+        def build():
+            try:
+                listing = controller.terminal_list_sessions() or {}
+            except Exception as exc:  # noqa: BLE001
+                listing = {"sessions": [], "error": f"{type(exc).__name__}: {exc}"}
+            herdr = live_monitor.herdr.snapshot() if live_monitor.herdr is not None else None
+            payload = unified_rows(list(listing.get("sessions") or []), herdr,
+                                   local_node_id=getattr(controller, "local_node_id", "local"))
+            if listing.get("error"):
+                payload["sources"]["tmux"] = {"status": "degraded", "detail": listing["error"]}
+            return payload
+
+        payload = await anyio.to_thread.run_sync(build)
         return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/ai-usage", methods=["GET"], include_in_schema=False)

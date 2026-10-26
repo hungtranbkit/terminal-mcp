@@ -136,6 +136,7 @@ class LiveSessionMonitor:
                  run_journal: Any = None,
                  direct_tasks: Callable[[], Any] | Any = None,
                  git_probe: Callable[[str | None], dict[str, Any]] | None = None,
+                 herdr: Any = None,
                  ttl_seconds: float = DEFAULT_TTL_SECONDS,
                  clock: Callable[[], float] = time.time) -> None:
         self.controller = controller
@@ -144,6 +145,9 @@ class LiveSessionMonitor:
         self.run_journal = run_journal
         self._direct_tasks = direct_tasks
         self._git_probe = git_probe
+        # Optional herdr_runtime.HerdrRuntimeAdapter (pilot). Its rows ride
+        # alongside, never inside, the tmux list: tmux stays the default.
+        self.herdr = herdr
         self.ttl = ttl_seconds
         self.clock = clock
         self.tracker = OutputChangeTracker()
@@ -315,7 +319,17 @@ class LiveSessionMonitor:
             "running_within_seconds": terminal_wall.RUNNING_WITHIN_SECONDS,
             "monitor_started_at": self._started_at,
             "read_only": True,
+            "runtimes": self._runtimes(),
         }
+
+    def _runtimes(self) -> dict[str, Any]:
+        if self.herdr is None:
+            return {}
+        try:
+            return {"herdr": self.herdr.snapshot()}
+        except Exception as exc:  # noqa: BLE001 -- the adapter already never raises
+            return {"herdr": {"source": "herdr", "enabled": True, "status": "degraded",
+                              "blocker": "HERDR_ADAPTER_ERROR", "detail": str(exc), "rows": []}}
 
     def _status(self, name: str, node_id: str, local_node_id: str) -> dict[str, Any]:
         target = name if node_id == local_node_id else f"{node_id}/{name}"

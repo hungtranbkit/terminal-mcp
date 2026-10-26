@@ -54,6 +54,13 @@ LIVE_SESSIONS_HTML = r"""<!doctype html>
     .banner { border:1px solid var(--line); background:var(--panel2); border-radius:10px; padding:8px 12px;
               margin:0 0 10px; font-size:13px }
     .banner.warn { border-color:#6b4f12; color:var(--amber) }
+    .rt { border:1px solid var(--line); background:var(--panel2); border-radius:10px; padding:8px 12px;
+          margin:0 0 10px; font-size:13px; overflow-x:auto }
+    .rt table { border-collapse:collapse; width:100% }
+    .rt td, .rt th { text-align:left; padding:3px 8px 3px 0; white-space:nowrap }
+    .rt .src { color:var(--violet); font-weight:700 }
+    .rt .st-working { color:var(--green) } .rt .st-blocked { color:var(--red) }
+    .rt .st-unknown, .rt .stale { color:var(--muted) }
     #list { display:grid; gap:10px; grid-template-columns:repeat(auto-fill, minmax(min(100%, 430px), 1fr)) }
     .card { background:var(--panel); border:1px solid var(--line); border-left:4px solid var(--line);
             border-radius:12px; padding:10px 12px; min-width:0; display:flex; flex-direction:column; gap:6px }
@@ -121,6 +128,7 @@ LIVE_SESSIONS_HTML = r"""<!doctype html>
     <button class="chip" data-f="all">Tất cả<b id="c-all">0</b></button>
   </div>
   <div id="banners"></div>
+  <div id="runtimes"></div>
   <div id="list" aria-live="polite"></div>
   <div class="empty" id="empty" hidden>Không có session nào khớp bộ lọc.</div>
 </div>
@@ -275,6 +283,40 @@ LIVE_SESSIONS_HTML = r"""<!doctype html>
     card.append(act);
     return card;
   }
+  // Herdr pilot (herdr_runtime.py): a separate source next to the tmux cards.
+  // Shown only when the server reports it enabled; degraded = a static banner,
+  // never a spinner.
+  function renderRuntimes(now) {
+    const box = $('runtimes'); box.textContent = '';
+    const h = (data.runtimes || {}).herdr;
+    if (!h || !h.enabled) return;
+    const wrap = el('div', 'rt');
+    const head = el('div', null, '');
+    head.append(el('span', 'src', 'herdr pilot'), el('span', 'muted',
+      ` · session ${h.session || '?'} · ${h.status}` + (h.version ? ` · v${h.version}` : '')));
+    wrap.append(head);
+    if (h.status !== 'ok') wrap.append(el('div', 'banner warn',
+      `Herdr lỗi (${h.blocker || '?'}): ${h.detail || ''} — tmux vẫn hoạt động bình thường.`));
+    const rows = h.rows || [];
+    if (!rows.length) { wrap.append(el('div', 'muted', 'Không có pane nào trong session pilot.')); }
+    else {
+      const t = el('table'); const hr = el('tr');
+      for (const c of ['nguồn', 'node', 'pane', 'agent', 'trạng thái', 'task', 'repo', 'blocker', 'đổi trạng thái'])
+        hr.append(el('th', 'muted', c));
+      t.append(hr);
+      for (const r of rows) {
+        const tr = el('tr', r.stale ? 'stale' : null);
+        const changed = r.state_changed_at ? age(now - r.state_changed_at) + ' trước' : '—';
+        for (const [v, cls] of [[r.source, 'src'], [r.node_id], [r.pane_id], [r.agent || (r.is_agent ? '?' : 'shell')],
+                                [r.state + (r.stale ? ' (cũ)' : ''), 'st-' + r.state], [r.task_id || '—'],
+                                [r.repo || r.cwd || '—'], [r.blocker || '—'], [changed]])
+          tr.append(el('td', cls || null, String(v ?? '—')));
+        t.append(tr);
+      }
+      wrap.append(t);
+    }
+    box.append(wrap);
+  }
   function render() {
     if (!data) return;
     const now = data.generated_at || Date.now() / 1000;
@@ -297,6 +339,7 @@ LIVE_SESSIONS_HTML = r"""<!doctype html>
     for (const e of data.source_errors || []) banners.append(el('div', 'banner warn', 'Nguồn dữ liệu lỗi: ' + e));
     if (data.error) banners.append(el('div', 'banner warn', data.error + ': ' + (data.detail || '')));
 
+    renderRuntimes(now);
     const list = $('list');
     const visible = sessions.filter(matches);
     const keep = new Set(visible.map(s => s.key));
