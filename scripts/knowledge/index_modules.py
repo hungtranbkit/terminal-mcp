@@ -156,6 +156,8 @@ GROUPS['queue'].append('queue_policy.py')
 GROUPS['session_ops'].append('session_admission.py')
 GROUPS['session_registry'].append('session_reconciler.py')
 GROUPS['work_ui'].extend(['live_sessions.py', 'live_sessions_page.py'])
+# Herdr pilot adapter: feeds the live view's runtimes.herdr panel.
+GROUPS['work_ui'].append('herdr_runtime.py')
 
 # Operational artifacts that are part of the system but are not Python. Kept
 # separate from GROUPS so the completeness check over the package stays
