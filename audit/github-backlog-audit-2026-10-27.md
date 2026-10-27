@@ -66,7 +66,7 @@ Repositories enumerated: **59** (owner/collaborator/organization_member affiliat
 | `hungtranbkit/sodoc` | 2 | 0 | — |
 | `hungtranbkit/startup-pixel` | 90 | 34 | — |
 | `hungtranbkit/terminal-mcp` | 7 | 18 | — |
-| `hungtranbkit/tro-ly` | 1 | 0 | — |
+| `hungtranbkit/tro-ly` | 1 | 0 | No |
 
 ## Scope and sequence
 
@@ -88,4 +88,5 @@ Read-only session/task survey found active Routerflow APK build, FSR backlog cle
 ## Progress log
 
 - 2026-10-27: full account-affiliation repository pagination completed (59 repositories); baseline saved above. FSR initial pass closed evidence-complete issues #139 and #141; consolidated 21 incomplete/smaller issues into #133 with acceptance/checklist links and closed them as `not planned`; PR #70 closed as superseded after source scope was shown already integrated. FSR after initial pass: 15 issues / 15 PRs, including concurrently opened PR #148. See issue/PR records in GitHub.
-- Current remaining work: complete FSR audit including #147/#125/#129 and active Brand Agent PRs; then proceed by priority above. Append per-repo before/after counts, evidence links, actions, and blockers here as work proceeds.
+- 2026-10-27 FSR audit: #147 is an active AI Sales parent; #125/#129 were consolidated into #133 as `not planned`, with their incomplete checklists preserved in #133 and explicitly linked from #147. Corrected stale checked boxes in #133 after discovering they overstated BA-01–BA-19 acceptance; only #139/#141 are marked completed with evidence. Active unique PRs #142, #144, #145, #146, #148 remain open; #148 has synthetic 89/89 Debug and Beta tests, but Meta/inventory/device gates remain blocked. Other unique unfinished work remains: #138 awaits authorized staging and review; #111 API/scanner release gates remain; #105/#106 parser evidence/gold-label gates remain. FSR remains 15 issues / 15 PRs. Exact item evidence is in GitHub (#133 audit note; #138/#111/#148 PR descriptions/comments).
+- Current remaining work: audit terminal-mcp, so-tro, routerflow, rag-engine/Gateway, offline-pos, startup-pixel, then other repos by risk and age. Append per-repo before/after counts, evidence links, actions, and blockers here as work proceeds.
