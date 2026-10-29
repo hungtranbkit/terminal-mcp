@@ -331,9 +331,14 @@ network — check `nodes.onboarding.controller_url`).
 
 **The node shows online but sessions cannot be created on it.**
 Expected on the Minimal profile: it has connectivity, SSH and a heartbeat,
-but no `terminal-node-agent` process. For an AI Coding node, first confirm the
-controller has a published bundle, then repair from an elevated PowerShell
-opened on the Windows machine:
+but no `terminal-node-agent` process. `-Repair` preserves the selected profile,
+so it deliberately does not turn a Minimal node into an agent host. Enroll it
+again with the AI Coding profile, using a new single-use enrollment code, when
+full session hosting is wanted. Do not reuse or reveal the existing node token.
+
+For a node already enrolled with AI Coding, first confirm the controller has a
+published bundle, then repair from an elevated PowerShell opened on the Windows
+machine:
 
 ```powershell
 Set-Location 'C:\ProgramData\TerminalMCP'
