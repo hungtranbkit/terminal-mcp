@@ -75,6 +75,7 @@ file count from `ls tests/*.py`), not recalled from memory.
 | Remote Linux node (RemoteNodeClient + node-agent) | VERIFIED |
 | macOS worker node | VERIFIED |
 | Windows native/ConPTY backend | VERIFIED |
+| Windows node-agent bundle build/publish/delivery | VERIFIED LOCALLY — deterministic bundle, immutable publisher and authenticated route; live Windows install remains node-dependent |
 | Dashboard: auth (Cloudflare Access + CSRF) | VERIFIED |
 | Dashboard: session tabs, live terminal/output/input | VERIFIED |
 | Dashboard: fullscreen/mobile behavior | VERIFIED |
@@ -2298,6 +2299,33 @@ tests/limitations/dependencies/follow-up/trace — for every checkpoint
 listed in §19, plus the living-requirements convention itself. This
 section is the backfill the user asked for; §1-§19 above are the fast-
 scan/audit view over the SAME facts.)*
+
+### Windows node-agent bundle publication — 2026-10-29
+
+- **Goal / user value:** a Windows node that already registers and sends a
+  heartbeat must be able to obtain the source and installer required to open
+  its authenticated session transport on port 8790. The controller route alone
+  is insufficient when its artifact store is empty.
+- **Status: VERIFIED LOCALLY; live delivery route verified on HP.** The bundle
+  is deterministic, SHA256-pinned, excludes tests/dotfiles/native build debris,
+  and is served only when the request carries that node's own credential.
+  `terminal-mcp-publish-agent-bundle` is now the supported release operation:
+  it requires a clean Git checkout, requires `build_sha` to equal checkout
+  `HEAD`, rejects path-like version names, and refuses to overwrite an existing
+  version. Publication is side-by-side and does not restart the controller.
+- **Tests:** `tests/test_agent_bundle.py`, `tests/test_node_agent_install.py`,
+  `tests/test_node_agent_python312.py`, the bootstrap route/ingress tests, and
+  the Windows onboarding source-contract tests.
+- **Security / rollback:** node tokens remain in their mode-0600 files and are
+  neither bundle inputs nor publisher output. A newly published version can be
+  rolled back before node installation by moving only its version directory
+  out of the artifact store; older versions are retained. After a node has
+  installed it, recovery is a newer forward release plus `windows-setup.ps1
+  -Repair` so the installed state remains auditable.
+- **Live limitation:** publishing and an HTTP 200/metadata/hash check prove
+  controller delivery. They do not prove Windows service installation or real
+  session hosting; those require running repair on the physical Windows node
+  and then authenticated `/v1/sessions` verification from the controller.
 
 ### The budget and the gate, proven against a real run (dogfood) — 2026-09-14
 

@@ -123,6 +123,45 @@ def test_available_never_leaks_the_path(tmp_path, store):
     assert set(found["bundle"]) == {"version", "build_sha", "sha256", "size", "name"}
 
 
+def test_publish_release_builds_and_publishes_one_clean_version(tmp_path, store):
+    head = ab._git_head(REPO)
+    result = ab.publish_release(
+        REPO, version="0.13.0-qa.1", build_sha=head, root=store,
+        allow_dirty=True,
+    )
+
+    assert result["version"] == "0.13.0-qa.1"
+    assert result["build_sha"] == head
+    assert result["path"] == str(store / "0.13.0-qa.1" / ab.BUNDLE_NAME)
+    assert ab.resolve(root=store)["sha256"] == result["sha256"]
+
+
+def test_publish_release_refuses_to_overwrite_an_existing_version(tmp_path, store):
+    head = ab._git_head(REPO)
+    ab.publish_release(REPO, version="0.13.0-qa.1", build_sha=head,
+                       root=store, allow_dirty=True)
+
+    with pytest.raises(ab.BundleError) as caught:
+        ab.publish_release(REPO, version="0.13.0-qa.1", build_sha=head,
+                           root=store, allow_dirty=True)
+    assert caught.value.code == "VERSION_EXISTS"
+
+
+@pytest.mark.parametrize("version", ("../escape", "/absolute", "bad version", ""))
+def test_publish_release_refuses_unsafe_version_names(tmp_path, store, version):
+    with pytest.raises(ab.BundleError) as caught:
+        ab.publish_release(REPO, version=version, build_sha=ab._git_head(REPO),
+                           root=store, allow_dirty=True)
+    assert caught.value.code == "INVALID_VERSION"
+
+
+def test_publish_release_refuses_a_build_sha_other_than_repo_head(store):
+    with pytest.raises(ab.BundleError) as caught:
+        ab.publish_release(REPO, version="0.13.0-qa.1", build_sha="0" * 40,
+                           root=store, allow_dirty=True)
+    assert caught.value.code == "BUILD_SHA_MISMATCH"
+
+
 # ---------------------------------------------------------------------------
 # extraction safety -- what the node will do with these bytes
 # ---------------------------------------------------------------------------

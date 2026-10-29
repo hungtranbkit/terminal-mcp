@@ -38,6 +38,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import subprocess
+import tempfile
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -52,6 +55,7 @@ BUNDLE_NAME = "terminal-mcp-node-agent.zip"
 BUNDLE_FILES = ("pyproject.toml", "config.example.yaml", "deploy/install-node-agent.ps1",
                  "deploy/node-agent-config.yaml")
 BUNDLE_PACKAGE = "terminal_mcp"
+_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 # Excluded from the package copy: bytecode and caches are rebuilt on the
 # node, and shipping them makes the hash depend on whoever ran the build.
@@ -172,6 +176,63 @@ def publish(source: Path, *, version: str, build_sha: str,
     return manifest
 
 
+def _git(repo_root: Path, *args: str) -> str:
+    try:
+        result = subprocess.run(
+            ("git", "-C", str(repo_root), *args), check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise BundleError("GIT_ERROR", f"cannot inspect release checkout {repo_root}") from exc
+    return result.stdout.strip()
+
+
+def _git_head(repo_root: Path) -> str:
+    return _git(Path(repo_root), "rev-parse", "HEAD")
+
+
+def publish_release(repo_root: Path, *, version: str, build_sha: str,
+                    root: Path | None = None, allow_dirty: bool = False) -> dict[str, Any]:
+    """Build and publish one immutable release checkout.
+
+    This is the operator-facing path.  It closes three easy deployment
+    mistakes that the lower-level ``build``/``publish`` primitives cannot:
+    path-like version names, a manifest claiming the wrong commit, and
+    silently overwriting a version that a Windows node may already have.
+    A unique version directory also makes publication crash-safe: resolve()
+    ignores it until its manifest is present, and rollback is removal of that
+    one directory while all older releases remain intact.
+    """
+    repo_root = Path(repo_root).resolve()
+    root = (root or bundle_root()).resolve()
+    if not _VERSION_RE.fullmatch(version):
+        raise BundleError("INVALID_VERSION", "version must contain only letters, numbers, '.', '_' or '-'")
+    head = _git_head(repo_root)
+    if build_sha != head:
+        raise BundleError("BUILD_SHA_MISMATCH", f"build_sha must equal checkout HEAD ({head})")
+    if not allow_dirty and _git(repo_root, "status", "--porcelain"):
+        raise BundleError("DIRTY_CHECKOUT", "release checkout has uncommitted or untracked files")
+    destination = root / version
+    if destination.exists():
+        raise BundleError("VERSION_EXISTS", f"node-agent bundle version {version} already exists")
+
+    root.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="terminal-mcp-agent-bundle-") as temp:
+        built = build(repo_root, Path(temp) / BUNDLE_NAME)
+        manifest = publish(built, version=version, build_sha=build_sha, root=root)
+    found = resolve(root=root)
+    if found["version"] != version or found["build_sha"] != build_sha:
+        raise BundleError("PUBLISH_VERIFY_FAILED", "published bundle did not resolve as the requested release")
+    return {
+        "version": version,
+        "build_sha": build_sha,
+        "sha256": manifest["bundle"]["sha256"],
+        "size": manifest["bundle"]["size"],
+        "path": str(destination / BUNDLE_NAME),
+        "manifest_path": str(destination / MANIFEST_NAME),
+    }
+
+
 def _published_versions(root: Path) -> list[Path]:
     if not root.is_dir():
         return []
@@ -222,3 +283,37 @@ def available(root: Path | None = None) -> dict[str, Any]:
         return {"published": False, "bundle": None}
     return {"published": True,
             "bundle": {k: v for k, v in found.items() if k != "path"}}
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Build and publish a Windows node-agent bundle on the controller."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="terminal-mcp-publish-agent-bundle",
+        description="Build and publish an immutable Windows node-agent bundle.",
+    )
+    parser.add_argument("--repo-root", type=Path, required=True,
+                        help="clean terminal-mcp release checkout to package")
+    parser.add_argument("--version", required=True,
+                        help="unique release version (letters, numbers, dot, underscore, dash)")
+    parser.add_argument("--build-sha", required=True,
+                        help="full git HEAD of the release checkout")
+    parser.add_argument("--store", type=Path, default=None,
+                        help="bundle store (default: controller state directory)")
+    parser.add_argument("--allow-dirty", action="store_true",
+                        help="development only: package a checkout with local changes")
+    args = parser.parse_args(argv)
+    try:
+        result = publish_release(
+            args.repo_root, version=args.version, build_sha=args.build_sha,
+            root=args.store, allow_dirty=args.allow_dirty,
+        )
+    except BundleError as exc:
+        parser.exit(2, f"{exc.code}: {exc.detail}\n")
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised through main()
+    raise SystemExit(main())

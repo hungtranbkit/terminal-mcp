@@ -135,6 +135,48 @@ nodes:
 The loader **refuses** `tailscale.auth_key` and any `rescue.*private_key*`
 / `*password*` field outright, rather than accepting and redacting them.
 
+### Publish the Windows node-agent bundle
+
+The AI Coding profile installs the session agent from a controller-hosted,
+SHA256-pinned bundle. Publishing is an explicit release step; the HTTP route
+returns `NOT_PUBLISHED` until an operator runs it. Use a clean, immutable
+checkout and a unique, monotonically increasing version:
+
+```bash
+release_dir=/path/to/clean/terminal-mcp-release
+release_sha=$(git -C "$release_dir" rev-parse HEAD)
+terminal-mcp-publish-agent-bundle \
+  --repo-root "$release_dir" \
+  --version "0.13.0-20261029.${release_sha:0:7}" \
+  --build-sha "$release_sha"
+```
+
+The default store is
+`~/.local/state/terminal-mcp/node-agent/<version>/`. The running controller
+reads it on each request, so publication requires no controller restart.
+The command refuses a dirty checkout, a commit other than checkout `HEAD`,
+an unsafe version name, or an existing version directory. It prints the
+bundle path, manifest path, byte count and SHA256; it never reads or prints a
+node token.
+
+Verify the live route with the node's credential loaded from its mode-0600
+token file. Keep the value in a shell variable and do not enable shell trace:
+
+```bash
+node_id=win
+controller_url=http://100.67.53.117:8766
+node_token=$(cat "$HOME/.local/state/terminal-mcp/node-tokens/$node_id.token")
+curl --fail --silent --show-error --head \
+  -H "Authorization: Bearer $node_token" \
+  "$controller_url/dashboard/api/nodes/$node_id/agent-bundle"
+unset node_token
+```
+
+Rollback is filesystem-only: move the new version directory outside the
+store. Older version directories remain untouched. Do this only before a
+node installs that version; after installation, publish a newer fixed version
+and run repair so the node receives an auditable forward update.
+
 ### Standing up a rescue gateway
 
 Any host with a public address and sshd. One unprivileged account, used for
@@ -289,6 +331,20 @@ network — check `nodes.onboarding.controller_url`).
 
 **The node shows online but sessions cannot be created on it.**
 Expected on the Minimal profile: it has connectivity, SSH and a heartbeat,
-but no `terminal-node-agent` process. Install the agent with
-`deploy/install-node-agent.ps1` when you want full session management on
-that machine; the two are independent.
+but no `terminal-node-agent` process. For an AI Coding node, first confirm the
+controller has a published bundle, then repair from an elevated PowerShell
+opened on the Windows machine:
+
+```powershell
+Set-Location 'C:\ProgramData\TerminalMCP'
+Get-ChildItem -Recurse -Filter windows-setup.ps1 | Select-Object -First 1
+& '<full path printed above>' -Repair
+Get-ScheduledTask -TaskName 'TerminalMcpNodeAgent-win' | Get-ScheduledTaskInfo
+Test-NetConnection 100.89.200.21 -Port 8790
+```
+
+`-Repair` reads the node's existing protected token file and downloads the
+bundle with that node's own bearer credential. Do not paste a token into the
+PowerShell command line or chat. If the protected token file is missing,
+generate a new single-use enrollment code in the Dashboard and run a newly
+downloaded setup script instead of reconstructing the secret manually.
