@@ -6,4 +6,4 @@
 # reporting the same string made `version` useless as a drift signal --
 # only contract_version could tell an upgraded controller from a node that
 # had not moved. Now the two disagree visibly, which is the point.
-__version__ = "0.13.0"
+__version__ = "0.13.7-dev"

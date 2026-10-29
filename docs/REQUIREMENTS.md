@@ -75,6 +75,7 @@ file count from `ls tests/*.py`), not recalled from memory.
 | Remote Linux node (RemoteNodeClient + node-agent) | VERIFIED |
 | macOS worker node | VERIFIED |
 | Windows native/ConPTY backend | VERIFIED |
+| Windows node-agent boot persistence (AtStartup + same-user S4U) | IMPLEMENTED_NOT_LIVE_VERIFIED — source/tests pass; physical `win` install pending |
 | Dashboard: auth (Cloudflare Access + CSRF) | VERIFIED |
 | Dashboard: session tabs, live terminal/output/input | VERIFIED |
 | Dashboard: fullscreen/mobile behavior | VERIFIED |
@@ -1854,6 +1855,22 @@ tests/limitations/dependencies/follow-up/trace — for every checkpoint
 listed in §19, plus the living-requirements convention itself. This
 section is the backfill the user asked for; §1-§19 above are the fast-
 scan/audit view over the SAME facts.)*
+
+### Windows node-agent starts before interactive logon — 2026-10-29
+
+- **Goal / user value:** a rebooted Windows worker must reopen its authenticated
+  port 8790 transport without waiting for a person to log on.
+- **Status: IMPLEMENTED_NOT_LIVE_VERIFIED.** `deploy/install-node-agent.ps1`
+  now registers `TerminalMcpNodeAgent-<node>` with an `AtStartup` trigger and
+  the installing user's S4U principal. It deliberately does not use SYSTEM:
+  hosted shells keep the intended user permissions and that user's AI CLI
+  credentials.
+- **Acceptance/tests:** the installer contract asserts AtStartup, absence of
+  AtLogOn, S4U, and absence of a SYSTEM principal. Bundle/installer tests also
+  verify authenticated delivery, SHA256-before-extract, rollback and readiness.
+- **Live limitation:** task registration, `/v1/health`, authenticated
+  `/v1/sessions`, and a real Codex session must still be exercised on the
+  physical `win` node. No reboot is required for initial verification.
 
 ### Runbook registry is the DEFAULT path for test/build/deploy/smoke — 2026-09-14
 

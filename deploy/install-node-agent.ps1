@@ -224,7 +224,16 @@ if (-not $NoScheduledTask) {
     $taskName = "TerminalMcpNodeAgent-$NodeId"
     $action = New-ScheduledTaskAction -Execute "powershell.exe" `
         -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$wrapperPath`""
-    $trigger = New-ScheduledTaskTrigger -AtLogOn
+    # The agent is infrastructure: it must be listening before any user logs
+    # on.  AtLogOn left a rebooted, unattended node heartbeating from its
+    # separate SYSTEM task while port 8790 stayed closed indefinitely.
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    # Keep the same Windows identity that owns this checkout and its AI CLI
+    # sign-ins. SYSTEM would make created shells over-privileged and would not
+    # have the user's Codex/Claude credentials. S4U runs without an interactive
+    # logon or stored password.
+    $taskUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $principal = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType S4U -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
         -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
         -ExecutionTimeLimit ([TimeSpan]::Zero)
@@ -250,13 +259,13 @@ if (-not $NoScheduledTask) {
     }
     try {
         Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings `
-            -Description "Terminal MCP node agent ($NodeId) -- auto-starts at logon, auto-restarts on failure" `
+            -Principal $principal `
+            -Description "Terminal MCP node agent ($NodeId) -- auto-starts at boot, auto-restarts on failure" `
             -Force | Out-Null
         Write-Host "-> Registered Scheduled Task '$taskName' (Task Scheduler > Task Scheduler Library)"
         Start-ScheduledTask -TaskName $taskName
         Write-Host "-> Started. Check with: Get-ScheduledTask -TaskName '$taskName' | Get-ScheduledTaskInfo"
-        Write-Host "   (Runs at logon; for a headless/always-on machine, also enable 'Run whether user is logged on or not'"
-        Write-Host "    in Task Scheduler's GUI, or re-register with -RunLevel Highest and a saved credential.)"
+        Write-Host "   (Runs as $taskUser via S4U at startup; no interactive logon is required.)"
     } catch {
         Write-Warning "Could not register the Scheduled Task automatically ($($_.Exception.Message)) -- run manually instead:"
         Write-Host "   powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$wrapperPath`""

@@ -119,6 +119,16 @@ def test_it_runs_the_install_script_shipped_inside_the_bundle():
     assert "if ($installerExit -ne 0)" in section
 
 
+def test_standalone_agent_task_starts_at_boot_as_same_user_via_s4u():
+    installer = _installer()
+    assert "New-ScheduledTaskTrigger -AtStartup" in installer
+    assert "New-ScheduledTaskTrigger -AtLogOn" not in installer
+    assert "-LogonType S4U" in installer
+    assert '-UserId "SYSTEM"' not in installer
+    register = installer[installer.index("Register-ScheduledTask -TaskName $taskName"):]
+    assert "-Principal $principal" in register
+
+
 def test_it_binds_the_interface_the_controller_reaches_not_everything():
     script = _script()
     # Resolved ONCE, before the heartbeat script is generated, so the beat

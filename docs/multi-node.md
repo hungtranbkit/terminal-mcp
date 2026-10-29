@@ -330,7 +330,7 @@ session spawn.
 steps (repo checkout, venv, `pip install -e .[windows]`, token
 generation, config.yaml bootstrap, printed controller-side instructions)
 plus a Windows Scheduled Task registration (`Register-ScheduledTask`,
-`AtLogOn` trigger, auto-restart settings) for auto-start-after-reboot/
+`AtStartup` trigger, same-user S4U principal, auto-restart settings) for auto-start-after-reboot/
 auto-reconnect. **Not executed anywhere** -- no PowerShell interpreter is
 available in this environment at all, so this script could only be
 manually, carefully reviewed for syntax correctness (and one real bug --
@@ -417,8 +417,8 @@ unchanged, `[CHANGED]`, or `[SKIPPED]` with a reason) and covers:
   (not LAN-scoped) -- functionally fine for a private LAN not exposed
   to the Internet, but worth deliberately narrowing to the node's own
   subnet later if wanted.
-- **Node-agent Scheduled Task persistence (the core fix):** the task
-  `install-node-agent.ps1` creates uses an `AtLogOn` trigger with
+- **Node-agent Scheduled Task persistence (the core fix):** older versions of
+  the task `install-node-agent.ps1` created used an `AtLogOn` trigger with
   `LogonType=Interactive`, meaning it only starts once someone actually
   logs in interactively -- after an unattended reboot with no auto-logon
   configured, the agent simply never starts. This script adds an
@@ -427,7 +427,9 @@ unchanged, `[CHANGED]`, or `[SKIPPED]` with a reason) and covers:
   logged on or not", still running as the *same* unprivileged node-agent
   user -- **never SYSTEM**, since an agent session spawned under SYSTEM
   would hand anyone with dashboard access to that node SYSTEM-level
-  shell access). Existing `RestartCount`/`RestartInterval`
+  shell access). The primary installer now creates this same AtStartup/S4U
+  definition directly; the stability script remains useful for repairing old
+  installations. Existing `RestartCount`/`RestartInterval`
   crash-recovery settings are left alone if already reasonable.
 
 Live-verified on `dell-5530`: after applying the script and cleanly
