@@ -6332,7 +6332,7 @@ NODES_ADMIN_HTML = """<!doctype html>
               <button class="icon-btn" id="anCopyCmdBtn" type="button">📋 Copy lệnh cài đặt</button>
               <a class="icon-btn" id="anHelperDlBtn" hidden
                  href="/dashboard/api/nodes/onboard/helper/windows-x64"
-                 download="terminal-mcp-bootstrap.exe">⬇ Tải Bootstrap helper (thủ công)</a>
+                 download="TerminalMCP-Setup.exe">⬇ Tải TerminalMCP-Setup.exe (thủ công)</a>
             </div>
             <div class="d-msg" id="anDoneMsg" role="status" aria-live="polite"></div>
             <div class="muted an-note" id="anPlatformNote" hidden></div>
@@ -7570,7 +7570,7 @@ NODES_ADMIN_HTML = """<!doctype html>
         const url = URL.createObjectURL(blob);
         const link = document.createElement('a');
         link.href = url;
-        link.download = match ? match[1] : 'terminal-mcp-bootstrap.exe';
+        link.download = match ? match[1] : 'TerminalMCP-Setup.exe';
         document.body.append(link);
         link.click();
         link.remove();

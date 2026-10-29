@@ -224,7 +224,19 @@ if (-not $NoScheduledTask) {
     $taskName = "TerminalMcpNodeAgent-$NodeId"
     $action = New-ScheduledTaskAction -Execute "powershell.exe" `
         -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$wrapperPath`""
-    $trigger = New-ScheduledTaskTrigger -AtLogOn
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+
+    # The one-file installer runs this script from its LocalSystem bootstrap
+    # service, so the node agent starts before interactive login. Preserve a
+    # safe developer fallback when this script is run directly by an admin.
+    $taskUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    if ($taskUser -match '(?i)\\SYSTEM$') {
+        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' `
+            -LogonType ServiceAccount -RunLevel Highest
+    } else {
+        $principal = New-ScheduledTaskPrincipal -UserId $taskUser `
+            -LogonType S4U -RunLevel Highest
+    }
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
         -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
         -ExecutionTimeLimit ([TimeSpan]::Zero)
@@ -249,14 +261,13 @@ if (-not $NoScheduledTask) {
         }
     }
     try {
-        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings `
-            -Description "Terminal MCP node agent ($NodeId) -- auto-starts at logon, auto-restarts on failure" `
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
+            -Description "Terminal MCP node agent ($NodeId) -- starts with Windows and auto-restarts on failure" `
             -Force | Out-Null
         Write-Host "-> Registered Scheduled Task '$taskName' (Task Scheduler > Task Scheduler Library)"
         Start-ScheduledTask -TaskName $taskName
         Write-Host "-> Started. Check with: Get-ScheduledTask -TaskName '$taskName' | Get-ScheduledTaskInfo"
-        Write-Host "   (Runs at logon; for a headless/always-on machine, also enable 'Run whether user is logged on or not'"
-        Write-Host "    in Task Scheduler's GUI, or re-register with -RunLevel Highest and a saved credential.)"
+        Write-Host "   (Runs at Windows startup, before interactive login.)"
     } catch {
         Write-Warning "Could not register the Scheduled Task automatically ($($_.Exception.Message)) -- run manually instead:"
         Write-Host "   powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$wrapperPath`""

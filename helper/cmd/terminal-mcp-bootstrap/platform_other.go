@@ -26,3 +26,5 @@ func runStagesBounded(controller, extraArg string, limit time.Duration) (int, er
 // restrictTokenACL is a no-op off Windows: the 0600 mode writeAtomic
 // already applied is the real protection there.
 func restrictTokenACL(path string) error { return nil }
+
+func ensureElevatedForInstall() (bool, error) { return false, nil }

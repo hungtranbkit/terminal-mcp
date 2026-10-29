@@ -5,14 +5,51 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/hungtranbkit/terminal-mcp/helper/internal/proto"
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
+
+var shellExecuteW = windows.NewLazySystemDLL("shell32.dll").NewProc("ShellExecuteW")
+
+// ensureElevatedForInstall turns the ordinary double-click into Windows'
+// native UAC flow. Pairing remains in the executable name, so no handle or
+// node token is copied into a command line or written to a staging file.
+func ensureElevatedForInstall() (bool, error) {
+	token := windows.GetCurrentProcessToken()
+	if token.IsElevated() {
+		return false, nil
+	}
+	executable, err := windows.UTF16PtrFromString(os.Args[0])
+	if err != nil {
+		return false, err
+	}
+	verb, _ := windows.UTF16PtrFromString("runas")
+	quoted := make([]string, 0, len(os.Args)-1)
+	for _, argument := range os.Args[1:] {
+		quoted = append(quoted, syscall.EscapeArg(argument))
+	}
+	parameters, err := windows.UTF16PtrFromString(strings.Join(quoted, " "))
+	if err != nil {
+		return false, err
+	}
+	result, _, callErr := shellExecuteW.Call(
+		0, uintptr(unsafe.Pointer(verb)), uintptr(unsafe.Pointer(executable)),
+		uintptr(unsafe.Pointer(parameters)), 0, windows.SW_SHOWNORMAL,
+	)
+	if result <= 32 {
+		return false, fmt.Errorf("ShellExecuteW(runas) failed: %w (code %d)", callErr, result)
+	}
+	return true, nil
+}
 
 // registerProtocol writes the terminalmcp:// handler under HKLM, so it
 // applies machine-wide rather than per-user. The command line is a FIXED

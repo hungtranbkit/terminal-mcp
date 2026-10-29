@@ -11,6 +11,7 @@ from __future__ import annotations
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -335,6 +336,17 @@ def test_cta_exists_and_its_ACTION_is_gated_on_real_detection():
     assert "product === 'terminal-mcp-bootstrap'" in page
     # Detection failure is the NORMAL case and must be silent.
     assert "return null;   // not installed, or not reachable" in page
+
+
+def test_public_installer_is_one_named_exe_with_native_uac_contract():
+    root = Path(__file__).resolve().parents[1]
+    build = (root / "helper" / "build.sh").read_text()
+    windows = (root / "helper" / "cmd" / "terminal-mcp-bootstrap" /
+               "platform_windows.go").read_text()
+    assert "dist/TerminalMCP-Setup.exe" in build
+    assert 'UTF16PtrFromString("runas")' in windows
+    assert "ShellExecuteW" in windows
+    assert "GetCurrentProcessToken" in windows and "IsElevated" in windows
 
 
 def test_cta_mints_a_handle_per_click_and_never_sends_the_code():

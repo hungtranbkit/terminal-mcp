@@ -31,6 +31,14 @@ func newMachineID() string {
 // runInstall is idempotent: an existing install is verified and updated in
 // place rather than duplicated. Re-running it is the Repair path.
 func runInstall(controller, session string) int {
+	relaunched, err := ensureElevatedForInstall()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cannot request Administrator access: %v\n", err)
+		return 1
+	}
+	if relaunched {
+		return 0
+	}
 	if controller == "" {
 		fmt.Fprintln(os.Stderr, "install requires -controller")
 		return 2

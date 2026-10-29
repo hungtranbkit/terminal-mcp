@@ -51,6 +51,15 @@ def _agent_section(script: str) -> str:
     return script[start:script.index("#  Verification + summary")]
 
 
+def test_node_agent_starts_with_windows_under_the_installer_service_account():
+    installer = _installer()
+    assert "New-ScheduledTaskTrigger -AtStartup" in installer
+    assert "New-ScheduledTaskTrigger -AtLogOn" not in installer
+    assert "New-ScheduledTaskPrincipal -UserId 'SYSTEM'" in installer
+    assert "-LogonType ServiceAccount -RunLevel Highest" in installer
+    assert "Register-ScheduledTask" in installer and "-Principal $principal" in installer
+
+
 # ---------------------------------------------------------------------------
 # fetching the bundle: authenticated, verified, never trusted
 # ---------------------------------------------------------------------------

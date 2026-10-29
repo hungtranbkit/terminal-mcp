@@ -60,7 +60,7 @@ BAD_MANIFEST = "HELPER_ARTIFACT_MANIFEST_INVALID"
 # parameter: a target name reaches the filesystem, so it may never be
 # caller-shaped.
 TARGETS: dict[str, str] = {
-    "windows-x64": "terminal-mcp-bootstrap.exe",
+    "windows-x64": "TerminalMCP-Setup.exe",
     "windows-arm64": "terminal-mcp-bootstrap-arm64.exe",
 }
 
