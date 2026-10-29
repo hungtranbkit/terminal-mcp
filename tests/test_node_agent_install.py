@@ -60,6 +60,13 @@ def test_node_agent_starts_with_windows_under_the_installer_service_account():
     assert "Register-ScheduledTask" in installer and "-Principal $principal" in installer
 
 
+def test_node_agent_wrapper_inherits_user_ai_launcher_directories():
+    installer = _installer()
+    assert "Programs\\OpenAI\\Codex\\bin" in installer
+    assert "$launcherPathPrefix" in installer
+    assert '`$env:Path = "$launcherPathPrefix;`$env:Path"' in installer
+
+
 # ---------------------------------------------------------------------------
 # fetching the bundle: authenticated, verified, never trusted
 # ---------------------------------------------------------------------------

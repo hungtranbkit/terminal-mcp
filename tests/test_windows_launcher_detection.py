@@ -99,6 +99,12 @@ def test_the_beat_script_carries_the_recorded_directories():
     assert "-replace \"'\", \"''\"" in script
 
 
+def test_codex_desktop_stable_launcher_directory_is_recorded():
+    script = _script()
+    resolver = script[script.index("function Get-LauncherDirs"):script.index("$LauncherDirs = @(Get-LauncherDirs)")]
+    assert "Programs\\OpenAI\\Codex\\bin" in resolver
+
+
 def test_detection_probes_path_first_then_the_recorded_directories():
     beat = _beat(_script())
     resolver = beat[beat.index("function Resolve-Tool"):beat.index("function Get-AgentTypes")]

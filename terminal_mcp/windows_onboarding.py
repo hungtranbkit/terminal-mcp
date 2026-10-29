@@ -1148,7 +1148,13 @@ function Get-LauncherDirs {
         }
     } catch { }
     # Deterministic fallbacks for the same user, only if they exist.
-    foreach ($candidate in @((Join-Path $env:APPDATA 'npm'), (Join-Path $env:LOCALAPPDATA 'npm'))) {
+    foreach ($candidate in @(
+        (Join-Path $env:APPDATA 'npm'),
+        (Join-Path $env:LOCALAPPDATA 'npm'),
+        # Codex Desktop ships a stable user launcher here. The versioned
+        # runtime directory changes on update; record the stable bin only.
+        (Join-Path $env:LOCALAPPDATA 'Programs\OpenAI\Codex\bin')
+    )) {
         if ($candidate -and (Test-Path -LiteralPath $candidate)) { [void]$dirs.Add($candidate) }
     }
     # Deduplicate, preserving order.
@@ -1314,7 +1320,11 @@ while (`$true) {
             metrics = Get-Metrics
             tmux_session_count = 0
             agent_counts = @{}
-            agent_types = Get-AgentTypes
+            # PowerShell unwraps a one-element function result to a scalar.
+            # Without @(), Minimal nodes reported JSON "shell" and Python
+            # turned that into ('s','h','e','l','l'), making placement reject
+            # every real agent type even after the node agent was healthy.
+            agent_types = @(Get-AgentTypes)
             agent_version = 'windows-setup/$ScriptVersion'
             labels = @('windows', 'onboarded', 'profile:$ProfileName')
             platform = 'windows'
