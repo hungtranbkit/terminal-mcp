@@ -583,13 +583,17 @@ def test_detach_nonexistent_session_reports_not_found(tmp_path):
 # -- delete -----------------------------------------------------------------
 
 @pytest.fixture
-def clean_delete_git(monkeypatch):
-    # These lifecycle tests run in the developer's checkout. Git safety has
-    # dedicated tests; do not depend on this checkout being clean.
+def safe_delete_preflight(monkeypatch):
+    # These lifecycle tests exercise deletion mechanics, not the status/Git
+    # classifiers. Shell prompt rendering differs across hosts (notably macOS),
+    # and the tests run in the developer's checkout. Both safety classifiers
+    # have dedicated coverage, so keep this fixture deterministic.
+    monkeypatch.setattr("terminal_mcp.core.classify_status", lambda *a, **kw: ("IDLE", False, "prompt"))
     monkeypatch.setattr("terminal_mcp.core.probe_git_state", lambda *a, **kw: {"dirty": False})
 
 
 def test_delete_requires_explicit_confirmation(tmp_path, tmux_session_factory, monkeypatch):
+    monkeypatch.setattr("terminal_mcp.core.classify_status", lambda *a, **kw: ("IDLE", False, "prompt"))
     monkeypatch.setattr("terminal_mcp.core.probe_git_state", lambda *a, **kw: {"dirty": None})
     service = TerminalService(_lifecycle_config(tmp_path))
     name = tmux_session_factory("lifecycle-confirm-required")
@@ -645,7 +649,7 @@ def test_delete_denied_session_does_not_disclose_target(tmp_path, tmux_session_f
     event = service.audit.list(limit=1)[0]
     assert event["session"] is None
 
-def test_delete_terminates_exact_target_only(tmp_path, tmux_session_factory, clean_delete_git):
+def test_delete_terminates_exact_target_only(tmp_path, tmux_session_factory, safe_delete_preflight):
     config = _lifecycle_config(tmp_path)
     service = TerminalService(config)
     victim = tmux_session_factory("lifecycle-victim")
@@ -699,7 +703,7 @@ def test_protected_set_always_includes_terminal_mcp_even_if_omitted(tmp_path):
     assert result["error"] == "SESSION_PROTECTED"
 
 
-def test_delete_cleans_up_stale_binding_and_grant(tmp_path, owned_name, tmux_session_factory, clean_delete_git):
+def test_delete_cleans_up_stale_binding_and_grant(tmp_path, owned_name, tmux_session_factory, safe_delete_preflight):
     config = _lifecycle_config(tmp_path)
     service = TerminalService(config)
     name = tmux_session_factory(owned_name("cleanup-1"))
@@ -720,7 +724,7 @@ def test_delete_cleans_up_stale_binding_and_grant(tmp_path, owned_name, tmux_ses
     assert grant.read_enabled is False and grant.input_enabled is False
 
 
-def test_delete_disables_supervisor_watch_without_losing_history(tmp_path, owned_name, tmux_session_factory, clean_delete_git):
+def test_delete_disables_supervisor_watch_without_losing_history(tmp_path, owned_name, tmux_session_factory, safe_delete_preflight):
     from terminal_mcp.supervisor import SupervisorService, SupervisorStore, watch_key
     config = _lifecycle_config(tmp_path)
     service = TerminalService(config)
@@ -778,13 +782,14 @@ def test_dashboard_lifecycle_routes_require_cloudflare_access_when_configured():
     assert response.json()["error"] == "CLOUDFLARE_ACCESS_VERIFICATION_FAILED"
 
 
-def test_dashboard_create_detach_delete_round_trip_refreshes_list(tmp_path, lifecycle_session_factory):
+def test_dashboard_create_detach_delete_round_trip_refreshes_list(tmp_path, lifecycle_session_factory,
+                                                                  safe_delete_preflight):
     config = _lifecycle_config(tmp_path)
     client, service = _dashboard_client(config)
     name = lifecycle_session_factory("roundtrip-1")
 
     created = client.post("/dashboard/api/session/create", json={"name": name, "agent_type": "shell"})
-    assert created.status_code == 200
+    assert created.status_code == 200, created.text
     listed = client.get("/dashboard/api/sessions").json()
     assert any(row["name"] == name for row in listed["sessions"])
     assert listed["session_lifecycle_enabled"] is True
@@ -823,7 +828,7 @@ def test_mcp_tool_and_dashboard_route_share_the_same_service(tmp_path, lifecycle
     client, service = _dashboard_client(config)
     name = lifecycle_session_factory("shared-svc")
     response = client.post("/dashboard/api/session/create", json={"name": name, "agent_type": "shell"})
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     direct = service.terminal_create_session(name, "shell")  # same session, via the "MCP" call shape
     assert direct["error"] == "SESSION_ALREADY_EXISTS"  # proves it's the same underlying tmux/service state
 
