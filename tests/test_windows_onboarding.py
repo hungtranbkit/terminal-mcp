@@ -367,6 +367,16 @@ def test_tunnel_ssh_options_bind_loopback_and_fail_closed():
     assert argv[-1] == "tunnel@gw.example.net"
 
 
+def test_tailscale_binary_signature_and_unattended_mode_are_required():
+    script = render_setup_script(
+        enrollment_code=GENERIC_CODE,
+        controller_url="https://controller.example", node_id="win-signed",
+        display_name="Windows", profile="ai_coding")
+    assert "Get-AuthenticodeSignature $tsExe" in script
+    assert "Tailscale Inc." in script
+    assert "--unattended" in script
+
+
 def test_authorized_keys_line_is_restricted_to_one_port():
     line = rescue_gateway.build_authorized_keys_line(
         reverse_port=22001, public_key=NODE_PUBLIC_KEY, node_id="win1")
@@ -810,9 +820,14 @@ def test_linux_installer_runtime_writes_complete_quoted_unit_without_running_com
     (repo / "node-agent.token").write_text("protected fixture token\n")
     (repo / ".venv" / "bin" / "pip").write_text("#!/bin/sh\nexit 0\n")
     (repo / ".venv" / "bin" / "pip").chmod(0o755)
+    (repo / ".venv" / "bin" / "python").write_text("#!/bin/sh\nexit 0\n")
+    (repo / ".venv" / "bin" / "python").chmod(0o755)
     for name in ("systemctl", "loginctl"):
         tool = fakebin / name
-        tool.write_text("#!/bin/sh\nexit 0\n")
+        if name == "systemctl":
+            tool.write_text("#!/bin/sh\ncase \"$*\" in *LoadState*) printf 'loaded\\n';; esac\nexit 0\n")
+        else:
+            tool.write_text("#!/bin/sh\nexit 0\n")
         tool.chmod(0o755)
 
     env = dict(os.environ, HOME=str(repo.parent), PATH=f"{fakebin}:{os.environ['PATH']}")
@@ -830,7 +845,7 @@ def test_linux_installer_runtime_writes_complete_quoted_unit_without_running_com
     unit = (repo.parent / ".config/systemd/user/terminal-node-agent.service").read_text()
     unit_repo = str(repo).replace("%", "%%")
     exec_repo = unit_repo.replace("$", "$$")
-    assert f'WorkingDirectory="{unit_repo}"' in unit
+    assert f'WorkingDirectory={unit_repo}' in unit
     assert f'Environment="TERMINAL_MCP_CONFIG={unit_repo}/config.yaml"' in unit
     home_path = str(repo.parent).replace("%", "%%")
     assert (f'Environment="PATH={home_path}/.local/bin:/usr/local/sbin:/usr/local/bin:'
@@ -1075,14 +1090,14 @@ def test_create_enrollment_returns_the_script_once(tmp_path, monkeypatch):
 def test_create_enrollment_request_key_replays_without_reissuing_code(tmp_path, monkeypatch):
     client, _controller, onboarding = _client(tmp_path, monkeypatch)
     first = client.post("/dashboard/api/nodes/onboard/enrollments",
-                        json={"node_id": "join-retry", "os": "linux", "machine_id": "c" * 32},
+                        json={"node_id": "join-retry", "os": "windows", "machine_id": "c" * 32},
                         headers={"Idempotency-Key": "join-request-00000004"})
     assert first.status_code == 200
     first_body = first.json()
     assert first_body["code"].startswith("TMCP-")
 
     retry = client.post("/dashboard/api/nodes/onboard/enrollments",
-                        json={"node_id": "join-retry", "os": "linux", "machine_id": "c" * 32},
+                        json={"node_id": "join-retry", "os": "windows", "machine_id": "c" * 32},
                         headers={"Idempotency-Key": "join-request-00000004"})
     assert retry.status_code == 200
     retry_body = retry.json()
@@ -1107,22 +1122,32 @@ def test_join_current_creates_origin_bound_pairing_without_returning_enrollment_
     client, _controller, onboarding = _client(tmp_path, monkeypatch)
     response = client.post("/dashboard/api/nodes/onboard/join/current",
                            headers={"Idempotency-Key": "join-current-machine-0001"},
-                           json={"platform": "windows"})
+                           json={"platform": "windows", "approve_admin_recovery": True})
     assert response.status_code == 200, response.text
     payload = response.json()
     assert payload["enrollment"]["node_id"].startswith("join-")
     assert payload["handle"] and len(payload["handle"]) == 32
     assert "code" not in payload and "script" not in payload and "node_token" not in payload
     assert onboarding.enrollments.handle_dashboard_origin(payload["handle"]) == "http://testserver"
+    assert payload["enrollment"]["profile"] == "ai_coding"
+
+
+def test_join_current_windows_requires_explicit_admin_recovery_consent(tmp_path, monkeypatch):
+    client, _controller, _onboarding = _client(tmp_path, monkeypatch)
+    response = client.post("/dashboard/api/nodes/onboard/join/current",
+                           headers={"Idempotency-Key": "join-current-no-admin-consent-0001"},
+                           json={"platform": "windows"})
+    assert response.status_code == 400
+    assert response.json()["error"] == "ADMIN_RECOVERY_CONSENT_REQUIRED"
 
 
 def test_join_current_idempotency_key_reuses_the_same_enrollment(tmp_path, monkeypatch):
     client, _controller, _onboarding = _client(tmp_path, monkeypatch)
     headers = {"Idempotency-Key": "join-current-machine-0002"}
     first = client.post("/dashboard/api/nodes/onboard/join/current", headers=headers,
-                        json={"platform": "windows"})
+                        json={"platform": "windows", "approve_admin_recovery": True})
     second = client.post("/dashboard/api/nodes/onboard/join/current", headers=headers,
-                         json={"platform": "windows"})
+                         json={"platform": "windows", "approve_admin_recovery": True})
     assert first.status_code == second.status_code == 200
     assert first.json()["enrollment"]["id"] == second.json()["enrollment"]["id"]
     assert first.json()["enrollment"]["node_id"] == second.json()["enrollment"]["node_id"]
@@ -1152,14 +1177,16 @@ def test_join_current_retry_after_success_reports_the_existing_node(tmp_path, mo
     client, _controller, onboarding = _client(tmp_path, monkeypatch)
     headers = {"Idempotency-Key": "join-current-machine-0003"}
     first = client.post("/dashboard/api/nodes/onboard/join/current", headers=headers,
-                        json={"platform": "windows"})
+                        json={"platform": "windows", "approve_admin_recovery": True})
     assert first.status_code == 200
     redeemed = onboarding.redeem_handle(
         first.json()["handle"], hostname="127.0.0.1", dashboard_origin="http://testserver",
-        machine_id="stable-machine-identity-0003")
+        machine_id="stable-machine-identity-0003", approved_admin_principal=r"WIN\admin")
     assert redeemed["node_id"] == first.json()["enrollment"]["node_id"]
+    assert redeemed["ssh"]["approved_admin_principal"] == r"WIN\admin"
+    assert onboarding.connection_store.get(redeemed["node_id"]).username == r"WIN\admin"
     retry = client.post("/dashboard/api/nodes/onboard/join/current", headers=headers,
-                        json={"platform": "windows"})
+                        json={"platform": "windows", "approve_admin_recovery": True})
     assert retry.status_code == 200
     assert retry.json()["joined"] is True
     assert retry.json()["enrollment"]["id"] == first.json()["enrollment"]["id"]
@@ -1195,11 +1222,11 @@ def test_non_windows_current_join_serves_a_paired_user_run_installer(tmp_path, m
 def test_create_enrollment_rejects_machine_id_with_a_different_key(tmp_path, monkeypatch):
     client, _controller, _onboarding = _client(tmp_path, monkeypatch)
     first = client.post("/dashboard/api/nodes/onboard/enrollments",
-                        json={"node_id": "join-duplicate-a", "os": "linux", "machine_id": "d" * 32},
+                        json={"node_id": "join-duplicate-a", "os": "windows", "machine_id": "d" * 32},
                         headers={"Idempotency-Key": "join-request-00000005"})
     assert first.status_code == 200
     duplicate = client.post("/dashboard/api/nodes/onboard/enrollments",
-                            json={"node_id": "join-duplicate-b", "os": "linux", "machine_id": "d" * 32},
+                            json={"node_id": "join-duplicate-b", "os": "windows", "machine_id": "d" * 32},
                             headers={"Idempotency-Key": "join-request-00000006"})
     assert duplicate.status_code == 409
     assert duplicate.json()["error"] == "MACHINE_ALREADY_ENROLLED"
@@ -1370,6 +1397,25 @@ def test_enrolled_node_can_heartbeat_immediately(tmp_path, monkeypatch):
     # A wrong token is refused, so an enrolled node id is not a free pass.
     assert client.post("/dashboard/api/nodes/win1/heartbeat",
                        headers={"Authorization": "Bearer wrong"}, json={}).status_code == 401
+
+
+def test_authenticated_heartbeat_hot_rebinds_agent_to_matching_tailnet_source(tmp_path, monkeypatch):
+    client, controller, onboarding = _client(tmp_path, monkeypatch)
+    code = client.post("/dashboard/api/nodes/onboard/enrollments",
+                       json={"node_id": "win-rebind", "profile": "minimal"}).json()["code"]
+    bootstrap = client.post("/dashboard/api/enroll/consume",
+                            json={"code": code, "hostname": "WIN-REBIND",
+                                  "addresses": {"lan_ip": "192.168.1.38"}}).json()
+    tailnet_client = TestClient(client.app, client=("100.89.200.21", 50123))
+    response = tailnet_client.post(
+        "/dashboard/api/nodes/win-rebind/heartbeat",
+        headers={"Authorization": f"Bearer {bootstrap['node_token']}"},
+        json={"metrics": {}, "agent_types": ["shell", "codex"],
+              "agent_endpoint": "http://100.89.200.21:8790", "platform": "windows",
+              "session_backend": "windows_pty"})
+    assert response.status_code == 200, response.text
+    assert onboarding.connection_store.get("win-rebind").endpoint == "http://100.89.200.21:8790"
+    assert controller.registry.get("win-rebind").endpoint == "http://100.89.200.21:8790"
 
 
 def test_node_onboarding_status_and_transport_test_routes(tmp_path, monkeypatch):

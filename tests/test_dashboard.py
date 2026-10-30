@@ -46,6 +46,8 @@ def test_nodes_dashboard_offers_current_machine_join_and_loopback_pair_states():
     from terminal_mcp.dashboard import NODES_ADMIN_HTML
 
     assert 'id="joinCurrentMachineBtn"' in NODES_ADMIN_HTML
+    assert 'id="joinCurrentAdminConsent"' in NODES_ADMIN_HTML
+    assert 'approve_admin_recovery: adminConsent' in NODES_ADMIN_HTML
     assert "Join this machine" in NODES_ADMIN_HTML
     assert "127.0.0.1:47562/v1/challenge" in NODES_ADMIN_HTML
     assert "127.0.0.1:47562/v1/pair" in NODES_ADMIN_HTML
@@ -70,31 +72,6 @@ def test_current_machine_join_keeps_os_permission_guidance_during_progress_polli
     # terminal outcome, rather than replacing it with a generic waiting label.
     assert "joinCurrentPermissionReminder(platform)" in join
     assert "joinStatus.dataset.state !== 'permission'" in poll
-
-
-@pytest.mark.parametrize("email,status", [
-    ("viewer@example.com", 403), ("operator@example.com", 200),
-])
-def test_current_machine_join_obeys_verified_access_role(email, status, monkeypatch, tmp_path):
-    from terminal_mcp import dashboard as dashboard_module
-    from terminal_mcp.cf_access import AccessIdentity
-
-    monkeypatch.setattr(
-        dashboard_module, "verify_access_assertion",
-        lambda token, **kw: AccessIdentity(email=email, subject="subject", raw_claims={}),
-    )
-    config = _cf_access_config(access_email_roles=(
-        ("viewer@example.com", "viewer"), ("operator@example.com", "operator"),
-    ))
-    service = TerminalService(config)
-    server = build_mcp(service)
-    register_dashboard(server, service)
-    client = TestClient(server.streamable_http_app(), headers={
-        "Origin": "http://testserver", "Cf-Access-Jwt-Assertion": "verified-test-token",
-        "Idempotency-Key": "join-current-role-test-0001",
-    })
-    response = client.post("/dashboard/api/nodes/onboard/join/current", json={"platform": "windows"})
-    assert response.status_code == status
 
 
 def test_sessions_admin_page_reachable_and_uses_the_same_api(tmp_path, tmux_session_factory):

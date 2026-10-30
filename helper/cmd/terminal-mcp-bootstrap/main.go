@@ -34,6 +34,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/hungtranbkit/terminal-mcp/helper/internal/proto"
 )
@@ -44,6 +45,10 @@ import (
 var (
 	Version  = "0.0.0-dev"
 	BuildSHA = "unknown"
+	// DefaultController is a public HTTPS origin stamped by the official
+	// build. It is an address, never a credential; all authority still
+	// comes from the owner's authenticated, one-time approval in the UI.
+	DefaultController = ""
 	// Signed is set to "true" only by a build that actually Authenticode-
 	// signs the artifact. It defaults to false so an unsigned dev build
 	// can never report itself as signed.
@@ -88,11 +93,12 @@ func nodeConfigPath() string {
 // allowlist here is what makes the protocol handler safe: a page can ask
 // for any controller it likes and be refused.
 type Config struct {
-	Controllers      []string `json:"controllers"`
-	DashboardOrigins []string `json:"dashboard_origins,omitempty"`
-	InstalledAt      string   `json:"installed_at"`
-	Version          string   `json:"version"`
-	MachineID        string   `json:"machine_id"`
+	Controllers            []string `json:"controllers"`
+	DashboardOrigins       []string `json:"dashboard_origins,omitempty"`
+	InstalledAt            string   `json:"installed_at"`
+	Version                string   `json:"version"`
+	MachineID              string   `json:"machine_id"`
+	ApprovedAdminPrincipal string   `json:"approved_admin_principal,omitempty"`
 }
 
 func configPath() string { return filepath.Join(programDataDir(), "bootstrap.json") }
@@ -213,40 +219,42 @@ const usage = `Terminal MCP Bootstrap
   terminal-mcp-bootstrap service          (started by the service manager)
   terminal-mcp-bootstrap "terminalmcp://enroll?handle=...&controller=..."`
 
-// runLaunchedDirectly handles a double-click: recover the pending session
-// from this executable's own file name, or fall back to explaining what to
-// do next. It never fails loudly for a missing pairing -- a generic
-// download is a supported way to arrive here.
+// runLaunchedDirectly is the public one-file path. The filename carries no
+// state and may be changed by any browser without changing setup behavior.
 func runLaunchedDirectly() int {
-	path, err := os.Executable()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, usage)
-		return 2
-	}
-	pairing, err := proto.ParseFilename(path)
-	if err != nil {
-		// No pairing, or a name we will not act on. Say what to do rather
-		// than printing a flag reference nobody asked for.
-		fmt.Println(noPairingMessage)
-		return 2
-	}
-	fmt.Printf("Terminal MCP Bootstrap %s\n", Version)
-	fmt.Printf("Controller: %s\n", pairing.Controller)
-	// The handle is never printed: it is a credential for its two minutes,
-	// and a console window is a screenshot away from a chat message.
-	fmt.Println("Continuing the setup session this installer was downloaded for...")
-	return runInstall(pairing.Controller, pairing.Handle)
+	return runGenericSetup(DefaultController)
 }
 
-const noPairingMessage = `Terminal MCP Bootstrap
+func runGenericSetup(controller string) int {
+	// A failed stage offers one real "Repair automatically" action. Retry
+	// reruns the same idempotent installer path; Cancel preserves state.
+	for {
+		code, retry := runGenericSetupOnce(controller)
+		if !retry {
+			return code
+		}
+	}
+}
 
-This installer was not downloaded for a specific setup session -- or the
-browser renamed it on the way down.
-
-Nothing is wrong. Install it, then press "Kết nối máy này" on the Nodes page
-again and it will continue from there:
-
-    terminal-mcp-bootstrap install -controller https://<your-controller>`
+func runGenericSetupOnce(controller string) (int, bool) {
+	origin, err := proto.NormalizeOrigin(controller)
+	if err != nil || !strings.HasPrefix(origin, "https://") {
+		return 2, showSetupError("This build has no trusted HTTPS controller. Download the official installer.")
+	}
+	showSetupStage(1, "Install prerequisites", "Approve Windows UAC. Existing healthy Tailscale, OpenSSH, keys and sessions are preserved.")
+	if code := runInstall(origin, ""); code != 0 {
+		return code, showSetupError("Prerequisite installation did not finish.")
+	}
+	showSetupStage(2, "Approve secure connection", "Your browser will show the controller identity and requested permissions. Approve there once; setup never embeds a reusable key.")
+	if err := openOwnerApproval(origin + "/dashboard/nodes?join=current&source=windows-setup"); err != nil {
+		return 3, showSetupError("The secure approval page could not be opened.")
+	}
+	if err := waitForInstalledNode(45 * time.Minute); err != nil {
+		return 4, showSetupError("Approval or node verification did not finish. No pairing was bypassed.")
+	}
+	showSetupStage(3, "Verify and finish", "Terminal MCP Node Agent is healthy and ready. Setup completed successfully.")
+	return 0, false
+}
 
 // runProtocol is the ONLY entry point a web page can reach. It validates
 // and forwards; it never executes. A failure here is a refusal, printed

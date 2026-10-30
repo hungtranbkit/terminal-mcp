@@ -6170,6 +6170,11 @@ NODES_ADMIN_HTML = """<!doctype html>
     .join-current-copy { min-width:0; overflow-wrap:anywhere }
     .join-current-actions { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end }
     .join-current-actions button { min-height:44px }
+    .join-current-consent { grid-column:1 / -1; display:flex; align-items:flex-start; gap:10px;
+      min-width:0; padding:10px 12px; border:1px solid var(--line); border-radius:8px;
+      color:var(--text); line-height:1.45; cursor:pointer; overflow-wrap:anywhere }
+    .join-current-consent input { width:20px; height:20px; flex:0 0 auto; margin:1px 0 0 }
+    .join-current-consent:focus-within { outline:2px solid var(--accent); outline-offset:2px }
     #joinCurrentStatus { grid-column:1 / -1; min-width:0; padding:10px 12px; border-radius:8px;
       background:#0f1730; border:1px solid var(--line); overflow-wrap:anywhere }
     #joinCurrentStatus[data-state="ready"] { border-color:var(--green); color:var(--green) }
@@ -6253,6 +6258,10 @@ NODES_ADMIN_HTML = """<!doctype html>
         <button class="icon-btn" id="joinCurrentRevokeBtn" type="button" hidden>Revoke node</button>
         <button class="icon-btn" id="joinCurrentCloseBtn" type="button">Close</button>
       </div>
+      <label class="join-current-consent">
+        <input id="joinCurrentAdminConsent" name="approve_admin_recovery" type="checkbox">
+        Allow this approved controller to install its public SSH key for Windows administrator recovery. Access stays restricted to the controller peer over Tailscale.
+      </label>
       <div id="joinCurrentStatus" role="status" aria-live="polite" data-state="idle">Ready to check this machine.</div>
     </section>
     <!-- ==================================================================
@@ -7245,9 +7254,14 @@ NODES_ADMIN_HTML = """<!doctype html>
           return;
         }
         const key = joinCurrentIdempotencyKey();
+        const adminConsent = platform !== 'windows' || document.getElementById('joinCurrentAdminConsent').checked;
+        if (!adminConsent) {
+          joinCurrentStatus('permission', 'Review and select the administrator recovery consent, then choose Retry Join.');
+          return;
+        }
         const joined = await api('/dashboard/api/nodes/onboard/join/current', {
           method: 'POST', headers: {'Content-Type': 'application/json', 'Idempotency-Key': key},
-          body: JSON.stringify({platform}),
+          body: JSON.stringify({platform, approve_admin_recovery: adminConsent}),
         });
         if (!joined.ok) {
           joinCurrentStatus('failed', joined.data.detail || joined.data.error || 'Could not create a pairing session.');
@@ -7330,6 +7344,14 @@ NODES_ADMIN_HTML = """<!doctype html>
 
     document.getElementById('joinCurrentMachineBtn').addEventListener('click', joinCurrentMachine);
     document.getElementById('joinCurrentRetryBtn').addEventListener('click', joinCurrentMachine);
+    // The public setup EXE opens this authenticated page after installing
+    // the loopback helper. Surface the consent immediately, but never tick
+    // it or begin enrollment on the owner's behalf.
+    if (new URLSearchParams(location.search).get('join') === 'current') {
+      document.getElementById('joinCurrentPanel').hidden = false;
+      document.getElementById('joinCurrentAdminConsent').focus();
+      joinCurrentStatus('permission', 'Review the controller recovery permission, select it, then choose Retry Join once.');
+    }
     document.getElementById('joinCurrentCloseBtn').addEventListener('click', () => {
       document.getElementById('joinCurrentPanel').hidden = true;
     });
@@ -18843,6 +18865,31 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
 
         def _compute() -> dict:
             from .host_metrics import NodeMetrics
+            advertised_endpoint = str(body.get("agent_endpoint") or "").strip()
+            if advertised_endpoint:
+                parsed_endpoint = urlparse(advertised_endpoint)
+                source_host = request.client.host if request.client else ""
+                connection = connection_store.get(node_id)
+                if (parsed_endpoint.scheme == "http" and parsed_endpoint.hostname == source_host
+                        and parsed_endpoint.port == terminal.config.nodes.onboarding.agent_port
+                        and connection is not None and advertised_endpoint != connection.endpoint):
+                    token = connection_store.read_token(connection.token_file or "")
+                    if token:
+                        existing_node = controller.registry.get(node_id)
+                        connection_store.save(
+                            node_id, transport_type=connection.transport_type,
+                            endpoint=advertised_endpoint, hostname=connection.hostname,
+                            username=connection.username, port=connection.port,
+                            host_key_fingerprint=connection.host_key_fingerprint,
+                            token_file=connection.token_file)
+                        controller.register_remote_node(
+                            node_id,
+                            display_name=(existing_node.display_name if existing_node else node_id),
+                            hostname=(connection.hostname or node_id), endpoint=advertised_endpoint,
+                            token=token,
+                            max_sessions=(existing_node.max_sessions if existing_node else None))
+                        _log.info("dashboard heartbeat hot-rebound node_id=%s endpoint=%s",
+                                  node_id, advertised_endpoint)
             metrics_raw = body.get("metrics") or {}
             metrics = NodeMetrics(**{k: metrics_raw.get(k) for k in NodeMetrics.__dataclass_fields__})
             node = controller.receive_remote_heartbeat(
@@ -19018,7 +19065,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         """Refuse a credential from now on. With no token_id, refuses
         every credential this node has -- which is what "revoke this
         node" means and is the safe default. Idempotent."""
-        blocked, identity = _mutation_guard(request, required_role=ROLE_OPERATOR)
+        blocked, identity = _mutation_guard(request)
         if blocked is not None:
             return blocked
         node_id = request.path_params["node_id"]
@@ -19300,7 +19347,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         returned. The helper receives only an origin-bound, single-use
         pairing handle; retries reuse the idempotent enrollment identity.
         """
-        blocked, identity = _mutation_guard(request, required_role=ROLE_OPERATOR)
+        blocked, identity = _mutation_guard(request)
         if blocked is not None:
             return blocked
         try:
@@ -19316,6 +19363,10 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                                  "detail": "No current-machine installer is available for this platform. "
                                           "Use Connect Node."},
                                 status_code=501, headers={"Cache-Control": "no-store"})
+        if platform == "windows" and body.get("approve_admin_recovery") is not True:
+            return JSONResponse({"error": "ADMIN_RECOVERY_CONSENT_REQUIRED",
+                                 "detail": "Approve controller-scoped Windows administrator recovery access."},
+                                status_code=400, headers={"Cache-Control": "no-store"})
         if not isinstance(idempotency_key, str) or not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", idempotency_key):
             return JSONResponse({"error": "INVALID_REQUEST",
                                  "detail": "Idempotency-Key must be a 16-128 character URL-safe value"},
@@ -19324,7 +19375,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
 
         def _compute() -> dict:
             created = onboarding.create_enrollment(
-                node_id=node_id, display_name="This machine", os_name=platform, profile="minimal",
+                node_id=node_id, display_name="This machine", os_name=platform,
+                profile=("ai_coding" if platform == "windows" else "minimal"),
                 created_by=(identity.email if identity else None), idempotency_key=idempotency_key)
             enrollment = created["enrollment"]
             if enrollment.get("status") != "pending":
@@ -19356,7 +19408,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     @server.custom_route("/dashboard/api/nodes/onboard/helper/install-script/{platform}", methods=["POST"],
                         include_in_schema=False)
     async def onboard_paired_install_script(request: Request) -> Response:
-        blocked, _identity = _mutation_guard(request, required_role=ROLE_OPERATOR)
+        blocked, _identity = _mutation_guard(request)
         if blocked is not None:
             return blocked
         platform = str(request.path_params.get("platform") or "").lower()
@@ -19686,6 +19738,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         addresses = body.get("addresses") if isinstance(body.get("addresses"), dict) else {}
         dashboard_origin = str(body.get("dashboard_origin") or "").strip() or None
         machine_id = str(body.get("machine_id") or "").strip() or None
+        admin_principal = str(body.get("approved_admin_principal") or "").strip() or None
 
         def _compute() -> dict:
             return onboarding.redeem_handle(
@@ -19693,7 +19746,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                 platform=str(body.get("platform") or "windows")[:32], addresses=addresses,
                 rescue_public_key=body.get("rescue_public_key"),
                 request_base_url=_request_base_url(request), dashboard_origin=dashboard_origin,
-                machine_id=machine_id)
+                machine_id=machine_id, approved_admin_principal=admin_principal)
 
         try:
             result = await anyio.to_thread.run_sync(_compute)

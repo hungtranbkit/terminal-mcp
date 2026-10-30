@@ -349,6 +349,25 @@ def test_public_installer_is_one_named_exe_with_native_uac_contract():
     assert "GetCurrentProcessToken" in windows and "IsElevated" in windows
 
 
+def test_generic_setup_embeds_only_public_controller_and_opens_owner_approval():
+    root = Path(__file__).resolve().parents[1]
+    main = (root / "helper" / "cmd" / "terminal-mcp-bootstrap" / "main.go").read_text()
+    workflow = (root / ".github" / "workflows" / "windows-setup.yml").read_text()
+    assert "DefaultController" in main
+    assert "runGenericSetup" in main
+    assert "openOwnerApproval" in main
+    assert "ParseFilename" not in main
+    assert "https://terminal-bootstrap.mesflow.net" in workflow
+
+
+def test_generic_setup_has_exactly_three_user_facing_stages_and_readiness_gate():
+    root = Path(__file__).resolve().parents[1]
+    main = (root / "helper" / "cmd" / "terminal-mcp-bootstrap" / "main.go").read_text()
+    assert main.count('showSetupStage(') == 3
+    assert "waitForInstalledNode" in main
+    assert "Repair automatically" in main
+
+
 
 def test_cta_mints_a_handle_per_click_and_posts_it_with_loopback_nonce():
     page = _page()

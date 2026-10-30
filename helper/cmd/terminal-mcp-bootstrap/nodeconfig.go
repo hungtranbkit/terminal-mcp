@@ -52,7 +52,34 @@ type redeemPayload struct {
 }
 
 // nodeTokenPath is $TokenFile: $env:ProgramData\TerminalMCP\node.token.
-func nodeTokenPath() string { return filepath.Join(programDataDir(), "node.token") }
+func nodeTokenPath() string         { return filepath.Join(programDataDir(), "node.token") }
+func tailscaleAuthOncePath() string { return filepath.Join(programDataDir(), "tailscale-auth.once") }
+
+// tailscaleAuthKey extracts the short-lived enrollment key before the durable
+// node config is scrubbed. The caller writes it to the ACL-protected one-shot
+// handoff file and removes it regardless of installer success.
+func tailscaleAuthKey(raw map[string]any) string {
+	tailscale, ok := raw["tailscale"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	key, _ := tailscale["auth_key"].(string)
+	return strings.TrimSpace(key)
+}
+
+func persistTailscaleAuthOnce(key string) error {
+	if strings.TrimSpace(key) == "" {
+		return nil
+	}
+	if err := writeAtomic(tailscaleAuthOncePath(), []byte(strings.TrimSpace(key)), 0o600); err != nil {
+		return fmt.Errorf("write Tailscale one-shot key: %w", err)
+	}
+	if err := restrictTokenACL(tailscaleAuthOncePath()); err != nil {
+		_ = os.Remove(tailscaleAuthOncePath())
+		return fmt.Errorf("protect Tailscale one-shot key: %w", err)
+	}
+	return nil
+}
 
 // canonicalNodeConfig splits one redeem response into exactly what the
 // installer's first run would have left on disk.

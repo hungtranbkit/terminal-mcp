@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -19,6 +20,42 @@ import (
 )
 
 var shellExecuteW = windows.NewLazySystemDLL("shell32.dll").NewProc("ShellExecuteW")
+var messageBoxW = windows.NewLazySystemDLL("user32.dll").NewProc("MessageBoxW")
+
+func currentAdminPrincipal() string {
+	account, err := user.Current()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(account.Username)
+}
+
+func showSetupStage(stage int, title, detail string) {
+	text, _ := windows.UTF16PtrFromString(fmt.Sprintf("Stage %d of 3: %s\n\n%s", stage, title, detail))
+	caption, _ := windows.UTF16PtrFromString("Terminal MCP Setup")
+	messageBoxW.Call(0, uintptr(unsafe.Pointer(text)), uintptr(unsafe.Pointer(caption)), 0x40)
+}
+
+func showSetupError(detail string) bool {
+	text, _ := windows.UTF16PtrFromString(detail + "\n\nChoose Retry to repair automatically, or Cancel to leave the current state unchanged.")
+	caption, _ := windows.UTF16PtrFromString("Terminal MCP Setup")
+	result, _, _ := messageBoxW.Call(0, uintptr(unsafe.Pointer(text)), uintptr(unsafe.Pointer(caption)), 0x15)
+	return result == 4 // IDRETRY
+}
+
+func openOwnerApproval(target string) error {
+	verb, _ := windows.UTF16PtrFromString("open")
+	value, err := windows.UTF16PtrFromString(target)
+	if err != nil {
+		return err
+	}
+	result, _, callErr := shellExecuteW.Call(0, uintptr(unsafe.Pointer(verb)),
+		uintptr(unsafe.Pointer(value)), 0, 0, windows.SW_SHOWNORMAL)
+	if result <= 32 {
+		return fmt.Errorf("ShellExecuteW(open) failed: %w", callErr)
+	}
+	return nil
+}
 
 // ensureElevatedForInstall turns the ordinary double-click into Windows'
 // native UAC flow. Pairing remains in the executable name, so no handle or

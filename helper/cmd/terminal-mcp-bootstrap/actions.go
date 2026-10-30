@@ -61,10 +61,14 @@ func runInstall(controller, session string) int {
 	// Preserve the machine identity across re-installs: losing it is what
 	// would turn a Repair into a duplicate node.
 	config := Config{Controllers: []string{origin}, Version: Version,
-		InstalledAt: time.Now().UTC().Format(time.RFC3339), MachineID: newMachineID()}
+		InstalledAt: time.Now().UTC().Format(time.RFC3339), MachineID: newMachineID(),
+		ApprovedAdminPrincipal: currentAdminPrincipal()}
 	if existing, err := loadConfig(); err == nil {
 		if existing.MachineID != "" {
 			config.MachineID = existing.MachineID
+		}
+		if existing.ApprovedAdminPrincipal != "" {
+			config.ApprovedAdminPrincipal = existing.ApprovedAdminPrincipal
 		}
 		config.DashboardOrigins = append(config.DashboardOrigins, existing.DashboardOrigins...)
 		// Binding to a second controller is a deliberate act, not a

@@ -1,4 +1,24 @@
-# Terminal MCP Bootstrap — web-only Windows onboarding
+# Terminal MCP Bootstrap — one-file Windows onboarding
+
+## Current one-file contract
+
+The official `TerminalMCP-Setup.exe` contains one public, trusted HTTPS
+controller origin and no pairing handle, node token, SSH private key, or
+Tailscale auth key. Renaming the file does not alter setup. A double-click:
+
+1. shows **Install prerequisites** and requests native UAC once;
+2. installs/repairs the bootstrap service, then opens the authenticated owner
+   page for **Approve secure connection**;
+3. accepts an origin-bound loopback nonce plus a single-use pairing handle,
+   installs the `ai_coding` Node Agent, and reports **Verify and finish** only
+   after the local Agent health endpoint is ready.
+
+Windows pairing requires an explicit checkbox approving controller-scoped SSH
+administrator recovery. The elevated principal is sent during the one-time
+redeem and persisted as connection metadata; the controller public key remains
+in Windows' required `administrators_authorized_keys` file with inheritance
+disabled and only SYSTEM/Administrators ACLs. The controller private key is
+never included in the installer.
 
 ## What a browser actually cannot do
 
@@ -133,9 +153,9 @@ The CTA offers the download only when this controller has actually published
 a build. Otherwise it stays hidden and the copy/paste path remains primary —
 a button that 404s in front of an operator is worse than no button.
 
-This route is deliberately NOT public. A first install on a machine that
-cannot reach the Dashboard hostname still needs a public bootstrap hostname,
-which does not exist yet.
+The official build is pinned to `https://terminal-bootstrap.mesflow.net`.
+Authentication and one-time approval still occur in the browser; knowing this
+public origin grants no enrollment authority.
 
 ## Signing
 
@@ -167,9 +187,8 @@ owner installed.
 
 ## What is NOT verified
 
-The helper cannot be executed in this project's environment: there is no
-Windows host and no signing certificate. What **is** verified here is the
-protocol validation, the handle lifecycle, the backend routes, the
-Dashboard states and the generated artifact's syntax. Running the helper
-on real Windows is outstanding, and it is marked dev-only until it has
-been.
+The new generic-file flow is cross-compiled and exercised in Windows CI. The
+existing Windows node has previously passed Node Agent and real Codex session
+smoke tests, but this exact build has not yet passed a fresh double-click,
+sign-out and reboot acceptance run. The release remains an explicitly unsigned
+development build until that run and Authenticode signing are complete.

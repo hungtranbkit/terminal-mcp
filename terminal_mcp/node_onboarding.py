@@ -411,7 +411,8 @@ class OnboardingService:
                       platform: str = "windows", addresses: dict[str, Any] | None = None,
                       rescue_public_key: str | None = None,
                       request_base_url: str | None = None, dashboard_origin: str | None = None,
-                      machine_id: str | None = None) -> dict[str, Any]:
+                      machine_id: str | None = None,
+                      approved_admin_principal: str | None = None) -> dict[str, Any]:
         """The Bootstrap helper's entry point: one-time handle in, full
         bootstrap payload out.
 
@@ -437,9 +438,25 @@ class OnboardingService:
                         detail={"reason": "handle_invalid_or_spent", "hostname": hostname,
                                 "source_ip": source_ip})
             raise OnboardingError("HANDLE_INVALID", "handle is unknown, already used, or expired", status=401)
+        if platform == "windows" and record.profile == "ai_coding":
+            principal = str(approved_admin_principal or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}\\[A-Za-z0-9_.@$-]{1,64}", principal):
+                raise OnboardingError("ADMIN_PRINCIPAL_REQUIRED",
+                                      "approved Windows administrator principal is missing or invalid",
+                                      status=400)
         result = self._consume_record(record, hostname=hostname, source_ip=source_ip, platform=platform,
                                       addresses=addresses, rescue_public_key=rescue_public_key,
                                       request_base_url=request_base_url, by_handle=True)
+        if platform == "windows" and approved_admin_principal:
+            result["ssh"]["approved_admin_principal"] = approved_admin_principal
+            connection = self.connection_store.get(result["node_id"])
+            if connection is not None:
+                self.connection_store.save(
+                    connection.node_id, transport_type=connection.transport_type,
+                    endpoint=connection.endpoint, hostname=connection.hostname,
+                    username=approved_admin_principal, port=connection.port,
+                    host_key_fingerprint=connection.host_key_fingerprint,
+                    token_file=connection.token_file)
         if bound_origin:
             result["dashboard_origin"] = bound_origin
         return result
