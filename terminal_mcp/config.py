@@ -9,6 +9,7 @@ from urllib.parse import urlsplit as _urlsplit
 
 import yaml
 
+from .autopilot_policy import AutopilotPolicy, load_autopilot_config
 from . import endpoint_policy
 from .node_models import NodeHeartbeatThresholds, OverloadThresholds
 from .project_task_feeder import ProjectFeedConfig
@@ -1430,6 +1431,8 @@ class AppConfig:
     ask_chatgpt: AskChatGptConfig = AskChatGptConfig()
     nodes: NodesConfig = NodesConfig()
     queue: QueueConfig = QueueConfig()
+    # ProjectFlow Autopilot (#106): everything off unless explicitly configured.
+    autopilot: AutopilotPolicy = AutopilotPolicy()
     router: RouterConfig = RouterConfig()
     agents: AgentsConfig = AgentsConfig()
     llm_governor: LLMGovernorConfig = LLMGovernorConfig()
@@ -1902,6 +1905,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         ask_chatgpt=_load_ask_chatgpt_config(raw.get("ask_chatgpt", {})),
         nodes=nodes_config,
         queue=_load_queue_config(raw.get("queue", {})),
+        autopilot=load_autopilot_config(raw.get("autopilot")),
         router=_load_router_config(raw.get("router", {})),
         agents=_load_agents_config(raw.get("agents", {})),
         llm_governor=governor_config,

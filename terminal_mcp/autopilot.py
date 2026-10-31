@@ -44,6 +44,7 @@ from typing import Any, Callable, Mapping
 from . import queue_store as qs
 from .coordinator import SENSITIVE_PROMPT_PATTERNS, _negated
 from .outcomes import OPEN_OUTCOME_STATUSES
+from .autopilot_policy import AutopilotPolicy, AutopilotProjectPolicy, PlannerProviderConfig  # noqa: F401 -- re-export
 from .redaction import redact_text
 from .verify_queue import (
     FALLBACK_HOLD, NEEDS_REWORK, VERIFIED_FAIL, VERIFY_BLOCKED,
@@ -143,47 +144,6 @@ class Observation:
     def __post_init__(self) -> None:
         if self.state not in OBSERVATION_STATES:
             raise ValueError(f"unknown observation state {self.state!r}")
-
-
-@dataclass(frozen=True)
-class AutopilotProjectPolicy:
-    project_id: str
-    dispatch: bool = False
-    approved_by: str | None = None
-    approval_ref: str | None = None
-    lanes: tuple[str, ...] = ()
-    max_in_flight: int = 1
-    max_repair_attempts: int = 2
-    verify_required_capabilities: tuple[str, ...] = ()
-
-    def __post_init__(self) -> None:
-        if not str(self.project_id or "").strip():
-            raise ValueError("autopilot project_id is required")
-        if self.dispatch and not (str(self.approved_by or "").strip()
-                                  and str(self.approval_ref or "").strip()):
-            raise ValueError(f"autopilot dispatch for {self.project_id} requires approved_by "
-                             f"and approval_ref -- dispatch is never implied")
-        if self.dispatch and not self.lanes:
-            raise ValueError(f"autopilot dispatch for {self.project_id} requires an explicit "
-                             f"lanes allowlist")
-        if not 1 <= int(self.max_in_flight) <= 8:
-            raise ValueError("max_in_flight must be 1..8")
-        if not 0 <= int(self.max_repair_attempts) <= 5:
-            raise ValueError("max_repair_attempts must be 0..5")
-
-
-@dataclass(frozen=True)
-class AutopilotPolicy:
-    enabled: bool = False
-    kill_switch: bool = False
-    projects: tuple[AutopilotProjectPolicy, ...] = ()
-    lease_seconds: float = 60.0
-    task_lease_seconds: float = 300.0
-    event_batch: int = 200
-    interval_seconds: float = 15.0
-
-    def project(self, project_id: str) -> AutopilotProjectPolicy | None:
-        return next((p for p in self.projects if p.project_id == project_id), None)
 
 
 class ProjectAutopilot:
