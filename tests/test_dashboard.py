@@ -42,6 +42,38 @@ def test_dashboard_routes_are_registered(read_config):
     assert routes["/dashboard/api/session/input"] == {"POST"}
 
 
+def test_nodes_dashboard_offers_current_machine_join_and_loopback_pair_states():
+    from terminal_mcp.dashboard import NODES_ADMIN_HTML
+
+    assert 'id="joinCurrentMachineBtn"' in NODES_ADMIN_HTML
+    assert 'id="joinCurrentAdminConsent"' in NODES_ADMIN_HTML
+    assert 'approve_admin_recovery: adminConsent' in NODES_ADMIN_HTML
+    assert "Join this machine" in NODES_ADMIN_HTML
+    assert "127.0.0.1:47562/v1/challenge" in NODES_ADMIN_HTML
+    assert "127.0.0.1:47562/v1/pair" in NODES_ADMIN_HTML
+    assert "permission prompt" in NODES_ADMIN_HTML
+    assert "/dashboard/api/nodes/onboard/helper/install-script/" in NODES_ADMIN_HTML
+    assert "localStorage.getItem(JOIN_CURRENT_KEY)" in NODES_ADMIN_HTML
+    assert "localStorage.setItem(JOIN_CURRENT_KEY, key)" in NODES_ADMIN_HTML
+    assert "node.status === 'online' && node.last_heartbeat_at" in NODES_ADMIN_HTML
+    assert "first heartbeat reached the controller" in NODES_ADMIN_HTML
+
+
+def test_current_machine_join_keeps_os_permission_guidance_during_progress_polling():
+    from terminal_mcp.dashboard import NODES_ADMIN_HTML
+
+    join = NODES_ADMIN_HTML[NODES_ADMIN_HTML.index("async function joinCurrentMachine()"):
+                            NODES_ADMIN_HTML.index("document.getElementById('joinCurrentMachineBtn')")]
+    poll_start = NODES_ADMIN_HTML.index("async function anPollProgress()")
+    poll = NODES_ADMIN_HTML[poll_start:NODES_ADMIN_HTML.index("function anRenderDone()", poll_start)]
+
+    # A pending progress response arrives immediately after pairing. Keep the
+    # OS-specific user-consent instruction visible until the helper reports a
+    # terminal outcome, rather than replacing it with a generic waiting label.
+    assert "joinCurrentPermissionReminder(platform)" in join
+    assert "joinStatus.dataset.state !== 'permission'" in poll
+
+
 def test_sessions_admin_page_reachable_and_uses_the_same_api(tmp_path, tmux_session_factory):
     # /dashboard/sessions is a second VIEW of the same data/mutations, not
     # a new privilege surface -- same read guard as /dashboard, same
@@ -1442,6 +1474,8 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         # itself. Split into two, this path-keyed dict would record only
         # whichever registered last, and silently stop guarding the other.
         "/dashboard/api/nodes/onboard/enrollments": {"GET", "POST", "HEAD"},
+        "/dashboard/api/nodes/onboard/join/current": {"POST"},
+        "/dashboard/api/nodes/onboard/helper/install-script/{platform}": {"POST"},
         "/dashboard/api/nodes/onboard/enrollments/{enrollment_id}/revoke": {"POST"},
         "/dashboard/api/nodes/onboard/gateway": {"GET", "HEAD"},
         # Bootstrap helper artifact: operator-facing reads, _read_guard only.

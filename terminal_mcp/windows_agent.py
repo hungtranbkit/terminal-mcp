@@ -198,7 +198,8 @@ def main(argv: list[str] | None = None) -> int:
                               token=credential, workspace_root=workspace_root,
                               interval_seconds=args.heartbeat_interval_seconds,
                               platform=PLATFORM_WINDOWS, session_backend=SESSION_BACKEND_WINDOWS_PTY,
-                              shell_capabilities=shell_capabilities, wsl_available=wsl_available)
+                              shell_capabilities=shell_capabilities, wsl_available=wsl_available,
+                              agent_host=args.host, agent_port=args.port)
 
     async def run() -> None:
         async with anyio.create_task_group() as tg:

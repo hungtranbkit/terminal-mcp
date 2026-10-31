@@ -75,6 +75,7 @@ file count from `ls tests/*.py`), not recalled from memory.
 | Remote Linux node (RemoteNodeClient + node-agent) | VERIFIED |
 | macOS worker node | VERIFIED |
 | Windows native/ConPTY backend | VERIFIED |
+| Windows one-file secure node setup | CODE-VERIFIED; REAL WINDOWS ACCEPTANCE PENDING |
 | Dashboard: auth (Cloudflare Access + CSRF) | VERIFIED |
 | Dashboard: session tabs, live terminal/output/input | VERIFIED |
 | Dashboard: fullscreen/mobile behavior | VERIFIED |
@@ -236,6 +237,17 @@ sessions bringing up dell-5530/m910/macbook — see `docs/multi-node.md`).
   until blg_20dc778df7ac: `node_agent.py` defaulted the reported platform
   to `"linux"` and macOS runs that same POSIX agent, so the value was a
   plausible-looking wrong answer rather than a missing one.
+- **Windows one-file setup (Issue #100):** the Nodes dashboard downloads a
+  paired `TerminalMCP-Setup.exe`. The filename carries only a short-lived,
+  single-use enrollment handle and a validated controller origin; the EXE
+  requests native UAC, installs its bootstrap service as LocalSystem, and
+  installs the node agent as an AtStartup task. The handle is hashed at rest,
+  redeemed once, and never embedded in the artifact bytes or logs. Re-running
+  the EXE repairs the persisted machine identity instead of creating a second
+  node. The public artifact route re-hashes the bytes against its manifest on
+  every download. Cross-compiled Windows code and synthetic enrollment tests
+  are required before publication; an actual Windows UAC, heartbeat, backend,
+  PowerShell and Codex run remains a separate live acceptance gate.
 - **Windows native/ConPTY backend:** `windows_backend.py`'s
   `WindowsSessionBackend` — a real ConPTY child process per session, a
   background reader thread feeding a `pyte.HistoryScreen` (real VT100

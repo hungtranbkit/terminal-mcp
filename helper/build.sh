@@ -9,12 +9,15 @@
 # report itself as signed.
 set -euo pipefail
 cd "$(dirname "$0")"
-VERSION="${VERSION:-0.1.0-dev}"
+VERSION="${VERSION:-0.2.0-dev}"
+CONTROLLER="${CONTROLLER:-https://terminal-bootstrap.mesflow.net}"
+DASHBOARD="${DASHBOARD:-https://terminal-dashboard.mesflow.net}"
 SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-OUT="${OUT:-dist/terminal-mcp-bootstrap.exe}"
+OUT="${OUT:-dist/TerminalMCP-Setup.exe}"
 mkdir -p "$(dirname "$OUT")"
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build \
-  -ldflags "-s -w -X main.Version=${VERSION} -X main.BuildSHA=${SHA} -X main.Signed=false" \
+	-trimpath -buildvcs=false \
+  -ldflags "-s -w -X main.Version=${VERSION} -X main.BuildSHA=${SHA} -X main.Signed=false -X main.DefaultController=${CONTROLLER} -X main.DefaultDashboard=${DASHBOARD}" \
   -o "$OUT" ./cmd/terminal-mcp-bootstrap
 echo "built $OUT"
 sha256sum "$OUT"

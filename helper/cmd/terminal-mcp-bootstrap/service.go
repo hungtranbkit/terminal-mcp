@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -14,16 +15,17 @@ import (
 // carries these -- never a command string. A privileged service that
 // accepted arbitrary RPC would undo every check in internal/proto.
 type pipeRequest struct {
-	Action     string `json:"action"`
-	Handle     string `json:"handle,omitempty"`
-	Session    string `json:"session,omitempty"`
-	Controller string `json:"controller"`
+	Action          string `json:"action"`
+	Handle          string `json:"handle,omitempty"`
+	Session         string `json:"session,omitempty"`
+	Controller      string `json:"controller"`
+	DashboardOrigin string `json:"dashboard_origin,omitempty"`
 }
 
 type pipeResponse struct {
-	OK     bool           `json:"ok"`
-	Error  string         `json:"error,omitempty"`
-	Status *statusReport  `json:"status,omitempty"`
+	OK     bool          `json:"ok"`
+	Error  string        `json:"error,omitempty"`
+	Status *statusReport `json:"status,omitempty"`
 }
 
 var pipeActions = map[string]bool{
@@ -87,13 +89,19 @@ func handlePipeRequest(raw []byte, config Config) pipeResponse {
 	if request.Action == "Bootstrap" && !handleLooksValid(request.Handle) {
 		return pipeResponse{Error: "bad handle"}
 	}
+	if request.DashboardOrigin != "" {
+		if normalized, ok := secureDashboardOrigin(request.DashboardOrigin); !ok || normalized != request.DashboardOrigin {
+			return pipeResponse{Error: "bad dashboard origin"}
+		}
+	}
 
 	switch request.Action {
 	case "GetStatus":
 		status := currentStatus()
 		return pipeResponse{OK: true, Status: &status}
 	case "Bootstrap":
-		if err := continueSession(request.Handle, origin); err != nil {
+		if err := continueSessionWithIdentity(request.Handle, origin, request.DashboardOrigin,
+			config.MachineID, config.ApprovedAdminPrincipal); err != nil {
 			return pipeResponse{Error: err.Error()}
 		}
 		return pipeResponse{OK: true}
@@ -142,6 +150,11 @@ func handleLooksValid(handle string) bool {
 const installerTimeout = 45 * time.Minute
 
 func continueSession(handle, controller string) error {
+	config, _ := loadConfig()
+	return continueSessionWithIdentity(handle, controller, "", config.MachineID, config.ApprovedAdminPrincipal)
+}
+
+func continueSessionWithIdentity(handle, controller, dashboardOrigin, machineID, adminPrincipal string) error {
 	report := newReporter(controller, handle)
 	report.report(stageHelperStarted)
 
@@ -160,16 +173,27 @@ func continueSession(handle, controller string) error {
 	if hostname == "" {
 		hostname = "windows"
 	}
-	payload, err := redeemHandle(controller, handle, hostname)
+	payload, err := redeemHandleIdentity(controller, handle, hostname, dashboardOrigin, machineID, adminPrincipal)
 	if err != nil {
 		report.fail(failPairingRejected)
 		return fmt.Errorf("redeem pairing: %w", err)
+	}
+	if trustedOrigin, ok := payload["dashboard_origin"].(string); ok && trustedOrigin != "" {
+		normalized, valid := secureDashboardOrigin(trustedOrigin)
+		if !valid || normalized != trustedOrigin {
+			report.fail(failPairingRejected)
+			return fmt.Errorf("controller returned an invalid dashboard origin")
+		}
+		if err := persistDashboardOrigin(trustedOrigin); err != nil {
+			return fmt.Errorf("persist dashboard origin: %w", err)
+		}
 	}
 	report.report(stageRedeemed)
 
 	// Split the response into exactly what the installer's own first run
 	// leaves on disk. Writing the raw payload here is what broke -Repair:
 	// it gates on node.token existing, and the old code never wrote one.
+	authKey := tailscaleAuthKey(payload)
 	config, token, err := canonicalNodeConfig(payload, controller)
 	if err != nil {
 		report.fail(failServiceInstall)
@@ -180,6 +204,11 @@ func continueSession(handle, controller string) error {
 		report.fail(failServiceInstall)
 		return fmt.Errorf("persist node config: %w", err)
 	}
+	if err := persistTailscaleAuthOnce(authKey); err != nil {
+		report.fail(failServiceInstall)
+		return err
+	}
+	defer os.Remove(tailscaleAuthOncePath())
 
 	if err := downloadSetupScript(controller); err != nil {
 		report.fail(failScriptDownload)
@@ -202,6 +231,24 @@ func continueSession(handle, controller string) error {
 	return nil
 }
 
+func persistDashboardOrigin(origin string) error {
+	config, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	for _, existing := range config.DashboardOrigins {
+		if existing == origin {
+			return nil
+		}
+	}
+	config.DashboardOrigins = append(config.DashboardOrigins, origin)
+	raw, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeAtomic(configPath(), raw, 0o600)
+}
+
 func runService() int {
 	config, err := loadConfig()
 	if err != nil {
@@ -212,15 +259,22 @@ func runService() int {
 }
 
 func runUninstall() int {
-	fmt.Println("[1/3] removing the service")
+	fmt.Println("[1/4] removing the Terminal MCP node")
+	if _, err := os.Stat(filepath.Join(programDataDir(), "windows-setup.ps1")); err == nil {
+		if code, runErr := runStagesBounded("", "-Uninstall", installerTimeout); runErr != nil {
+			fmt.Fprintf(os.Stderr, "      ! node uninstall failed (exit %d): %v\n", code, runErr)
+			return 1
+		}
+	}
+	fmt.Println("[2/4] removing the service")
 	if err := removeService(); err != nil {
 		fmt.Fprintf(os.Stderr, "      ! %v\n", err)
 	}
-	fmt.Println("[2/3] removing the terminalmcp:// registration")
+	fmt.Println("[3/4] removing the terminalmcp:// registration")
 	if err := unregisterProtocol(); err != nil {
 		fmt.Fprintf(os.Stderr, "      ! %v\n", err)
 	}
-	fmt.Println("[3/3] removing helper state")
+	fmt.Println("[4/4] removing helper state")
 	// Only what this helper owns. Never OpenSSH, Tailscale, Git, Node,
 	// Python or anything the machine's owner installed.
 	_ = os.Remove(configPath())

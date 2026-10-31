@@ -4,15 +4,92 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/hungtranbkit/terminal-mcp/helper/internal/proto"
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
+	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/mgr"
 )
+
+var shellExecuteW = windows.NewLazySystemDLL("shell32.dll").NewProc("ShellExecuteW")
+var messageBoxW = windows.NewLazySystemDLL("user32.dll").NewProc("MessageBoxW")
+
+func currentAdminPrincipal() string {
+	account, err := user.Current()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(account.Username)
+}
+
+func showSetupStage(stage int, title, detail string) {
+	text, _ := windows.UTF16PtrFromString(fmt.Sprintf("Stage %d of 3: %s\n\n%s", stage, title, detail))
+	caption, _ := windows.UTF16PtrFromString("Terminal MCP Setup")
+	messageBoxW.Call(0, uintptr(unsafe.Pointer(text)), uintptr(unsafe.Pointer(caption)), 0x40)
+}
+
+func showSetupError(detail string) bool {
+	text, _ := windows.UTF16PtrFromString(detail + "\n\nChoose Retry to repair automatically, or Cancel to leave the current state unchanged.")
+	caption, _ := windows.UTF16PtrFromString("Terminal MCP Setup")
+	result, _, _ := messageBoxW.Call(0, uintptr(unsafe.Pointer(text)), uintptr(unsafe.Pointer(caption)), 0x15)
+	return result == 4 // IDRETRY
+}
+
+func openOwnerApproval(target string) error {
+	verb, _ := windows.UTF16PtrFromString("open")
+	value, err := windows.UTF16PtrFromString(target)
+	if err != nil {
+		return err
+	}
+	result, _, callErr := shellExecuteW.Call(0, uintptr(unsafe.Pointer(verb)),
+		uintptr(unsafe.Pointer(value)), 0, 0, windows.SW_SHOWNORMAL)
+	if result <= 32 {
+		return fmt.Errorf("ShellExecuteW(open) failed: %w", callErr)
+	}
+	return nil
+}
+
+// ensureElevatedForInstall turns the ordinary double-click into Windows'
+// native UAC flow. Pairing remains in the executable name, so no handle or
+// node token is copied into a command line or written to a staging file.
+func ensureElevatedForInstall() (bool, error) {
+	token := windows.GetCurrentProcessToken()
+	if token.IsElevated() {
+		return false, nil
+	}
+	executable, err := windows.UTF16PtrFromString(os.Args[0])
+	if err != nil {
+		return false, err
+	}
+	verb, _ := windows.UTF16PtrFromString("runas")
+	quoted := make([]string, 0, len(os.Args)-1)
+	for _, argument := range os.Args[1:] {
+		quoted = append(quoted, syscall.EscapeArg(argument))
+	}
+	parameters, err := windows.UTF16PtrFromString(strings.Join(quoted, " "))
+	if err != nil {
+		return false, err
+	}
+	result, _, callErr := shellExecuteW.Call(
+		0, uintptr(unsafe.Pointer(verb)), uintptr(unsafe.Pointer(executable)),
+		uintptr(unsafe.Pointer(parameters)), 0, windows.SW_SHOWNORMAL,
+	)
+	if result <= 32 {
+		return false, fmt.Errorf("ShellExecuteW(runas) failed: %w (code %d)", callErr, result)
+	}
+	return true, nil
+}
 
 // registerProtocol writes the terminalmcp:// handler under HKLM, so it
 // applies machine-wide rather than per-user. The command line is a FIXED
@@ -178,4 +255,46 @@ func runStagesBounded(controller, extraArg string, limit time.Duration) (int, er
 		args = append(args, extraArg)
 	}
 	return runBoundedCommand(limit, newlineFeeder(), "powershell.exe", args...)
+}
+
+// stopServiceForUpdate releases the running executable before replacement.
+// Use SCM state codes, not localized sc.exe text, and fail closed on timeout.
+func stopServiceForUpdate() error {
+	manager, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer manager.Disconnect()
+	service, err := manager.OpenService(ServiceName)
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer service.Close()
+	status, err := service.Query()
+	if err != nil {
+		return err
+	}
+	if status.State == svc.Stopped {
+		return nil
+	}
+	if status.State != svc.StopPending {
+		if _, err = service.Control(svc.Stop); err != nil {
+			return err
+		}
+	}
+	deadline := time.Now().Add(serviceStartTimeout)
+	for time.Now().Before(deadline) {
+		status, err = service.Query()
+		if err != nil {
+			return err
+		}
+		if status.State == svc.Stopped {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("helper service did not stop before update")
 }

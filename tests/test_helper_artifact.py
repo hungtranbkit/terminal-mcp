@@ -49,7 +49,7 @@ def test_a_published_artifact_resolves_with_its_metadata(store):
     assert resolved.size == len(BODY)
     assert resolved.sha256 == published.sha256
     assert resolved.signed is False
-    assert resolved.filename == "terminal-mcp-bootstrap.exe"
+    assert resolved.filename == "TerminalMCP-Setup.exe"
 
 
 def test_the_manifest_hash_is_computed_from_the_stored_bytes(store):
@@ -274,7 +274,7 @@ def test_a_published_artifact_downloads_with_the_right_headers(client, store):
     assert response.content == BODY
     assert response.headers["content-type"] == "application/octet-stream"
     assert response.headers["content-disposition"] == \
-        'attachment; filename="terminal-mcp-bootstrap.exe"'
+        'attachment; filename="TerminalMCP-Setup.exe"'
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["x-content-type-options"] == "nosniff"
     assert response.headers["x-artifact-sha256"] == published.sha256
@@ -349,7 +349,7 @@ from terminal_mcp.dashboard import NODES_ADMIN_HTML               # noqa: E402
 def test_the_cta_points_at_this_route_when_the_helper_is_absent():
     assert 'id="anHelperDlBtn"' in NODES_ADMIN_HTML
     assert '/dashboard/api/nodes/onboard/helper/windows-x64' in NODES_ADMIN_HTML
-    assert 'download="terminal-mcp-bootstrap.exe"' in NODES_ADMIN_HTML
+    assert 'download="TerminalMCP-Setup.exe"' in NODES_ADMIN_HTML
 
 
 def test_the_cta_only_offers_a_download_this_controller_actually_published():
@@ -365,7 +365,8 @@ def test_the_cta_only_offers_a_download_this_controller_actually_published():
 
 def test_an_unsigned_build_is_stated_plainly_not_coached_past():
     assert "chưa ký" in NODES_ADMIN_HTML
-    assert "SmartScreen" in NODES_ADMIN_HTML
+    assert "Windows may block it" in NODES_ADMIN_HTML
+    assert "More info → Run anyway" not in NODES_ADMIN_HTML
     assert "build.signed" in NODES_ADMIN_HTML
 
 
@@ -380,7 +381,8 @@ def test_the_manual_powershell_fallback_is_untouched():
 
 def test_the_one_click_connect_button_still_exists_for_an_installed_helper():
     assert 'id="anHelperBtn"' in NODES_ADMIN_HTML
-    assert "terminalmcp" in NODES_ADMIN_HTML or "issued.data.url" in NODES_ADMIN_HTML
+    assert "http://127.0.0.1:47562/v1/pair" in NODES_ADMIN_HTML
+    assert "nonce: challenge.nonce, handle" in NODES_ADMIN_HTML
 
 
 # -- pairing the download with a pending session ------------------------------------
@@ -389,18 +391,18 @@ HANDLE = "0123456789abcdef0123456789abcdef"
 
 
 def test_a_paired_filename_carries_origin_and_handle():
-    name = ha.paired_filename("terminal-mcp-bootstrap.exe", "https://ctl.example", HANDLE)
-    assert name == f"terminal-mcp-bootstrap__ctl.example__{HANDLE}.exe"
+    name = ha.paired_filename("TerminalMCP-Setup.exe", "https://ctl.example", HANDLE)
+    assert name == f"TerminalMCP-Setup__ctl.example__{HANDLE}.exe"
 
 
 def test_a_port_is_encoded_because_colon_is_illegal_in_a_windows_filename():
-    name = ha.paired_filename("terminal-mcp-bootstrap.exe", "https://ctl.example:8443", HANDLE)
-    assert name == f"terminal-mcp-bootstrap__ctl.example-p8443__{HANDLE}.exe"
+    name = ha.paired_filename("TerminalMCP-Setup.exe", "https://ctl.example:8443", HANDLE)
+    assert name == f"TerminalMCP-Setup__ctl.example-p8443__{HANDLE}.exe"
 
 
 def test_a_dev_http_controller_records_its_scheme_rather_than_being_guessed():
-    name = ha.paired_filename("terminal-mcp-bootstrap.exe", "http://127.0.0.1:8766", HANDLE)
-    assert name == f"terminal-mcp-bootstrap__http-127.0.0.1-p8766__{HANDLE}.exe"
+    name = ha.paired_filename("TerminalMCP-Setup.exe", "http://127.0.0.1:8766", HANDLE)
+    assert name == f"TerminalMCP-Setup__http-127.0.0.1-p8766__{HANDLE}.exe"
 
 
 @pytest.mark.parametrize("controller,handle", [
@@ -414,16 +416,16 @@ def test_a_dev_http_controller_records_its_scheme_rather_than_being_guessed():
 def test_anything_malformed_degrades_to_the_plain_name(controller, handle):
     """A generic download is a supported outcome, never an error -- the
     operator installs it and presses Connect again."""
-    assert ha.paired_filename("terminal-mcp-bootstrap.exe", controller, handle) == \
-        "terminal-mcp-bootstrap.exe"
+    assert ha.paired_filename("TerminalMCP-Setup.exe", controller, handle) == \
+        "TerminalMCP-Setup.exe"
 
 
 def test_a_path_on_the_controller_url_does_not_affect_the_origin(client, store):
     """An origin is scheme + host + port. A path is not part of it, and
     pairing on the correct origin is right rather than a degradation."""
-    name = ha.paired_filename("terminal-mcp-bootstrap.exe",
+    name = ha.paired_filename("TerminalMCP-Setup.exe",
                               "https://ctl.example/../../etc", HANDLE)
-    assert name == f"terminal-mcp-bootstrap__ctl.example__{HANDLE}.exe"
+    assert name == f"TerminalMCP-Setup__ctl.example__{HANDLE}.exe"
 
 
 def test_the_paired_download_names_the_file_after_the_session(client, store):
@@ -434,7 +436,7 @@ def test_the_paired_download_names_the_file_after_the_session(client, store):
     assert response.status_code == 200
     disposition = response.headers["content-disposition"]
     assert HANDLE in disposition
-    assert disposition.startswith('attachment; filename="terminal-mcp-bootstrap__')
+    assert disposition.startswith('attachment; filename="TerminalMCP-Setup__')
     assert disposition.endswith('.exe"')
 
 
@@ -458,7 +460,7 @@ def test_a_malformed_session_still_serves_a_generic_download(client, store):
 
     assert response.status_code == 200
     assert response.headers["content-disposition"] == \
-        'attachment; filename="terminal-mcp-bootstrap.exe"'
+        'attachment; filename="TerminalMCP-Setup.exe"'
 
 
 def test_the_handle_never_reaches_a_log(client, store, caplog):

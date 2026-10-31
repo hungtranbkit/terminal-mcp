@@ -111,6 +111,21 @@ func TestTheTailscaleAuthKeyNeverReachesDisk(t *testing.T) {
 	}
 }
 
+func TestTheTailscaleAuthKeyIsAvailableOnlyForOneShotHandoff(t *testing.T) {
+	payload := redeemFixture()
+	if got := tailscaleAuthKey(payload); got != "tskey-auth-SECRET-VALUE" {
+		t.Fatalf("tailscaleAuthKey = %q", got)
+	}
+	config, _, err := canonicalNodeConfig(payload, "https://dialed.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ := json.Marshal(config)
+	if strings.Contains(string(encoded), "tskey-auth-SECRET-VALUE") {
+		t.Fatal("one-shot Tailscale key leaked into durable config")
+	}
+}
+
 func TestTheTwoFieldsTheScriptAddsArePresent(t *testing.T) {
 	// windows_onboarding.py adds controller_url and controller_key to
 	// $safe before writing node.json. -Uninstall reads controller_key to
