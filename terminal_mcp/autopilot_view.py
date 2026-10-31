@@ -113,10 +113,24 @@ class ControlTower:
             "depends_on": list(task.depends_on), "attempt": task.attempt_count,
             "started_at": task.started_at, "completed_at": task.completed_at,
             "updated_at": task.updated_at, "last_error": _safe(task.last_error),
-            "qa": ({"job_id": jobs[0].id, "status": jobs[0].status, "attempt": jobs[0].attempt}
-                   if jobs else None),
+            "qa": self._qa_view(task, jobs[0], report if fresh else None) if jobs else None,
             "evidence_ref": evidence,
         }
+
+    @staticmethod
+    def _qa_view(task: qs.QueueTask, job: Any, report: dict[str, Any] | None) -> dict[str, Any]:
+        """The verify job plus, when the autopilot sends QA, who it went to and
+        why it is not moving -- the latter only from a FRESH observation."""
+        meta = (task.metadata.get(ap.METADATA_KEY) or {}).get("qa") or {}
+        mine = meta.get("job_id") == job.id
+        waiting = next((item for item in (report or {}).get("qa_waiting", ())
+                        if item.get("verify_job") == job.id), None)
+        return {"job_id": job.id, "status": job.status, "attempt": job.attempt,
+                "commit_sha": job.commit_sha,
+                "verifier": job.verifier or (meta.get("verifier") if mine else None),
+                "dispatches": int(meta.get("dispatches") or 0) if mine else 0,
+                "waiting_reason": waiting.get("reason") if waiting else None,
+                "waiting_detail": _safe(waiting.get("detail")) if waiting else None}
 
     def _readiness(self, tasks: list[qs.QueueTask], outcomes: list[Any]) -> dict[str, str]:
         live = [t for t in tasks if t.status not in (qs.CANCELLED, qs.SKIPPED)]
@@ -154,6 +168,12 @@ class ControlTower:
                        for t in task_views if t["status"] in (qs.BLOCKED, qs.FAILED)]
         needs_owner += [{"task_id": t["id"], "status": "WAITING_INPUT", "reason": None}
                         for t in task_views if t["display_status"] == "WAITING_INPUT"]
+        verifying = {t["id"] for t in task_views if t["status"] == qs.VERIFYING}
+        if fresh:  # QA held for a human (no verdict, stale commit, budget spent)
+            needs_owner += [{"task_id": item["task_id"], "status": qs.VERIFYING,
+                             "reason": item["reason"]}
+                            for item in (report or {}).get("owner_attention", ())
+                            if item.get("task_id") in verifying]
         paused = self._paused_lanes(project_id)
         return {
             "schema": SNAPSHOT_SCHEMA, "project_id": project_id,
@@ -252,8 +272,38 @@ class ControlTower:
         return {"project_id": project_id, "notifications": items, "next_seq": next_seq}
 
 
+def build_workspace_probe(session_ops: Any, repo_evidence: Any) -> Any:
+    """lane -> {"dirty", "head"} read WHERE the lane lives: the session's cwd
+    and node from the controller, then the node-aware repo-evidence collector
+    the dispatch gate already uses. Any failure raises, which the autopilot
+    reads as an UNKNOWN workspace (no dispatch) and an unknown HEAD (no QA)."""
+    def probe(lane: str) -> dict[str, Any]:
+        status = session_ops.terminal_status(lane) or {}
+        if status.get("error"):
+            raise RuntimeError(f"status {status.get('error')}")
+        cwd = str(status.get("cwd") or "").strip()
+        if not cwd:
+            raise RuntimeError("session reports no cwd")
+        evidence = repo_evidence(cwd, status.get("node_id"))
+        return {"dirty": not evidence.clean, "head": evidence.head}
+    return probe
+
+
+def build_verifier_probe(session_ops: Any) -> Any:
+    """verifier session -> {"available", "reason"}. Only a status read that
+    succeeds counts as available; an unknown session or an offline node does
+    not, and the reason is shown instead of sending blind."""
+    def probe(session: str) -> dict[str, Any]:
+        status = session_ops.terminal_status(session) or {}
+        if status.get("error"):
+            return {"available": False, "reason": str(status.get("error"))}
+        return {"available": True, "reason": None}
+    return probe
+
+
 def build_autopilot_runtime(config: Any, *, queue: Any, bus: Any, outcomes: Any, projects: Any,
-                            locks: Any, direct_tasks: Any, instance_id: str
+                            locks: Any, direct_tasks: Any, instance_id: str,
+                            session_ops: Any = None, repo_evidence: Any = None,
                             ) -> tuple[ControlTower | None, ap.AutopilotLoop | None]:
     """Server wiring. The Control Tower read model exists whenever a queue is
     wired (it shows DISABLED when the policy is off). The loop exists only
@@ -268,7 +318,10 @@ def build_autopilot_runtime(config: Any, *, queue: Any, bus: Any, outcomes: Any,
         autopilot = ap.ProjectAutopilot(
             store=queue.store, verify=verify, outcomes=outcomes, bus=bus, locks=locks,
             dispatcher=ap.DirectTaskDispatcher(direct_tasks), policy=policy,
-            instance_id=instance_id)
+            instance_id=instance_id,
+            workspace_probe=(build_workspace_probe(session_ops, repo_evidence)
+                             if session_ops is not None and repo_evidence is not None else None),
+            verifier_probe=build_verifier_probe(session_ops) if session_ops is not None else None)
         loop = ap.AutopilotLoop(autopilot)
     tower = ControlTower(store=queue.store, verify=verify, outcomes=outcomes, bus=bus,
                          projects=projects, policy=policy, loop=loop)

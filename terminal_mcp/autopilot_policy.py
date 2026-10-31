@@ -42,6 +42,19 @@ class PlannerProviderConfig:
 
 
 @dataclass(frozen=True)
+class VerifierSessionPolicy:
+    """A session the autopilot may send QA to. `capabilities` is what that
+    session HAS; a verify job goes to it only when every capability the job
+    requires is present (verify_queue's AND semantics)."""
+    session: str
+    capabilities: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not str(self.session or "").strip():
+            raise ValueError("autopilot verifier session is required")
+
+
+@dataclass(frozen=True)
 class AutopilotProjectPolicy:
     project_id: str
     dispatch: bool = False
@@ -55,6 +68,15 @@ class AutopilotProjectPolicy:
     # Empty means approved_by alone. Pausing is a safety action open to any
     # authenticated operator.
     owners: tuple[str, ...] = ()
+    # QA dispatch. Empty means the autopilot never sends QA anywhere and a
+    # verifier must claim jobs by itself, exactly as before.
+    verifiers: tuple[VerifierSessionPolicy, ...] = ()
+    max_qa_dispatches: int = 2
+    qa_require_commit: bool = True
+
+    @property
+    def qa_dispatch_enabled(self) -> bool:
+        return bool(self.dispatch and self.verifiers)
 
     @property
     def owner_identities(self) -> tuple[str, ...]:
@@ -76,6 +98,18 @@ class AutopilotProjectPolicy:
             raise ValueError("max_in_flight must be 1..8")
         if not 0 <= int(self.max_repair_attempts) <= 5:
             raise ValueError("max_repair_attempts must be 0..5")
+        if self.verifiers and not self.dispatch:
+            raise ValueError(f"autopilot verifiers for {self.project_id} require dispatch "
+                             f"approval -- sending QA is a dispatch")
+        sessions = [v.session for v in self.verifiers]
+        if len(sessions) != len(set(sessions)):
+            raise ValueError(f"autopilot verifiers for {self.project_id} are duplicated")
+        overlap = set(sessions) & set(self.lanes)
+        if overlap:
+            raise ValueError(f"autopilot verifier(s) {sorted(overlap)} are also implementer lanes "
+                             f"-- QA must be independent of the work it checks")
+        if not 1 <= int(self.max_qa_dispatches) <= 5:
+            raise ValueError("max_qa_dispatches must be 1..5")
 
 
 @dataclass(frozen=True)
@@ -117,6 +151,12 @@ def load_autopilot_config(raw: Any) -> AutopilotPolicy:
         caps = item.get("verify_required_capabilities") or []
         if not isinstance(lanes, list) or not all(isinstance(x, str) for x in lanes):
             raise ValueError(f"autopilot.projects[{index}].lanes must be a list of strings")
+        verifiers_raw = item.get("verifiers") or []
+        if not isinstance(verifiers_raw, list) or not all(isinstance(v, dict) for v in verifiers_raw):
+            raise ValueError(f"autopilot.projects[{index}].verifiers must be a list of mappings")
+        verifiers = tuple(VerifierSessionPolicy(
+            session=str(v.get("session") or ""),
+            capabilities=tuple(str(c) for c in (v.get("capabilities") or []))) for v in verifiers_raw)
         projects.append(AutopilotProjectPolicy(
             project_id=str(item.get("project_id") or ""),
             dispatch=item.get("dispatch") is True,
@@ -124,7 +164,9 @@ def load_autopilot_config(raw: Any) -> AutopilotPolicy:
             lanes=tuple(lanes), max_in_flight=int(item.get("max_in_flight", 1)),
             max_repair_attempts=int(item.get("max_repair_attempts", 2)),
             verify_required_capabilities=tuple(str(c) for c in caps),
-            owners=tuple(str(o) for o in (item.get("owners") or []))))
+            owners=tuple(str(o) for o in (item.get("owners") or [])),
+            verifiers=verifiers, max_qa_dispatches=int(item.get("max_qa_dispatches", 2)),
+            qa_require_commit=item.get("qa_require_commit", True) is not False))
     ids = [p.project_id for p in projects]
     if len(ids) != len(set(ids)):
         raise ValueError("autopilot.projects has duplicate project_id")
@@ -133,6 +175,12 @@ def load_autopilot_config(raw: Any) -> AutopilotPolicy:
         for lane in project.lanes:
             if lane_owner.setdefault(lane, project.project_id) != project.project_id:
                 raise ValueError(f"autopilot lane {lane!r} is allowlisted for two projects")
+    for project in projects:
+        for verifier in project.verifiers:
+            owner = lane_owner.get(verifier.session)
+            if owner is not None:
+                raise ValueError(f"autopilot verifier {verifier.session!r} is an implementer lane "
+                                 f"of {owner} -- QA must be independent")
     planner_raw = raw.get("planner") or {}
     if not isinstance(planner_raw, dict):
         raise ValueError("autopilot.planner must be a mapping")

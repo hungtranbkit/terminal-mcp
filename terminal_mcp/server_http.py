@@ -639,13 +639,17 @@ def main() -> None:
     autopilot_tower, autopilot_loop = None, None
     try:
         from .autopilot_view import build_autopilot_runtime
+        from .coordinator import node_aware_repo_evidence
         autopilot_tower, autopilot_loop = build_autopilot_runtime(
             config, queue=queue, bus=getattr(server, "event_bus", None) or events,
             outcomes=getattr(server, "outcome_store", None),
             projects=getattr(server, "project_service", None),
             locks=getattr(server, "resource_locks", None),
             direct_tasks=getattr(server, "direct_task_supervisor", None),
-            instance_id=f"{controller.local_node_id}:{os.getpid()}")
+            instance_id=f"{controller.local_node_id}:{os.getpid()}",
+            session_ops=controller,
+            repo_evidence=node_aware_repo_evidence(
+                local_node_id=controller.local_node_id, node_client_factory=controller.client_for))
     except Exception:  # noqa: BLE001 -- never block startup on an opt-in feature
         _log.exception("autopilot runtime unavailable")
     register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store,

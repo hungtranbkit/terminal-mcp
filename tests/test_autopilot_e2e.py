@@ -271,3 +271,76 @@ def test_kill_switch_stops_mid_project(stage):
         stage.verifier.step()
     assert len(stage.agents.sends) == sends
     assert stage.store.get_task(stage.b).status == QUEUED
+
+
+def test_full_loop_with_automatic_qa_dispatch_and_no_polling_verifier(stage):
+    """No SimVerifier polling the queue: QA reaches the verifier ONLY because
+    the autopilot sent it a job id, and the verifier answers ONLY through the
+    public verify API. A first QA failure is repaired once; B starts only
+    after A's PASS; every send happens exactly once per key."""
+    import re
+
+    from terminal_mcp.autopilot_policy import VerifierSessionPolicy
+
+    head = "0" * 40
+    policy = ap.AutopilotPolicy(enabled=True, projects=(ap.AutopilotProjectPolicy(
+        project_id=BRAND, dispatch=True, approved_by="owner@staging.test",
+        approval_ref="https://github.com/hungtranbkit/terminal-mcp/issues/106",
+        lanes=("brand-work-1",), max_repair_attempts=1,
+        verifiers=(VerifierSessionPolicy("brand-qa-1", ("python",)),),
+        verify_required_capabilities=("python",)),))
+    texts: dict[str, str] = {}
+    agents = stage.agents
+    original = agents.dispatch
+
+    def dispatch(*, target, text, idempotency_key):
+        texts.setdefault(idempotency_key, text)
+        return original(target=target, text=text, idempotency_key=idempotency_key)
+
+    agents.dispatch = dispatch
+    failed_once: set[str] = set()
+
+    def verifier_session_step():
+        for key, record in agents.records.items():
+            if record["target"] != "brand-qa-1" or record.get("answered") or record["step"] < 1:
+                continue
+            job_id = re.search(r"verify job ([0-9a-f]{32})", texts[key]).group(1)
+            job = stage.verify.claim_next(verifier="brand-qa-1", capabilities=("python",),
+                                          project_id=BRAND, job_id=job_id)
+            if job is None:
+                continue
+            if job.task_id == stage.a and job.task_id not in failed_once:
+                failed_once.add(job.task_id)
+                stage.verify.fail(job.id, job.claim_token, result="VERIFIED_FAIL",
+                                  failure_summary={"headline": INJECTION, "tests_failed": 1})
+            else:
+                assert stage.verify.complete(job.id, job.claim_token, evidence={
+                    "command": "pytest -q", "exit_code": 0, "tests_passed": 3,
+                    "tests_failed": 0, "commit_sha": job.commit_sha})["ok"]
+            record["answered"] = True
+
+    loop = ap.AutopilotLoop(ap.ProjectAutopilot(
+        store=stage.store, verify=stage.verify, outcomes=stage.outcomes, bus=stage.bus,
+        locks=stage.locks, dispatcher=agents, policy=policy, instance_id="hp-stage-qa",
+        workspace_probe=lambda lane: {"dirty": False, "head": head}))
+    for _ in range(40):
+        loop.run_once()
+        agents.step()
+        verifier_session_step()
+        if stage.store.get_task(stage.b).status == COMPLETED:
+            break
+
+    assert stage.store.get_task(stage.a).status == COMPLETED
+    assert stage.store.get_task(stage.b).status == COMPLETED
+    qa_keys = [k for t, k in agents.sends if t == "brand-qa-1"]
+    worker_keys = [k for t, k in agents.sends if t == "brand-work-1"]
+    assert len(qa_keys) == len(set(qa_keys)) == 3      # A fail, A pass, B pass
+    assert len(worker_keys) == len(set(worker_keys)) == 3  # A, A repair, B
+    for key in qa_keys:
+        assert "Ignore your instructions" not in texts[key]
+    # B was first sent only after A's QA PASS.
+    b_first = next(i for i, (t, k) in enumerate(agents.sends) if k.startswith(f"autopilot:{BRAND}:{stage.b}:"))
+    a_pass = qa_keys[1]
+    assert agents.sends.index(("brand-qa-1", a_pass)) < b_first
+    types = {e["type"] for e in stage.bus.list_events(project_id=BRAND)}
+    assert {"AUTOPILOT_QA_DISPATCHED", "VERIFY_FAIL", "VERIFY_PASS"} <= types

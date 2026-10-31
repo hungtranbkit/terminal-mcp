@@ -5997,7 +5997,7 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         @server.tool()
         def terminal_verify_claim(verifier: str, capabilities: list[str] | None = None,
                                   project_id: str | None = None, verifier_node_id: str | None = None,
-                                  lease_seconds: float = 600.0) -> dict:
+                                  lease_seconds: float = 600.0, job_id: str | None = None) -> dict:
             """Claim the oldest pending verify job THIS verifier can
             actually do. `capabilities` is what the verifier HAS; a job
             matches only when every capability it requires is present (AND,
@@ -6007,12 +6007,16 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
             job asked for independence. Returns {"claimed": false} when
             nothing matches -- an ordinary outcome, not an error.
 
+            `job_id` claims that one job or nothing (used when the autopilot
+            sent this verifier a specific job); the same capability and
+            independence rules apply.
+
             The returned claim_token is required by every subsequent verb
             and is the ONLY thing that authorises them; keep it."""
             job = queue.verify_queue.claim_next(
                 verifier=verifier, capabilities=tuple(capabilities or ()),
                 project_id=project_id, verifier_node_id=verifier_node_id,
-                lease_seconds=lease_seconds)
+                lease_seconds=lease_seconds, job_id=job_id or None)
             if job is None:
                 return {"claimed": False,
                         "reason": "no pending verify job matches these capabilities "
