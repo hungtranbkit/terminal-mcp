@@ -241,3 +241,120 @@ def test_explicit_idempotency_key_takes_precedence_over_legacy_request_key(rig):
                         request_key='changed-legacy', idempotency_key='explicit')
     assert replay == first
     assert len(controller.send_calls) == 1
+
+
+def test_direct_start_uses_durable_owner_hint_and_live_guard(rig):
+    """A bare session must not spend its 2s probe budget scanning the fleet."""
+    from types import SimpleNamespace
+
+    tools, _, controller = rig
+    controller.ownership = SimpleNamespace(owners=lambda session: [
+        SimpleNamespace(state="ACTIVE", node_id="hp-linux")])
+    controller.statuses.pop("codex")
+    controller.statuses["hp-linux/codex"] = [
+        {"state": "IDLE", "agent_type": "codex", "exists": True, "node_id": "hp-linux"},
+        {"state": "RUNNING", "agent_type": "codex", "exists": True, "node_id": "hp-linux"},
+    ]
+    result = start(tools)
+    assert result["status"] == "TASK_STARTED"
+    assert controller.send_calls[0][0] == "hp-linux/codex"
+    assert controller.status_calls == 2
+    assert controller.bounded_status_timeouts
+    assert all(0 < budget <= 4 for budget in controller.bounded_status_timeouts)
+
+
+def test_direct_start_does_not_guess_with_ambiguous_ownership(rig):
+    from types import SimpleNamespace
+
+    tools, _, controller = rig
+    controller.ownership = SimpleNamespace(owners=lambda session: [
+        SimpleNamespace(state="ACTIVE", node_id="hp-linux"),
+        SimpleNamespace(state="ACTIVE", node_id="dell-linux")])
+    controller.statuses["codex"] = {"error": "AMBIGUOUS_SESSION"}
+    result = start(tools)
+    assert result["error"] == "AMBIGUOUS_SESSION"
+    assert controller.send_calls == []
+
+
+def test_direct_start_stale_owner_fails_closed_without_input(rig):
+    from types import SimpleNamespace
+
+    tools, _, controller = rig
+    controller.ownership = SimpleNamespace(owners=lambda session: [
+        SimpleNamespace(state="ACTIVE", node_id="hp-linux")])
+    controller.statuses["hp-linux/codex"] = {"error": "SESSION_NOT_FOUND"}
+    result = start(tools)
+    assert result["error"] == "SESSION_NOT_FOUND"
+    assert controller.send_calls == []
+
+
+def test_direct_start_preserves_explicit_target_even_if_owner_differs(rig):
+    from types import SimpleNamespace
+
+    tools, _, controller = rig
+    controller.ownership = SimpleNamespace(owners=lambda session: [
+        SimpleNamespace(state="ACTIVE", node_id="dell-linux")])
+    controller.statuses["hp-linux/codex"] = [
+        {"state": "IDLE", "agent_type": "codex", "exists": True},
+        {"state": "RUNNING", "agent_type": "codex", "exists": True},
+    ]
+    result = tools.turn(action="start", target="hp-linux/codex",
+                        text="inert task", request_key="explicit-target", timeout=1)
+    assert result["status"] == "TASK_STARTED"
+    assert controller.send_calls[0][0] == "hp-linux/codex"
+
+
+def test_direct_start_owner_lookup_error_falls_back_to_original_routing(rig):
+    from types import SimpleNamespace
+
+    tools, _, controller = rig
+    def failed_owner_lookup(_session):
+        raise RuntimeError("ownership DB unavailable")
+    controller.ownership = SimpleNamespace(owners=failed_owner_lookup)
+    result = start(tools)
+    assert result["status"] == "TASK_STARTED"
+    assert controller.send_calls[0][0] == "codex"
+
+
+def test_real_ownership_db_avoids_expired_fleet_status_probe(tmp_path, rig):
+    """Live ownership, not the 20s volatile location cache, routes direct Codex."""
+    import time
+    from terminal_mcp.session_ownership import SessionOwnershipStore
+
+    tools, _, controller = rig
+    owner = SessionOwnershipStore(tmp_path / "ownership.db")
+    owner.record_created("codex", "hp-linux", instance_id=None, created_epoch=None)
+    controller.ownership = owner
+    controller.statuses.pop("codex")
+    controller.statuses["hp-linux/codex"] = [
+        {"state": "IDLE", "agent_type": "codex", "exists": True},
+        {"state": "RUNNING", "agent_type": "codex", "exists": True},
+    ]
+    original = controller.terminal_status_bounded
+    def expensive_fleet_resolution(session, timeout_seconds):
+        if session == "codex":
+            time.sleep(2.1)
+            return {"error": "STATUS_PROBE_TIMEOUT"}
+        return original(session, timeout_seconds)
+    controller.terminal_status_bounded = expensive_fleet_resolution
+    started_at = time.monotonic()
+    result = start(tools)
+    assert result["status"] == "TASK_STARTED"
+    assert time.monotonic() - started_at < 1
+    assert controller.send_calls[0][0] == "hp-linux/codex"
+
+
+def test_owner_hint_keeps_approval_guard_fail_closed(rig):
+    from types import SimpleNamespace
+
+    tools, _, controller = rig
+    controller.ownership = SimpleNamespace(owners=lambda session: [
+        SimpleNamespace(state="ACTIVE", node_id="hp-linux")])
+    controller.statuses.pop("codex")
+    controller.statuses["hp-linux/codex"] = {
+        "state": "WAITING_INPUT", "agent_type": "codex",
+        "exists": True, "input_required": True,
+    }
+    result = start(tools)
+    assert result["error"] == "DIRECT_TARGET_NOT_IDLE"
+    assert controller.send_calls == []
