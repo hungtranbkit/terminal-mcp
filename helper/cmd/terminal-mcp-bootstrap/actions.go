@@ -63,6 +63,13 @@ func runInstall(controller, session string) int {
 	config := Config{Controllers: []string{origin}, Version: Version,
 		InstalledAt: time.Now().UTC().Format(time.RFC3339), MachineID: newMachineID(),
 		ApprovedAdminPrincipal: currentAdminPrincipal()}
+	if compiled, err := proto.NormalizeOrigin(DefaultController); err == nil && compiled == origin {
+		dashboard, err := setupDashboardOrigin(origin, DefaultDashboard)
+		if err != nil {
+			return 2
+		}
+		config.DashboardOrigins = []string{dashboard}
+	}
 	if existing, err := loadConfig(); err == nil {
 		if existing.MachineID != "" {
 			config.MachineID = existing.MachineID

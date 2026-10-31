@@ -49,6 +49,7 @@ var (
 	// build. It is an address, never a credential; all authority still
 	// comes from the owner's authenticated, one-time approval in the UI.
 	DefaultController = ""
+	DefaultDashboard  = ""
 	// Signed is set to "true" only by a build that actually Authenticode-
 	// signs the artifact. It defaults to false so an unsigned dev build
 	// can never report itself as signed.
@@ -241,12 +242,16 @@ func runGenericSetupOnce(controller string) (int, bool) {
 	if err != nil || !strings.HasPrefix(origin, "https://") {
 		return 2, showSetupError("This build has no trusted HTTPS controller. Download the official installer.")
 	}
+	dashboard, err := setupDashboardOrigin(origin, DefaultDashboard)
+	if err != nil {
+		return 2, showSetupError("This build has no trusted HTTPS dashboard.")
+	}
 	showSetupStage(1, "Install prerequisites", "Approve Windows UAC. Existing healthy Tailscale, OpenSSH, keys and sessions are preserved.")
 	if code := runInstall(origin, ""); code != 0 {
 		return code, showSetupError("Prerequisite installation did not finish.")
 	}
 	showSetupStage(2, "Approve secure connection", "Your browser will show the controller identity and requested permissions. Approve there once; setup never embeds a reusable key.")
-	if err := openOwnerApproval(origin + "/dashboard/nodes?join=current&source=windows-setup"); err != nil {
+	if err := openOwnerApproval(dashboard + "/dashboard/nodes?join=current&source=windows-setup"); err != nil {
 		return 3, showSetupError("The secure approval page could not be opened.")
 	}
 	if err := waitForInstalledNode(45 * time.Minute); err != nil {
