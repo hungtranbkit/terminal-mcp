@@ -32,3 +32,5 @@ func showSetupStage(stage int, title, detail string) {}
 func showSetupError(detail string) bool              { return false }
 func openOwnerApproval(target string) error          { return errNotWindows }
 func currentAdminPrincipal() string                  { return "" }
+
+func stopServiceForUpdate() error { return nil }

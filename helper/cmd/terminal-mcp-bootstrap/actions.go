@@ -88,6 +88,10 @@ func runInstall(controller, session string) int {
 		return 1
 	}
 
+	if err := stopServiceForUpdate(); err != nil {
+		fmt.Fprintf(os.Stderr, "cannot stop helper for update: %v\n", err)
+		return 1
+	}
 	steps := []struct {
 		name string
 		run  func() error

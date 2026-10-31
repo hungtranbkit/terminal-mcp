@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -17,6 +18,8 @@ import (
 	"github.com/hungtranbkit/terminal-mcp/helper/internal/proto"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
+	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/mgr"
 )
 
 var shellExecuteW = windows.NewLazySystemDLL("shell32.dll").NewProc("ShellExecuteW")
@@ -252,4 +255,46 @@ func runStagesBounded(controller, extraArg string, limit time.Duration) (int, er
 		args = append(args, extraArg)
 	}
 	return runBoundedCommand(limit, newlineFeeder(), "powershell.exe", args...)
+}
+
+// stopServiceForUpdate releases the running executable before replacement.
+// Use SCM state codes, not localized sc.exe text, and fail closed on timeout.
+func stopServiceForUpdate() error {
+	manager, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer manager.Disconnect()
+	service, err := manager.OpenService(ServiceName)
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer service.Close()
+	status, err := service.Query()
+	if err != nil {
+		return err
+	}
+	if status.State == svc.Stopped {
+		return nil
+	}
+	if status.State != svc.StopPending {
+		if _, err = service.Control(svc.Stop); err != nil {
+			return err
+		}
+	}
+	deadline := time.Now().Add(serviceStartTimeout)
+	for time.Now().Before(deadline) {
+		status, err = service.Query()
+		if err != nil {
+			return err
+		}
+		if status.State == svc.Stopped {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("helper service did not stop before update")
 }
