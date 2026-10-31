@@ -283,11 +283,21 @@ exactly-once recovery via a TTL lock that self-frees on crash, sticky
 
 | Piece | Status |
 | --- | --- |
-| Project Coordinator framework + provider | `PLANNED` — no LLM provider abstraction exists anywhere yet |
+| Project Coordinator framework + provider | **Built, off by default** (issue #106): `autopilot.py` (deterministic auto-continue), `autopilot_planner.py` (advisory, validated LLM plans; Gateway provider `BLOCKED_PROVIDER` until authorized), `autopilot_view.py` (Control Tower read model). No deployment enables it. See §12a |
 | Portfolio Scheduler | `PLANNED` — will compose over `pm_router`'s two-phase deterministic routing (hard constraints, then scoring with fairness), not replace it |
 | Preview / deploy execution | `PLANNED` — `release_store` is **state-tracking only**: `DEPLOYED` and `VERIFIED_PROD` are assertions, not observations |
 | Merge queue activation | `PLANNED` — built, 88 tests, 0 production rows. Blocked on a real defect: the integrator merges via `git checkout` in the **shared** repo path and would switch branches under a live working tree |
 | Project-scoped knowledge | `PLANNED` — `session_knowledge` is session-keyed and matches project by substring over paths |
+
+## 12a. ProjectFlow Autopilot (issue #106) — built, disabled
+
+Design: `docs/superpowers/specs/2026-10-31-projectflow-autopilot-design.md`.
+
+- **No new authority.** Tasks, leases, transitions and deps live in `queue_store`. QA is `verify_queue` (PASS completes atomically). The rollup is `outcomes`. The audit log is the bus cursor `autopilot:<project>`. One coordinator per project is enforced by `ResourceLockStore` key `autopilot:coordinator`. Sending goes through `DirectTaskSupervisor` via `DirectTaskDispatcher`.
+- **Gates.** `autopilot.enabled`, the kill switch, a per-project entry, and for dispatch `dispatch: true` + `approved_by` + `approval_ref` + a lane allowlist. A lane with `auto_dispatch_enabled` (QueueLoop) is refused.
+- **Exactly once.** The row and its idempotency key are persisted before sending, and the lease is fenced before sending. On restart, `NOT_FOUND` means the task was never sent and goes back to QUEUED. A found record is reconciled and never resent. `UNCERTAIN` is never resent.
+- **Honest states.** A submit receipt is not RUNNING, IDLE is not DONE, and an unreachable node gets no mutation (it reads `UNKNOWN`). Only an explicit DONE opens independent QA.
+- **AI is advisory.** A plan can only append validated tasks. The model never decides a lease, permission, completion or release.
 
 ## 13. Reading order for a new contributor
 
