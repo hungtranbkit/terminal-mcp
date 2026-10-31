@@ -61,6 +61,10 @@ const PairSeparator = "__"
 
 const PairPrefix = "terminal-mcp-bootstrap"
 
+// SetupPairPrefix is the public one-file installer name. PairPrefix remains
+// accepted for already downloaded helpers and the installed service binary.
+const SetupPairPrefix = "TerminalMCP-Setup"
+
 var (
 	ErrNoPairing     = errors.New("no_pairing_in_filename")
 	ErrPairingHandle = errors.New("bad_pairing_handle")
@@ -152,7 +156,8 @@ func ParseFilename(name string) (Pairing, error) {
 	if len(parts) != 3 {
 		return zero, fmt.Errorf("%w: %d segments", ErrNoPairing, len(parts))
 	}
-	if !strings.EqualFold(parts[0], PairPrefix) {
+	if !strings.EqualFold(parts[0], PairPrefix) &&
+		!strings.EqualFold(parts[0], SetupPairPrefix) {
 		return zero, fmt.Errorf("%w: unexpected prefix", ErrPairingShape)
 	}
 

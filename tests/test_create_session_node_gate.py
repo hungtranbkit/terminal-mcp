@@ -49,6 +49,12 @@ def test_a_windows_node_advertises_shell_alongside_the_ai_agents():
         assert f"'{agent}'" in types, agent
 
 
+def test_single_shell_agent_type_is_serialized_as_a_json_array():
+    """PowerShell otherwise unwraps @('shell') to the scalar "shell"."""
+    beat = _beat(_script())
+    assert "agent_types = @(Get-AgentTypes)" in beat
+
+
 def test_the_capability_set_covers_session_transport_and_the_tools():
     beat = _beat(_script())
     caps = beat[beat.index("function Get-Capabilities"):]

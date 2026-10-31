@@ -49,8 +49,11 @@ from urllib.parse import urlparse
 from . import rescue_gateway
 from .enrollment import (
     DEFAULT_TTL_SECONDS,
+    DuplicateEnrollmentError,
     EnrollmentStore,
     OS_WINDOWS,
+    STATUS_EXPIRED,
+    STATUS_REVOKED,
     SUPPORTED_OS,
     suggest_node_id,
     validate_node_id,
@@ -331,7 +334,8 @@ class OnboardingService:
                           os_name: str = OS_WINDOWS, profile: str = "minimal",
                           connectivity: dict[str, Any] | None = None, created_by: str | None = None,
                           hostname_hint: str | None = None,
-                          replace_existing: bool = False) -> dict[str, Any]:
+                          replace_existing: bool = False, machine_id: str | None = None,
+                          idempotency_key: str | None = None) -> dict[str, Any]:
         if not self.onboarding_config.enabled:
             raise OnboardingError("ONBOARDING_DISABLED", "nodes.onboarding.enabled is false", status=403)
         if os_name not in SUPPORTED_OS:
@@ -343,6 +347,19 @@ class OnboardingService:
             candidate = validate_node_id(candidate)
         except ValueError as exc:
             raise OnboardingError("INVALID_REQUEST", str(exc)) from exc
+        if idempotency_key and machine_id is None:
+            try:
+                replay = self.enrollments.find_idempotent(
+                    idempotency_key=idempotency_key, created_by=created_by, node_id=candidate)
+            except DuplicateEnrollmentError as exc:
+                raise OnboardingError(str(exc), "idempotency key is already bound to another node",
+                                      status=409) from exc
+            if replay is not None and replay.status not in (STATUS_EXPIRED, STATUS_REVOKED):
+                return {"enrollment": replay.to_dict(), "code": None,
+                        "connectivity": replay.connectivity,
+                        "profile": profile_summary(replay.profile),
+                        "ttl_seconds": self.onboarding_config.enrollment_ttl_seconds,
+                        "idempotent_replay": True}
         existing = self.controller.registry.get(candidate)
         if existing is not None and not replace_existing:
             raise OnboardingError("NODE_ALREADY_EXISTS", f"a node named {candidate!r} is already registered",
@@ -361,17 +378,23 @@ class OnboardingService:
             existing_host = urlparse(existing.endpoint).hostname or ""
             if is_tailnet_address(existing_host):
                 enrollment_connectivity["_repair_tailscale_ip"] = existing_host
-        record, code = self.enrollments.create(
-            node_id=candidate, display_name=display_name, os_name=os_name, profile=profile,
-            connectivity=enrollment_connectivity, ttl_seconds=self.onboarding_config.enrollment_ttl_seconds,
-            created_by=created_by)
+        try:
+            record, code = self.enrollments.create(
+                node_id=candidate, display_name=display_name, os_name=os_name, profile=profile,
+                connectivity=enrollment_connectivity,
+                ttl_seconds=self.onboarding_config.enrollment_ttl_seconds,
+                created_by=created_by, machine_id=machine_id, idempotency_key=idempotency_key)
+        except DuplicateEnrollmentError as exc:
+            raise OnboardingError(str(exc), "this machine or node id already has an active enrollment",
+                                  status=409) from exc
         self._audit("node_enrollment_created", node_id=candidate,
                     detail={"enrollment_id": record.id, "profile": profile, "os": os_name,
                             "connectivity": plan.to_dict(), "replace_existing": replace_existing})
         _log.info("onboarding: enrollment created node_id=%s profile=%s os=%s expires_at=%s by=%s",
                   candidate, profile, os_name, record.expires_at, created_by)
         return {"enrollment": record.to_dict(), "code": code, "connectivity": plan.to_dict(),
-                "profile": profile_summary(profile), "ttl_seconds": self.onboarding_config.enrollment_ttl_seconds}
+                "profile": profile_summary(profile), "ttl_seconds": self.onboarding_config.enrollment_ttl_seconds,
+                "idempotent_replay": code is None}
 
     def list_enrollments(self, *, limit: int = 50) -> list[dict[str, Any]]:
         return [record.to_dict() for record in self.enrollments.list(limit=limit)]
@@ -387,7 +410,9 @@ class OnboardingService:
     def redeem_handle(self, handle: str, *, hostname: str, source_ip: str | None = None,
                       platform: str = "windows", addresses: dict[str, Any] | None = None,
                       rescue_public_key: str | None = None,
-                      request_base_url: str | None = None) -> dict[str, Any]:
+                      request_base_url: str | None = None, dashboard_origin: str | None = None,
+                      machine_id: str | None = None,
+                      approved_admin_principal: str | None = None) -> dict[str, Any]:
         """The Bootstrap helper's entry point: one-time handle in, full
         bootstrap payload out.
 
@@ -396,15 +421,45 @@ class OnboardingService:
         the controller resolves it to an enrollment and consumes THAT.
         Nothing the helper holds afterwards can be replayed -- the handle
         is spent and the code was never issued to it."""
-        record = self.enrollments.redeem_handle(handle)
+        bound_origin = self.enrollments.handle_dashboard_origin(handle)
+        if bound_origin and dashboard_origin and bound_origin != dashboard_origin:
+            raise OnboardingError("HANDLE_ORIGIN_MISMATCH", "pairing was created for another Dashboard origin",
+                                  status=401)
+        try:
+            record = self.enrollments.redeem_handle(
+                handle, expected_origin=dashboard_origin or bound_origin, machine_id=machine_id)
+        except DuplicateEnrollmentError as exc:
+            raise OnboardingError(str(exc), "this helper machine is already joined or changed identity",
+                                  status=409) from exc
+        except ValueError as exc:
+            raise OnboardingError("INVALID_REQUEST", str(exc)) from exc
         if record is None:
             self._audit("node_enrollment_rejected", node_id=None,
                         detail={"reason": "handle_invalid_or_spent", "hostname": hostname,
                                 "source_ip": source_ip})
             raise OnboardingError("HANDLE_INVALID", "handle is unknown, already used, or expired", status=401)
-        return self._consume_record(record, hostname=hostname, source_ip=source_ip, platform=platform,
-                                    addresses=addresses, rescue_public_key=rescue_public_key,
-                                    request_base_url=request_base_url, by_handle=True)
+        if platform == "windows" and record.profile == "ai_coding":
+            principal = str(approved_admin_principal or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}\\[A-Za-z0-9_.@$-]{1,64}", principal):
+                raise OnboardingError("ADMIN_PRINCIPAL_REQUIRED",
+                                      "approved Windows administrator principal is missing or invalid",
+                                      status=400)
+        result = self._consume_record(record, hostname=hostname, source_ip=source_ip, platform=platform,
+                                      addresses=addresses, rescue_public_key=rescue_public_key,
+                                      request_base_url=request_base_url, by_handle=True)
+        if platform == "windows" and approved_admin_principal:
+            result["ssh"]["approved_admin_principal"] = approved_admin_principal
+            connection = self.connection_store.get(result["node_id"])
+            if connection is not None:
+                self.connection_store.save(
+                    connection.node_id, transport_type=connection.transport_type,
+                    endpoint=connection.endpoint, hostname=connection.hostname,
+                    username=approved_admin_principal, port=connection.port,
+                    host_key_fingerprint=connection.host_key_fingerprint,
+                    token_file=connection.token_file)
+        if bound_origin:
+            result["dashboard_origin"] = bound_origin
+        return result
 
     def consume_enrollment(self, code: str, *, hostname: str, source_ip: str | None = None,
                            platform: str = "windows", addresses: dict[str, Any] | None = None,
@@ -688,6 +743,7 @@ class OnboardingService:
         a removal that hangs on an unreachable host is a removal that
         never completes."""
         revoked_codes = self.enrollments.revoke_pending_for_node(node_id, by=by)
+        retired_machine_enrollments = self.enrollments.retire_machine_enrollments_for_node(node_id, by=by)
         released = self.ports.release(node_id)
         directory = rescue_authorized_keys_dir()
         stale = directory / f"{node_id}.pub"
@@ -703,12 +759,15 @@ class OnboardingService:
         self.controller._clients.pop(node_id, None)
         os.environ.pop(_token_env_var(node_id), None)
         self._audit("node_removed", node_id=node_id,
-                    detail={"revoked_codes": revoked_codes, "rescue_port_released": released,
+                    detail={"revoked_codes": revoked_codes,
+                            "retired_machine_enrollments": retired_machine_enrollments,
+                            "rescue_port_released": released,
                             "transports_removed": transports_removed,
                             "connection_removed": connection_removed, "deregistered": deregistered})
         _log.info("onboarding: node removed node_id=%s codes=%s rescue=%s transports=%s registry=%s by=%s",
                   node_id, revoked_codes, released, transports_removed, deregistered, by)
         return {"ok": True, "node_id": node_id, "revoked_enrollments": revoked_codes,
+                "retired_machine_enrollments": retired_machine_enrollments,
                 "rescue_port_released": released, "transports_removed": transports_removed,
                 "credentials_removed": connection_removed, "deregistered": deregistered,
                 "gateway_resync_required": released}

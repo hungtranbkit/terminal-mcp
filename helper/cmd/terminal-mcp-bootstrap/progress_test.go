@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -147,7 +148,7 @@ func TestRedeemSendsTheHandleAndHostnameAndNothingElseSensitive(t *testing.T) {
 	if asString(sent["handle"]) != testHandle || asString(sent["hostname"]) != "WIN-BOX" {
 		t.Fatalf("redeem body = %v", sent)
 	}
-	if asString(sent["platform"]) != "windows" {
+	if asString(sent["platform"]) != runtime.GOOS {
 		t.Fatalf("platform = %v", sent["platform"])
 	}
 }

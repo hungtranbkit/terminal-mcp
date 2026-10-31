@@ -31,6 +31,7 @@ from contextlib import asynccontextmanager
 import hashlib
 import hmac
 import json
+import ipaddress
 import logging
 import os
 import secrets
@@ -1254,7 +1255,8 @@ def _collect_rotated_token(*, controller_url: str, node_id: str, credential: Age
 async def _heartbeat_loop(*, node_id: str, terminal: TerminalService, controller_url: str, token: str,
                           workspace_root: str, interval_seconds: float, platform: str | None = None,
                           session_backend: str = "tmux", shell_capabilities: tuple[str, ...] = (),
-                          wsl_available: bool = False) -> None:
+                          wsl_available: bool = False, agent_host: str | None = None,
+                          agent_port: int | None = None) -> None:
     """Runs forever (until the process exits) -- a single failed push is
     logged and retried next cycle, never raised past this loop, so a
     controller outage can never crash the node agent (task item 2's own
@@ -1285,6 +1287,13 @@ async def _heartbeat_loop(*, node_id: str, terminal: TerminalService, controller
                 if command:
                     agent_counts[command] = agent_counts.get(command, 0) + 1
             agent_types = available_agent_types(terminal.config.session_lifecycle.launch_commands)
+            advertised_endpoint = None
+            try:
+                address = ipaddress.ip_address(str(agent_host or ""))
+                if address in ipaddress.ip_network("100.64.0.0/10") and agent_port:
+                    advertised_endpoint = f"http://{address}:{int(agent_port)}"
+            except ValueError:
+                pass
             body = json.dumps({
                 "metrics": metrics.__dict__, "tmux_session_count": len(session_rows),
                 "agent_counts": agent_counts, "agent_types": list(agent_types),
@@ -1298,6 +1307,7 @@ async def _heartbeat_loop(*, node_id: str, terminal: TerminalService, controller
                 "capabilities": list(probe_capabilities()),
                 "platform": platform, "session_backend": session_backend,
                 "shell_capabilities": list(shell_capabilities), "wsl_available": wsl_available,
+                "agent_endpoint": advertised_endpoint,
             }).encode()
             request = _controller_post_request(url, body)
             request.add_header("Authorization", f"Bearer {credential.current}")

@@ -31,6 +31,14 @@ func newMachineID() string {
 // runInstall is idempotent: an existing install is verified and updated in
 // place rather than duplicated. Re-running it is the Repair path.
 func runInstall(controller, session string) int {
+	relaunched, err := ensureElevatedForInstall()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cannot request Administrator access: %v\n", err)
+		return 1
+	}
+	if relaunched {
+		return 0
+	}
 	if controller == "" {
 		fmt.Fprintln(os.Stderr, "install requires -controller")
 		return 2
@@ -53,11 +61,23 @@ func runInstall(controller, session string) int {
 	// Preserve the machine identity across re-installs: losing it is what
 	// would turn a Repair into a duplicate node.
 	config := Config{Controllers: []string{origin}, Version: Version,
-		InstalledAt: time.Now().UTC().Format(time.RFC3339), MachineID: newMachineID()}
+		InstalledAt: time.Now().UTC().Format(time.RFC3339), MachineID: newMachineID(),
+		ApprovedAdminPrincipal: currentAdminPrincipal()}
+	if compiled, err := proto.NormalizeOrigin(DefaultController); err == nil && compiled == origin {
+		dashboard, err := setupDashboardOrigin(origin, DefaultDashboard)
+		if err != nil {
+			return 2
+		}
+		config.DashboardOrigins = []string{dashboard}
+	}
 	if existing, err := loadConfig(); err == nil {
 		if existing.MachineID != "" {
 			config.MachineID = existing.MachineID
 		}
+		if existing.ApprovedAdminPrincipal != "" {
+			config.ApprovedAdminPrincipal = existing.ApprovedAdminPrincipal
+		}
+		config.DashboardOrigins = append(config.DashboardOrigins, existing.DashboardOrigins...)
 		// Binding to a second controller is a deliberate act, not a
 		// side effect of running install again.
 		config.Controllers = mergeControllers(existing.Controllers, origin)

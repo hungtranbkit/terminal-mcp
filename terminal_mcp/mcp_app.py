@@ -638,6 +638,13 @@ def build_mcp(service: TerminalService | None = None,
                 agent_types=agent_types, agent_version=None,
             )
             _local_heartbeat_next_refresh[0] = time.monotonic() + _LOCAL_HEARTBEAT_MIN_INTERVAL_SECONDS
+        except Exception as exc:
+            # Heartbeat is advisory. A temporary SQLite/agent-inventory error must
+            # never break unrelated MCP actions (including node/session reads).
+            # Throttle failures too, so a broken store does not cause a retry storm.
+            _LOGGER.warning("LOCAL_HEARTBEAT_REFRESH_FAILED type=%s; tool call continues",
+                            type(exc).__name__)
+            _local_heartbeat_next_refresh[0] = time.monotonic() + _LOCAL_HEARTBEAT_MIN_INTERVAL_SECONDS
         finally:
             _local_heartbeat_lock.release()
 
