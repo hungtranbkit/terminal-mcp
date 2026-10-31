@@ -1267,6 +1267,32 @@ class CompactTerminalTools:
         return {**result, "action": action}
 
 
+    def _direct_owner_hint(self, target: str) -> str:
+        """Use durable session ownership to skip fleet-wide scans for Codex start.
+
+        A unique ACTIVE owner is only a routing *hint*, never authorization:
+        _codex_direct_start still checks live status and sends through the
+        normal guarded node endpoint (including the idle/approval checks).
+        Explicit node-qualified targets and bindings keep their own routing.
+        A missing/ambiguous/stale owner fails safely through normal resolution.
+        """
+        if "/" in target or target.startswith(("binding:", "session:")):
+            return target
+        ownership = getattr(self.controller, "ownership", None)
+        if ownership is None or not hasattr(ownership, "owners"):
+            return target
+        try:
+            active = [row for row in ownership.owners(target)
+                      if getattr(row, "state", None) == "ACTIVE"]
+        except Exception:
+            return target
+        if len(active) != 1:
+            return target
+        node_id = getattr(active[0], "node_id", None)
+        if not isinstance(node_id, str) or not node_id or "/" in node_id:
+            return target
+        return f"{node_id}/{target}"
+
     def _codex_direct_start(self, target: str, text: str, *, timeout: float,
                             request_key: str | None) -> dict[str, Any] | None:
         """Immediate Codex startup; None preserves non-Codex legacy behavior.
@@ -1294,10 +1320,18 @@ class CompactTerminalTools:
         if not hasattr(self.controller, "terminal_status"):
             return None
         deadline = self.monotonic() + float(timeout)
+        # An unqualified name can require scanning every node when its
+        # 20-second location cache expires. That routinely exceeds the old
+        # 2-second preflight and incorrectly refused an idle, healthy Codex.
+        # Use the persisted owner only as a hint; live node status and the
+        # guarded send remain mandatory. A slow node still has a hard bound.
+        status_target = self._direct_owner_hint(target)
         def observe() -> dict[str, Any]:
             remaining = max(0.0, deadline - self.monotonic())
-            return self._bounded_read(("direct-start", target),
-                lambda: self._status(target, timeout_seconds=remaining), min(remaining, 2.0))
+            probe_budget = min(remaining, 4.0)
+            return self._bounded_read(("direct-start", status_target),
+                lambda: self._status(status_target, timeout_seconds=probe_budget),
+                probe_budget)
         try:
             before = observe()
         except Exception:
@@ -1333,7 +1367,9 @@ class CompactTerminalTools:
                     or before.get("exists") is False or before.get("allowed") is False):
                 return finish({**base, "status": "FAILED", "error": "DIRECT_TARGET_NOT_IDLE",
                                "task_state": before.get("state", "UNKNOWN")})
-            sent = self.send_task(target, text, timeout=float(timeout), idempotency_key=cache_key + ":send",
+            # Send to the SAME live-verified node, so dispatch cannot fall
+            # back into a fleet scan or silently choose a different owner.
+            sent = self.send_task(status_target, text, timeout=float(timeout), idempotency_key=cache_key + ":send",
                                   require_idle=True)
             base = {**base, "send": sent, "submission_id": sent.get("submission_id")}
             if sent.get("status") != "SUBMIT_CONFIRMED":
