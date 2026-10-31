@@ -580,6 +580,9 @@ def _parse_json_object(raw: str | None) -> dict[str, Any]:
 
 _INTERNAL_TASK_METADATA_KEYS = frozenset({
     "execution_evidence", "dispatch_observation", "dispatch_reconciliation",
+    # ProjectFlow Autopilot ownership/repair budget: a creator who could seed
+    # it could claim autopilot ownership or reset the repair budget.
+    "autopilot",
 })
 
 
@@ -2970,6 +2973,26 @@ class QueueStore:
             connection.execute("UPDATE queue_tasks SET metadata = ?, updated_at = ? WHERE id = ?",
                                (json.dumps(metadata), iso_now(), task_id))
         return observation
+
+    def set_internal_metadata(self, task_id: str, key: str, value: Any, *, event_type: str,
+                              reason: str | None = None) -> QueueTask:
+        """Write ONE queue-owned metadata key (see _INTERNAL_TASK_METADATA_KEYS)
+        without a status change, paired with a queue_events row in the same
+        transaction. Refuses any key a task creator could also have supplied."""
+        if key not in _INTERNAL_TASK_METADATA_KEYS:
+            raise ValueError(f"{key!r} is not a queue-owned metadata key")
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            metadata = _parse_json_object(row["metadata"])
+            metadata[key] = value
+            connection.execute("UPDATE queue_tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+                               (json.dumps(metadata), iso_now(), task_id))
+            self._record_event_locked(connection, session=row["session"], task_id=task_id,
+                                      event_type=event_type, reason=reason)
+            row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+        return QueueTask.from_row(row)
 
     def mark_running_with_evidence(self, task_id: str, *, evidence: dict[str, Any],
                                    reason: str | None = None) -> QueueTask:
