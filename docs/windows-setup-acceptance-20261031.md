@@ -18,7 +18,8 @@
 - Existing Node Agent scheduled task uses MSFT_TaskBootTrigger; sshd and Tailscale are Automatic. This is configuration evidence, NOT a performed reboot acceptance.
 - Public /enroll/windows-setup.ps1 downloads successfully (HTTP 200, 86511 bytes).
 - Latest installer published in controller artifact store as 0.3.0-dev.20261031.2, signed=false. Temporary Tailnet file-transfer services stopped.
-- Windows Codex session creation previously returned a real codex.EXE process. Exact-response verification tracked separately below; do not confuse process creation with completed model execution.
+- Windows Codex execution through the Terminal MCP-created Windows shell returned exactly TMCP-WIN-CODEX-OK and CODEX_EXIT=0. A prior SSH attempt waited on additional stdin; piping the prompt and closing stdin resolved the test. Separate agent_type=codex session creation also returned a real process; automated interactive prompt submission in that session was not accepted as proof.
+- Reproducible smoke: pipe a prompt into codex.exe exec --skip-git-repo-check -C C:\\Users\\admin\\Documents\\Codex -o <result-file> -; do not leave non-TTY stdin open.
 
 ## Owner action required
 
