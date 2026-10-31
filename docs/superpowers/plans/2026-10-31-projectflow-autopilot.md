@@ -39,6 +39,20 @@ Tests: `.venv/bin/python -m pytest -q <files>`, run from the worktree.
 - Delta notifications are cursor-based.
 - Route guards are covered by tests that go through the dashboard app.
 
+## Slice 6 — automatic QA dispatch (`autopilot.py`, `verify_queue.py`, `tests/test_autopilot_qa_dispatch.py`)
+
+- Policy: `verifiers`, `max_qa_dispatches`, `qa_require_commit`; a verifier can never be an implementer lane.
+- `VerifyQueue`: `claim_next(job_id=…)`, `ensure_verify_job(require_commit_evidence=…)`, a commit check in `complete`, and `reconcile(project_id=…)`. MCP `terminal_verify_claim` accepts `job_id`.
+- RED→GREEN: A→QA→B; ACK/IDLE/DONE without a verdict is not a PASS; implementer rejection (also by id); claim-by-id never takes another job; no capable verifier; verifier unavailable then back; busy refusal costs no budget; duplicate events; restart before and after submit; lost lease and two coordinators; WAITING_INPUT/UNCERTAIN/node lost; QA dispatch budget; QA FAIL repair budget; missing and stale commit; prompt carries no agent text or token; Control Tower QA view.
+- Production probes wired in `build_autopilot_runtime`; the loop still starts only when enabled.
+
+## Handoff state (2026-11-01)
+
+- Branch `feat/projectflow-autopilot-106`, draft PR #107. Defaults off everywhere. No live config or deployment touched.
+- Built and tested against synthetic executors: P0, config, P1 planner, P2 API, QA dispatch.
+- Blocked on owner approval: G2 (observe-only) and G3 (dispatch) pilot on HP, naming the project, lanes, verifier session(s) and `approval_ref`. The first live run of `DirectTaskDispatcher` and of the production probes happens there.
+- Not built: Control Tower UI widget; Gateway Task Center #115 consumer (separate repo, separate PR); live `GatewayPlanner` (needs an authorized endpoint and token file).
+
 ## Contracts
 
 ### `autopilot_status/v1`
@@ -50,7 +64,8 @@ Tests: `.venv/bin/python -m pytest -q <files>`, run from the worktree.
               "progress":{"completed":0,"total":0}}],
  "tasks":[{"id":"…","title":"…","status":"…","lane":"…","node_id":null,
            "depends_on":[],"updated_at":"…","stale":false,
-           "qa":{"job_id":null,"status":null},"evidence_ref":null}],
+           "qa":{"job_id":null,"status":null,"attempt":1,"commit_sha":null,"verifier":null,
+                 "dispatches":0,"waiting_reason":null,"waiting_detail":null},"evidence_ref":null}],
  "readiness":{"CODE_READY":"UNKNOWN|READY|NOT_READY","DEVICE_QA":"UNKNOWN|…","RELEASE_READY":"UNKNOWN|…"},
  "needs_owner":[{"task_id":"…","reason":"…"}]}
 ```

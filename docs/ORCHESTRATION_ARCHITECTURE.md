@@ -297,6 +297,7 @@ Design: `docs/superpowers/specs/2026-10-31-projectflow-autopilot-design.md`.
 - **Gates.** `autopilot.enabled`, the kill switch, a per-project entry, and for dispatch `dispatch: true` + `approved_by` + `approval_ref` + a lane allowlist. A lane with `auto_dispatch_enabled` (QueueLoop) is refused.
 - **Exactly once.** The row and its idempotency key are persisted before sending, and the lease is fenced before sending. On restart, `NOT_FOUND` means the task was never sent and goes back to QUEUED. A found record is reconciled and never resent. `UNCERTAIN` is never resent.
 - **Honest states.** A submit receipt is not RUNNING, IDLE is not DONE, and an unreachable node gets no mutation (it reads `UNKNOWN`). Only an explicit DONE opens independent QA.
+- **QA dispatch.** With a `verifiers` allowlist, the verify job carries the lane HEAD the controller observed, and the autopilot sends a fixed prompt (job id and commit, no claim token) to one capable, independent, reachable verifier, persisting the correlation first and fencing on the lease. The verifier claims that exact job; only `VerifyQueue.complete` with evidence for that commit can PASS it. A verifier ACK, IDLE or DONE is never a verdict.
 - **AI is advisory.** A plan can only append validated tasks. The model never decides a lease, permission, completion or release.
 
 ## 13. Reading order for a new contributor

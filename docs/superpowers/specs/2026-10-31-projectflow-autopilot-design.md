@@ -108,6 +108,48 @@ The dispatcher must persist its record under `idempotency_key` **before** it sen
 - FAIL / NEEDS_REWORK: the task lands in FAILED. If `metadata.autopilot.repairs < max_repair_attempts`, the autopilot calls `retry_task`, then records `repairs += 1` and `repair_of_job`. The next dispatch appends a fixed repair section that **references the verify job id only** and never inlines the verifier's text. Past the budget, the task stays FAILED and `AUTOPILOT_REPAIR_EXHAUSTED` is published.
 - VERIFY_BLOCKED: the task is BLOCKED, with owner attention.
 
+### 3.6a Automatic QA dispatch to a verifier session
+
+On only when the project has `dispatch: true` **and** a `verifiers` allowlist
+(`[{session, capabilities}]`). A verifier session may not be an implementer
+lane of any project; config refuses it.
+
+- **Commit correlation.** On an explicit worker DONE the verify job is opened with
+  the lane HEAD as the controller observes it (`workspace_probe`, read where the
+  session lives through `node_aware_repo_evidence`), not as the agent reports it.
+  With `qa_require_commit` (default) the job records `require_commit_evidence`,
+  and `VerifyQueue.complete` then refuses a PASS whose evidence does not name
+  that commit (`COMMIT_EVIDENCE_REQUIRED`). Evidence naming a different commit
+  is refused for every job that has a commit (`STALE_COMMIT`). No observed
+  commit: QA is held (`QA_NO_COMMIT_EVIDENCE`). Lane HEAD moved since: held
+  (`QA_STALE_COMMIT`).
+- **Selection.** A capable verifier has every required capability, is not the
+  implementer, and is not busy with another of our QA sends. It must also pass
+  `verifier_probe`, a controller status read; an error there means unavailable,
+  and the reason is shown.
+- **Persist, fence, send.** `metadata.autopilot.qa = {job_id, attempt, commit_sha,
+  verifier, key, dispatches}` is written (queue-owned key) before the send, the
+  coordinator lease is renewed as a fence, then a fixed prompt is sent. The
+  prompt has ids, the commit and allowlisted names only, and **no claim token**.
+  The verifier claims that exact job with `terminal_verify_claim(job_id=…)`
+  (it gets that job or nothing; independence and capability rules still apply)
+  and receives its own token.
+- **Key.** `autopilot-qa:{project}:{job}:{n}`. A key whose send is provably
+  absent (`NOT_FOUND` after a crash, `REFUSED` by a busy verifier) is reused for
+  the same verifier and costs no budget. A verifier run that ended `FAILED`
+  without a verdict moves to `n+1`, up to `max_qa_dispatches`, after which
+  `QA_DISPATCH_BUDGET_EXHAUSTED` goes to the owner.
+- **No verdict by inference.** A verifier ACK, IDLE or TMCP-DONE is not a PASS:
+  DONE without a verdict is `QA_DONE_WITHOUT_VERDICT` (owner), and nothing is
+  resent. `WAITING_INPUT`, `UNCERTAIN` and `UNREACHABLE` are shown as reasons
+  and never resent. A job claimed by someone else is left alone
+  (`QA_EXTERNAL_VERIFIER`). Dead verifier leases in this project only are
+  returned by `VerifyQueue.reconcile(project_id=…)`.
+- PASS still only comes from `VerifyQueue.complete` with evidence, and only PASS
+  completes the task and unlocks dependents. FAIL feeds the existing bounded
+  repair (§3.6); the repaired attempt gets a new job, a new commit and a fresh
+  QA budget.
+
 ### 3.7 Exactly-once argument
 
 - **Two coordinators.** The project lease admits one. If a lease lapses mid-tick, `claim_next_task` still admits one claimant per task, transitions are validated (a second DISPATCHING→RUNNING raises), and the dispatcher dedups by key. Just before sending, the holder renews the lease and re-checks it; if it lost the lease, it leaves the row DISPATCHING with the key persisted.
@@ -172,7 +214,7 @@ the same object served to the dashboard and to a read-only ChatGPT connector.
 ## 9. Not done in this branch (honest)
 
 - The production wiring of `DirectTaskDispatcher` into the HTTP server loop is behind config and has never been run against a live session.
-- QA dispatch to a verifier session is not automated. The independent verifier still claims and completes verify jobs itself. In E2E this is simulated.
+- QA dispatch (§3.6a) is built and tested against synthetic executors only. No real verifier session has received a QA prompt, and the production probes (`build_workspace_probe`, `build_verifier_probe`) have not run against a live controller.
 - `GatewayPlanner` stays `BLOCKED_PROVIDER` until the owner authorizes an endpoint and token path.
 - There is no Control Tower UI widget, only the API. The Gateway Task Center PR is not opened.
 - Acceptance criteria (A) "real enabled pilot" and (C) "two real projects on dashboard" require G2/G3 approval.
