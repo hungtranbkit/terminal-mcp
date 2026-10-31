@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
@@ -517,8 +518,10 @@ class AutopilotLoop:
     """Calls tick() for each configured project on an interval. Started only
     when the policy is enabled; one daemon thread; stop() is immediate."""
 
-    def __init__(self, autopilot: ProjectAutopilot) -> None:
+    def __init__(self, autopilot: ProjectAutopilot, *,
+                 clock: Callable[[], float] = time.time) -> None:
         self.autopilot = autopilot
+        self.clock = clock
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.last_reports: dict[str, dict[str, Any]] = {}
@@ -526,10 +529,14 @@ class AutopilotLoop:
     def run_once(self) -> dict[str, dict[str, Any]]:
         for project in self.autopilot.policy.projects:
             try:
-                self.last_reports[project.project_id] = self.autopilot.tick(project.project_id)
+                report = self.autopilot.tick(project.project_id)
             except Exception as exc:  # noqa: BLE001 -- one project must not stop the rest
                 _LOGGER.exception("autopilot tick failed for %s", project.project_id)
-                self.last_reports[project.project_id] = {"state": "ERROR", "error": _clip(exc)}
+                report = {"state": "ERROR", "error": _clip(exc)}
+            # Only a tick that actually observed counts as a fresh observation.
+            if report.get("state") == STATE_OK:
+                report["observed_at"] = self.clock()
+            self.last_reports[project.project_id] = report
         return self.last_reports
 
     def start(self) -> bool:

@@ -1733,6 +1733,12 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         "/dashboard/api/projects/plan": {"POST"},
         "/dashboard/api/projects/advance": {"POST"},
         "/dashboard/api/projects/reconcile": {"POST"},
+        # ProjectFlow Control Tower (#106): two guarded reads, two guarded
+        # controls (pause; owner-only resume) on the existing projects surface.
+        "/dashboard/api/projects/autopilot": {"GET", "HEAD"},
+        "/dashboard/api/projects/autopilot/notifications": {"GET", "HEAD"},
+        "/dashboard/api/projects/autopilot/pause": {"POST"},
+        "/dashboard/api/projects/autopilot/resume": {"POST"},
         # Runtime health: the two admin actions a stalled project needs,
         # which existed only as MCP tools. The GET is a REPORT (its recovery
         # half runs as a dry run, so opening the panel moves nothing); both

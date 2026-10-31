@@ -6539,6 +6539,11 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
     # server_http starts the background ticker; import-time builds do not.
     server.headless_manager = compact_tools.headless
     server.direct_task_supervisor = direct_tasks
+    # ProjectFlow Autopilot (#106) wiring reads these; it owns none of them.
+    server.project_service = projects
+    server.outcome_store = outcomes
+    server.event_bus = events
+    server.resource_locks = locks
     server.task_labels = task_labels
     server.compact_tools = compact_tools
     server.session_reconciler = session_reconciler

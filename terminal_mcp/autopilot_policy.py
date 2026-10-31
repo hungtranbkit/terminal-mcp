@@ -51,6 +51,16 @@ class AutopilotProjectPolicy:
     max_in_flight: int = 1
     max_repair_attempts: int = 2
     verify_required_capabilities: tuple[str, ...] = ()
+    # Identities allowed to RESUME (re-enable dispatch) from the Control Tower.
+    # Empty means approved_by alone. Pausing is a safety action open to any
+    # authenticated operator.
+    owners: tuple[str, ...] = ()
+
+    @property
+    def owner_identities(self) -> tuple[str, ...]:
+        if self.owners:
+            return self.owners
+        return (self.approved_by,) if self.approved_by else ()
 
     def __post_init__(self) -> None:
         if not str(self.project_id or "").strip():
@@ -113,7 +123,8 @@ def load_autopilot_config(raw: Any) -> AutopilotPolicy:
             approved_by=item.get("approved_by"), approval_ref=item.get("approval_ref"),
             lanes=tuple(lanes), max_in_flight=int(item.get("max_in_flight", 1)),
             max_repair_attempts=int(item.get("max_repair_attempts", 2)),
-            verify_required_capabilities=tuple(str(c) for c in caps)))
+            verify_required_capabilities=tuple(str(c) for c in caps),
+            owners=tuple(str(o) for o in (item.get("owners") or []))))
     ids = [p.project_id for p in projects]
     if len(ids) != len(set(ids)):
         raise ValueError("autopilot.projects has duplicate project_id")
