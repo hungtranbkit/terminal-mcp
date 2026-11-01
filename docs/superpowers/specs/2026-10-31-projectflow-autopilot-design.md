@@ -108,6 +108,7 @@ The dispatcher must persist its record under `idempotency_key` **before** it sen
 - FAIL / NEEDS_REWORK: the task lands in FAILED. If `metadata.autopilot.repairs < max_repair_attempts`, the autopilot calls `retry_task`, then records `repairs += 1` and `repair_of_job`. The next dispatch appends a fixed repair section that **references the verify job id only** and never inlines the verifier's text. Past the budget, the task stays FAILED and `AUTOPILOT_REPAIR_EXHAUSTED` is published.
 - VERIFY_BLOCKED: the task is BLOCKED, with owner attention.
 - **Restart safety.** The repair record (`repairs`, `repair_of_job`) is written before `retry_task`. A coordinator that finds a FAILED task whose record already names this QA job only retries it and does not count it again. A crash between the two writes can therefore neither drop the repair reference nor buy a repair past the budget. A retry the queue refuses is reported (`RETRY_REFUSED`) and leaves the repair counted.
+- **One attempt per verdict.** A verify job settles only the attempt it was opened for. If the task left VERIFYING and came back at a newer attempt before `reconcile` ran, the old job is not claimable, its holder's PASS or FAIL is refused with `STALE_ATTEMPT`, and `reconcile` closes it VERIFY_CANCELLED as superseded. It never becomes a VERIFIED_PASS borrowed from the newer attempt's evidence.
 
 ### 3.6a Automatic QA dispatch to a verifier session
 

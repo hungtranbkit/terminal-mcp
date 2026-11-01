@@ -442,6 +442,18 @@ def _commit_evidence_problem(row: sqlite3.Row, evidence: dict[str, Any]) -> str 
     return None
 
 
+def _stale_attempt(job_row: sqlite3.Row, task_row: sqlite3.Row) -> str | None:
+    """A verify job is about ONE attempt. A task can leave VERIFYING, be
+    retried and return to VERIFYING at a newer attempt before reconcile
+    closed the old job; that job's verdict is about other code and must
+    never settle the newer attempt."""
+    current = task_row["attempt_count"]
+    if job_row["attempt"] == current:
+        return None
+    return (f"STALE_ATTEMPT: job verifies attempt {job_row['attempt']}, "
+            f"the task is at attempt {current}")
+
+
 def _lease_expiry(lease_seconds: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + lease_seconds))
 
@@ -667,16 +679,21 @@ class VerifyQueue:
 
         `job_id` narrows the claim to that one job, for a verifier that was
         sent a specific job: it gets that job or nothing, never a different
-        one, and every capability/independence rule still applies."""
+        one, and every capability/independence rule still applies.
+
+        A job for an attempt the task has since moved past is never handed
+        out: its verdict would be about different code (see _stale_attempt)."""
         have = frozenset(str(item) for item in capabilities)
         with self._immediate() as connection:
-            clause = "AND project_id = ? " if project_id else ""
+            clause = "AND v.project_id = ? " if project_id else ""
             params: tuple[Any, ...] = (project_id,) if project_id else ()
             if job_id:
-                clause += "AND id = ? "
+                clause += "AND v.id = ? "
                 params += (job_id,)
             rows = connection.execute(
-                f"SELECT * FROM verify_jobs WHERE status = ? {clause}ORDER BY created_at, id",
+                f"SELECT v.* FROM verify_jobs v JOIN queue_tasks t ON t.id = v.task_id "
+                f"WHERE v.status = ? AND v.attempt = t.attempt_count {clause}"
+                f"ORDER BY v.created_at, v.id",
                 (VERIFY_PENDING, *params)).fetchall()
             for row in rows:
                 required = frozenset(json.loads(row["required_capabilities"] or "[]"))
@@ -801,6 +818,10 @@ class VerifyQueue:
                 return {"ok": False, "error": "TASK_NOT_VERIFYING", "job_id": job_id,
                         "task_id": row["task_id"],
                         "reason": f"task is {task_row['status'] if task_row else 'missing'}, not VERIFYING"}
+            stale = _stale_attempt(row, task_row)
+            if stale:
+                return {"ok": False, "error": "STALE_ATTEMPT", "job_id": job_id,
+                        "task_id": row["task_id"], "reason": stale}
             task = QueueTask.from_row(task_row)
             commit_problem = _commit_evidence_problem(row, clean)
             if commit_problem:
@@ -855,12 +876,16 @@ class VerifyQueue:
             if row is None or row["claim_token"] != claim_token or row["status"] not in LEASED_VERIFY_STATUSES:
                 return {"ok": False, "error": "NOT_LEASE_HOLDER", "job_id": job_id,
                         "reason": "claim_token is not the current holder, or the job is not claimed"}
-            task_row = connection.execute("SELECT status FROM queue_tasks WHERE id = ?",
+            task_row = connection.execute("SELECT status, attempt_count FROM queue_tasks WHERE id = ?",
                                           (row["task_id"],)).fetchone()
             if task_row is None or task_row["status"] != VERIFYING:
                 return {"ok": False, "error": "TASK_NOT_VERIFYING", "job_id": job_id,
                         "task_id": row["task_id"],
                         "reason": f"task is {task_row['status'] if task_row else 'missing'}, not VERIFYING"}
+            stale = _stale_attempt(row, task_row)
+            if stale:
+                return {"ok": False, "error": "STALE_ATTEMPT", "job_id": job_id,
+                        "task_id": row["task_id"], "reason": stale}
             headline = str(clean.get("headline") or clean.get("reason") or result)
             self.store._transition_locked(
                 connection, row["task_id"], VERIFYING, target_status,
@@ -1021,6 +1046,10 @@ class VerifyQueue:
            other terminal/diverted status closes the job as
            VERIFY_CANCELLED with the task's status as the reason.
 
+        A job for an attempt older than the task's current one is
+           SUPERSEDED: it closes as VERIFY_CANCELLED whatever the task's
+           status, never as VERIFIED_PASS from the newer attempt's evidence.
+
         Idempotent: running it twice changes nothing the second time.
 
         `project_id` limits both parts to that project's jobs, so a
@@ -1049,15 +1078,24 @@ class VerifyQueue:
 
             open_placeholders = ", ".join("?" * len(OPEN_VERIFY_STATUSES))
             rows = connection.execute(
-                f"SELECT v.*, t.status AS task_status, t.verification_evidence AS task_evidence "
+                f"SELECT v.*, t.status AS task_status, t.verification_evidence AS task_evidence, "
+                f"t.attempt_count AS task_attempt "
                 f"FROM verify_jobs v LEFT JOIN queue_tasks t ON t.id = v.task_id "
                 f"WHERE v.status IN ({open_placeholders}) {scope.replace('project_id', 'v.project_id')}",
                 (*OPEN_VERIFY_STATUSES, *scope_params)).fetchall()
             for row in rows:
                 task_status = row["task_status"]
-                if task_status == VERIFYING:
+                superseded = task_status is not None and row["attempt"] != row["task_attempt"]
+                if task_status == VERIFYING and not superseded:
                     continue
-                if task_status == COMPLETED:
+                if superseded:
+                    self._set_status_locked(
+                        connection, row, VERIFY_CANCELLED, actor=actor, event="VERIFY_CANCELLED",
+                        reason=f"superseded: job verifies attempt {row['attempt']}, the task is "
+                               f"at attempt {row['task_attempt']} ({task_status})",
+                        fields={"completed_at": iso_now(), "claim_token": None,
+                                "lease_expires_at": None})
+                elif task_status == COMPLETED:
                     evidence = json.loads(row["task_evidence"] or "{}")
                     passed.append(self._set_status_locked(
                         connection, row, VERIFIED_PASS, actor=actor, event="VERIFIED_PASS",

@@ -55,6 +55,10 @@ Tests: `.venv/bin/python -m pytest -q <files>`, run from the worktree.
 
 - Record before retry; resume without recount. RED: a crash after the first repair write lost `repairs`/`repair_of_job`.
 
+## Slice 9 — a verify job settles only its own attempt (`verify_queue.py`, `tests/test_verify_queue_stale_attempt.py`)
+
+- `complete`/`fail` refuse `STALE_ATTEMPT` when the job's attempt is not the task's current `attempt_count`; `claim_next` never hands out such a job; `reconcile` closes it VERIFY_CANCELLED ("superseded"), never VERIFIED_PASS. RED: a task blocked, retried and back in VERIFYING before any reconcile let the old job be claimed first (oldest-first) and its PASS complete attempt 2 with attempt 1's commit.
+
 ## Handoff state (2026-11-01)
 
 - Branch `feat/projectflow-autopilot-106`, draft PR #107. Defaults off everywhere. No live config or deployment touched.
