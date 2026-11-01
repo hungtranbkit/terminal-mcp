@@ -418,6 +418,75 @@ class VerifyJob:
         return data
 
 
+def _same_commit(a: str, b: str) -> bool:
+    a, b = a.strip().lower(), b.strip().lower()
+    return bool(a and b) and (a.startswith(b) or b.startswith(a))
+
+
+def _commit_evidence_problem(row: sqlite3.Row, evidence: dict[str, Any]) -> str | None:
+    """A PASS must be for the commit the job was opened for. Evidence that
+    names a DIFFERENT commit contradicts itself as a pass for this job; a job
+    created with require_commit_evidence also refuses evidence naming none."""
+    expected = str(row["commit_sha"] or "")
+    if not expected:
+        return None
+    claimed = str(evidence.get("commit_sha") or "")
+    if claimed and not _same_commit(claimed, expected):
+        return (f"STALE_COMMIT: evidence is for {claimed[:12]}, this job verifies "
+                f"{expected[:12]}")
+    if not claimed:
+        created = next((h for h in json.loads(row["history"] or "[]")
+                        if h.get("event") == "CREATED"), {})
+        if created.get("require_commit_evidence"):
+            return f"COMMIT_EVIDENCE_REQUIRED: evidence must name commit_sha {expected[:12]}"
+    return None
+
+
+def _verifier_allowed(row: sqlite3.Row, verifier: str) -> bool:
+    """The job's creation-time verifier allowlist, if it has one. A verifier
+    name is self-declared on the MCP surface, so this scopes routing (no other
+    project's or polling verifier takes the job); it is not authentication."""
+    created = next((h for h in json.loads(row["history"] or "[]")
+                    if h.get("event") == "CREATED"), {})
+    allowed = created.get("allowed_verifiers")
+    return not allowed or verifier in allowed
+
+
+def _created_entry(row: sqlite3.Row) -> dict[str, Any]:
+    return next((h for h in json.loads(row["history"] or "[]") if h.get("event") == "CREATED"), {})
+
+
+def _assignment(row: sqlite3.Row) -> dict[str, Any] | None:
+    """The latest ASSIGNED entry: where the coordinator sent this job last.
+    A newer assignment retires every earlier destination."""
+    return next((h for h in reversed(json.loads(row["history"] or "[]"))
+                 if h.get("event") == "ASSIGNED"), None)
+
+
+def _destination_allows(row: sqlite3.Row, verifier: str, node_id: str | None) -> bool:
+    """Only the assigned (session, node) may claim or be handed an assigned
+    job, and a job that requires assignment is unclaimable before one."""
+    assignment = _assignment(row)
+    if assignment is None:
+        return not _created_entry(row).get("require_assignment")
+    if verifier != assignment.get("verifier"):
+        return False
+    expected_node = assignment.get("verifier_node_id")
+    return not expected_node or node_id == expected_node
+
+
+def _stale_attempt(job_row: sqlite3.Row, task_row: sqlite3.Row) -> str | None:
+    """A verify job is about ONE attempt. A task can leave VERIFYING, be
+    retried and return to VERIFYING at a newer attempt before reconcile
+    closed the old job; that job's verdict is about other code and must
+    never settle the newer attempt."""
+    current = task_row["attempt_count"]
+    if job_row["attempt"] == current:
+        return None
+    return (f"STALE_ATTEMPT: job verifies attempt {job_row['attempt']}, "
+            f"the task is at attempt {current}")
+
+
 def _lease_expiry(lease_seconds: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + lease_seconds))
 
@@ -528,7 +597,8 @@ class VerifyQueue:
 
     def _set_status_locked(self, connection: sqlite3.Connection, row: sqlite3.Row, to_status: str, *,
                            actor: str | None, reason: str | None, fields: dict[str, Any] | None = None,
-                           event: str | None = None) -> VerifyJob:
+                           event: str | None = None,
+                           history_extra: dict[str, Any] | None = None) -> VerifyJob:
         from_status = row["status"]
         if to_status not in VERIFY_TRANSITIONS.get(from_status, frozenset()):
             raise InvalidVerifyTransitionError(
@@ -537,7 +607,7 @@ class VerifyQueue:
         payload.update(fields or {})
         payload["history"] = self._append_history(
             row, actor=actor, event=event or to_status, reason=reason,
-            from_status=from_status, to_status=to_status)
+            from_status=from_status, to_status=to_status, **(history_extra or {}))
         clause = ", ".join(f"{key} = ?" for key in payload)
         connection.execute(f"UPDATE verify_jobs SET {clause} WHERE id = ?",
                            (*payload.values(), row["id"]))
@@ -548,7 +618,10 @@ class VerifyQueue:
     def ensure_verify_job(self, task: QueueTask, *, required_capabilities: Sequence[str] = (),
                           require_independent: bool = True, fallback: str = FALLBACK_IN_SESSION,
                           backlog_id: str | None = None, branch: str | None = None,
-                          commit_sha: str | None = None, actor: str = "queue-engine") -> VerifyJob:
+                          commit_sha: str | None = None, actor: str = "queue-engine",
+                          require_commit_evidence: bool = False,
+                          allowed_verifiers: Sequence[str] = (),
+                          require_assignment: bool = False) -> VerifyJob:
         """IDEMPOTENT per (task_id, attempt): the same task at the same
         attempt always yields the SAME job, whether this is called twice
         by a re-entered tick, again after a process restart, or again on
@@ -564,9 +637,23 @@ class VerifyQueue:
 
         Moves the task RUNNING -> VERIFYING in the same transaction when
         it is not already there, so 'job exists' and 'task is awaiting
-        verification' can never disagree."""
+        verification' can never disagree.
+
+        `require_commit_evidence` (needs `commit_sha`) is recorded on the
+        CREATED history entry, next to the other creation-time policy, and
+        makes complete() refuse a PASS whose evidence does not name this
+        exact commit.
+
+        `allowed_verifiers`, recorded the same way, limits who may claim or
+        be handed this job. Empty keeps the open claim every existing
+        caller relies on.
+
+        `require_assignment` makes the job unclaimable until assign() names
+        the destination the coordinator is about to send it to."""
         if fallback not in VALID_FALLBACKS:
             raise ValueError(f"fallback must be one of {VALID_FALLBACKS}, got {fallback!r}")
+        if require_commit_evidence and not commit_sha:
+            raise ValueError("require_commit_evidence needs the commit_sha under verification")
         with self._immediate() as connection:
             existing = connection.execute(
                 "SELECT * FROM verify_jobs WHERE task_id = ? AND attempt = ?",
@@ -596,6 +683,10 @@ class VerifyQueue:
                 "at": now, "event": "CREATED", "actor": actor,
                 "required_capabilities": list(required_capabilities),
                 "fallback": fallback,
+                **({"require_commit_evidence": True} if require_commit_evidence else {}),
+                **({"allowed_verifiers": [str(v) for v in allowed_verifiers]}
+                   if allowed_verifiers else {}),
+                **({"require_assignment": True} if require_assignment else {}),
             }])
             connection.execute(
                 "INSERT INTO verify_jobs (id, task_id, attempt, session, project_id, backlog_id, status, "
@@ -622,7 +713,7 @@ class VerifyQueue:
 
     def claim_next(self, *, verifier: str, capabilities: Sequence[str] = (),
                    project_id: str | None = None, verifier_node_id: str | None = None,
-                   lease_seconds: float = 600.0) -> VerifyJob | None:
+                   lease_seconds: float = 600.0, job_id: str | None = None) -> VerifyJob | None:
         """Claim the oldest VERIFY_PENDING job this verifier can actually
         do. `capabilities` is what the verifier HAS; a job matches when
         its required set is a subset of that (AND semantics).
@@ -630,13 +721,25 @@ class VerifyQueue:
         Refuses a job whose implementer is this same verifier when the job
         asked for independence -- the point of routing verification
         elsewhere is not to hand it straight back. Returns None when
-        nothing matches, which is an ordinary outcome, not an error."""
+        nothing matches, which is an ordinary outcome, not an error.
+
+        `job_id` narrows the claim to that one job, for a verifier that was
+        sent a specific job: it gets that job or nothing, never a different
+        one, and every capability/independence rule still applies.
+
+        A job for an attempt the task has since moved past is never handed
+        out: its verdict would be about different code (see _stale_attempt)."""
         have = frozenset(str(item) for item in capabilities)
         with self._immediate() as connection:
-            clause = "AND project_id = ? " if project_id else ""
+            clause = "AND v.project_id = ? " if project_id else ""
             params: tuple[Any, ...] = (project_id,) if project_id else ()
+            if job_id:
+                clause += "AND v.id = ? "
+                params += (job_id,)
             rows = connection.execute(
-                f"SELECT * FROM verify_jobs WHERE status = ? {clause}ORDER BY created_at, id",
+                f"SELECT v.* FROM verify_jobs v JOIN queue_tasks t ON t.id = v.task_id "
+                f"WHERE v.status = ? AND v.attempt = t.attempt_count {clause}"
+                f"ORDER BY v.created_at, v.id",
                 (VERIFY_PENDING, *params)).fetchall()
             for row in rows:
                 required = frozenset(json.loads(row["required_capabilities"] or "[]"))
@@ -644,6 +747,11 @@ class VerifyQueue:
                     continue
                 if row["require_independent"] and row["implementer"] and row["implementer"] == verifier:
                     continue
+                if not _verifier_allowed(row, verifier):
+                    continue
+                if not _destination_allows(row, verifier, verifier_node_id):
+                    continue
+                assignment = _assignment(row)
                 token = new_task_id()
                 claimed = self._set_status_locked(
                     connection, row, VERIFY_CLAIMED, actor=verifier, event="CLAIMED",
@@ -651,10 +759,36 @@ class VerifyQueue:
                     fields={"verifier": verifier, "verifier_node_id": verifier_node_id,
                             "claim_token": token, "lease_expires_at": _lease_expiry(lease_seconds),
                             "claimed_at": iso_now(), "claim_count": row["claim_count"] + 1,
-                            "block_reason": None})
+                            "block_reason": None},
+                    history_extra={"verifier_node_id": verifier_node_id,
+                                   "assignment_key": (assignment or {}).get("dispatch_key")})
                 self._emit(claimed)
                 return claimed
         return None
+
+    def assign(self, job_id: str, *, verifier: str, verifier_node_id: str | None,
+               dispatch_key: str, actor: str) -> VerifyJob | None:
+        """Record the destination a coordinator is about to send this job to,
+        BEFORE the send. Only that (session, node) can then claim it, and its
+        claim carries `dispatch_key` as `assignment_key` so a proof can tie the
+        verdict to the exact dispatch. Idempotent for the same destination and
+        key; a different one supersedes the previous assignment. Refused (None)
+        unless the job is still VERIFY_PENDING, or for a verifier outside the
+        job's allowlist. Not authentication: MCP callers are not attested."""
+        with self._immediate() as connection:
+            row = self._row(connection, job_id)
+            if row is None or row["status"] != VERIFY_PENDING or not _verifier_allowed(row, verifier):
+                return None
+            current = _assignment(row) or {}
+            wanted = {"verifier": verifier, "verifier_node_id": verifier_node_id,
+                      "dispatch_key": dispatch_key}
+            if {k: current.get(k) for k in wanted} == wanted:
+                return VerifyJob.from_row(row)
+            history = self._append_history(row, actor=actor, event="ASSIGNED",
+                                           reason=f"QA sent to {verifier}", **wanted)
+            connection.execute("UPDATE verify_jobs SET history = ?, updated_at = ? WHERE id = ?",
+                               (history, iso_now(), job_id))
+            return VerifyJob.from_row(self._row(connection, job_id))
 
     def start(self, job_id: str, claim_token: str, *, detail: str | None = None) -> VerifyJob | None:
         """VERIFY_CLAIMED -> VERIFY_RUNNING. Separate from the claim so
@@ -707,6 +841,10 @@ class VerifyQueue:
         with self._immediate() as connection:
             row = self._row(connection, job_id)
             if row is None or row["claim_token"] != claim_token or row["status"] not in LEASED_VERIFY_STATUSES:
+                return None
+            if not _verifier_allowed(row, to_verifier):
+                return None
+            if not _destination_allows(row, to_verifier, to_node_id):
                 return None
             token = new_task_id()
             history = self._append_history(row, actor=row["verifier"], event="HANDOFF", reason=reason,
@@ -761,7 +899,18 @@ class VerifyQueue:
                 return {"ok": False, "error": "TASK_NOT_VERIFYING", "job_id": job_id,
                         "task_id": row["task_id"],
                         "reason": f"task is {task_row['status'] if task_row else 'missing'}, not VERIFYING"}
+            stale = _stale_attempt(row, task_row)
+            if stale:
+                return {"ok": False, "error": "STALE_ATTEMPT", "job_id": job_id,
+                        "task_id": row["task_id"], "reason": stale}
             task = QueueTask.from_row(task_row)
+            commit_problem = _commit_evidence_problem(row, clean)
+            if commit_problem:
+                self.store._record_event_locked(
+                    connection, session=task.session, task_id=task.id,
+                    event_type="COMPLETION_REFUSED_EVIDENCE", reason=commit_problem)
+                return {"ok": False, "error": "EVIDENCE_REJECTED", "job_id": job_id,
+                        "reason": commit_problem}
             try:
                 if task.metadata.get("requires_git_evidence"):
                     self.store._validate_git_completion_evidence(task, clean)
@@ -808,12 +957,16 @@ class VerifyQueue:
             if row is None or row["claim_token"] != claim_token or row["status"] not in LEASED_VERIFY_STATUSES:
                 return {"ok": False, "error": "NOT_LEASE_HOLDER", "job_id": job_id,
                         "reason": "claim_token is not the current holder, or the job is not claimed"}
-            task_row = connection.execute("SELECT status FROM queue_tasks WHERE id = ?",
+            task_row = connection.execute("SELECT status, attempt_count FROM queue_tasks WHERE id = ?",
                                           (row["task_id"],)).fetchone()
             if task_row is None or task_row["status"] != VERIFYING:
                 return {"ok": False, "error": "TASK_NOT_VERIFYING", "job_id": job_id,
                         "task_id": row["task_id"],
                         "reason": f"task is {task_row['status'] if task_row else 'missing'}, not VERIFYING"}
+            stale = _stale_attempt(row, task_row)
+            if stale:
+                return {"ok": False, "error": "STALE_ATTEMPT", "job_id": job_id,
+                        "task_id": row["task_id"], "reason": stale}
             headline = str(clean.get("headline") or clean.get("reason") or result)
             self.store._transition_locked(
                 connection, row["task_id"], VERIFYING, target_status,
@@ -954,7 +1107,8 @@ class VerifyQueue:
 
     # -- recovery --------------------------------------------------------
 
-    def reconcile(self, *, now: str | None = None, actor: str = "reconciler") -> dict[str, Any]:
+    def reconcile(self, *, now: str | None = None, actor: str = "reconciler",
+                  project_id: str | None = None) -> dict[str, Any]:
         """Restart/crash safety, in two parts -- neither of which may ever
         lose a job or invent a verdict.
 
@@ -973,8 +1127,17 @@ class VerifyQueue:
            other terminal/diverted status closes the job as
            VERIFY_CANCELLED with the task's status as the reason.
 
-        Idempotent: running it twice changes nothing the second time."""
+        A job for an attempt older than the task's current one is
+           SUPERSEDED: it closes as VERIFY_CANCELLED whatever the task's
+           status, never as VERIFIED_PASS from the newer attempt's evidence.
+
+        Idempotent: running it twice changes nothing the second time.
+
+        `project_id` limits both parts to that project's jobs, so a
+        per-project caller (the autopilot) never settles another project's."""
         now = now or iso_now()
+        scope = "AND project_id = ? " if project_id else ""
+        scope_params: tuple[Any, ...] = (project_id,) if project_id else ()
         expired: list[str] = []
         closed: list[dict[str, str]] = []
         # Collected inside the transaction, fired only after it commits --
@@ -984,8 +1147,8 @@ class VerifyQueue:
         with self._immediate() as connection:
             rows = connection.execute(
                 f"SELECT * FROM verify_jobs WHERE status IN ({placeholders}) "
-                f"AND lease_expires_at IS NOT NULL AND lease_expires_at < ?",
-                (*LEASED_VERIFY_STATUSES, now)).fetchall()
+                f"AND lease_expires_at IS NOT NULL AND lease_expires_at < ? {scope}",
+                (*LEASED_VERIFY_STATUSES, now, *scope_params)).fetchall()
             for row in rows:
                 self._set_status_locked(
                     connection, row, VERIFY_PENDING, actor=actor, event="LEASE_EXPIRED",
@@ -996,14 +1159,24 @@ class VerifyQueue:
 
             open_placeholders = ", ".join("?" * len(OPEN_VERIFY_STATUSES))
             rows = connection.execute(
-                f"SELECT v.*, t.status AS task_status, t.verification_evidence AS task_evidence "
+                f"SELECT v.*, t.status AS task_status, t.verification_evidence AS task_evidence, "
+                f"t.attempt_count AS task_attempt "
                 f"FROM verify_jobs v LEFT JOIN queue_tasks t ON t.id = v.task_id "
-                f"WHERE v.status IN ({open_placeholders})", OPEN_VERIFY_STATUSES).fetchall()
+                f"WHERE v.status IN ({open_placeholders}) {scope.replace('project_id', 'v.project_id')}",
+                (*OPEN_VERIFY_STATUSES, *scope_params)).fetchall()
             for row in rows:
                 task_status = row["task_status"]
-                if task_status == VERIFYING:
+                superseded = task_status is not None and row["attempt"] != row["task_attempt"]
+                if task_status == VERIFYING and not superseded:
                     continue
-                if task_status == COMPLETED:
+                if superseded:
+                    self._set_status_locked(
+                        connection, row, VERIFY_CANCELLED, actor=actor, event="VERIFY_CANCELLED",
+                        reason=f"superseded: job verifies attempt {row['attempt']}, the task is "
+                               f"at attempt {row['task_attempt']} ({task_status})",
+                        fields={"completed_at": iso_now(), "claim_token": None,
+                                "lease_expires_at": None})
+                elif task_status == COMPLETED:
                     evidence = json.loads(row["task_evidence"] or "{}")
                     passed.append(self._set_status_locked(
                         connection, row, VERIFIED_PASS, actor=actor, event="VERIFIED_PASS",

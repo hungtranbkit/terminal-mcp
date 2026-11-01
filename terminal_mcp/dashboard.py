@@ -13440,7 +13440,8 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                        projects: Any = None,
                        harness: "HarnessService | None" = None,
                        webauth: WebAuthStore | None = None,
-                       run_journal: RunJournalStore | None = None) -> None:
+                       run_journal: RunJournalStore | None = None,
+                       autopilot: Any = None) -> None:
     if supervisor is None:
         supervisor = SupervisorService(terminal, SupervisorStore())
     if supervisor_v2 is None:
@@ -15098,6 +15099,94 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         result = await anyio.to_thread.run_sync(lambda: projects.reconcile_team(project_id))
         return JSONResponse(result, status_code=200 if "error" not in result else 400,
                             headers={"Cache-Control": "no-store"})
+
+    # -- ProjectFlow Control Tower (issue #106) -------------------------------
+    #
+    # Extends this project surface rather than adding a second board. Reads go
+    # through _read_guard; pause/resume through _mutation_guard (mutations
+    # enabled + same-origin CSRF + CF Access). Resume additionally needs a
+    # VERIFIED owner identity (autopilot_view.ControlTower.resume). Without an
+    # autopilot runtime wired, every route answers 404 rather than pretending.
+
+    def _autopilot_unavailable() -> JSONResponse:
+        return JSONResponse({"error": "AUTOPILOT_UNAVAILABLE"}, status_code=404,
+                            headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/projects/autopilot", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_api_autopilot(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        if autopilot is None:
+            return _autopilot_unavailable()
+        project_id = request.query_params.get("project_id") or ""
+        result = await anyio.to_thread.run_sync(
+            lambda: autopilot.snapshot(project_id) if project_id else autopilot.overview())
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/projects/autopilot/notifications", methods=["GET"],
+                         include_in_schema=False)
+    async def dashboard_api_autopilot_notifications(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        if autopilot is None:
+            return _autopilot_unavailable()
+        project_id = request.query_params.get("project_id") or ""
+        try:
+            since_seq = int(request.query_params.get("since_seq") or 0)
+        except ValueError:
+            return JSONResponse({"error": "INVALID_REQUEST", "detail": "since_seq must be an int"},
+                                status_code=400)
+        if not project_id:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        result = await anyio.to_thread.run_sync(
+            lambda: autopilot.notifications(project_id, since_seq=since_seq))
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    async def _autopilot_control(request: Request, action: str) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        if autopilot is None:
+            return _autopilot_unavailable()
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        project_id = body.get("project_id")
+        if not isinstance(project_id, str) or not project_id:
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        key = body.get("idempotency_key")
+        key = str(key)[:120] if key else None
+        email = identity.email if identity else None
+        actor = email or "dashboard"
+        _log.info("dashboard autopilot_%s project=%s identity=%s", action, project_id, email)
+        if action == "pause":
+            result = await anyio.to_thread.run_sync(lambda: autopilot.pause(
+                project_id, actor=actor, reason=str(body.get("reason") or "")[:300] or None,
+                idempotency_key=key))
+        else:
+            result = await anyio.to_thread.run_sync(lambda: autopilot.resume(
+                project_id, actor=actor, verified_identity=email, idempotency_key=key))
+        status = 200
+        if result.get("error") == "OWNER_APPROVAL_REQUIRED":
+            status = 403
+        elif "error" in result:
+            status = 400
+        return JSONResponse(result, status_code=status, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/projects/autopilot/pause", methods=["POST"],
+                         include_in_schema=False)
+    async def dashboard_api_autopilot_pause(request: Request) -> JSONResponse:
+        return await _autopilot_control(request, "pause")
+
+    @server.custom_route("/dashboard/api/projects/autopilot/resume", methods=["POST"],
+                         include_in_schema=False)
+    async def dashboard_api_autopilot_resume(request: Request) -> JSONResponse:
+        return await _autopilot_control(request, "resume")
 
     # -- Runtime health: the two admin actions a stalled project needs -------
     #

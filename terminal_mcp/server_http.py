@@ -633,11 +633,47 @@ def main() -> None:
             follower.restore_active_tasks(queue.store)
         except Exception:  # noqa: BLE001 -- durable task rows remain available for manual recovery
             _log.exception("fast-agent follower recovery failed")
+    # ProjectFlow Autopilot (#106). The Control Tower read model is always
+    # wired (it reports DISABLED while config.autopilot is off); the loop is
+    # built and started ONLY when config.autopilot.enabled lists projects.
+    autopilot_tower, autopilot_loop = None, None
+    try:
+        from .autopilot_view import build_autopilot_runtime
+        from .coordinator import node_aware_repo_evidence
+        autopilot_tower, autopilot_loop = build_autopilot_runtime(
+            config, queue=queue, bus=getattr(server, "event_bus", None) or events,
+            outcomes=getattr(server, "outcome_store", None),
+            projects=getattr(server, "project_service", None),
+            locks=getattr(server, "resource_locks", None),
+            direct_tasks=getattr(server, "direct_task_supervisor", None),
+            instance_id=f"{controller.local_node_id}:{os.getpid()}",
+            session_ops=controller,
+            repo_evidence=node_aware_repo_evidence(
+                local_node_id=controller.local_node_id, node_client_factory=controller.client_for))
+    except Exception:  # noqa: BLE001 -- never block startup on an opt-in feature
+        _log.exception("autopilot runtime unavailable")
     register_dashboard(server, terminal, supervisor, supervisor_v2, controller, connection_store,
                        queue=queue, integration=integration, pm=pm, planner=planner, ai_usage=ai_usage,
                        recovery=recovery, backlog=backlog, fleet=fleet, onboarding=onboarding,
                        credentials=credentials, heartbeat_replay=heartbeat_replay, notes=notes, webauth=webauth,
-                       run_journal=run_journal, harness=queue.harness, archify=archify)
+                       run_journal=run_journal, harness=queue.harness, archify=archify,
+                       autopilot=autopilot_tower)
+    # GitHub webhook ingress (#106): registered only when enabled, and only
+    # once its 0600 secret file reads cleanly -- otherwise no route at all.
+    if config.github_ingress.enabled and getattr(queue, "store", None) is not None:
+        try:
+            from .github_ingress import GithubIngress, register_github_ingress
+            register_github_ingress(server, GithubIngress(
+                config.github_ingress, store=queue.store,
+                bus=getattr(server, "event_bus", None) or events))
+            _log.warning("GitHub webhook ingress enabled for %s",
+                         [r.repo for r in config.github_ingress.repos])
+        except Exception:  # noqa: BLE001 -- fail closed: no route, startup continues
+            _log.exception("GitHub webhook ingress NOT registered")
+    if autopilot_loop is not None and autopilot_loop.start():
+        atexit.register(autopilot_loop.stop)
+        _log.warning("ProjectFlow autopilot loop STARTED for %s",
+                     [p.project_id for p in config.autopilot.projects])
     archify.start()
     atexit.register(archify.close)
     register_webauth_dashboard(server, terminal, webauth, supervisor, supervisor_v2, controller,
