@@ -5,6 +5,8 @@ Access identity when configured, and owner-only resume.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 from starlette.testclient import TestClient
 
@@ -106,3 +108,17 @@ def test_resume_with_cf_access_identity(tower, monkeypatch, email, status):  # n
 def test_cf_access_configured_blocks_anonymous_reads(tower, monkeypatch):  # noqa: F811
     _, client = _client(_config(cf=True), tower)
     assert client.get("/dashboard/api/projects/autopilot").status_code in (401, 403)
+
+
+def test_snapshot_route_serves_proof_provenance_and_readiness_detail(tower):  # noqa: F811
+    a = _add(tower, "p1-work", "A")
+    tower.test["loop"].run_once()
+    tower.test["dispatcher"].set_state("p1-work", "DONE")
+    tower.test["loop"].run_once()
+    _, client = _client(_config(), tower)
+    snap = client.get("/dashboard/api/projects/autopilot", params={"project_id": P1}).json()
+    task = next(t for t in snap["tasks"] if t["id"] == a)
+    assert task["proof"]["kind"] == "NONE" and task["proof"]["trusted"] is False
+    assert snap["readiness"]["CODE_READY"] == "NOT_READY"
+    assert snap["readiness_detail"]["CODE_READY"]["open"] == [a]
+    assert "claim_token" not in json.dumps(snap)

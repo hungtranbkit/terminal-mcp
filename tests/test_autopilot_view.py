@@ -26,6 +26,7 @@ from .test_autopilot import FakeDispatcher
 
 P1 = "synthetic/brandagent-staging"
 P2 = "synthetic/second-project"
+HEAD = "c0ffee1" + "0" * 33
 
 
 class _Queue:
@@ -49,7 +50,9 @@ def tower(tmp_path):
     dispatcher = FakeDispatcher()
     autopilot = ap.ProjectAutopilot(store=store, verify=verify, outcomes=outcomes, bus=bus,
                                     locks=ResourceLockStore(tmp_path / "locks.db"),
-                                    dispatcher=dispatcher, policy=policy, instance_id="hp-1")
+                                    dispatcher=dispatcher, policy=policy, instance_id="hp-1",
+                                    # The controller-observed HEAD: CODE_READY needs one exact commit.
+                                    workspace_probe=lambda lane: {"dirty": False, "head": HEAD})
     clock = {"now": 1_000_000.0}
     loop = ap.AutopilotLoop(autopilot, clock=lambda: clock["now"])
     t = av.ControlTower(store=store, verify=verify, outcomes=outcomes, bus=bus, projects=projects,
@@ -109,7 +112,8 @@ def test_device_qa_reads_only_explicit_device_evidence(tower):
     tower.test["dispatcher"].set_state("p1-work", ap.DONE)
     tower.test["loop"].run_once()
     _verify_pass(tower, a, evidence={"command": "maestro test", "exit_code": 0, "tests_passed": 4,
-                                     "tests_failed": 0, "device_qa": {"passed": True,
+                                     "tests_failed": 0, "commit_sha": HEAD,
+                                     "device_qa": {"passed": True,
                                                                       "device": "synthetic-emulator"}})
     readiness = tower.snapshot(P1)["readiness"]
     assert readiness["DEVICE_QA"] == "READY"

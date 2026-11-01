@@ -187,6 +187,16 @@ events. Every event carries `causation_id`. The consumer skips its own events.
   - `stale` flags and autopilot state
 - `POST /dashboard/api/projects/autopilot/pause|resume` uses `_mutation_guard`: mutations enabled, same-origin CSRF, CF Access identity. Each call is idempotent and audited, and the actor is recorded. Resume never overrides a non-autopilot pause.
 - Notifications are deltas only: a new verified milestone, a new blocker, or a needed approval. They are computed from the event stream with a per-consumer cursor, so a repeat read produces no repeat.
+- **Trusted proof.** Each task carries `proof` = {kind, trusted, problems, job_id, attempt, verifier, verifier_node_id, implementer, commit_sha, verified_at, device}.
+  - `kind`: `VERIFIED_PASS` (an independent verifier's PASS), `TERMINAL_RECEIPT` (the worker completed its own task, or `reconcile` closed the job with no verifier), or `NONE`.
+  - Trusted only when the PASS is for the current attempt and the verifier is not the implementer. The evidence must clear the gate and be canonically identical to the task's stored evidence, and the job commit, the evidence commit and the HEAD the autopilot observed at DONE must be one commit.
+  - Readiness reads proofs only:
+    - CODE_READY is READY when every live task is trusted.
+    - It is NOT_READY when work is open or a proof fails (`SELF_VERIFIED`, `STALE_ATTEMPT`, `EVIDENCE_REJECTED`, `EVIDENCE_MISMATCH`, `COMMIT_MISMATCH`).
+    - It is otherwise UNKNOWN: the work is completed but unproven, with no independent PASS or no commit.
+  - DEVICE_QA counts only trusted proofs whose `device_qa` names a device.
+  - `readiness_detail` lists the open, failed and unproven task ids.
+  - MILESTONE_VERIFIED is raised by `VERIFY_PASS`, never by a task row reaching COMPLETED.
 - Gateway Task Center #115 consumes this JSON contract through a separate, scoped PR in that repo. Nothing in the gateway repo is changed from here.
 
 ## 6. Data/event contract (versioned)

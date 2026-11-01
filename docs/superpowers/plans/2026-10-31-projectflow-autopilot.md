@@ -46,6 +46,11 @@ Tests: `.venv/bin/python -m pytest -q <files>`, run from the worktree.
 - RED→GREEN: A→QA→B; ACK/IDLE/DONE without a verdict is not a PASS; implementer rejection (also by id); claim-by-id never takes another job; no capable verifier; verifier unavailable then back; busy refusal costs no budget; duplicate events; restart before and after submit; lost lease and two coordinators; WAITING_INPUT/UNCERTAIN/node lost; QA dispatch budget; QA FAIL repair budget; missing and stale commit; prompt carries no agent text or token; Control Tower QA view.
 - Production probes wired in `build_autopilot_runtime`; the loop still starts only when enabled.
 
+## Slice 7 — trusted QA proof in the snapshot (`autopilot_view.py`, `tests/test_autopilot_proof.py`)
+
+- `task_proof()` provenance per task; readiness and `readiness_detail` from trusted proofs only; MILESTONE_VERIFIED from VERIFY_PASS.
+- RED→GREEN negatives: terminal receipt, reconcile-closed job with no verifier, self-verified, edited task evidence, commit mismatch (evidence and observed HEAD), incomplete evidence, no commit, device without a device id or on a receipt, failed device QA, cross-project and token leakage.
+
 ## Handoff state (2026-11-01)
 
 - Branch `feat/projectflow-autopilot-106`, draft PR #107. Defaults off everywhere. No live config or deployment touched.
@@ -65,8 +70,12 @@ Tests: `.venv/bin/python -m pytest -q <files>`, run from the worktree.
  "tasks":[{"id":"…","title":"…","status":"…","lane":"…","node_id":null,
            "depends_on":[],"updated_at":"…","stale":false,
            "qa":{"job_id":null,"status":null,"attempt":1,"commit_sha":null,"verifier":null,
-                 "dispatches":0,"waiting_reason":null,"waiting_detail":null},"evidence_ref":null}],
+                 "dispatches":0,"waiting_reason":null,"waiting_detail":null},"evidence_ref":null,
+           "proof":{"kind":"VERIFIED_PASS|TERMINAL_RECEIPT|NONE","trusted":false,"problems":[],
+                    "job_id":null,"attempt":null,"verifier":null,"verifier_node_id":null,
+                    "implementer":null,"commit_sha":null,"verified_at":null,"device":null}}],
  "readiness":{"CODE_READY":"UNKNOWN|READY|NOT_READY","DEVICE_QA":"UNKNOWN|…","RELEASE_READY":"UNKNOWN|…"},
+ "readiness_detail":{"CODE_READY":{"open":[],"failed":[],"unproven":[]},"DEVICE_QA":{"proofs":0}},
  "needs_owner":[{"task_id":"…","reason":"…"}]}
 ```
 

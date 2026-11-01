@@ -11,6 +11,10 @@ HONESTY RULES, enforced here rather than left to a UI:
   * CODE_READY, DEVICE_QA and RELEASE_READY are separate and UNKNOWN unless a
     verified fact establishes them -- verified code is not device QA, and
     neither is a release (a release additionally needs owner approval);
+  * a "verified fact" is a TRUSTED PROOF (task_proof below): an independent
+    VERIFIED_PASS for the current attempt at one exact commit, with the task's
+    stored evidence identical to the verifier's. A worker's own completion is
+    a terminal receipt, never verification;
   * in-flight work nobody has observed recently, or whose node is
     unreachable, is shown UNKNOWN, never RUNNING;
   * prompts are not part of the read model; evidence strings are redacted.
@@ -22,6 +26,7 @@ only a verified milestone, a QA failure or an owner decision is news.
 """
 from __future__ import annotations
 
+import json
 import time
 from typing import Any, Callable
 
@@ -29,7 +34,7 @@ from . import autopilot as ap
 from . import queue_store as qs
 from .outcomes import OUTCOME_DONE
 from .redaction import redact_text
-from .verify_queue import evidence_verdict
+from .verify_queue import VERIFIED_PASS, _same_commit, evidence_verdict
 
 SNAPSHOT_SCHEMA = "autopilot_status/v1"
 UNKNOWN = "UNKNOWN"
@@ -38,8 +43,95 @@ NOT_READY = "NOT_READY"
 
 _OBSERVED = (qs.DISPATCHING, qs.DISPATCH_UNCERTAIN, qs.RUNNING)
 _EVIDENCE_KEYS = ("commit_sha", "command", "exit_code", "tests_passed", "tests_failed")
-_NOTIFY = {"TASK_COMPLETED": "MILESTONE_VERIFIED", "VERIFY_FAIL": "QA_FAILED",
+# A verified milestone is a verifier's PASS, not a task row reaching COMPLETED
+# (a worker can complete its own task in-session: that is a receipt).
+_NOTIFY = {"VERIFY_PASS": "MILESTONE_VERIFIED", "VERIFY_FAIL": "QA_FAILED",
            "AUTOPILOT_OWNER_ATTENTION": "NEEDS_OWNER"}
+
+# -- proof provenance ---------------------------------------------------------
+PROOF_VERIFIED_PASS = "VERIFIED_PASS"        # an independent verifier's PASS
+PROOF_TERMINAL_RECEIPT = "TERMINAL_RECEIPT"  # completed without one
+PROOF_NONE = "NONE"                          # not completed
+# missing provenance -> UNKNOWN
+PROBLEM_NO_INDEPENDENT_PASS = "NO_INDEPENDENT_PASS"
+PROBLEM_NO_VERIFIER = "NO_VERIFIER"
+PROBLEM_NO_COMMIT = "NO_COMMIT"
+PROBLEM_EVIDENCE_NO_COMMIT = "EVIDENCE_NO_COMMIT"
+# a proof that exists and fails -> NOT_READY
+PROBLEM_SELF_VERIFIED = "SELF_VERIFIED"
+PROBLEM_STALE_ATTEMPT = "STALE_ATTEMPT"
+PROBLEM_EVIDENCE_REJECTED = "EVIDENCE_REJECTED"
+PROBLEM_EVIDENCE_MISMATCH = "EVIDENCE_MISMATCH"
+PROBLEM_COMMIT_MISMATCH = "COMMIT_MISMATCH"
+_FAILING_PROBLEMS = frozenset({PROBLEM_SELF_VERIFIED, PROBLEM_STALE_ATTEMPT,
+                               PROBLEM_EVIDENCE_REJECTED, PROBLEM_EVIDENCE_MISMATCH,
+                               PROBLEM_COMMIT_MISMATCH})
+
+
+def _canonical(value: Any) -> str:
+    return json.dumps(value or {}, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def task_proof(task: qs.QueueTask, job: Any) -> dict[str, Any]:
+    """Where a task's completion claim comes from, and whether it holds.
+
+    `job` is the task's latest verify job (or None). Trusted only when every
+    record agrees: the job PASSED for the task's current attempt, a verifier
+    other than the implementer signed it, its evidence clears the gate and is
+    byte-identical (canonically) to the task's stored evidence, and the job's
+    commit, the evidence's commit and the HEAD the autopilot observed at DONE
+    are one commit. Reads only durable rows; decides nothing, mutates nothing."""
+    problems: list[str] = []
+    passed = job is not None and job.status == VERIFIED_PASS
+    if task.status != qs.COMPLETED and not passed:
+        kind = PROOF_NONE
+    elif not passed:
+        kind = PROOF_TERMINAL_RECEIPT
+        problems.append(PROBLEM_NO_INDEPENDENT_PASS)
+    elif not job.verifier:
+        # reconcile() closes an open job as PASS when the task completed
+        # in-session: the record of a receipt, not an independent verdict.
+        kind = PROOF_TERMINAL_RECEIPT
+        problems.append(PROBLEM_NO_VERIFIER)
+    else:
+        kind = PROOF_VERIFIED_PASS
+    if kind == PROOF_VERIFIED_PASS:
+        if job.implementer and job.verifier == job.implementer:
+            problems.append(PROBLEM_SELF_VERIFIED)
+        if job.attempt != task.attempt_count:
+            problems.append(PROBLEM_STALE_ATTEMPT)
+        if not evidence_verdict(job.evidence)[0]:
+            problems.append(PROBLEM_EVIDENCE_REJECTED)
+        if _canonical(job.evidence) != _canonical(task.verification_evidence):
+            problems.append(PROBLEM_EVIDENCE_MISMATCH)
+        observed = ((task.metadata.get(ap.METADATA_KEY) or {}).get("qa") or {})
+        observed_commit = (str(observed.get("commit_sha") or "")
+                           if observed.get("job_id") == job.id else "")
+        claimed = str((job.evidence or {}).get("commit_sha") or "")
+        commit = str(job.commit_sha or "")
+        if not commit:
+            problems.append(PROBLEM_NO_COMMIT)
+        else:
+            if not claimed:
+                problems.append(PROBLEM_EVIDENCE_NO_COMMIT)
+            if any(other and not _same_commit(other, commit)
+                   for other in (claimed, observed_commit)):
+                problems.append(PROBLEM_COMMIT_MISMATCH)
+    device = (job.evidence or {}).get("device_qa") if passed else None
+    return {
+        "kind": kind, "trusted": kind == PROOF_VERIFIED_PASS and not problems,
+        "problems": problems,
+        "job_id": job.id if job is not None else None,
+        "attempt": job.attempt if job is not None else None,
+        "verifier": job.verifier if job is not None else None,
+        "verifier_node_id": job.verifier_node_id if job is not None else None,
+        "implementer": job.implementer if job is not None else None,
+        "commit_sha": job.commit_sha if job is not None else None,
+        "verified_at": job.completed_at if passed else None,
+        "device": ({"passed": device.get("passed") is True,
+                    "device": _safe(device.get("device")) or None}
+                   if isinstance(device, dict) else None),
+    }
 
 
 def _safe(value: Any) -> Any:
@@ -102,6 +194,7 @@ class ControlTower:
             elif task.id in (report or {}).get("waiting_input", ()):
                 display = "WAITING_INPUT"
         jobs = self.verify.list_jobs(task_id=task.id, limit=1) if self.verify else []
+        proof = task_proof(task, jobs[0] if jobs else None)
         evidence = None
         if task.status == qs.COMPLETED and task.verification_evidence:
             evidence = {k: _safe(task.verification_evidence[k])
@@ -115,6 +208,7 @@ class ControlTower:
             "updated_at": task.updated_at, "last_error": _safe(task.last_error),
             "qa": self._qa_view(task, jobs[0], report if fresh else None) if jobs else None,
             "evidence_ref": evidence,
+            "proof": proof,
         }
 
     @staticmethod
@@ -132,22 +226,34 @@ class ControlTower:
                 "waiting_reason": waiting.get("reason") if waiting else None,
                 "waiting_detail": _safe(waiting.get("detail")) if waiting else None}
 
-    def _readiness(self, tasks: list[qs.QueueTask], outcomes: list[Any]) -> dict[str, str]:
-        live = [t for t in tasks if t.status not in (qs.CANCELLED, qs.SKIPPED)]
+    @staticmethod
+    def _readiness(views: list[dict[str, Any]], outcomes: list[Any]
+                   ) -> tuple[dict[str, str], dict[str, Any]]:
+        """From trusted proofs only. CODE: READY when every live task has one;
+        NOT_READY when work is unfinished or a proof fails; otherwise UNKNOWN
+        (completed, but nothing independent proves it). DEVICE: only trusted
+        proofs that name a device count."""
+        live = [v for v in views if v["status"] not in (qs.CANCELLED, qs.SKIPPED)]
+        open_ids = [v["id"] for v in live if v["status"] != qs.COMPLETED]
+        failed = [v["id"] for v in live if v["status"] == qs.COMPLETED
+                  and _FAILING_PROBLEMS & set(v["proof"]["problems"])]
+        unproven = [v["id"] for v in live if v["status"] == qs.COMPLETED
+                    and not v["proof"]["trusted"] and v["id"] not in failed]
         if not live:
             code = UNKNOWN
-        elif all(t.status == qs.COMPLETED and evidence_verdict(t.verification_evidence)[0]
-                 for t in live):
-            code = READY
-        else:
+        elif open_ids or failed:
             code = NOT_READY
-        device = UNKNOWN
-        verdicts = [t.verification_evidence.get("device_qa") for t in live
-                    if isinstance(t.verification_evidence, dict)
-                    and "device_qa" in t.verification_evidence]
-        if verdicts:
-            passed = [isinstance(v, dict) and v.get("passed") is True for v in verdicts]
-            device = READY if all(passed) else NOT_READY
+        elif unproven:
+            code = UNKNOWN
+        else:
+            code = READY
+        verdicts = [v["proof"]["device"] for v in live
+                    if v["proof"]["trusted"] and v["proof"]["device"]
+                    and v["proof"]["device"]["device"]]
+        if not verdicts:
+            device = UNKNOWN
+        else:
+            device = READY if all(d["passed"] for d in verdicts) else NOT_READY
         if code == NOT_READY or device == NOT_READY:
             release = NOT_READY
         elif (code == READY and device == READY and outcomes
@@ -156,7 +262,9 @@ class ControlTower:
             release = READY
         else:
             release = UNKNOWN
-        return {"CODE_READY": code, "DEVICE_QA": device, "RELEASE_READY": release}
+        detail = {"CODE_READY": {"open": open_ids, "failed": failed, "unproven": unproven},
+                  "DEVICE_QA": {"proofs": len(verdicts)}}
+        return {"CODE_READY": code, "DEVICE_QA": device, "RELEASE_READY": release}, detail
 
     def snapshot(self, project_id: str) -> dict[str, Any]:
         project = self.policy.project(project_id)
@@ -175,6 +283,7 @@ class ControlTower:
                             for item in (report or {}).get("owner_attention", ())
                             if item.get("task_id") in verifying]
         paused = self._paused_lanes(project_id)
+        readiness, readiness_detail = self._readiness(task_views, outcomes)
         return {
             "schema": SNAPSHOT_SCHEMA, "project_id": project_id,
             "generated_at": qs.iso_now(),
@@ -193,7 +302,8 @@ class ControlTower:
                 "progress": {k: self.outcomes.progress(o.id)[k] for k in ("completed", "total")},
             } for o in outcomes],
             "tasks": task_views,
-            "readiness": self._readiness(tasks, outcomes),
+            "readiness": readiness,
+            "readiness_detail": readiness_detail,
             "release_requires_owner_approval": True,
             "needs_owner": needs_owner,
         }
@@ -266,6 +376,8 @@ class ControlTower:
             seen.add(marker)
             payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
             items.append({"kind": kind, "seq": event["seq"], "entity_id": event.get("entity_id"),
+                          "task_id": payload.get("task_id") or (
+                              event.get("entity_id") if event.get("entity_type") == "task" else None),
                           "at": event.get("created_at"),
                           "reason": _safe(payload.get("reason") or payload.get("detail"))})
         next_seq = max([int(since_seq)] + [int(e["seq"]) for e in events])
