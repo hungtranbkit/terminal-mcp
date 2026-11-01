@@ -583,6 +583,9 @@ _INTERNAL_TASK_METADATA_KEYS = frozenset({
     # ProjectFlow Autopilot ownership/repair budget: a creator who could seed
     # it could claim autopilot ownership or reset the repair budget.
     "autopilot",
+    # GitHub ingress provenance (#106): only the signed-webhook path writes
+    # it, so a task carrying it was created from a verified delivery.
+    "github_ingress",
 })
 
 
@@ -1749,7 +1752,8 @@ class QueueStore:
 
     # -- task CRUD ---------------------------------------------------------
 
-    def set_tasks(self, session: str, tasks: list[dict[str, Any]], *, replace_pending: bool = True) -> list[str]:
+    def set_tasks(self, session: str, tasks: list[dict[str, Any]], *, replace_pending: bool = True,
+                  internal_metadata: dict[str, Any] | None = None) -> list[str]:
         """queue_set: pushes an array of tasks into `session`'s lane in
         one call. replace_pending=True (queue_set's own default) cancels
         every currently-QUEUED (not yet dispatched) task first -- RUNNING/
@@ -1759,7 +1763,14 @@ class QueueStore:
         RUNNING task" (this call can't affect a RUNNING task either way).
         replace_pending=False is queue_append's own behavior: pure
         append, nothing existing is touched. Returns the new tasks' ids,
-        in the same order given."""
+        in the same order given.
+
+        `internal_metadata` (queue-owned keys only, for in-process producers)
+        is written in the SAME insert, so a task can never exist without it."""
+        internal = dict(internal_metadata or {})
+        foreign = set(internal) - _INTERNAL_TASK_METADATA_KEYS
+        if foreign:
+            raise ValueError(f"not queue-owned metadata key(s): {sorted(foreign)}")
         with self._connection() as connection:
             self._ensure_lane(connection, session)
             if replace_pending:
@@ -1785,7 +1796,7 @@ class QueueStore:
                     "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (task_id, session, next_position + offset, task.get("title") or "", task["prompt"], QUEUED, now,
                      int(task.get("max_attempts") or 3), json.dumps(task.get("completion_policy") or {}),
-                     json.dumps(_external_task_metadata(task.get("metadata") or {})),
+                     json.dumps({**_external_task_metadata(task.get("metadata") or {}), **internal}),
                      now, int(task.get("priority") or 0),
                      json.dumps(list(task.get("depends_on") or [])), session,
                      task.get("project_id"), task.get("request_key") or None,
@@ -1795,8 +1806,10 @@ class QueueStore:
                                           reason=None)
         return ids
 
-    def append_tasks(self, session: str, tasks: list[dict[str, Any]]) -> list[str]:
-        return self.set_tasks(session, tasks, replace_pending=False)
+    def append_tasks(self, session: str, tasks: list[dict[str, Any]], *,
+                     internal_metadata: dict[str, Any] | None = None) -> list[str]:
+        return self.set_tasks(session, tasks, replace_pending=False,
+                              internal_metadata=internal_metadata)
 
     def waiting_since(self, task_id: str, status: str) -> str | None:
         """When this task most recently ENTERED `status`, from its own events.

@@ -658,6 +658,18 @@ def main() -> None:
                        credentials=credentials, heartbeat_replay=heartbeat_replay, notes=notes, webauth=webauth,
                        run_journal=run_journal, harness=queue.harness, archify=archify,
                        autopilot=autopilot_tower)
+    # GitHub webhook ingress (#106): registered only when enabled, and only
+    # once its 0600 secret file reads cleanly -- otherwise no route at all.
+    if config.github_ingress.enabled and getattr(queue, "store", None) is not None:
+        try:
+            from .github_ingress import GithubIngress, register_github_ingress
+            register_github_ingress(server, GithubIngress(
+                config.github_ingress, store=queue.store,
+                bus=getattr(server, "event_bus", None) or events))
+            _log.warning("GitHub webhook ingress enabled for %s",
+                         [r.repo for r in config.github_ingress.repos])
+        except Exception:  # noqa: BLE001 -- fail closed: no route, startup continues
+            _log.exception("GitHub webhook ingress NOT registered")
     if autopilot_loop is not None and autopilot_loop.start():
         atexit.register(autopilot_loop.stop)
         _log.warning("ProjectFlow autopilot loop STARTED for %s",

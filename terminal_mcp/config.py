@@ -10,6 +10,7 @@ from urllib.parse import urlsplit as _urlsplit
 import yaml
 
 from .autopilot_policy import AutopilotPolicy, load_autopilot_config
+from .github_ingress import GithubIngressPolicy, load_github_ingress_config
 from . import endpoint_policy
 from .node_models import NodeHeartbeatThresholds, OverloadThresholds
 from .project_task_feeder import ProjectFeedConfig
@@ -1433,6 +1434,8 @@ class AppConfig:
     queue: QueueConfig = QueueConfig()
     # ProjectFlow Autopilot (#106): everything off unless explicitly configured.
     autopilot: AutopilotPolicy = AutopilotPolicy()
+    # Signed GitHub webhooks -> local CI tasks (#106); off unless configured.
+    github_ingress: GithubIngressPolicy = GithubIngressPolicy()
     router: RouterConfig = RouterConfig()
     agents: AgentsConfig = AgentsConfig()
     llm_governor: LLMGovernorConfig = LLMGovernorConfig()
@@ -1906,6 +1909,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         nodes=nodes_config,
         queue=_load_queue_config(raw.get("queue", {})),
         autopilot=load_autopilot_config(raw.get("autopilot")),
+        github_ingress=load_github_ingress_config(raw.get("github_ingress")),
         router=_load_router_config(raw.get("router", {})),
         agents=_load_agents_config(raw.get("agents", {})),
         llm_governor=governor_config,

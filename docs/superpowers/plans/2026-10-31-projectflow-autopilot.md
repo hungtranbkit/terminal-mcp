@@ -69,6 +69,14 @@ Tests: `.venv/bin/python -m pytest -q <files>`, run from the worktree.
 - `verify_queue.assign(job, verifier, verifier_node_id, dispatch_key)` writes an ASSIGNED history entry; autopilot jobs are created `require_assignment`, so they cannot be claimed before it. `claim_next`/`handoff` accept only the latest assignment's (session, node), and the CLAIMED entry carries `assignment_key`. The coordinator writes the task correlation, renews the lease fence, assigns, then sends. With a verifier probe wired, a verifier whose node is unknown is not sent to. Proof problem `UNASSIGNED_CLAIM` fails CODE_READY when claim, assignment and the task's dispatch key disagree. RED: any declared verifier, the destination name on another node, or a claim before any send could take the job.
 - Limit: MCP callers are not authenticated, so this binds to the controller-recorded (session, node), not to the calling process.
 
+## Slice 12 — signed GitHub webhook ingress (`github_ingress.py`, `queue_store.append_tasks(internal_metadata)`, `tests/test_github_ingress*.py`)
+
+- Signed delivery to at most one CI task per (repo, SHA, check), recorded in the event bus before the 2xx. Negative tests: bad/missing/wrong-secret HMAC, oversize, bad JSON/delivery id, duplicate delivery, replayed body, reused delivery id, stale/future event, foreign repo, unsupported events, fork PR, malformed SHA, injected PR text, rate limit, forged `request_key`, restart, 8 concurrent deliveries, insecure secret file. The E2E covers webhook, offline node, two coordinators, restart redelivery, QA FAIL, bounded repair and QA PASS.
+
+## Slice 13 — local CI evidence runner (`local_ci.py`, `tests/test_local_ci.py`)
+
+- A versioned script at an exact SHA produces checkable evidence. Negative tests: failing script, timeout (process group killed), script not committed at that SHA, unknown commit, unsafe/unsupported path, symbolic SHA, scrubbed env, caller checkout untouched, forged result line.
+
 ## Handoff state (2026-11-01)
 
 - Branch `feat/projectflow-autopilot-106`, draft PR #107. Defaults off everywhere. No live config or deployment touched.

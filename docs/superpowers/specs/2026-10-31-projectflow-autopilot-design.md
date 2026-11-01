@@ -169,6 +169,14 @@ actor is always `projectflow-autopilot`. The key is
 `autopilot:{project}:{task}:{attempt}:{kind}`, or `…:{source}` for state-keyed
 events. Every event carries `causation_id`. The consumer skips its own events.
 
+### 3.9 Local CI from signed GitHub events (no GitHub Actions)
+
+Owner decision 2026-11-01 (#106 comment 6553918746): GitHub is source/PR/webhook transport only.
+
+- **Ingress** (`github_ingress.py`, `POST /github/webhook`, off by default). Checks run in this order: size, then HMAC-SHA256 of the raw body (0600 secret file), then delivery id, JSON, repo allowlist, event/branch/action allowlist (fork PRs ignored), then freshness of the payload's own signed time, then a per-repo rate limit. Persist before ack: a body-hash key (replay under a new delivery id), a delivery-id key (reuse with a different body), then one task per `github-ci:{repo}:{sha}:{check}` with queue-owned `github_ingress` provenance written in the same insert. A `request_key` without that provenance is refused (`REQUEST_KEY_CONFLICT`), never adopted. Prompts carry validated identifiers only.
+- **Runner** (`local_ci.py`). Runs a versioned script at an exact commit in a fresh detached worktree, with a scrubbed environment, a process-group timeout and a 0600 log. Evidence (`local_ci_evidence/v1`) passes `evidence_verdict` only for exit 0 with no failed tests. A timeout or setup error sets `passed: false`.
+- The task then follows the existing path: the autopilot dispatches it on an approved lane, then independent QA, then the trusted proof. No new queue, dispatcher or store.
+
 ## 4. P1 — bounded AI Project Coordinator (`autopilot_planner.py`)
 
 - **Input.** The context is built from project-scoped rows only: outcome titles and acceptance criteria, task id/title/status/deps, and the latest verified SHA. Every string goes through `redaction.redact_text`. Prompt bodies are excluded and the context is hard-capped in characters.
