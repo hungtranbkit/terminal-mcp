@@ -34,10 +34,11 @@ import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import Any
+
+from .ephemeral_state import ephemeral_state_dir
 
 SCHEMA = "local_ci_evidence/v1"
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -90,7 +91,7 @@ def run_local_ci(repo: str | Path, sha: str, script: str, *, timeout_seconds: fl
     os.chmod(logs, 0o700)
     started = time.time()
     log_path = logs / f"{sha[:12]}-{time.strftime('%Y%m%dT%H%M%S', time.gmtime(started))}-{os.getpid()}.log"
-    workdir = Path(tempfile.mkdtemp(prefix="tmcp-ci-"))
+    workdir = ephemeral_state_dir("local-ci")
     worktree = workdir / "wt"
     try:
         added = _git(repo, "worktree", "add", "--detach", str(worktree), sha, check=False)
