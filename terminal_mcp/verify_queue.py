@@ -452,6 +452,29 @@ def _verifier_allowed(row: sqlite3.Row, verifier: str) -> bool:
     return not allowed or verifier in allowed
 
 
+def _created_entry(row: sqlite3.Row) -> dict[str, Any]:
+    return next((h for h in json.loads(row["history"] or "[]") if h.get("event") == "CREATED"), {})
+
+
+def _assignment(row: sqlite3.Row) -> dict[str, Any] | None:
+    """The latest ASSIGNED entry: where the coordinator sent this job last.
+    A newer assignment retires every earlier destination."""
+    return next((h for h in reversed(json.loads(row["history"] or "[]"))
+                 if h.get("event") == "ASSIGNED"), None)
+
+
+def _destination_allows(row: sqlite3.Row, verifier: str, node_id: str | None) -> bool:
+    """Only the assigned (session, node) may claim or be handed an assigned
+    job, and a job that requires assignment is unclaimable before one."""
+    assignment = _assignment(row)
+    if assignment is None:
+        return not _created_entry(row).get("require_assignment")
+    if verifier != assignment.get("verifier"):
+        return False
+    expected_node = assignment.get("verifier_node_id")
+    return not expected_node or node_id == expected_node
+
+
 def _stale_attempt(job_row: sqlite3.Row, task_row: sqlite3.Row) -> str | None:
     """A verify job is about ONE attempt. A task can leave VERIFYING, be
     retried and return to VERIFYING at a newer attempt before reconcile
@@ -574,7 +597,8 @@ class VerifyQueue:
 
     def _set_status_locked(self, connection: sqlite3.Connection, row: sqlite3.Row, to_status: str, *,
                            actor: str | None, reason: str | None, fields: dict[str, Any] | None = None,
-                           event: str | None = None) -> VerifyJob:
+                           event: str | None = None,
+                           history_extra: dict[str, Any] | None = None) -> VerifyJob:
         from_status = row["status"]
         if to_status not in VERIFY_TRANSITIONS.get(from_status, frozenset()):
             raise InvalidVerifyTransitionError(
@@ -583,7 +607,7 @@ class VerifyQueue:
         payload.update(fields or {})
         payload["history"] = self._append_history(
             row, actor=actor, event=event or to_status, reason=reason,
-            from_status=from_status, to_status=to_status)
+            from_status=from_status, to_status=to_status, **(history_extra or {}))
         clause = ", ".join(f"{key} = ?" for key in payload)
         connection.execute(f"UPDATE verify_jobs SET {clause} WHERE id = ?",
                            (*payload.values(), row["id"]))
@@ -596,7 +620,8 @@ class VerifyQueue:
                           backlog_id: str | None = None, branch: str | None = None,
                           commit_sha: str | None = None, actor: str = "queue-engine",
                           require_commit_evidence: bool = False,
-                          allowed_verifiers: Sequence[str] = ()) -> VerifyJob:
+                          allowed_verifiers: Sequence[str] = (),
+                          require_assignment: bool = False) -> VerifyJob:
         """IDEMPOTENT per (task_id, attempt): the same task at the same
         attempt always yields the SAME job, whether this is called twice
         by a re-entered tick, again after a process restart, or again on
@@ -621,7 +646,10 @@ class VerifyQueue:
 
         `allowed_verifiers`, recorded the same way, limits who may claim or
         be handed this job. Empty keeps the open claim every existing
-        caller relies on."""
+        caller relies on.
+
+        `require_assignment` makes the job unclaimable until assign() names
+        the destination the coordinator is about to send it to."""
         if fallback not in VALID_FALLBACKS:
             raise ValueError(f"fallback must be one of {VALID_FALLBACKS}, got {fallback!r}")
         if require_commit_evidence and not commit_sha:
@@ -658,6 +686,7 @@ class VerifyQueue:
                 **({"require_commit_evidence": True} if require_commit_evidence else {}),
                 **({"allowed_verifiers": [str(v) for v in allowed_verifiers]}
                    if allowed_verifiers else {}),
+                **({"require_assignment": True} if require_assignment else {}),
             }])
             connection.execute(
                 "INSERT INTO verify_jobs (id, task_id, attempt, session, project_id, backlog_id, status, "
@@ -720,6 +749,9 @@ class VerifyQueue:
                     continue
                 if not _verifier_allowed(row, verifier):
                     continue
+                if not _destination_allows(row, verifier, verifier_node_id):
+                    continue
+                assignment = _assignment(row)
                 token = new_task_id()
                 claimed = self._set_status_locked(
                     connection, row, VERIFY_CLAIMED, actor=verifier, event="CLAIMED",
@@ -727,10 +759,36 @@ class VerifyQueue:
                     fields={"verifier": verifier, "verifier_node_id": verifier_node_id,
                             "claim_token": token, "lease_expires_at": _lease_expiry(lease_seconds),
                             "claimed_at": iso_now(), "claim_count": row["claim_count"] + 1,
-                            "block_reason": None})
+                            "block_reason": None},
+                    history_extra={"verifier_node_id": verifier_node_id,
+                                   "assignment_key": (assignment or {}).get("dispatch_key")})
                 self._emit(claimed)
                 return claimed
         return None
+
+    def assign(self, job_id: str, *, verifier: str, verifier_node_id: str | None,
+               dispatch_key: str, actor: str) -> VerifyJob | None:
+        """Record the destination a coordinator is about to send this job to,
+        BEFORE the send. Only that (session, node) can then claim it, and its
+        claim carries `dispatch_key` as `assignment_key` so a proof can tie the
+        verdict to the exact dispatch. Idempotent for the same destination and
+        key; a different one supersedes the previous assignment. Refused (None)
+        unless the job is still VERIFY_PENDING, or for a verifier outside the
+        job's allowlist. Not authentication: MCP callers are not attested."""
+        with self._immediate() as connection:
+            row = self._row(connection, job_id)
+            if row is None or row["status"] != VERIFY_PENDING or not _verifier_allowed(row, verifier):
+                return None
+            current = _assignment(row) or {}
+            wanted = {"verifier": verifier, "verifier_node_id": verifier_node_id,
+                      "dispatch_key": dispatch_key}
+            if {k: current.get(k) for k in wanted} == wanted:
+                return VerifyJob.from_row(row)
+            history = self._append_history(row, actor=actor, event="ASSIGNED",
+                                           reason=f"QA sent to {verifier}", **wanted)
+            connection.execute("UPDATE verify_jobs SET history = ?, updated_at = ? WHERE id = ?",
+                               (history, iso_now(), job_id))
+            return VerifyJob.from_row(self._row(connection, job_id))
 
     def start(self, job_id: str, claim_token: str, *, detail: str | None = None) -> VerifyJob | None:
         """VERIFY_CLAIMED -> VERIFY_RUNNING. Separate from the claim so
@@ -785,6 +843,8 @@ class VerifyQueue:
             if row is None or row["claim_token"] != claim_token or row["status"] not in LEASED_VERIFY_STATUSES:
                 return None
             if not _verifier_allowed(row, to_verifier):
+                return None
+            if not _destination_allows(row, to_verifier, to_node_id):
                 return None
             token = new_task_id()
             history = self._append_history(row, actor=row["verifier"], event="HANDOFF", reason=reason,

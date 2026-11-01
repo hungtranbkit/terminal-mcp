@@ -141,7 +141,7 @@ REPAIR_TEMPLATE = (
 QA_TEMPLATE = (
     "AUTOPILOT INDEPENDENT QA (project {project}): verify job {job_id} for task {task_id}, "
     "attempt {attempt}, at commit {commit}.\n"
-    "1. Claim exactly this job with terminal_verify_claim(verifier=\"{verifier}\", "
+    "1. Claim exactly this job with terminal_verify_claim(verifier=\"{verifier}\"{node_arg}, "
     "capabilities={capabilities}, project_id=\"{project}\", job_id=\"{job_id}\"). "
     "If it is not claimed, stop and say so.\n"
     "2. Inspect commit {commit} without changing it, and run the tests relevant to that task.\n"
@@ -318,7 +318,8 @@ class ProjectAutopilot:
                         commit_sha=commit,
                         require_commit_evidence=bool(commit and project.qa_dispatch_enabled
                                                      and project.qa_require_commit),
-                        allowed_verifiers=tuple(v.session for v in project.verifiers))
+                        allowed_verifiers=tuple(v.session for v in project.verifiers),
+                        require_assignment=project.qa_dispatch_enabled)
                     report["reconciled"].append({"task_id": task.id, "from": qs.RUNNING,
                                                  "to": qs.VERIFYING, "verify_job": job.id})
                     self._publish(project.project_id, fresh, "QA_REQUESTED",
@@ -413,14 +414,23 @@ class ProjectAutopilot:
         except Exception as exc:  # noqa: BLE001 -- unknown, never a guess
             return Observation(UNREACHABLE, reason=f"{type(exc).__name__}: {exc}")
 
-    def _verifier_available(self, session: str) -> tuple[bool, str | None]:
+    def _verifier_available(self, session: str) -> tuple[bool, str | None, str | None]:
+        """(available, why not, node_id). With a probe wired, a session whose
+        node is unknown is not available: the claim is bound to (session,
+        node), and an unknown node cannot be bound. No probe (synthetic
+        executors) binds by session only."""
         if self.verifier_probe is None:
-            return True, None
+            return True, None, None
         try:
             probe = self.verifier_probe(session) or {}
         except Exception as exc:  # noqa: BLE001 -- unknown is not available
-            return False, f"{type(exc).__name__}: {exc}"
-        return probe.get("available") is True, _clip(probe.get("reason"))
+            return False, f"{type(exc).__name__}: {exc}", None
+        if probe.get("available") is not True:
+            return False, _clip(probe.get("reason")), None
+        node = str(probe.get("node_id") or "").strip()
+        if not node:
+            return False, f"VERIFIER_NODE_UNKNOWN: no node reported for {session}", None
+        return True, None, node
 
     def _dispatch_qa(self, project: AutopilotProjectPolicy, report: dict) -> None:
         """Send each pending verify job of ours to ONE independent verifier.
@@ -535,9 +545,9 @@ class ProjectAutopilot:
         if not free:
             self._qa_wait(report, task, job, REASON_QA_VERIFIERS_BUSY)
             return
-        verifier, why_not = None, None
+        verifier, why_not, node = None, None, None
         for candidate in free:
-            ok, why = self._verifier_available(candidate.session)
+            ok, why, node = self._verifier_available(candidate.session)
             if ok:
                 verifier = candidate
                 break
@@ -547,7 +557,8 @@ class ProjectAutopilot:
             return
 
         correlation = {"job_id": job.id, "attempt": job.attempt, "commit_sha": job.commit_sha,
-                       "verifier": verifier.session, "key": key, "dispatches": dispatches}
+                       "verifier": verifier.session, "verifier_node_id": node, "key": key,
+                       "dispatches": dispatches}
         if {k: qa.get(k) for k in correlation} != correlation:
             meta = dict(self.store.get_task(task.id).metadata.get(METADATA_KEY) or {})
             meta["qa"] = {**correlation, "requested_at": qs.iso_now()}
@@ -560,9 +571,16 @@ class ProjectAutopilot:
         if not renewed.get("renewed"):
             report["fenced"] = True
             return
+        # Bind the claim to this exact destination before anything is sent.
+        if self.verify.assign(job.id, verifier=verifier.session, verifier_node_id=node,
+                              dispatch_key=key, actor=ACTOR) is None:
+            self._qa_wait(report, task, job, REASON_QA_EXTERNAL_VERIFIER,
+                          "job left VERIFY_PENDING before it could be assigned")
+            return
         text = QA_TEMPLATE.format(project=project.project_id, job_id=job.id, task_id=task.id,
                                   attempt=job.attempt, commit=job.commit_sha or "unrecorded",
                                   verifier=verifier.session,
+                                  node_arg=f', verifier_node_id="{node}"' if node else "",
                                   capabilities=json.dumps(list(verifier.capabilities)))
         try:
             sent = self.dispatcher.dispatch(target=verifier.session, text=text, idempotency_key=key)

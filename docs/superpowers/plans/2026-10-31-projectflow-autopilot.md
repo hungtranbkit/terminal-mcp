@@ -64,6 +64,11 @@ Tests: `.venv/bin/python -m pytest -q <files>`, run from the worktree.
 
 - The autopilot's verify job records the project's `verifiers` as `allowed_verifiers` in its CREATED entry; `claim_next` and `handoff` refuse anyone else. Proof problems `UNDECLARED_VERIFIER` and `VERIFIER_IS_LANE` fail CODE_READY. RED: another project's capable verifier, polling without a project filter, could claim the job, and its PASS (or one from a second implementer lane) read as trusted. Verifier names are still self-declared on MCP: this scopes routing and proof, it is not authentication.
 
+## Slice 11 — the QA claim is bound to the dispatch destination (`verify_queue.py`, `autopilot.py`, `autopilot_view.py`, `tests/test_autopilot_qa_assignment.py`)
+
+- `verify_queue.assign(job, verifier, verifier_node_id, dispatch_key)` writes an ASSIGNED history entry; autopilot jobs are created `require_assignment`, so they cannot be claimed before it. `claim_next`/`handoff` accept only the latest assignment's (session, node), and the CLAIMED entry carries `assignment_key`. The coordinator writes the task correlation, renews the lease fence, assigns, then sends. With a verifier probe wired, a verifier whose node is unknown is not sent to. Proof problem `UNASSIGNED_CLAIM` fails CODE_READY when claim, assignment and the task's dispatch key disagree. RED: any declared verifier, the destination name on another node, or a claim before any send could take the job.
+- Limit: MCP callers are not authenticated, so this binds to the controller-recorded (session, node), not to the calling process.
+
 ## Handoff state (2026-11-01)
 
 - Branch `feat/projectflow-autopilot-106`, draft PR #107. Defaults off everywhere. No live config or deployment touched.

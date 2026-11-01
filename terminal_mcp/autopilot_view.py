@@ -65,10 +65,11 @@ PROBLEM_EVIDENCE_MISMATCH = "EVIDENCE_MISMATCH"
 PROBLEM_COMMIT_MISMATCH = "COMMIT_MISMATCH"
 PROBLEM_UNDECLARED_VERIFIER = "UNDECLARED_VERIFIER"
 PROBLEM_VERIFIER_IS_LANE = "VERIFIER_IS_LANE"
+PROBLEM_UNASSIGNED_CLAIM = "UNASSIGNED_CLAIM"
 _FAILING_PROBLEMS = frozenset({PROBLEM_SELF_VERIFIED, PROBLEM_STALE_ATTEMPT,
                                PROBLEM_EVIDENCE_REJECTED, PROBLEM_EVIDENCE_MISMATCH,
                                PROBLEM_COMMIT_MISMATCH, PROBLEM_UNDECLARED_VERIFIER,
-                               PROBLEM_VERIFIER_IS_LANE})
+                               PROBLEM_VERIFIER_IS_LANE, PROBLEM_UNASSIGNED_CLAIM})
 
 
 def _canonical(value: Any) -> str:
@@ -116,6 +117,8 @@ def task_proof(task: qs.QueueTask, job: Any,
         if _canonical(job.evidence) != _canonical(task.verification_evidence):
             problems.append(PROBLEM_EVIDENCE_MISMATCH)
         observed = ((task.metadata.get(ap.METADATA_KEY) or {}).get("qa") or {})
+        if _assignment_problem(job, observed):
+            problems.append(PROBLEM_UNASSIGNED_CLAIM)
         observed_commit = (str(observed.get("commit_sha") or "")
                            if observed.get("job_id") == job.id else "")
         claimed = str((job.evidence or {}).get("commit_sha") or "")
@@ -143,6 +146,26 @@ def task_proof(task: qs.QueueTask, job: Any,
                     "device": _safe(device.get("device")) or None}
                    if isinstance(device, dict) else None),
     }
+
+
+def _assignment_problem(job: Any, observed: dict[str, Any]) -> bool:
+    """For a job the coordinator assigned (or that required assignment): the
+    PASS must come from a claim made under the latest assignment, by its
+    session on its node, and that assignment must be the dispatch the task
+    records. A job that never needed one is not judged here."""
+    history = list(job.history or ())
+    assigned = [h for h in history if h.get("event") == "ASSIGNED"]
+    created = next((h for h in history if h.get("event") == "CREATED"), {})
+    if not assigned:
+        return bool(created.get("require_assignment"))
+    assignment = assigned[-1]
+    claim = next((h for h in reversed(history) if h.get("event") == "CLAIMED"), {})
+    node = assignment.get("verifier_node_id")
+    if (claim.get("assignment_key") != assignment.get("dispatch_key")
+            or job.verifier != assignment.get("verifier")
+            or (node and job.verifier_node_id != node)):
+        return True
+    return observed.get("job_id") == job.id and observed.get("key") != assignment.get("dispatch_key")
 
 
 def _safe(value: Any) -> Any:

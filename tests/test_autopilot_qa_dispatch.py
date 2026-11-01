@@ -24,7 +24,7 @@ from terminal_mcp.event_bus import EventBus
 from terminal_mcp.lease import ResourceLockStore
 from terminal_mcp.outcomes import OutcomeStore
 from terminal_mcp.queue_store import COMPLETED, FAILED, QUEUED, VERIFYING, QueueStore
-from terminal_mcp.verify_queue import VERIFY_CLAIMED, VERIFY_PENDING, VerifyQueue
+from terminal_mcp.verify_queue import VERIFY_PENDING, VerifyQueue
 
 from .test_autopilot import FakeDispatcher, SimulatedCrash
 
@@ -276,7 +276,8 @@ def test_verifier_unavailable_waits_then_dispatches_when_back(tmp_path):
     availability = {"ok": False}
 
     def verifier_probe(session):
-        return {"available": availability["ok"], "reason": "node m910 offline"}
+        return {"available": availability["ok"], "reason": "node m910 offline",
+                "node_id": "m910" if availability["ok"] else None}
 
     w = World(tmp_path, verifier_probe=verifier_probe)
     a = w.add("A")
@@ -436,8 +437,9 @@ def test_verifier_failure_redispatches_within_budget_then_stops(tmp_path):
     assert len(w.dispatcher.qa_sends()) == 2 and w.status(a) == VERIFYING
 
 
-def test_job_claimed_by_someone_else_is_left_alone(tmp_path):
-    # A second DECLARED verifier took the job; only declared verifiers can.
+def test_job_sent_to_one_verifier_cannot_be_taken_by_another(tmp_path):
+    # Both verifiers are declared, but the claim is bound to the destination
+    # the prompt was sent to (see test_autopilot_qa_assignment.py).
     w = World(tmp_path, verifiers=(VerifierSessionPolicy(QA, ("python",)),
                                    VerifierSessionPolicy("ba-qa-2", ("python",))))
     a = w.add("A")
@@ -446,9 +448,9 @@ def test_job_claimed_by_someone_else_is_left_alone(tmp_path):
     qa_sends = [s for s in w.dispatcher.sends if s[0] in (QA, "ba-qa-2")]
     [(sent_to, _, _)] = qa_sends
     other_name = "ba-qa-2" if sent_to == QA else QA
-    other = w.verify.claim_next(verifier=other_name, capabilities=("python",),
-                                project_id=PROJECT, job_id=job.id)
-    assert other.status == VERIFY_CLAIMED
+    assert w.verify.claim_next(verifier=other_name, capabilities=("python",),
+                               project_id=PROJECT, job_id=job.id) is None
+    assert w.verify.get(job.id).status == VERIFY_PENDING
     w.autopilot().tick(PROJECT)
     assert [s for s in w.dispatcher.sends if s[0] in (QA, "ba-qa-2")] == qa_sends  # nothing new
 
