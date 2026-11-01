@@ -366,22 +366,27 @@ class ProjectAutopilot:
                 continue
             meta = dict(task.metadata.get(METADATA_KEY) or {})
             repairs = int(meta.get("repairs") or 0)
-            if repairs >= project.max_repair_attempts:
-                self._attention(project.project_id, task, REASON_REPAIR_EXHAUSTED,
-                                f"{repairs} repair(s) used; last verify job {job.id}", report)
-                continue
+            if meta.get("repair_of_job") != job.id:
+                if repairs >= project.max_repair_attempts:
+                    self._attention(project.project_id, task, REASON_REPAIR_EXHAUSTED,
+                                    f"{repairs} repair(s) used; last verify job {job.id}", report)
+                    continue
+                # RECORD BEFORE RETRY: the repair is counted and its reference
+                # durable before the task can be dispatched again. A death
+                # right after this write is resumed below without recounting.
+                repairs += 1
+                meta.update({"repairs": repairs, "repair_of_job": job.id})
+                self.store.set_internal_metadata(task.id, METADATA_KEY, meta,
+                                                 event_type="AUTOPILOT_REPAIR_SCHEDULED",
+                                                 reason=f"repair {repairs}/{project.max_repair_attempts}")
             try:
                 self.store.retry_task(task.id)
             except Exception as exc:  # noqa: BLE001 -- e.g. HarnessRunOwnsTask
                 self._attention(project.project_id, task, REASON_RETRY_REFUSED, str(exc), report)
                 continue
-            meta.update({"repairs": repairs + 1, "repair_of_job": job.id})
-            self.store.set_internal_metadata(task.id, METADATA_KEY, meta,
-                                             event_type="AUTOPILOT_REPAIR_SCHEDULED",
-                                             reason=f"repair {repairs + 1}/{project.max_repair_attempts}")
             report["repairs"].append(task.id)
             self._publish(project.project_id, task, "REPAIR_SCHEDULED",
-                          {"verify_job": job.id, "repair": repairs + 1}, report)
+                          {"verify_job": job.id, "repair": repairs}, report)
 
     # -- QA dispatch ---------------------------------------------------------
 

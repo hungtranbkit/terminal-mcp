@@ -51,6 +51,10 @@ Tests: `.venv/bin/python -m pytest -q <files>`, run from the worktree.
 - `task_proof()` provenance per task; readiness and `readiness_detail` from trusted proofs only; MILESTONE_VERIFIED from VERIFY_PASS.
 - RED→GREEN negatives: terminal receipt, reconcile-closed job with no verifier, self-verified, edited task evidence, commit mismatch (evidence and observed HEAD), incomplete evidence, no commit, device without a device id or on a receipt, failed device QA, cross-project and token leakage.
 
+## Slice 8 — repair step restart safety (`autopilot.py`, `tests/test_autopilot_restart.py`)
+
+- Record before retry; resume without recount. RED: a crash after the first repair write lost `repairs`/`repair_of_job`.
+
 ## Handoff state (2026-11-01)
 
 - Branch `feat/projectflow-autopilot-106`, draft PR #107. Defaults off everywhere. No live config or deployment touched.
