@@ -442,6 +442,16 @@ def _commit_evidence_problem(row: sqlite3.Row, evidence: dict[str, Any]) -> str 
     return None
 
 
+def _verifier_allowed(row: sqlite3.Row, verifier: str) -> bool:
+    """The job's creation-time verifier allowlist, if it has one. A verifier
+    name is self-declared on the MCP surface, so this scopes routing (no other
+    project's or polling verifier takes the job); it is not authentication."""
+    created = next((h for h in json.loads(row["history"] or "[]")
+                    if h.get("event") == "CREATED"), {})
+    allowed = created.get("allowed_verifiers")
+    return not allowed or verifier in allowed
+
+
 def _stale_attempt(job_row: sqlite3.Row, task_row: sqlite3.Row) -> str | None:
     """A verify job is about ONE attempt. A task can leave VERIFYING, be
     retried and return to VERIFYING at a newer attempt before reconcile
@@ -585,7 +595,8 @@ class VerifyQueue:
                           require_independent: bool = True, fallback: str = FALLBACK_IN_SESSION,
                           backlog_id: str | None = None, branch: str | None = None,
                           commit_sha: str | None = None, actor: str = "queue-engine",
-                          require_commit_evidence: bool = False) -> VerifyJob:
+                          require_commit_evidence: bool = False,
+                          allowed_verifiers: Sequence[str] = ()) -> VerifyJob:
         """IDEMPOTENT per (task_id, attempt): the same task at the same
         attempt always yields the SAME job, whether this is called twice
         by a re-entered tick, again after a process restart, or again on
@@ -606,7 +617,11 @@ class VerifyQueue:
         `require_commit_evidence` (needs `commit_sha`) is recorded on the
         CREATED history entry, next to the other creation-time policy, and
         makes complete() refuse a PASS whose evidence does not name this
-        exact commit."""
+        exact commit.
+
+        `allowed_verifiers`, recorded the same way, limits who may claim or
+        be handed this job. Empty keeps the open claim every existing
+        caller relies on."""
         if fallback not in VALID_FALLBACKS:
             raise ValueError(f"fallback must be one of {VALID_FALLBACKS}, got {fallback!r}")
         if require_commit_evidence and not commit_sha:
@@ -641,6 +656,8 @@ class VerifyQueue:
                 "required_capabilities": list(required_capabilities),
                 "fallback": fallback,
                 **({"require_commit_evidence": True} if require_commit_evidence else {}),
+                **({"allowed_verifiers": [str(v) for v in allowed_verifiers]}
+                   if allowed_verifiers else {}),
             }])
             connection.execute(
                 "INSERT INTO verify_jobs (id, task_id, attempt, session, project_id, backlog_id, status, "
@@ -700,6 +717,8 @@ class VerifyQueue:
                 if not required.issubset(have):
                     continue
                 if row["require_independent"] and row["implementer"] and row["implementer"] == verifier:
+                    continue
+                if not _verifier_allowed(row, verifier):
                     continue
                 token = new_task_id()
                 claimed = self._set_status_locked(
@@ -764,6 +783,8 @@ class VerifyQueue:
         with self._immediate() as connection:
             row = self._row(connection, job_id)
             if row is None or row["claim_token"] != claim_token or row["status"] not in LEASED_VERIFY_STATUSES:
+                return None
+            if not _verifier_allowed(row, to_verifier):
                 return None
             token = new_task_id()
             history = self._append_history(row, actor=row["verifier"], event="HANDOFF", reason=reason,

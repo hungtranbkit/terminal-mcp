@@ -59,6 +59,10 @@ Tests: `.venv/bin/python -m pytest -q <files>`, run from the worktree.
 
 - `complete`/`fail` refuse `STALE_ATTEMPT` when the job's attempt is not the task's current `attempt_count`; `claim_next` never hands out such a job; `reconcile` closes it VERIFY_CANCELLED ("superseded"), never VERIFIED_PASS. RED: a task blocked, retried and back in VERIFYING before any reconcile let the old job be claimed first (oldest-first) and its PASS complete attempt 2 with attempt 1's commit.
 
+## Slice 10 — only a declared verifier verifies a project (`verify_queue.py`, `autopilot.py`, `autopilot_view.py`, `tests/test_autopilot_verifier_scope.py`)
+
+- The autopilot's verify job records the project's `verifiers` as `allowed_verifiers` in its CREATED entry; `claim_next` and `handoff` refuse anyone else. Proof problems `UNDECLARED_VERIFIER` and `VERIFIER_IS_LANE` fail CODE_READY. RED: another project's capable verifier, polling without a project filter, could claim the job, and its PASS (or one from a second implementer lane) read as trusted. Verifier names are still self-declared on MCP: this scopes routing and proof, it is not authentication.
+
 ## Handoff state (2026-11-01)
 
 - Branch `feat/projectflow-autopilot-106`, draft PR #107. Defaults off everywhere. No live config or deployment touched.

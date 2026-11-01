@@ -63,16 +63,20 @@ PROBLEM_STALE_ATTEMPT = "STALE_ATTEMPT"
 PROBLEM_EVIDENCE_REJECTED = "EVIDENCE_REJECTED"
 PROBLEM_EVIDENCE_MISMATCH = "EVIDENCE_MISMATCH"
 PROBLEM_COMMIT_MISMATCH = "COMMIT_MISMATCH"
+PROBLEM_UNDECLARED_VERIFIER = "UNDECLARED_VERIFIER"
+PROBLEM_VERIFIER_IS_LANE = "VERIFIER_IS_LANE"
 _FAILING_PROBLEMS = frozenset({PROBLEM_SELF_VERIFIED, PROBLEM_STALE_ATTEMPT,
                                PROBLEM_EVIDENCE_REJECTED, PROBLEM_EVIDENCE_MISMATCH,
-                               PROBLEM_COMMIT_MISMATCH})
+                               PROBLEM_COMMIT_MISMATCH, PROBLEM_UNDECLARED_VERIFIER,
+                               PROBLEM_VERIFIER_IS_LANE})
 
 
 def _canonical(value: Any) -> str:
     return json.dumps(value or {}, sort_keys=True, separators=(",", ":"), default=str)
 
 
-def task_proof(task: qs.QueueTask, job: Any) -> dict[str, Any]:
+def task_proof(task: qs.QueueTask, job: Any,
+               project: ap.AutopilotProjectPolicy | None = None) -> dict[str, Any]:
     """Where a task's completion claim comes from, and whether it holds.
 
     `job` is the task's latest verify job (or None). Trusted only when every
@@ -80,7 +84,9 @@ def task_proof(task: qs.QueueTask, job: Any) -> dict[str, Any]:
     other than the implementer signed it, its evidence clears the gate and is
     byte-identical (canonically) to the task's stored evidence, and the job's
     commit, the evidence's commit and the HEAD the autopilot observed at DONE
-    are one commit. Reads only durable rows; decides nothing, mutates nothing."""
+    are one commit. With the project's policy, the verifier must also be one
+    of its declared verifiers (when it declares any) and never one of its
+    implementer lanes. Reads only durable rows; decides nothing, mutates nothing."""
     problems: list[str] = []
     passed = job is not None and job.status == VERIFIED_PASS
     if task.status != qs.COMPLETED and not passed:
@@ -98,6 +104,11 @@ def task_proof(task: qs.QueueTask, job: Any) -> dict[str, Any]:
     if kind == PROOF_VERIFIED_PASS:
         if job.implementer and job.verifier == job.implementer:
             problems.append(PROBLEM_SELF_VERIFIED)
+        if project is not None:
+            if project.verifiers and job.verifier not in {v.session for v in project.verifiers}:
+                problems.append(PROBLEM_UNDECLARED_VERIFIER)
+            if job.verifier in project.lanes and job.verifier != job.implementer:
+                problems.append(PROBLEM_VERIFIER_IS_LANE)
         if job.attempt != task.attempt_count:
             problems.append(PROBLEM_STALE_ATTEMPT)
         if not evidence_verdict(job.evidence)[0]:
@@ -184,7 +195,7 @@ class ControlTower:
         return paused
 
     def _task_view(self, task: qs.QueueTask, report: dict[str, Any] | None,
-                   fresh: bool) -> dict[str, Any]:
+                   fresh: bool, project: ap.AutopilotProjectPolicy | None = None) -> dict[str, Any]:
         display, stale = task.status, False
         if task.status in _OBSERVED:
             if not fresh:
@@ -194,7 +205,7 @@ class ControlTower:
             elif task.id in (report or {}).get("waiting_input", ()):
                 display = "WAITING_INPUT"
         jobs = self.verify.list_jobs(task_id=task.id, limit=1) if self.verify else []
-        proof = task_proof(task, jobs[0] if jobs else None)
+        proof = task_proof(task, jobs[0] if jobs else None, project)
         evidence = None
         if task.status == qs.COMPLETED and task.verification_evidence:
             evidence = {k: _safe(task.verification_evidence[k])
@@ -271,7 +282,7 @@ class ControlTower:
         report, fresh = self._observation(project_id)
         tasks = self.store.list_tasks_for_project(project_id, limit=500)
         outcomes = self.outcomes.list_outcomes(project_id=project_id)
-        task_views = [self._task_view(t, report, fresh) for t in tasks]
+        task_views = [self._task_view(t, report, fresh, project) for t in tasks]
         needs_owner = [{"task_id": t["id"], "status": t["status"], "reason": t["last_error"]}
                        for t in task_views if t["status"] in (qs.BLOCKED, qs.FAILED)]
         needs_owner += [{"task_id": t["id"], "status": "WAITING_INPUT", "reason": None}

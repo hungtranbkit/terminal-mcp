@@ -437,15 +437,20 @@ def test_verifier_failure_redispatches_within_budget_then_stops(tmp_path):
 
 
 def test_job_claimed_by_someone_else_is_left_alone(tmp_path):
-    w = World(tmp_path)
+    # A second DECLARED verifier took the job; only declared verifiers can.
+    w = World(tmp_path, verifiers=(VerifierSessionPolicy(QA, ("python",)),
+                                   VerifierSessionPolicy("ba-qa-2", ("python",))))
     a = w.add("A")
     w.worker_done(a)
     job = w.verify.open_job_for_task(a)
-    other = w.verify.claim_next(verifier="human-qa", capabilities=("python",),
+    qa_sends = [s for s in w.dispatcher.sends if s[0] in (QA, "ba-qa-2")]
+    [(sent_to, _, _)] = qa_sends
+    other_name = "ba-qa-2" if sent_to == QA else QA
+    other = w.verify.claim_next(verifier=other_name, capabilities=("python",),
                                 project_id=PROJECT, job_id=job.id)
     assert other.status == VERIFY_CLAIMED
     w.autopilot().tick(PROJECT)
-    assert len(w.dispatcher.qa_sends()) == 1  # nothing new sent at a foreign holder
+    assert [s for s in w.dispatcher.sends if s[0] in (QA, "ba-qa-2")] == qa_sends  # nothing new
 
 
 # -- failure budget ----------------------------------------------------------------

@@ -109,6 +109,7 @@ The dispatcher must persist its record under `idempotency_key` **before** it sen
 - VERIFY_BLOCKED: the task is BLOCKED, with owner attention.
 - **Restart safety.** The repair record (`repairs`, `repair_of_job`) is written before `retry_task`. A coordinator that finds a FAILED task whose record already names this QA job only retries it and does not count it again. A crash between the two writes can therefore neither drop the repair reference nor buy a repair past the budget. A retry the queue refuses is reported (`RETRY_REFUSED`) and leaves the repair counted.
 - **One attempt per verdict.** A verify job settles only the attempt it was opened for. If the task left VERIFYING and came back at a newer attempt before `reconcile` ran, the old job is not claimable, its holder's PASS or FAIL is refused with `STALE_ATTEMPT`, and `reconcile` closes it VERIFY_CANCELLED as superseded. It never becomes a VERIFIED_PASS borrowed from the newer attempt's evidence.
+- **Declared verifiers only.** A verify job the autopilot opens records the project's `verifiers` as `allowed_verifiers`; nobody else can claim it or be handed it, so another project's verifier polling without a project filter cannot take it. A PASS from an undeclared verifier or from one of the project's implementer lanes is a failing proof (`UNDECLARED_VERIFIER`, `VERIFIER_IS_LANE`). Verifier names are self-declared on the MCP surface; this is routing and proof scoping, not authentication.
 
 ### 3.6a Automatic QA dispatch to a verifier session
 

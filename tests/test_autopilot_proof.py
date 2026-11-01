@@ -202,7 +202,7 @@ def test_pass_without_any_commit_provenance_is_unknown(tmp_path):
     w = World(tmp_path)
     task = w.running("N")
     job = w.verify.ensure_verify_job(task)  # opened with no commit
-    claimed = w.verify.claim_next(verifier="human-qa", job_id=job.id)
+    claimed = w.verify.claim_next(verifier=QA, job_id=job.id)
     assert w.verify.complete(job.id, claimed.claim_token, evidence=GOOD)["ok"]
     proof = w.task_view(task.id)["proof"]
     assert av.PROBLEM_NO_COMMIT in proof["problems"]

@@ -317,7 +317,8 @@ class ProjectAutopilot:
                         require_independent=True, fallback=FALLBACK_HOLD, actor=ACTOR,
                         commit_sha=commit,
                         require_commit_evidence=bool(commit and project.qa_dispatch_enabled
-                                                     and project.qa_require_commit))
+                                                     and project.qa_require_commit),
+                        allowed_verifiers=tuple(v.session for v in project.verifiers))
                     report["reconciled"].append({"task_id": task.id, "from": qs.RUNNING,
                                                  "to": qs.VERIFYING, "verify_job": job.id})
                     self._publish(project.project_id, fresh, "QA_REQUESTED",
