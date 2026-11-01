@@ -204,7 +204,10 @@ class ControlTower:
                 display = UNKNOWN
             elif task.id in (report or {}).get("waiting_input", ()):
                 display = "WAITING_INPUT"
-        jobs = self.verify.list_jobs(task_id=task.id, limit=1) if self.verify else []
+        # The CURRENT attempt's job: created_at has one-second resolution, so a
+        # failed attempt and its repair can tie, and only `attempt` orders them.
+        jobs = sorted(self.verify.list_jobs(task_id=task.id) if self.verify else [],
+                      key=lambda j: (j.attempt, j.created_at), reverse=True)[:1]
         proof = task_proof(task, jobs[0] if jobs else None, project)
         evidence = None
         if task.status == qs.COMPLETED and task.verification_evidence:

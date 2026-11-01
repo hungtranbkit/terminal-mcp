@@ -49,6 +49,7 @@ Tests: `.venv/bin/python -m pytest -q <files>`, run from the worktree.
 ## Slice 7 — trusted QA proof in the snapshot (`autopilot_view.py`, `tests/test_autopilot_proof.py`)
 
 - `task_proof()` provenance per task; readiness and `readiness_detail` from trusted proofs only; MILESTONE_VERIFIED from VERIFY_PASS.
+- The view reads the job with the highest `attempt`, not the newest `created_at` (one-second resolution: a failed attempt and its repair can tie, which made a verified task read TERMINAL_RECEIPT at random).
 - RED→GREEN negatives: terminal receipt, reconcile-closed job with no verifier, self-verified, edited task evidence, commit mismatch (evidence and observed HEAD), incomplete evidence, no commit, device without a device id or on a receipt, failed device QA, cross-project and token leakage.
 
 ## Slice 8 — repair step restart safety (`autopilot.py`, `tests/test_autopilot_restart.py`)

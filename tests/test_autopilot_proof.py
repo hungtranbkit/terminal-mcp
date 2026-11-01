@@ -266,3 +266,25 @@ def test_proof_and_snapshot_never_leak_tokens_or_other_projects(tmp_path):
     text = json.dumps(w.tower.snapshot(PROJECT))
     assert held.claim_token not in text and other_job.id not in text and SHA_B not in text
     assert "claim_token" not in text
+
+
+def test_proof_reads_the_current_attempts_job_even_when_created_in_the_same_second(tmp_path):
+    """created_at has one-second resolution: a failed attempt and its repair
+    verified within the same second (or across a clock step back) must still
+    show the CURRENT attempt's verdict, not whichever row sorts first."""
+    w = World(tmp_path)
+    a = w.add("A")
+    w.worker_done(a)
+    job1, _ = w.qa.act(passed=False)
+    w.autopilot().tick(PROJECT)  # repair scheduled and re-dispatched
+    w.heads[LANE] = SHA_B
+    w.worker_done(a)
+    job2, result = w.qa.act(passed=True, commit=SHA_B)
+    assert result["ok"] and w.store.get_task(a).status == qs.COMPLETED
+    with w.store._connection() as connection:  # the older attempt now sorts first
+        connection.execute("UPDATE verify_jobs SET created_at = '2000-01-01T00:00:00Z' WHERE id = ?",
+                           (job2.id,))
+    view = w.task_view(a)
+    assert view["qa"]["job_id"] == job2.id
+    assert view["proof"]["job_id"] == job2.id and view["proof"]["trusted"] is True
+    assert w.readiness()["CODE_READY"] == av.READY
