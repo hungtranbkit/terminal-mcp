@@ -87,6 +87,7 @@ from .replay_guard import (HEADER_NONCE, HEADER_TIMESTAMP, HeartbeatReplayGuard,
 from .novaretail_dispatch_dashboard import register as register_novaretail_dispatch_dashboard
 from .dispatch_settings_dashboard import register as register_dispatch_settings_dashboard
 from .archify_dashboard import register_archify_dashboard
+from .repo_kanban_dashboard import build_repo_kanban_service, register as register_repo_kanban_dashboard
 
 _log = logging.getLogger(__name__)
 
@@ -11276,7 +11277,10 @@ PROJECTS_HTML = """<!doctype html>
       advanceBtn.disabled = !project.next_phase;
       const reconcileBtn = el('button', 'btn', 'Reconcile team');
       const backBtn = el('button', 'btn', '\u2190 All projects');
-      actions.append(advanceBtn, reconcileBtn, backBtn);
+      // Read-only task board committed in the repo (repo_kanban.py).
+      const kanbanLink = el('a', 'btn', 'Repo Kanban');
+      kanbanLink.href = '/dashboard/repo-kanban?project=' + encodeURIComponent(project.id);
+      actions.append(advanceBtn, reconcileBtn, backBtn, kanbanLink);
       const err = el('div', 'err');
       head.append(actions, err);
       root.append(head);
@@ -17955,6 +17959,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     )
     register_novaretail_dispatch_dashboard(server, _read_guard, _mutation_guard)
     register_dispatch_settings_dashboard(server, _read_guard, _mutation_guard)
+    register_repo_kanban_dashboard(server, _read_guard, build_repo_kanban_service(terminal))
 
     @server.custom_route("/dashboard/api/verified-prompt-watcher", methods=["GET"], include_in_schema=False)
     async def verified_prompt_watcher_status(request: Request) -> JSONResponse:

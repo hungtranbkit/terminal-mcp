@@ -1406,6 +1406,35 @@ class SessionAccessConfig:
     migrate_whitelist_on_start: bool = True
 
 
+_REPO_KANBAN_REF_RE = re.compile(r"^[A-Za-z0-9._/-]{1,200}$")
+_REPO_KANBAN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+@dataclass(frozen=True)
+class RepoKanbanRepo:
+    id: str
+    name: str
+    path: str
+    ref: str = "HEAD"
+    board_path: str = "docs/kanban/board.json"
+    live_path: str = "docs/kanban/live.json"
+    # Optional slug of the matching /dashboard/projects project, for links
+    # both ways (Projects runtime ids are slugs, not git remotes).
+    project: str | None = None
+
+
+@dataclass(frozen=True)
+class RepoKanbanConfig:
+    """Repo Kanban (repo_kanban.py): read-only multi-repo task boards read
+    from each repo's committed docs/kanban/*.json. Read-only, so ON by
+    default like repo_read; with no repos configured the page lists none.
+    Repo paths must also sit inside repo_read's allowed roots."""
+    enabled: bool = True
+    repos: tuple[RepoKanbanRepo, ...] = ()
+    timeout_seconds: float = 10.0
+    max_bytes: int = 1_000_000
+
+
 @dataclass(frozen=True)
 class AppConfig:
     permissions: PermissionsConfig
@@ -1418,6 +1447,7 @@ class AppConfig:
     maintenance: MaintenanceConfig = MaintenanceConfig()
     fleet_sync: FleetSyncConfig = FleetSyncConfig()
     repo_read: RepoReadConfig = RepoReadConfig()
+    repo_kanban: RepoKanbanConfig = RepoKanbanConfig()
     archify: ArchifyConfig = ArchifyConfig()
     browser: BrowserGatewayConfig = BrowserGatewayConfig()
     ui_workflow: UiWorkflowConfig = UiWorkflowConfig()
@@ -1890,6 +1920,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         maintenance=_load_maintenance_config(raw.get("maintenance", {})),
         fleet_sync=_load_fleet_sync_config(raw.get("fleet_sync", {})),
         repo_read=_load_repo_read_config(raw.get("repo_read", {})),
+        repo_kanban=_load_repo_kanban_config(raw.get("repo_kanban", {})),
         archify=_load_archify_config(raw.get("archify", {})),
         browser=_load_browser_gateway_config(raw.get("browser", {})),
         ui_workflow=_load_ui_workflow_config(raw.get("ui_workflow", {})),
@@ -2954,3 +2985,52 @@ def _load_dashboard_config(dashboard_raw: object) -> DashboardConfig:
         allowed_origins=tuple(origins),
         web_terminal_enabled=bool(dashboard_raw.get("web_terminal_enabled", False)),
     )
+
+
+def _load_repo_kanban_config(raw: object) -> RepoKanbanConfig:
+    """Strict and fail-closed, same as the other sections in config.py."""
+    if not isinstance(raw, dict):
+        raw = {}
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("repo_kanban.enabled must be a boolean")
+    repos_raw = raw.get("repos", [])
+    if not isinstance(repos_raw, list):
+        raise ValueError("repo_kanban.repos must be a list")
+    repos: list[RepoKanbanRepo] = []
+    seen: set[str] = set()
+    for entry in repos_raw:
+        if not isinstance(entry, dict):
+            raise ValueError("repo_kanban.repos entries must be mappings")
+        repo_id = entry.get("id")
+        if not isinstance(repo_id, str) or not _REPO_KANBAN_ID_RE.match(repo_id):
+            raise ValueError(f"repo_kanban.repos id {repo_id!r} must match {_REPO_KANBAN_ID_RE.pattern}")
+        if repo_id in seen:
+            raise ValueError(f"repo_kanban.repos id {repo_id!r} is duplicated")
+        seen.add(repo_id)
+        path = entry.get("path")
+        if not isinstance(path, str) or not (path.startswith("/") or path.startswith("~")):
+            raise ValueError(f"repo_kanban.repos[{repo_id}].path must be an absolute path")
+        ref = entry.get("ref", "HEAD")
+        if not isinstance(ref, str) or not _REPO_KANBAN_REF_RE.match(ref) or ".." in ref or ref.startswith("-"):
+            raise ValueError(f"repo_kanban.repos[{repo_id}].ref is not a plain git ref")
+        files = {}
+        for key, default in (("board_path", RepoKanbanRepo.board_path), ("live_path", RepoKanbanRepo.live_path)):
+            value = entry.get(key, default)
+            if not isinstance(value, str) or not _REPO_KANBAN_REF_RE.match(value) or ".." in value or value.startswith(("/", "-")):
+                raise ValueError(f"repo_kanban.repos[{repo_id}].{key} must be a relative repo path")
+            files[key] = value
+        name = entry.get("name", repo_id)
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"repo_kanban.repos[{repo_id}].name must be a string")
+        project = entry.get("project")
+        if project is not None and (not isinstance(project, str) or not _REPO_KANBAN_ID_RE.match(project)):
+            raise ValueError(f"repo_kanban.repos[{repo_id}].project must be a project slug")
+        repos.append(RepoKanbanRepo(id=repo_id, name=name.strip()[:80], path=path, ref=ref, project=project, **files))
+    timeout = raw.get("timeout_seconds", RepoKanbanConfig.timeout_seconds)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 1.0 <= float(timeout) <= 60.0:
+        raise ValueError("repo_kanban.timeout_seconds must be a number between 1 and 60")
+    max_bytes = raw.get("max_bytes", RepoKanbanConfig.max_bytes)
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or not 1_024 <= max_bytes <= 8_000_000:
+        raise ValueError("repo_kanban.max_bytes must be an integer between 1024 and 8000000")
+    return RepoKanbanConfig(enabled=enabled, repos=tuple(repos), timeout_seconds=float(timeout), max_bytes=max_bytes)

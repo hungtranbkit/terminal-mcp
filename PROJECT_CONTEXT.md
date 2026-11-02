@@ -1,5 +1,42 @@
 # PROJECT_CONTEXT.md
 
+## 2026-10-24 — Repo Kanban: multi-repo task boards in the dashboard (staging only, not deployed)
+
+- **New:**
+  - `terminal_mcp/repo_kanban.py` (service), `terminal_mcp/repo_kanban_dashboard.py` (page + 2 GET routes).
+  - Config `repo_kanban` (`RepoKanbanConfig`/`RepoKanbanRepo` + strict `_load_repo_kanban_config` in `config.py`).
+  - Nav entry "Repo Kanban"; a "Repo Kanban" link in the Projects detail actions (`?project=<slug>`).
+  - Contract doc `docs/repo-kanban.md`; this repo's own `docs/kanban/board.json`.
+- **Routes:**
+  - `GET /dashboard/repo-kanban` (page; `?repo=<id>` or `?project=<slug>`).
+  - `GET /dashboard/api/repo-kanban/projects`.
+  - `GET /dashboard/api/repo-kanban/board?repo=<id>`.
+  - All three go through `_read_guard`. There is no POST, and `tests/test_dashboard.py`'s route inventory lists them.
+- **Design invariants:**
+  - Boards are read from a committed ref via `git show`, never from a worktree.
+  - Repos come from config only, inside the repo_read allowed roots.
+  - Fields are whitelisted and redacted; remotes lose userinfo.
+  - Session rows (from `session_registry`, matched by normalised git_remote + branch) never expose cwd, launch_command or notes.
+  - Errors are codes only.
+  - Statuses never change automatically; drift is reported as warnings.
+  - The controller does not `git fetch`.
+- **Tests:**
+  - `tests/test_repo_kanban.py` 10 passed.
+  - `test_repo_kanban + test_global_nav + test_config_nodes + test_project_dashboard + test_dashboard -k "not browser"`: 222 passed, then 1 route-inventory failure, fixed by listing the 3 routes (rerun PASS).
+  - Full suite not run (known red baseline, live tmux).
+- **Staging:**
+  - Transient user unit `tmcp-repo-kanban-staging` on Dell `127.0.0.1:8786`, code = this worktree (`~/workspace/tmcp-worktrees/repo-tasks-kanban-20261024`).
+  - Config `~/.config/tmcp-repo-kanban-staging/config.yaml`: terminal read/input off, dashboard mutations off, sentinel session pattern.
+  - State `~/.local/state/tmcp-repo-kanban-staging`, holding a read-only snapshot of HP's `session_registry.db` taken 2026-10-24.
+  - Stop: `systemctl --user stop tmcp-repo-kanban-staging`.
+- **Browser QA (HP, Playwright image v1.64.0, serialized via browser-qa-slot, reverse tunnel to Dell staging):**
+  - At 6f41402 it FAILED on phone horizontal overflow of ~103 px from the wide session/QA tables.
+  - Fixed in 77b497e (scroll wrappers, overflow-wrap).
+  - Rerun at 77b497e: **PASS 4/4** (Chromium + WebKit × 1366×768 / 390×844), 76 checks: list, board, owner filter, `?project=` note, 404 probe, Startup Pixel static `docs/kanban/index.html`.
+  - Evidence on Dell: `~/.local/share/tmcp-qa-runs/repo-kanban-77b497e/` (json + 12 PNG).
+  - Draft PR #89.
+- **Production unchanged:** HP `terminal-dashboard.mesflow.net` (:8766, release 4b9c44d). Deploy only after owner approval. The production config then needs `repo_kanban.repos` with HP-local paths and a fetch timer.
+
 ## 2026-10-23 — Issue #80 Add Node fresh-add vs repair consent
 
 - In `terminal_mcp/dashboard.py` (`NODES_ADMIN_HTML`), fresh Linux add no longer presents the existing-node replacement checkbox or sends `replace_existing`. Repair mode is entered only by the Repair connection action rendered for a registered Linux node. Its checkbox starts unchecked and must be affirmatively checked. Changing the prefilled node ID clears repair mode and hides/unchecks consent. Server validation in `node_onboarding.py` remains authoritative and still requires the node to exist.
