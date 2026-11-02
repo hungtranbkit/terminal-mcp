@@ -5,6 +5,8 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -13,6 +15,13 @@ from terminal_mcp.kanzo_projection import (
     ProjectionError,
     snapshot_from_repo_kanban,
     write_projection,
+)
+from terminal_mcp.kanzo_source import (
+    HttpMcpReadSource,
+    LiveProject,
+    SourceError,
+    load_live_projects,
+    snapshot_from_terminal_mcp,
 )
 
 SYNCED = "2026-11-02T09:30:00Z"
@@ -244,6 +253,253 @@ def test_repo_kanban_service_is_the_only_projection_source():
 
     with pytest.raises(ProjectionError, match="not configured"):
         snapshot_from_repo_kanban(Service(), ["not-allowed"])
+
+
+def test_live_source_uses_real_session_identity_and_idle_is_unknown():
+    class Source:
+        def call(self, tool, arguments):
+            if tool == "terminal_registry_search":
+                name = arguments["query"]
+                return {
+                    "records": [{
+                        "node_id": "dell-linux",
+                        "session_name": name,
+                        "stable_session_id": "16c73059-d6a0-496a-89de-494fc992a75b",
+                        "status": "ACTIVE",
+                        "agent_type": "codex",
+                        "cwd": "/home/dell/workspace/brand-agent-studio-20261029",
+                        "git_remote": "https://github.com/hungtranbkit/facebook-sales-radar.git",
+                        "git_branch": "feat/brandagent-brand-studio-20261029",
+                        "last_commit": "7b501242 docs: clarify BrandAgent handoff head",
+                        "last_seen_at": "2026-11-02T06:43:42Z",
+                    }]
+                }
+            if tool == "terminal_batch_inspect":
+                return {"targets": [{
+                    "node": "dell-linux",
+                    "session": "dell-codex-brandagent-autocore-v1-20261030",
+                    "state": "IDLE",
+                    "reason": "codex is back at its composer; the turn has finished",
+                    "cwd": "/home/dell/workspace/brand-agent-studio-20261029",
+                }]}
+            if tool == "terminal_session_tasks":
+                return {
+                    "session": arguments["session"], "queued": [], "running": [],
+                    "blocked_rework": [], "waiting_dependency": [], "recent": [],
+                }
+            raise AssertionError(tool)
+
+    snapshot = snapshot_from_terminal_mcp(Source(), [LiveProject(
+        id="brandagent",
+        name="BrandAgent",
+        remote="github.com/hungtranbkit/facebook-sales-radar",
+        node_id="dell-linux",
+        session_name="dell-codex-brandagent-autocore-v1-20261030",
+    )])
+
+    card = snapshot["projects"][0]["cards"][0]
+    assert card["id"] == "session:16c73059-d6a0-496a-89de-494fc992a75b"
+    assert card["status"] == "UNKNOWN"
+    assert card["sessions"][0]["state"] == "IDLE"
+    assert "No canonical queue task" in card["warnings"][0]
+    assert card["evidence"] == ""
+    assert card["issues"] == [] and card["prs"] == []
+
+
+def test_live_source_projects_real_queue_task_without_inventing_qa(tmp_path: Path):
+    class Source:
+        def call(self, tool, arguments):
+            if tool == "terminal_registry_search":
+                return {"records": [{
+                    "node_id": "dell-linux", "session_name": arguments["query"],
+                    "stable_session_id": "1283726d-cd79-409b-aa3d-b8599783da22",
+                    "status": "ACTIVE", "agent_type": "codex",
+                    "git_remote": "https://github.com/hungtranbkit/offline-pos.git",
+                    "git_branch": "fix/offlinepos-ci-nav-browser-20261030",
+                    "last_seen_at": "2026-11-02T06:43:42Z",
+                }]}
+            if tool == "terminal_batch_inspect":
+                return {"targets": [{"node": "dell-linux", "session": arguments["targets"][0].split("/", 1)[1], "state": "IDLE"}]}
+            if tool == "terminal_session_tasks":
+                return {"session": arguments["session"], "queued": [], "running": [],
+                        "blocked_rework": [], "waiting_dependency": [],
+                        "recent": [{"id": "task-32", "title": "Fix CI navigation",
+                                    "node_id": "dell-linux",
+                                    "status": "COMPLETED", "updated_at": "2026-11-02T06:40:00Z",
+                                    "verification_evidence": ""}]}
+            raise AssertionError(tool)
+
+    snapshot = snapshot_from_terminal_mcp(Source(), [LiveProject(
+        id="offline-pos", name="Offline POS",
+        remote="github.com/hungtranbkit/offline-pos", node_id="dell-linux",
+        session_name="dell-codex-offlinepos-ci32-claude-handoff-20261030",
+    )])
+    card = snapshot["projects"][0]["cards"][0]
+    assert card["id"] == "queue:task-32"
+    assert card["status"] == "DONE"
+    assert card["evidence"] == ""
+    write_projection(snapshot, tmp_path / "kanzo-live-source", synced_at=SYNCED)
+
+
+def test_live_source_refuses_task_without_matching_node_identity():
+    class Source:
+        def call(self, tool, arguments):
+            if tool == "terminal_registry_search":
+                return {"records": [{
+                    "node_id": "dell-linux", "session_name": arguments["query"],
+                    "stable_session_id": "stable", "status": "ACTIVE",
+                    "git_remote": "https://github.com/hungtranbkit/offline-pos.git",
+                }]}
+            if tool == "terminal_batch_inspect":
+                return {"targets": []}
+            if tool == "terminal_session_tasks":
+                return {"queued": [{"id": "wrong-node-task", "node_id": "macbook"}],
+                        "running": [], "blocked_rework": [],
+                        "waiting_dependency": [], "recent": []}
+            raise AssertionError(tool)
+
+    with pytest.raises(SourceError, match="node identity"):
+        snapshot_from_terminal_mcp(Source(), [LiveProject(
+            id="offline-pos", name="Offline POS",
+            remote="github.com/hungtranbkit/offline-pos", node_id="dell-linux",
+            session_name="dell-codex-offlinepos-ci32-claude-handoff-20261030",
+        )])
+
+
+def test_live_source_rejects_repo_or_session_identity_mismatch():
+    class Source:
+        def call(self, tool, arguments):
+            return {"records": [{
+                "node_id": "other-node", "session_name": arguments["query"],
+                "stable_session_id": "stable", "status": "ACTIVE",
+                "git_remote": "https://github.com/attacker/wrong.git",
+            }]}
+
+    with pytest.raises(SourceError, match="identity mismatch"):
+        snapshot_from_terminal_mcp(Source(), [LiveProject(
+            id="offline-pos", name="Offline POS",
+            remote="github.com/hungtranbkit/offline-pos", node_id="dell-linux",
+            session_name="dell-codex-offlinepos-ci32-claude-handoff-20261030",
+        )])
+
+
+def test_http_source_is_loopback_only_and_calls_only_read_tools():
+    calls = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            return
+
+        def do_POST(self):
+            length = int(self.headers.get("content-length", "0"))
+            request = json.loads(self.rfile.read(length))
+            calls.append(request)
+            if request["method"] == "initialize":
+                body = {"jsonrpc": "2.0", "id": request["id"], "result": {}}
+                self.send_response(200)
+                self.send_header("Mcp-Session-Id", "test-session")
+            elif request["method"] == "notifications/initialized":
+                self.send_response(202)
+                body = {}
+            else:
+                body = {"jsonrpc": "2.0", "id": request["id"], "result": {
+                    "content": [{"type": "text", "text": json.dumps({"records": []})}]
+                }}
+                self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            encoded = json.dumps(body).encode()
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        source = HttpMcpReadSource(f"http://127.0.0.1:{server.server_port}/mcp")
+        assert source.call("terminal_registry_search", {"query": "x"}) == {"records": []}
+        with pytest.raises(SourceError, match="read tool"):
+            source.call("terminal_send_text", {"session": "x", "text": "no"})
+        with pytest.raises(SourceError, match="loopback"):
+            HttpMcpReadSource("http://192.0.2.1:8766/mcp")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+    assert [call["method"] for call in calls] == [
+        "initialize", "notifications/initialized", "tools/call"
+    ]
+
+
+def test_http_source_never_forwards_a_redirect():
+    forwarded = []
+
+    class Sink(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            return
+
+        def do_POST(self):
+            forwarded.append(True)
+            self.send_response(200)
+            self.end_headers()
+
+        def do_GET(self):
+            forwarded.append(True)
+            self.send_response(200)
+            self.end_headers()
+
+    sink = ThreadingHTTPServer(("127.0.0.1", 0), Sink)
+
+    class Redirect(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            return
+
+        def do_POST(self):
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{sink.server_port}/mcp")
+            self.end_headers()
+
+    redirect = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+    threads = [
+        threading.Thread(target=server.serve_forever, daemon=True)
+        for server in (sink, redirect)
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        with pytest.raises(SourceError, match="read failed"):
+            HttpMcpReadSource(f"http://127.0.0.1:{redirect.server_port}/mcp")
+    finally:
+        for server in (redirect, sink):
+            server.shutdown()
+            server.server_close()
+        for thread in threads:
+            thread.join()
+    assert forwarded == []
+
+
+def test_live_project_config_requires_explicit_real_source_identifiers(tmp_path: Path):
+    path = tmp_path / "source.json"
+    path.write_text(json.dumps({"projects": [{
+        "id": "offline-pos", "name": "Offline POS",
+        "remote": "github.com/hungtranbkit/offline-pos",
+        "node_id": "dell-linux",
+        "session_name": "dell-codex-offlinepos-ci32-claude-handoff-20261030",
+    }]}), encoding="utf-8")
+    projects = load_live_projects(path)
+    assert projects == [LiveProject(
+        id="offline-pos", name="Offline POS",
+        remote="github.com/hungtranbkit/offline-pos", node_id="dell-linux",
+        session_name="dell-codex-offlinepos-ci32-claude-handoff-20261030",
+    )]
+
+    path.write_text(json.dumps({"projects": [{"id": "offline-pos"}]}), encoding="utf-8")
+    with pytest.raises(SourceError, match="exactly"):
+        load_live_projects(path)
+
+    path.write_text(" " * 2_000_001, encoding="utf-8")
+    with pytest.raises(SourceError, match="too large"):
+        load_live_projects(path)
 
 
 def test_manifest_records_disposable_one_way_contract(tmp_path: Path):

@@ -28,7 +28,19 @@ The v0.3.0 GitHub release metadata reports SHA-256 `912469c510ee3d704a2f5d59bf63
 
 ## Projection input
 
-Use `snapshot_from_repo_kanban()` in `terminal_mcp.kanzo_projection` inside an authenticated/offline operator process to select the allowlisted `brandagent` and `offline-pos` Repo Kanban entries. The projection layer must not read repositories, GitHub, queues, or the session database directly.
+There are two read-only inputs. `snapshot_from_repo_kanban()` accepts an existing Repo Kanban board. The live HP adapter calls only three existing Terminal MCP read tools over the literal loopback `/mcp` endpoint: `terminal_registry_search`, `terminal_batch_inspect`, and `terminal_session_tasks`. It refuses DNS names, non-loopback addresses, ambiguous node/session identity, missing stable IDs, and repository mismatches. It never opens `queue.db`, constructs a queue service, or calls a mutation tool.
+
+The project allowlist binds each view to a real source identity. The verified HP staging example is [hp-live-source-projects.json](evidence/kanzo-readonly-pilot/hp-live-source-projects.json). Run it without touching the production service:
+
+```bash
+uv run python scripts/kanzo-readonly-pilot.py live \
+  --source-url http://127.0.0.1:8766/mcp \
+  --projects docs/evidence/kanzo-readonly-pilot/hp-live-source-projects.json \
+  --home /home/operator/.local/state/tmcp-kanzo-pilot \
+  --synced-at 2026-11-02T07:00:00Z
+```
+
+On 2026-11-02 the live source returned both named Dell sessions with stable IDs, repositories, branches, commits, and `IDLE` runtime state. `terminal_session_tasks` returned no canonical tasks for either session. The adapter therefore emits two explicitly labelled `session:<stable-id>` observations with canonical status `UNKNOWN`; it does not invent a task, QA result, GitHub link, or completion. When the read API later returns a real task ID, the card key becomes `queue:<task-id>` and only source-provided issue/PR structures are considered.
 
 For replayable staging tests, the CLI accepts an explicit sanitized snapshot containing the `projects` returned by Repo Kanban plus each project's `cards` response:
 
@@ -52,6 +64,8 @@ Status mapping:
 | unverified `DONE` | `review` | `qa-pending` |
 | `BLOCKED`, `WAITING_INPUT`, `FAILED`, `STALE`, `UNKNOWN` | `todo` | explicit source state |
 
+`IDLE` is session telemetry, not task completion. A session without a linked task always projects as `UNKNOWN`/`todo` even when the agent is back at its composer.
+
 ## Isolated launch
 
 After projection and binary verification:
@@ -63,6 +77,10 @@ scripts/kanzo-pilot-launch.sh \
   --listen 127.0.0.1 \
   --port 14242
 ```
+
+Open `http://127.0.0.1:14242` from the same HP host (or use an already-authorized local port-forward that terminates on loopback). Do not add a tunnel, firewall exception, LAN bind, or public route for this pilot.
+
+To refresh, rerun the `live` command against the same dedicated home. The database replacement is atomic and removes Kanzo-local card moves. Then restart only the isolated Kanzo process with the launch command above; Terminal MCP, its sessions, and its queue are not restarted.
 
 The launcher refuses non-loopback addresses, broad/shared homes, invalid ports, a missing projection database, or a non-executable binary. It does not install a service, alter a firewall, create a tunnel, or touch Terminal MCP processes.
 
@@ -84,4 +102,4 @@ Record for each run:
 - attempted Kanzo mutation followed by reconciliation, proving no upstream effect;
 - listener addresses from `ss -ltnp`, proving loopback only.
 
-Current recommendation is **NO-GO for production** until a real authorized two-project staging run meets those checks. Even then, Kanzo should remain an optional view: its unauthenticated writable UI and four-column state model lose fidelity compared with the authenticated Repo Task Board unless the one-way metadata convention is maintained.
+Current recommendation remains **NO-GO for production**. The HP source-backed run now proves two real projects and real session identities, but it also proves the missing acceptance datum: neither selected session has a canonical Terminal MCP task. This is a truthful staging observation, not the requested end-to-end real-task acceptance. Kanzo should remain an optional view: its unauthenticated writable UI and four-column state model lose fidelity compared with the authenticated Repo Task Board unless the one-way metadata convention is maintained.

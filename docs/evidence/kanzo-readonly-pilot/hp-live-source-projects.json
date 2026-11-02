@@ -1,0 +1,18 @@
+{
+  "projects": [
+    {
+      "id": "brandagent",
+      "name": "BrandAgent",
+      "node_id": "dell-linux",
+      "remote": "github.com/hungtranbkit/facebook-sales-radar",
+      "session_name": "dell-codex-brandagent-autocore-v1-20261030"
+    },
+    {
+      "id": "offline-pos",
+      "name": "Offline POS",
+      "node_id": "dell-linux",
+      "remote": "github.com/hungtranbkit/offline-pos",
+      "session_name": "dell-codex-offlinepos-ci32-claude-handoff-20261030"
+    }
+  ]
+}
