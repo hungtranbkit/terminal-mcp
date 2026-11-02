@@ -11,6 +11,7 @@ from pathlib import Path
 from terminal_mcp.kanzo_projection import write_projection
 from terminal_mcp.kanzo_source import (
     HttpMcpReadSource,
+    GhCliReadSource,
     SourceError,
     load_live_projects,
     snapshot_from_terminal_mcp,
@@ -59,7 +60,7 @@ def main() -> int:
         else:
             source = HttpMcpReadSource(args.source_url)
             snapshot = snapshot_from_terminal_mcp(
-                source, load_live_projects(args.projects)
+                source, load_live_projects(args.projects), github=GhCliReadSource()
             )
         result = write_projection(snapshot, args.home, synced_at=args.synced_at)
     except (OSError, SourceError, ValueError) as exc:

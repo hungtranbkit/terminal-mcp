@@ -10,6 +10,8 @@ from dataclasses import dataclass
 import ipaddress
 import json
 from pathlib import Path
+import re
+import subprocess
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -30,6 +32,50 @@ class ReadSource(Protocol):
     def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]: ...
 
 
+class GitHubSource(Protocol):
+    def get(self, item: "GitHubWorkItem") -> dict[str, Any]: ...
+
+
+@dataclass(frozen=True)
+class GitHubWorkItem:
+    repo: str
+    kind: str
+    number: int
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"issue", "pr"} or self.number <= 0:
+            raise SourceError("invalid GitHub work item allowlist")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.repo):
+            raise SourceError("invalid GitHub repository allowlist")
+
+
+class GhCliReadSource:
+    """Read one explicitly allowlisted GitHub item through authenticated gh."""
+
+    def get(self, item: GitHubWorkItem) -> dict[str, Any]:
+        endpoint = (
+            f"repos/{item.repo}/issues/{item.number}"
+            if item.kind == "issue"
+            else f"repos/{item.repo}/pulls/{item.number}"
+        )
+        try:
+            result = subprocess.run(
+                ["gh", "api", endpoint], capture_output=True, text=True,
+                timeout=20, check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise SourceError("GitHub read failed") from exc
+        if result.returncode != 0:
+            raise SourceError("GitHub read failed")
+        try:
+            value = json.loads(result.stdout)
+        except ValueError as exc:
+            raise SourceError("GitHub returned invalid JSON") from exc
+        if not isinstance(value, dict):
+            raise SourceError("GitHub returned invalid work item")
+        return value
+
+
 @dataclass(frozen=True)
 class LiveProject:
     id: str
@@ -37,6 +83,7 @@ class LiveProject:
     remote: str
     node_id: str
     session_name: str
+    github: tuple[GitHubWorkItem, ...] = ()
 
 
 def load_live_projects(path: Path | str) -> list[LiveProject]:
@@ -59,13 +106,26 @@ def load_live_projects(path: Path | str) -> list[LiveProject]:
     projects: list[LiveProject] = []
     identities: set[tuple[str, str]] = set()
     for row in rows:
-        if not isinstance(row, dict) or set(row) != required:
+        if not isinstance(row, dict) or not required.issubset(row) or set(row) - required != {"github"} and set(row) != required:
             raise SourceError(
                 "each live project must contain exactly id, name, remote, node_id, session_name"
             )
         if not all(isinstance(row[key], str) and row[key].strip() for key in required):
             raise SourceError("live project identifiers must be non-empty strings")
-        project = LiveProject(**row)
+        github_rows = row.get("github", [])
+        if not isinstance(github_rows, list):
+            raise SourceError("live project github allowlist must be a list")
+        items: list[GitHubWorkItem] = []
+        expected_repo = normalise_git_remote(row["remote"])
+        for value in github_rows:
+            if not isinstance(value, dict) or set(value) != {"repo", "kind", "number"}:
+                raise SourceError("invalid GitHub work item allowlist")
+            item = GitHubWorkItem(**value)
+            if f"github.com/{item.repo}" != expected_repo:
+                raise SourceError("GitHub work item repository mismatch")
+            items.append(item)
+        base = {key: row[key] for key in required}
+        project = LiveProject(**base, github=tuple(items))
         identity = (project.node_id, project.session_name)
         if identity in identities:
             raise SourceError("duplicate live session identity")
@@ -275,8 +335,44 @@ def _observation_card(record: dict[str, Any], state: str) -> dict[str, Any]:
     }
 
 
+def _github_card(item: GitHubWorkItem, payload: dict[str, Any]) -> dict[str, Any]:
+    expected = f"https://github.com/{item.repo}/{'issues' if item.kind == 'issue' else 'pull'}/{item.number}"
+    if payload.get("number") != item.number or payload.get("html_url") != expected:
+        raise SourceError("GitHub work item identity mismatch")
+    state = str(payload.get("state") or "").lower()
+    if state not in {"open", "closed"}:
+        raise SourceError("GitHub work item has invalid state")
+    draft = item.kind == "pr" and payload.get("draft") is True
+    if state == "closed":
+        status = "CLOSED"
+    elif draft:
+        status = "DRAFT"
+    else:
+        status = "OPEN_PR" if item.kind == "pr" else "OPEN"
+    link = {"number": item.number, "url": expected, "state": state.upper()}
+    labels = payload.get("labels") or []
+    if not isinstance(labels, list) or not all(isinstance(label, dict) for label in labels):
+        raise SourceError("GitHub labels must be a list of objects")
+    return {
+        "id": f"github:{item.kind}:{item.number}",
+        "title": str(payload.get("title") or f"GitHub {item.kind} #{item.number}"),
+        "status": status,
+        "owner": "GitHub",
+        "last_updated": str(payload.get("updated_at") or ""),
+        "created": str(payload.get("created_at") or ""),
+        "issues": [link] if item.kind == "issue" else [],
+        "prs": [link] if item.kind == "pr" else [],
+        "evidence": "",
+        "next": "Read-only provider work item",
+        "warnings": (["Draft pull request; not QA and not complete"] if draft else []),
+        "sessions": [],
+        "labels": [str(label.get("name") or "") for label in labels],
+    }
+
+
 def snapshot_from_terminal_mcp(
-    source: ReadSource, projects: list[LiveProject] | tuple[LiveProject, ...]
+    source: ReadSource, projects: list[LiveProject] | tuple[LiveProject, ...],
+    *, github: GitHubSource | None = None,
 ) -> dict[str, Any]:
     """Build a sanitized snapshot from explicitly identified live sessions."""
     if not projects:
@@ -318,6 +414,10 @@ def snapshot_from_terminal_mcp(
         cards = _task_cards(tasks, record, state)
         if not cards:
             cards = [_observation_card(record, state)]
+        if project.github and github is None:
+            raise SourceError("GitHub source is required by the project allowlist")
+        for item in project.github:
+            cards.append(_github_card(item, github.get(item)))  # type: ignore[union-attr]
         output.append({
             "id": project.id,
             "name": project.name,

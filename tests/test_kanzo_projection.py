@@ -17,12 +17,14 @@ from terminal_mcp.kanzo_projection import (
     write_projection,
 )
 from terminal_mcp.kanzo_source import (
+    GitHubWorkItem,
     HttpMcpReadSource,
     LiveProject,
     SourceError,
     load_live_projects,
     snapshot_from_terminal_mcp,
 )
+from terminal_mcp.kanzo_reconcile import reconcile_once
 
 SYNCED = "2026-11-02T09:30:00Z"
 
@@ -500,6 +502,71 @@ def test_live_project_config_requires_explicit_real_source_identifiers(tmp_path:
     path.write_text(" " * 2_000_001, encoding="utf-8")
     with pytest.raises(SourceError, match="too large"):
         load_live_projects(path)
+
+
+def test_provider_work_items_are_separate_real_cards_and_draft_is_not_done():
+    class Source:
+        def call(self, tool, arguments):
+            if tool == "terminal_registry_search":
+                repo = "facebook-sales-radar" if "brandagent" in arguments["query"] else "offline-pos"
+                return {"records": [{
+                    "node_id": "dell-linux", "session_name": arguments["query"],
+                    "stable_session_id": f"stable-{repo}", "status": "ACTIVE",
+                    "agent_type": "codex",
+                    "git_remote": f"https://github.com/hungtranbkit/{repo}.git",
+                    "last_seen_at": "2026-11-02T06:43:42Z",
+                }]}
+            if tool == "terminal_batch_inspect":
+                return {"targets": [{"node": "dell-linux", "session": target.split("/", 1)[1], "state": "IDLE"} for target in arguments["targets"]]}
+            if tool == "terminal_session_tasks":
+                return {name: [] for name in ("queued", "running", "blocked_rework", "waiting_dependency", "recent")}
+            raise AssertionError(tool)
+
+    class GitHub:
+        def get(self, item):
+            if item.kind == "issue":
+                return {"number": 153, "title": "Brand Studio", "state": "open",
+                        "html_url": "https://github.com/hungtranbkit/facebook-sales-radar/issues/153",
+                        "created_at": "2026-10-29T03:46:44Z", "updated_at": "2026-10-29T04:26:25Z",
+                        "labels": [{"name": "in-review"}]}
+            return {"number": item.number, "title": "Draft delivery", "state": "open", "draft": True,
+                    "html_url": f"https://github.com/{item.repo}/pull/{item.number}",
+                    "created_at": "2026-10-29T04:26:08Z", "updated_at": "2026-11-02T06:33:35Z"}
+
+    projects = [
+        LiveProject("brandagent", "BrandAgent", "github.com/hungtranbkit/facebook-sales-radar", "dell-linux", "dell-codex-brandagent-autocore-v1-20261030",
+                    (GitHubWorkItem("hungtranbkit/facebook-sales-radar", "issue", 153), GitHubWorkItem("hungtranbkit/facebook-sales-radar", "pr", 154))),
+        LiveProject("offline-pos", "Offline POS", "github.com/hungtranbkit/offline-pos", "dell-linux", "dell-codex-offlinepos-ci32-claude-handoff-20261030",
+                    (GitHubWorkItem("hungtranbkit/offline-pos", "pr", 47),)),
+    ]
+    snapshot = snapshot_from_terminal_mcp(Source(), projects, github=GitHub())
+    cards = [card for project in snapshot["projects"] for card in project["cards"]]
+    assert len(cards) == 5
+    assert sum(card["id"].startswith("session:") for card in cards) == 2
+    assert {card["id"] for card in cards if card["id"].startswith("github:")} == {
+        "github:issue:153", "github:pr:154", "github:pr:47"
+    }
+    drafts = [card for card in cards if card["id"] in {"github:pr:154", "github:pr:47"}]
+    assert all(card["status"] == "DRAFT" and card["evidence"] == "" for card in drafts)
+    assert all(card["status"] != "DONE" for card in cards)
+
+
+def test_reconcile_failure_preserves_last_good_database_and_marks_stale(tmp_path: Path):
+    home = tmp_path / "kanzo"
+    first = reconcile_once(lambda: _snapshot(), home, synced_at=SYNCED)
+    before = (home / "kanzo.db").read_bytes()
+
+    def outage():
+        raise SourceError("provider unavailable token=secret-value")
+
+    failed = reconcile_once(outage, home, synced_at="2026-11-02T09:31:00Z")
+    assert failed["ok"] is False and failed["stale"] is True
+    assert "secret-value" not in json.dumps(failed)
+    assert (home / "kanzo.db").read_bytes() == before
+    status = json.loads((home / "tmcp-reconcile-status.json").read_text())
+    assert status["last_success_at"] == SYNCED
+    assert status["stale"] is True
+    assert first["digest"] == status["last_good_digest"]
 
 
 def test_manifest_records_disposable_one_way_contract(tmp_path: Path):

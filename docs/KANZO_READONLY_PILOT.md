@@ -40,6 +40,10 @@ uv run python scripts/kanzo-readonly-pilot.py live \
   --synced-at 2026-11-02T07:00:00Z
 ```
 
+Each optional `github` entry is an exact `{repo, kind, number}` allowlist. The adapter invokes authenticated `gh api` only for those fixed endpoints, validates the returned URL/number/repository, and never reads or prints the token. GitHub issues, draft PRs, and session observations remain separate cards. `OPEN`, `DRAFT`, and `OPEN_PR` are never mapped to `done`; a draft PR is tagged `github-draft`, not `waiting-qa`.
+
+The current real allowlist reads BrandAgent issue #153 and draft PR #154 from `hungtranbkit/facebook-sales-radar`, plus Offline POS draft PR #47. Missing or failed provider reads abort the replacement and leave the previous database intact.
+
 On 2026-11-02 the live source returned both named Dell sessions with stable IDs, repositories, branches, commits, and `IDLE` runtime state. `terminal_session_tasks` returned no canonical tasks for either session. The adapter therefore emits two explicitly labelled `session:<stable-id>` observations with canonical status `UNKNOWN`; it does not invent a task, QA result, GitHub link, or completion. When the read API later returns a real task ID, the card key becomes `queue:<task-id>` and only source-provided issue/PR structures are considered.
 
 For replayable staging tests, the CLI accepts an explicit sanitized snapshot containing the `projects` returned by Repo Kanban plus each project's `cards` response:
@@ -81,6 +85,27 @@ scripts/kanzo-pilot-launch.sh \
 Open `http://127.0.0.1:14242` from the same HP host (or use an already-authorized local port-forward that terminates on loopback). Do not add a tunnel, firewall exception, LAN bind, or public route for this pilot.
 
 To refresh, rerun the `live` command against the same dedicated home. The database replacement is atomic and removes Kanzo-local card moves. Then restart only the isolated Kanzo process with the launch command above; Terminal MCP, its sessions, and its queue are not restarted.
+
+For the bounded 60-second HP pilot:
+
+```bash
+systemd-run --user --unit=tmcp-kanzo-pilot-reconcile-82-106 \
+  --property=WorkingDirectory=/home/kimex/workspace/terminal-mcp-kanzo-pilot \
+  /home/kimex/workspace/terminal-mcp-kanzo-pilot/.venv/bin/python \
+  /home/kimex/workspace/terminal-mcp-kanzo-pilot/scripts/kanzo-pilot-reconcile.py \
+  --source-url http://127.0.0.1:8766/mcp \
+  --projects /home/kimex/workspace/terminal-mcp-kanzo-pilot/docs/evidence/kanzo-readonly-pilot/hp-live-source-projects.json \
+  --home /home/kimex/.local/state/terminal-mcp/kanzo-pilot-82-106 \
+  --interval 60 --max-backoff 300
+```
+
+The transient user unit takes an exclusive worker lock, uses exponential backoff, writes `tmcp-reconcile-status.json` atomically, redacts errors, and preserves the last good database on any source outage. It does not install a persistent unit. Operations:
+
+```bash
+systemctl --user status tmcp-kanzo-pilot-ui-82-106 tmcp-kanzo-pilot-reconcile-82-106
+journalctl --user -u tmcp-kanzo-pilot-reconcile-82-106 -f
+systemctl --user stop tmcp-kanzo-pilot-reconcile-82-106 tmcp-kanzo-pilot-ui-82-106
+```
 
 The launcher refuses non-loopback addresses, broad/shared homes, invalid ports, a missing projection database, or a non-executable binary. It does not install a service, alter a firewall, create a tunnel, or touch Terminal MCP processes.
 

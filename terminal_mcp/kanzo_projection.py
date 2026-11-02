@@ -189,6 +189,14 @@ def _state(card: Mapping[str, Any]) -> tuple[str, list[str]]:
     tags: list[str] = []
     if source == "NEW":
         status = "todo"
+    elif source == "OPEN":
+        status, tags = "todo", ["github-open"]
+    elif source == "DRAFT":
+        status, tags = "review", ["github-draft"]
+    elif source == "OPEN_PR":
+        status, tags = "review", ["github-open-pr"]
+    elif source == "CLOSED":
+        status, tags = "todo", ["github-closed", "not-verified-done"]
     elif source == "RUNNING":
         status = "doing"
     elif source in {"REVIEW", "QA_PENDING", "WAITING_QA"}:
@@ -234,6 +242,12 @@ def _description(card: Mapping[str, Any], links: list[str], synced_at: str) -> s
         f"Last synced: {synced_at}",
     ]
     lines.extend(f"Source: {link}" for link in links)
+    created = _text(card.get("created"), "card.created", 80)
+    if created:
+        lines.append(f"Source created: {created}")
+    labels = [_text(label, "card.label", 100) for label in (card.get("labels") or [])]
+    if labels:
+        lines.append(f"Source labels: {', '.join(labels)}")
     evidence = _text(card.get("evidence"), "card.evidence", 4000)
     next_step = _text(card.get("next"), "card.next", 2000)
     if evidence:

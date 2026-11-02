@@ -2,6 +2,10 @@
   "projects": [
     {
       "id": "brandagent",
+      "github": [
+        {"kind": "issue", "number": 153, "repo": "hungtranbkit/facebook-sales-radar"},
+        {"kind": "pr", "number": 154, "repo": "hungtranbkit/facebook-sales-radar"}
+      ],
       "name": "BrandAgent",
       "node_id": "dell-linux",
       "remote": "github.com/hungtranbkit/facebook-sales-radar",
@@ -9,6 +13,9 @@
     },
     {
       "id": "offline-pos",
+      "github": [
+        {"kind": "pr", "number": 47, "repo": "hungtranbkit/offline-pos"}
+      ],
       "name": "Offline POS",
       "node_id": "dell-linux",
       "remote": "github.com/hungtranbkit/offline-pos",
