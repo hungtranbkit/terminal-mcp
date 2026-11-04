@@ -919,11 +919,11 @@ class CompactTerminalTools:
         - list_sessions (list, sessions), list_nodes (nodes)
         - create_session (create): `target` is the new name; agent_type,
           working_directory, initial_prompt, grant_mode, binding, node apply.
-        - delete_session (delete, kill): `target` is the name; requires
-          `confirm=true` (or `args={"confirm": true}`; omitted ->
-          CONFIRMATION_REQUIRED, nothing deleted). Attached,
-          leased, recovering, protected and active-work sessions are refused
-          regardless of confirmation.
+        - delete_session (delete, kill): `target` is the name. Owner-authorized
+          clean idle sessions delete immediately. Risky targets require one
+          `confirm=true` (or `args={"confirm": true}`) call. Attached, leased,
+          recovering, protected, active-work and dirty-Git sessions are refused
+          regardless of confirmation. Deletion is never queued.
         - enqueue_task (enqueue): `target` is the session, `text` the prompt;
           title, priority, metadata, request_key apply.
         - task_status (task): `task_id`. task_batch_status (tasks): `task_ids`.
