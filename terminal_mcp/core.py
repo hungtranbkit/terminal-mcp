@@ -510,7 +510,11 @@ class TerminalService:
         if registry_node_id and registry_node_id.strip():
             self.REGISTRY_LOCAL_NODE_ID = registry_node_id.strip()
         self.config = config
-        self.tmux = tmux or TmuxClient()
+        if tmux is None:
+            from .session_backend_factory import build_session_backend
+            self.tmux = build_session_backend(node_id=self.REGISTRY_LOCAL_NODE_ID)
+        else:
+            self.tmux = tmux
         self.bindings = bindings or BindingStore()
         self.audit = audit or AuditStore()
         self.grants = grants or SessionGrantStore()
