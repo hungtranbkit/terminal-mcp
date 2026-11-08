@@ -5536,11 +5536,25 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       }
       csSubmitBtnEl.disabled = true; csSubmitBtnEl.textContent = 'Đang tạo…';
       try {
-        const response = await fetch('/dashboard/api/session/create', {
+        const createBody = {name, agent_type: csSelectedAgent, cwd: cwd || null, node: chosenNode, grant_mode: csGrantEl.value, show_on_desktop: csShowOnDesktopEl.checked};
+        let response = await fetch('/dashboard/api/session/create', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({name, agent_type: csSelectedAgent, cwd: cwd || null, node: chosenNode, grant_mode: csGrantEl.value, show_on_desktop: csShowOnDesktopEl.checked}),
+          body: JSON.stringify(createBody),
         });
-        const result = await response.json().catch(() => ({}));
+        let result = await response.json().catch(() => ({}));
+        if (result && result.error === 'SESSION_CREATE_ADVISORY') {
+          const advice = result.advisories.map(item => {
+            if (item.code === 'PROJECT_SESSION_SPRAWL') return `Project already has ${item.existing_sessions.length} sessions; reuse one if possible.`;
+            if (item.code === 'SAME_TASK_SESSION_EXISTS') return `Same task may already be active in: ${(item.sessions || []).join(', ')}. Reuse one if possible.`;
+            return `Session inventory is incomplete (${item.code}). ${item.recommendation || item.reason || 'Retry after checking nodes.'}`;
+          }).join('\n');
+          if (!confirm(`${advice}\n\nCreate another session anyway?`)) return;
+          createBody.confirm_advisories = true;
+          response = await fetch('/dashboard/api/session/create', {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(createBody),
+          });
+          result = await response.json().catch(() => ({}));
+        }
         if (result && result.error) {
           csErrorEl.textContent = `Lỗi: ${clean(result.error)}${result.reason ? ' -- ' + clean(result.reason) : ''}`;
           return;
@@ -17322,12 +17336,17 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # visible_window field (surfaced from lifecycle.py's create())
         # says whether it really did.
         show_on_desktop = bool(body.get("show_on_desktop", False)) if isinstance(body, dict) else False
+        confirm_advisories = bool(body.get("confirm_advisories", False)) if isinstance(body, dict) else False
         granted_by = identity.email if identity else None
         _log.info("dashboard create_session name=%s agent_type=%s node=%s grant_mode=%s show_on_desktop=%s identity=%s",
                  name, agent_type, node, grant_mode, show_on_desktop, granted_by)
+        from .session_advisory import create_session_with_advisories
         result = await anyio.to_thread.run_sync(
-            lambda: _routed(lambda: controller.terminal_create_session(
-                name, agent_type, cwd, node=node, grant_mode=grant_mode, requested_by=granted_by,
+            lambda: _routed(lambda: create_session_with_advisories(
+                controller, name=name, agent_type=agent_type, cwd=cwd,
+                label_index=terminal.audit.task_label_index,
+                confirm_advisories=confirm_advisories,
+                node=node, grant_mode=grant_mode, requested_by=granted_by,
                 show_on_desktop=show_on_desktop))
         )
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)

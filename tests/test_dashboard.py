@@ -2247,8 +2247,10 @@ def test_sessions_admin_node_capability_filter_mirrors_scheduler_eligibility():
 
 
 def test_sessions_admin_create_sends_node_field_and_refetches_on_agent_change():
-    assert ("body: JSON.stringify({name, agent_type: csSelectedAgent, cwd: cwd || null, node: chosenNode, "
-           "grant_mode: csGrantEl.value, show_on_desktop: csShowOnDesktopEl.checked})") in SESSIONS_ADMIN_HTML
+    assert ("const createBody = {name, agent_type: csSelectedAgent, cwd: cwd || null, node: chosenNode, "
+            "grant_mode: csGrantEl.value, show_on_desktop: csShowOnDesktopEl.checked};") in SESSIONS_ADMIN_HTML
+    assert "Create another session anyway?" in SESSIONS_ADMIN_HTML
+    assert "createBody.confirm_advisories = true;" in SESSIONS_ADMIN_HTML
     assert "renderNodeOptions(); // re-filter the SAME cached node list -- no re-fetch needed just for this" in SESSIONS_ADMIN_HTML
     assert "loadNodesForCreateModal(); // fresh every open" in SESSIONS_ADMIN_HTML
 

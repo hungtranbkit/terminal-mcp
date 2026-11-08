@@ -1421,6 +1421,10 @@ class TerminalService:
                 "name": item.name, "allowed": read_allowed, "attached": item.attached,
                 "windows": item.windows, "created": iso_timestamp(item.created_epoch),
                 "activity": iso_timestamp(item.activity_epoch),
+                # Project grouping is useful for session-reuse advice, but a
+                # working path is disclosed only to callers who can already
+                # read that session (same gate as terminal_status).
+                "cwd": item.pane_current_path or None if read_allowed else None,
                 "read_allowed": read_allowed, "read_granted": read_granted,
                 "input_allowed": input_allowed, "input_granted": input_granted,
                 "effective_read": read_allowed, "effective_input": input_allowed,
