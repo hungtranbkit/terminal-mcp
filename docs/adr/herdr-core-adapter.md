@@ -64,6 +64,8 @@ starts/new sessions; it never kills or migrates tmux sessions.
 
 `CANARY_ONLY`: unit and HP dummy-shell E2E pass, but Dell is at capacity and
 no real Dell Codex/Claude canary or 24/48-hour soak was performed. Herdr is
-also slower in this local microbenchmark, especially guarded send. Promotion
-to `HERDR_DEFAULT` is forbidden until issue #109's complete gate passes.
-
+also slower in this local microbenchmark. Cold guarded send intentionally
+waits for an 800 ms startup settle plus a 200 ms paste/Enter gap; warm send
+still measures p95 207.767 ms. Terminal MCP preserves these guards rather
+than weakening upstream's dropped-paste protection. Promotion to
+`HERDR_DEFAULT` is forbidden until issue #109's complete gate passes.

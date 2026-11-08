@@ -14,8 +14,18 @@ clock milliseconds; RSS is KiB. This is not a Dell result.
 | read | 3.174 / 3.583 | 5.685 / 6.327 |
 | server RSS | 4608 (median) | 6228 |
 
-The Herdr send result includes its intentional safe-input pause. It must not
-be presented as lower control latency than tmux. No event-to-dashboard or
-concurrent real-agent benchmark was run, so those acceptance cells remain
-UNKNOWN.
+The original Herdr send loop sends immediately after creating each terminal.
+Source inspection and a separate 30-run warm benchmark isolate the cost:
 
+- for a terminal younger than 10 seconds, core waits for 800 ms without
+  output (`HC_SETTLE_MS`) before accepting a paste;
+- core then intentionally waits 200 ms between paste and Enter;
+- after terminals were older than 10 seconds, warm send acknowledgement was
+  p50 207.221 ms / p95 207.767 ms (min 203.161, max 209.118).
+
+Thus the ~1.026 s p95 is core's cold-start dropped-paste protection, not
+Python wrapper, CLI startup or socket event-loop overhead. The remaining
+~207 ms is the intentional paste/submit separation. Terminal MCP does not
+override either safety value. It must not present Herdr as lower control
+latency than tmux. No event-to-dashboard or concurrent real-agent benchmark
+was run, so those acceptance cells remain UNKNOWN.
