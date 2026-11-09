@@ -158,6 +158,57 @@ def test_setup_never_mutates_node_when_authenticated_host_key_disagrees_with_pin
     assert client.calls == ["status"]
 
 
+def test_repeated_setup_preserves_verified_profile_when_identity_and_pin_are_unchanged(monkeypatch, tmp_path):
+    import json
+
+    host_key = "ssh-ed25519 dGVzdA== host"
+
+    class SetupClient:
+        username = "alice"
+
+        def ssh_manage(self, action, public_key=None):
+            if action == "status":
+                return {"status": "ready", "host_public_key": host_key, "username": self.username,
+                        "hostname": "node-a", "port": 22}
+            if action == "setup":
+                return {"status": "configured", "changed": False, "username": self.username,
+                        "hostname": "node-a", "port": 22}
+            raise AssertionError(action)
+
+    client = SetupClient()
+    controller = Controller(client)
+    controller.local_node_id = "hp-linux"
+    service = NodeSSHService(controller, tmp_path / "keys")
+    _key, known_hosts, profile_path = service._paths("hp-linux")
+    known_hosts.write_text(f"10.1.2.3 {host_key}\n")
+    fingerprint = service._fingerprint(host_key)
+    profile_path.write_text(json.dumps({
+        "node_id": "hp-linux", "address": "10.1.2.3", "username": "alice", "port": 22,
+        "expected_hostname": "node-a", "host_key_fingerprint": fingerprint,
+        "status": "verified", "verified": True, "verified_at": "2026-11-09T12:00:00+00:00",
+        "verified_hostname": "node-a",
+    }))
+    monkeypatch.setattr(service, "_ensure_key", lambda _path:
+                        "ssh-ed25519 AAAA terminal-mcp:hp-linux-hp-linux:20261109")
+
+    result = service.setup("hp-linux")
+    saved = json.loads(profile_path.read_text())
+
+    assert result["status"] == "verified"
+    assert result["verified"] is True
+    assert saved["status"] == "verified"
+    assert saved["verified"] is True
+    assert saved["verified_at"] == "2026-11-09T12:00:00+00:00"
+
+    client.username = "another-user"
+    changed = service.setup("hp-linux")
+    changed_profile = json.loads(profile_path.read_text())
+    assert changed["status"] == "configured"
+    assert changed["verified"] is False
+    assert changed_profile["username"] == "another-user"
+    assert changed_profile["verified"] is False
+
+
 def test_connect_argv_uses_fixed_persistent_tmux_and_strict_hostkey(tmp_path):
     import json
 

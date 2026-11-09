@@ -215,10 +215,29 @@ class NodeSSHService:
                 configured = client.ssh_manage("setup", pub)
                 if configured.get("status") != "configured":
                     return {"node_id": node_id, **configured}
-                profile = {"node_id": node_id, "address": host, "username": configured.get("username"),
-                           "port": int(configured.get("port") or port), "host_key_fingerprint": fingerprint,
-                           "expected_hostname": configured.get("hostname") or preflight.get("hostname"),
-                           "status": "configured", "verified": False}
+                username = configured.get("username")
+                ssh_port = int(configured.get("port") or port)
+                expected_hostname = configured.get("hostname") or preflight.get("hostname")
+                previous_profile = self._load_profile(profile_path)
+                same_verified_identity = (
+                    previous_profile.get("status") == "verified"
+                    and previous_profile.get("verified") is True
+                    and previous_profile.get("verified_at")
+                    and previous_profile.get("address") == host
+                    and previous_profile.get("username") == username
+                    and previous_profile.get("port") == ssh_port
+                    and previous_profile.get("host_key_fingerprint") == fingerprint
+                    and str(previous_profile.get("expected_hostname") or "").casefold()
+                    == str(expected_hostname or "").casefold()
+                )
+                profile = {"node_id": node_id, "address": host, "username": username,
+                           "port": ssh_port, "host_key_fingerprint": fingerprint,
+                           "expected_hostname": expected_hostname,
+                           "status": "verified" if same_verified_identity else "configured",
+                           "verified": bool(same_verified_identity)}
+                if same_verified_identity:
+                    profile["verified_at"] = previous_profile["verified_at"]
+                    profile["verified_hostname"] = previous_profile.get("verified_hostname")
                 self._store_profile(profile_path, profile)
                 return {"node_id": node_id, **profile}
             except NodeClientError as exc:
