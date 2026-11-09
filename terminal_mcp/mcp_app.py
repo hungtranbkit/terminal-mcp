@@ -93,7 +93,8 @@ _DIRECT_ACTION_SCHEMA_HELP = (
     "Direct Terminal MCP action. Normal public actions: start (idle local Codex, confirmed RUNNING or error), inspect, send, send_wait, wait, resume, "
     "supervise (long task continued server-side until explicit DONE), supervise_status, "
     "supervise_complete, supervise_cancel, "
-    "list_sessions, list_nodes, create_session, delete_session, task_status, task_batch_status, "
+    "list_sessions, list_nodes, node_ssh(node_id + args.operation=status|setup|verify|connect|revoke|exec), "
+    "create_session, delete_session, task_status, task_batch_status, "
     "browser_verify, browser_screenshot, browser_status, browser_stop. "
     "Tracked work: create_session (no initial_prompt) -> supervise(text, title, idempotency_key) "
     "-> supervise_status(task_id or idempotency_key). Retired queue actions return "
@@ -143,7 +144,7 @@ def _fleet_session_names(controller: "ControllerService") -> list[str]:
 
 def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_session,
                      enqueue_task, queue_resume, queue_run_once, route_start, task_status, task_batch_status,
-                     task_checkpoint,
+                     task_checkpoint, node_ssh,
                      agent_start, list_agents, get_agent, create_agent, update_agent,
                      list_skills, register_skill, bind_agent_skill, cleanup_candidates,
                      session_lifecycle, session_reconcile,
@@ -168,6 +169,7 @@ def turn_handler_map(*, list_sessions, list_nodes, create_session, delete_sessio
         "put_file": put_file,
         "list_sessions": list_sessions,
         "list_nodes": list_nodes,
+        "node_ssh": node_ssh,
         "create_session": create_session,
         "delete_session": delete_session,
         "enqueue_task": enqueue_task,
@@ -350,6 +352,9 @@ def build_mcp(service: TerminalService | None = None,
         except Exception:  # noqa: BLE001 -- other tools remain available
             _LOGGER.exception("durable run journal unavailable")
     compact_tools = CompactTerminalTools(terminal, controller, run_journal=run_journal)
+    from .node_ssh import NodeSSHService
+    from .connection_store import default_connection_store_path
+    compact_tools.node_ssh = NodeSSHService(controller, default_connection_store_path().parent / "node-ssh", audit=terminal.audit)
     # Supervised direct tasks (direct_task.py). Every dispatch/observation
     # goes through compact_tools' own guarded, bounded send/status/tail.
     from .direct_task import DirectTaskStore, DirectTaskSupervisor
@@ -590,6 +595,7 @@ def build_mcp(service: TerminalService | None = None,
         instructions=orchestration_policy.server_instructions() + "\n\n" + ANALYSIS_GATE_BOOTSTRAP,
         version=__version__,
     )
+    server.node_ssh_service = compact_tools.node_ssh
 
     # Dem loi goi tung tool. Boc mot lan o day, truoc moi @server.tool ben
     # duoi, nen ca ~290 tool deu duoc dem ma khong phai sua tung cho.
@@ -827,7 +833,7 @@ def build_mcp(service: TerminalService | None = None,
                       url: str | None = None, args: dict | None = None,
                       path: str | None = None, content_b64: str | None = None,
                       overwrite: bool = False, mode: str | None = None,
-                      confirm: StrictBool | None = None,
+                      confirm: StrictBool | None = None, node_id: str | None = None,
                       steps: list[dict[str, Any]] | None = None,
                       viewport: dict[str, Any] | None = None,
                       screenshot: str | None = None,
@@ -891,6 +897,7 @@ Direct actions:
   supervise_status/supervise_complete/supervise_cancel  (task_id; status also
                 takes idempotency_key or target)
   list_sessions/list, list_nodes/nodes
+  node_ssh (node_id + args.operation): status/setup/verify/connect/revoke; exec accepts structured argv and timeout<=30s
   create_session/create, delete_session/delete (confirm=true, or args={"confirm": true})
   session_lifecycle (read-only classification), session_reconcile (dry run by default)
   task_status/task, task_batch_status/tasks (read-only historical task state)
@@ -927,7 +934,7 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
             node=node, title=title, priority=priority, metadata=metadata,
             request_key=request_key, task_id=task_id, task_ids=task_ids,
             long_task=long_task,
-            url=url, args=args,
+            url=url, args=args, node_id=node_id,
         )
 
     @server.tool()
@@ -6479,10 +6486,14 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
     # closures over this build's own services. `server.tool()` returns the
     # plain function, so this is an ordinary call with the wrapper-layer side
     # effects (heartbeat refresh, supervisor-watch cleanup on delete) intact.
+    def terminal_node_ssh(node_id: str, operation: str) -> dict:
+        return getattr(compact_tools.node_ssh, operation)(node_id)
+
     compact_tools.handlers.update(turn_handler_map(
         put_file=terminal_put_file,
         list_sessions=terminal_list_sessions,
         list_nodes=terminal_list_nodes,
+        node_ssh=terminal_node_ssh,
         create_session=terminal_create_session,
         delete_session=terminal_delete_session,
         enqueue_task=terminal_enqueue_task,

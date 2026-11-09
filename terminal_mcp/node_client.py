@@ -82,6 +82,7 @@ class NodeClient(Protocol):
     def list_killed_sessions(self) -> dict[str, Any]: ...
     def grant_read(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]: ...
     def grant_input(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]: ...
+    def ssh_manage(self, action: str, public_key: str | None = None) -> dict[str, Any]: ...
     def health(self) -> dict[str, Any]: ...
     def execution_probe(self, timeout_seconds: float = 3.0) -> dict[str, Any]: ...
     def self_heal(self, action: str) -> dict[str, Any]: ...
@@ -246,6 +247,10 @@ class LocalNodeClient:
 
     def grant_input(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]:
         return self._terminal.grant_session_input(name, enabled, granted_by=granted_by)
+
+    def ssh_manage(self, action: str, public_key: str | None = None) -> dict[str, Any]:
+        from .node_ssh_agent import manage_ssh
+        return manage_ssh(action, public_key)
 
     def health(self) -> dict[str, Any]:
         return {"status": "ok"}
@@ -620,6 +625,14 @@ class RemoteNodeClient:
     def grant_input(self, name: str, enabled: bool, *, granted_by: str | None = None) -> dict[str, Any]:
         return self._request("POST", f"/v1/sessions/{urllib.parse.quote(name)}/grant-input",
                              body={"enabled": enabled, "granted_by": granted_by})
+
+    def ssh_manage(self, action: str, public_key: str | None = None) -> dict[str, Any]:
+        if action not in {"status", "setup", "revoke"}:
+            raise NodeClientError("unsupported SSH management action")
+        body: dict[str, Any] = {"action": action}
+        if public_key is not None:
+            body["public_key"] = public_key
+        return self._request("POST", "/v1/ssh/manage", body=body, timeout_seconds=5)
 
     def health(self) -> dict[str, Any]:
         return self._request("GET", "/v1/health")

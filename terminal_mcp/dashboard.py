@@ -6059,6 +6059,7 @@ NODES_ADMIN_HTML = """<!doctype html>
     button.icon-btn:hover { background:#233252 }
     main { flex:1; min-height:0; overflow:auto; padding:18px 24px 24px }
     #cards { display:grid; grid-template-columns:repeat(auto-fill, minmax(300px, 1fr)); gap:14px }
+    .nc-ssh { border:1px solid var(--line); border-radius:10px; padding:10px; margin:10px 0; }
     .node-card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px; cursor:pointer; transition:border-color .15s }
     .node-card:hover { border-color:var(--accent) }
     .node-card.selected { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) }
@@ -6640,6 +6641,16 @@ NODES_ADMIN_HTML = """<!doctype html>
           </div>
         </div>
         <div class="d-msg" id="detailMsg"></div>
+        <section class="nc-ssh" aria-label="Quản lý SSH">
+          <div><b>SSH</b> <span id="nodeSshStatus" class="muted">Đang đọc trạng thái…</span></div>
+          <div id="nodeSshProfile" class="muted" style="font-size:12px;margin:4px 0"></div>
+          <div class="d-actions">
+            <button id="nodeSshSetup" type="button">Thiết lập SSH</button>
+            <button id="nodeSshVerify" type="button">Kiểm tra</button>
+            <button id="nodeSshOpen" type="button" disabled>Mở terminal</button>
+            <button id="nodeSshRevoke" type="button">Thu hồi key</button>
+          </div>
+        </section>
         <table>
           <thead><tr><th>Session</th><th>Node</th><th>Windows</th><th>Đã đính kèm</th></tr></thead>
           <tbody>
@@ -6649,6 +6660,40 @@ NODES_ADMIN_HTML = """<!doctype html>
         </table>
         <div id="nodeTransports"></div>`;
       renderOnboardingSection(nodeId);
+      const sshStatusEl = document.getElementById('nodeSshStatus');
+      const sshProfileEl = document.getElementById('nodeSshProfile');
+      const sshOpenEl = document.getElementById('nodeSshOpen');
+      async function refreshNodeSsh() {
+        const r = await api('/dashboard/api/nodes/' + encodeURIComponent(nodeId) + '/ssh');
+        const ssh = r.data || {};
+        sshStatusEl.textContent = ssh.status || ssh.error || 'UNKNOWN';
+        sshProfileEl.textContent = [ssh.username && ('user ' + ssh.username), ssh.address, ssh.port && ('port ' + ssh.port),
+          ssh.host_key_fingerprint, ssh.error || ssh.detail].filter(Boolean).join(' · ');
+        sshOpenEl.disabled = !(ssh.verified || ssh.connect_available);
+        sshOpenEl.title = (ssh.verified || ssh.connect_available) ? 'Mở SSH terminal an toàn; kết nối sẽ xác minh lại host key' : 'Cần xác minh SSH thành công trước';
+      }
+      async function sshAction(operation) {
+        sshStatusEl.textContent = operation === 'setup' ? 'Đang thiết lập…' : 'Đang kiểm tra…';
+        const r = await api('/dashboard/api/nodes/' + encodeURIComponent(nodeId) + '/ssh/' + operation, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        const ssh = r.data || {};
+        sshStatusEl.textContent = ssh.status || ssh.error || ('HTTP ' + r.status);
+        sshProfileEl.textContent = [ssh.username && ('user ' + ssh.username), ssh.address, ssh.port && ('port ' + ssh.port),
+          ssh.host_key_fingerprint, ssh.error || ssh.reason || ssh.detail].filter(Boolean).join(' · ');
+        sshOpenEl.disabled = !(ssh.verified || ssh.connect_available || ssh.status === 'verified');
+        await refreshNodeSsh();
+      }
+      document.getElementById('nodeSshSetup').addEventListener('click', () => sshAction('setup'));
+      document.getElementById('nodeSshVerify').addEventListener('click', () => sshAction('verify'));
+      document.getElementById('nodeSshRevoke').addEventListener('click', async () => {
+        if (!window.confirm('Thu hồi đúng public key do Terminal MCP quản lý trên node này?')) return;
+        await sshAction('revoke');
+      });
+      sshOpenEl.addEventListener('click', () => {
+        if (!sshOpenEl.disabled) window.open('/dashboard/terminal?transport=ssh&node_id=' + encodeURIComponent(nodeId), '_blank', 'noopener');
+      });
+      refreshNodeSsh();
       document.getElementById('refreshDetailBtn').addEventListener('click', () => loadDetail(nodeId));
       const repairButton = document.getElementById('repairPairBtn');
       if (repairButton) repairButton.addEventListener('click', async () => {
@@ -12603,7 +12648,9 @@ WEBTERM_HTML = """<!doctype html>
   <script src="/dashboard/assets/xterm-addon-fit.js"></script>
   <script>
     const params = new URLSearchParams(location.search);
-    const sessionName = params.get('session') || '';
+    const sshMode = params.get('transport') === 'ssh';
+    const sshNodeId = params.get('node_id') || '';
+    const sessionName = sshMode ? `SSH ${sshNodeId}` : (params.get('session') || '');
     let takeover = params.get('takeover') === '1';
     document.getElementById('sessName').textContent = sessionName || '(thiếu tên session)';
 
@@ -12612,6 +12659,7 @@ WEBTERM_HTML = """<!doctype html>
     const attachPillEl = document.getElementById('attachPill');
     const bannerEl = document.getElementById('banner');
     const takeoverBtnEl = document.getElementById('takeoverBtn');
+    if (sshMode) takeoverBtnEl.hidden = true;
     const WS_PATH = '/dashboard/ws/terminal';
 
     const FONT_KEY = 'terminal-mcp:webterm-font-size';
@@ -12659,9 +12707,9 @@ WEBTERM_HTML = """<!doctype html>
     document.getElementById('fontMinusBtn').onclick = () => applyFontSize(fontSize - 1);
     document.getElementById('fontPlusBtn').onclick = () => applyFontSize(fontSize + 1);
 
-    if (!sessionName) {
+    if (!sessionName || (sshMode && !sshNodeId)) {
       connPillEl.textContent = '● lỗi'; connPillEl.className = 'pill err';
-      bannerEl.textContent = 'Thiếu tham số ?session=<tên session>.';
+      bannerEl.textContent = sshMode ? 'Thiếu node_id SSH.' : 'Thiếu tham số ?session=<tên session>.';
       bannerEl.className = 'show error';
       term.write('\\r\\n\\x1b[31mThiếu tham số session.\\x1b[0m\\r\\n');
       throw new Error('missing session param');
@@ -12676,7 +12724,7 @@ WEBTERM_HTML = """<!doctype html>
 
     function wsUrl() {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const q = new URLSearchParams({ session: sessionName });
+      const q = sshMode ? new URLSearchParams({ transport: 'ssh', node_id: sshNodeId }) : new URLSearchParams({ session: sessionName });
       if (takeover) q.set('takeover', '1');
       return `${proto}//${location.host}${WS_PATH}?${q.toString()}`;
     }
@@ -13475,6 +13523,11 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # server_http.py's real main() always passes an explicit,
         # persistent ConnectionStore instead of relying on this fallback.
         connection_store = ConnectionStore(ephemeral_db_path("connections", "connections.db"))
+    from .node_ssh import NodeSSHService
+    node_ssh_service = getattr(server, "node_ssh_service", None)
+    if node_ssh_service is None:
+        node_ssh_service = NodeSSHService(controller, connection_store.path.parent / "node-ssh", audit=terminal.audit)
+        server.node_ssh_service = node_ssh_service
     if projects is None:
         projects = getattr(queue, "projects", None)
     if agents is None:
@@ -17871,6 +17924,39 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         if not _origin_allowed(websocket):
             await websocket.close(code=4403)
             return
+        if websocket.query_params.get("transport") == "ssh":
+            blocked, _identity = _mutation_guard(websocket)
+            if blocked is not None or not terminal.config.permissions.terminal_input:
+                await websocket.close(code=4403)
+                return
+            node_id = websocket.query_params.get("node_id", "")
+            try:
+                verified = await anyio.to_thread.run_sync(lambda: node_ssh_service.verify(node_id))
+                if verified.get("status") != "verified":
+                    await websocket.close(code=4404, reason=str(verified.get("status") or "ssh_not_ready")[:100])
+                    return
+                argv = node_ssh_service.connect_argv(node_id)
+            except (ValueError, OSError):
+                await websocket.close(code=4404)
+                return
+            from .webterm import SshWebTerminalProcess
+            await websocket.accept()
+            try:
+                proc = await anyio.to_thread.run_sync(lambda: SshWebTerminalProcess(argv, readonly=False))
+            except OSError:
+                await websocket.send_json({"type": "closed", "reason": "ssh_client_unavailable"})
+                await websocket.close()
+                return
+            terminal.audit.record(action="node_ssh_terminal_open", session=None, node_id=node_id,
+                                  result="OPENED", source_transport="dashboard")
+            try:
+                await websocket.send_json({"type": "ready", "session": "managed-ssh-terminal", "readonly": False})
+                await pump_websocket(websocket, proc)
+            finally:
+                await anyio.to_thread.run_sync(proc.close)
+                terminal.audit.record(action="node_ssh_terminal_close", session=None, node_id=node_id,
+                                      result="DETACHED", source_transport="dashboard")
+            return
         session = websocket.query_params.get("session", "")
         takeover_requested = websocket.query_params.get("takeover") == "1"
         if not valid_session_name(session):
@@ -18054,6 +18140,54 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return {"nodes": [_node_to_dict(n) for n in nodes], "controller_endpoints": endpoints}
 
         result = await anyio.to_thread.run_sync(_compute)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/ssh", methods=["GET"], include_in_schema=False)
+    async def node_ssh_status(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        node_id = request.path_params.get("node_id", "")
+        try:
+            from .remote_connect import validate_node_id
+            validate_node_id(node_id)
+        except ValueError:
+            return JSONResponse({"status": "error", "error": "INVALID_NODE_ID"}, status_code=400,
+                                headers={"Cache-Control": "no-store"})
+        result = await anyio.to_thread.run_sync(lambda: node_ssh_service.status(node_id))
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @server.custom_route("/dashboard/api/nodes/{node_id}/ssh/{operation}", methods=["POST"], include_in_schema=False)
+    async def node_ssh_mutation(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        node_id, operation = request.path_params.get("node_id", ""), request.path_params.get("operation", "")
+        try:
+            from .remote_connect import validate_node_id
+            validate_node_id(node_id)
+        except ValueError:
+            return JSONResponse({"status": "error", "error": "INVALID_NODE_ID"}, status_code=400,
+                                headers={"Cache-Control": "no-store"})
+        if operation not in {"setup", "verify", "revoke"}:
+            return JSONResponse({"status": "error", "error": "INVALID_OPERATION"}, status_code=400,
+                                headers={"Cache-Control": "no-store"})
+        # Profile fields always come from the registered node and authenticated
+        # node operation. Request bodies cannot override host/user/key/command.
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse({"status": "error", "error": "INVALID_REQUEST"}, status_code=400,
+                                headers={"Cache-Control": "no-store"})
+        if body not in ({}, None):
+            return JSONResponse({"status": "error", "error": "INVALID_REQUEST"}, status_code=400,
+                                headers={"Cache-Control": "no-store"})
+        result = await anyio.to_thread.run_sync(lambda: getattr(node_ssh_service, operation)(node_id))
+        terminal.audit.record(action=f"node_ssh_{operation}", session=None,
+                              result=str(result.get("status") or "UNKNOWN"),
+                              reason=str(result.get("error") or result.get("reason") or "")[:200] or None,
+                              source_transport="dashboard", actor=getattr(identity, "subject", None),
+                              node_id=node_id)
         return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
     @server.custom_route("/dashboard/api/node", methods=["GET"], include_in_schema=False)

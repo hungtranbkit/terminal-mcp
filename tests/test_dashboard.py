@@ -1429,6 +1429,8 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         # Multi-node capability refresh (this batch) -- listed so this
         # inventory guard keeps catching UNINTENDED route changes.
         "/dashboard/api/nodes/{node_id}/refresh-capabilities": {"POST"},
+        "/dashboard/api/nodes/{node_id}/ssh": {"GET", "HEAD"},
+        "/dashboard/api/nodes/{node_id}/ssh/{operation}": {"POST"},
         # Windows node onboarding (docs/windows-node-onboarding.md). Two
         # audiences, and the split matters more here than anywhere else on
         # this list, so it is spelled out rather than left to the reader.
@@ -2605,3 +2607,52 @@ def test_one_unreachable_session_does_not_fail_the_whole_summary(read_config):
 
     assert response.status_code == 200
     assert response.json()["runtime_untracked"] == 1, "the healthy one still counts"
+
+
+def test_node_ssh_dashboard_setup_requires_mutation_origin_and_never_accepts_target_override(monkeypatch, tmp_path):
+    from terminal_mcp.node_ssh import NodeSSHService
+
+    calls = []
+    monkeypatch.setattr(NodeSSHService, "setup", lambda self, node_id: calls.append(node_id) or {
+        "node_id": node_id, "status": "needs_admin", "reason": "requires administrator"})
+    service = TerminalService(AppConfig(
+        PermissionsConfig(True, True), ("test-*",), 50, 20,
+        InputPolicyConfig(allowed_session_patterns=("test-*",)),
+    ))
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    app = server.streamable_http_app()
+
+    denied = TestClient(app).post("/dashboard/api/nodes/hp-linux/ssh/setup", json={})
+    assert denied.status_code == 403
+    assert denied.json()["error"] == "ORIGIN_NOT_ALLOWED"
+    assert calls == []
+
+    client = TestClient(app, headers={"Origin": "http://testserver"})
+    invalid = client.post("/dashboard/api/nodes/hp-linux/ssh/setup", json={"host": "127.0.0.1", "username": "root"})
+    assert invalid.status_code == 400
+    assert calls == []
+    result = client.post("/dashboard/api/nodes/hp-linux/ssh/setup", json={})
+    assert result.status_code == 200
+    assert result.json()["status"] == "needs_admin"
+    assert calls == ["hp-linux"]
+
+
+def test_ssh_websocket_requires_mutations_enabled_before_profile_use(monkeypatch):
+    from terminal_mcp.node_ssh import NodeSSHService
+
+    def should_not_verify(self, node_id):
+        raise AssertionError("SSH profile must not be used before the mutation guard")
+    monkeypatch.setattr(NodeSSHService, "verify", should_not_verify)
+    config = AppConfig(
+        PermissionsConfig(True, True), ("test-*",), 50, 20,
+        InputPolicyConfig(allowed_session_patterns=("test-*",)),
+        dashboard=DashboardConfig(mutations_enabled=False),
+    )
+    service = TerminalService(config)
+    server = build_mcp(service)
+    register_dashboard(server, service)
+    client = TestClient(server.streamable_http_app(), headers={"Origin": "http://testserver"})
+    with pytest.raises(Exception):
+        with client.websocket_connect("/dashboard/ws/terminal?transport=ssh&node_id=hp-linux"):
+            pass

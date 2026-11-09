@@ -434,7 +434,7 @@ async def test_heartbeat_post_uses_explicit_controller_user_agent(monkeypatch, c
         )
 
     assert len(requests) == 1
-    assert requests[0].get_header("User-agent") == "TerminalMCP-node-agent/0.13"
+    assert requests[0].get_header("User-agent") == "TerminalMCP-node-agent/0.14"
     assert token not in caplog.text
 
 
@@ -537,3 +537,27 @@ def test_the_agent_cli_hands_its_own_node_id_to_the_session_registry(tmp_path, m
 
     assert seen.get("registry_node_id") == "hp-linux", \
         "the agent must record sessions under the id it registers and heartbeats as"
+
+
+def test_ssh_management_route_requires_bearer_auth_and_uses_fixed_action(monkeypatch, agent_client):
+    from terminal_mcp import node_ssh_agent
+
+    calls = []
+    monkeypatch.setattr(node_ssh_agent, "manage_ssh", lambda action, public_key=None: calls.append((action, public_key)) or {"status": "ready"})
+
+    denied = agent_client.post("/v1/ssh/manage", json={"action": "status"})
+    assert denied.status_code == 401
+    assert calls == []
+
+    response = agent_client.post("/v1/ssh/manage", headers=_auth(), json={"action": "status"})
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready", "node_id": "test-node"}
+    assert calls == [("status", None)]
+
+
+def test_ssh_management_route_rejects_arbitrary_target_fields(agent_client):
+    response = agent_client.post("/v1/ssh/manage", headers=_auth(),
+                                 json={"action": "setup", "public_key": "key", "username": "root",
+                                       "host": "169.254.169.254", "command": "id"})
+    assert response.status_code == 200
+    assert response.json()["error"] == "invalid_request"
