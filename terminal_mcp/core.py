@@ -4456,7 +4456,8 @@ class TerminalService:
                                 initial_prompt: str | None = None, grant_mode: str = "none",
                                 binding: str | None = None, requested_by: str | None = None,
                                 show_on_desktop: bool = False,
-                                resume_session_id: str | None = None) -> dict[str, Any]:
+                                resume_session_id: str | None = None,
+                                permission_mode: str | None = None) -> dict[str, Any]:
         """Create a new detached tmux session running a plain shell, or
         Claude/Codex via a server-side-only launcher (config.session_
         lifecycle.launch_commands -- agent_type never becomes a command
@@ -4492,11 +4493,10 @@ class TerminalService:
         so a LATER registry_reopen -- even after this process's own
         node-agent restarts -- can find it. A non-resume-capable
         agent_type (including "shell") is completely unaffected: no extra
-        args, no conversation_id recorded, exactly today's behavior. Codex is
-        an explicit exception when a caller supplies resume_session_id:
-        Codex 0.153.4 requires `--ask-for-approval never --sandbox
-        workspace-write resume <id>`, and recovery must not use the normal
-        new-session YOLO flag."""
+        args, no conversation_id recorded, exactly today's behavior. Codex
+        resume uses the same explicit per-session permission mode as a fresh
+        launch: owner mode passes the verified `--yolo` flag before `resume`,
+        while native mode preserves CLI-native approval behavior."""
         action = "create_session"
         headless = getattr(self, "headless_store", None)
         if headless is not None and any(row["target"] == name and row["state"] != "RELEASED"
@@ -4556,17 +4556,16 @@ class TerminalService:
                                "session_lifecycle.max_sessions")}
         conversation_id: str | None = None
         extra_args: tuple[str, ...] = ()
+        effective_permission_mode = permission_mode or lifecycle_cfg.default_permission_mode
+        if effective_permission_mode not in {"owner", "native"}:
+            return {"error": "INVALID_PERMISSION_MODE", "session": name}
         if agent_type == "codex" and resume_session_id:
-            # Keep every value as a separate argv token; no shell parsing or
-            # interpolation is involved. Recovery is explicitly bounded to
-            # the workspace and approval policy requested by the caller.
             conversation_id = resume_session_id
-            extra_args = ("--ask-for-approval", "never", "--sandbox", "workspace-write",
-                          "resume", resume_session_id)
-        elif agent_type == "codex" and self.config.session_lifecycle.codex_yolo:
-            # Audited against Codex CLI --help on local and Windows 0.153.4:
-            # one argv token, never shell-concatenated or duplicated.
-            extra_args += ("--dangerously-bypass-approvals-and-sandbox",)
+            # Keep the explicit per-session opt-out on recovery. Owner mode
+            # uses the same verified --yolo policy as a fresh launch.
+            extra_args = (("resume", resume_session_id) if effective_permission_mode == "owner" else
+                          ("--ask-for-approval", "never", "--sandbox", "workspace-write",
+                           "resume", resume_session_id))
         if agent_type in self.config.session_lifecycle.resume_capable_agent_types and not (
                 agent_type == "codex" and resume_session_id):
             if resume_session_id:
@@ -4576,7 +4575,7 @@ class TerminalService:
                 conversation_id = str(uuid.uuid4())
                 extra_args = ("--session-id", conversation_id)
         result = self.lifecycle.create(name, agent_type, cwd, show_on_desktop=show_on_desktop,
-                                       extra_args=extra_args)
+                                       extra_args=extra_args, permission_mode=effective_permission_mode)
         ok = "error" not in result
         self.audit.record(action=action, session=name, result="CREATED" if ok else "BLOCKED",
                           reason=result.get("error") or f"agent_type={agent_type}")
@@ -4598,6 +4597,7 @@ class TerminalService:
         self.session_registry.upsert_seen(
             self.REGISTRY_LOCAL_NODE_ID, name, backend_type=self._registry_backend_type(),
             cwd=result.get("cwd"), agent_type=agent_type, conversation_id=conversation_id,
+            permission_mode=effective_permission_mode,
             # The launcher we ACTUALLY ran, from the same lookup that ran it --
             # now the only place a launch_command is ever written, which is
             # what its docstring always claimed.
@@ -5211,7 +5211,11 @@ class TerminalService:
             return {"error": "REOPEN_METADATA_INCOMPLETE", "session": name, "missing": ["working_directory"]}
         used_saved_metadata_only = record is not None and agent_type is None and cwd is None
         result = self.terminal_create_session(name, effective_agent_type, effective_cwd,
-                                              grant_mode=grant_mode, requested_by=requested_by)
+                                              grant_mode=grant_mode, requested_by=requested_by,
+                                              permission_mode=(self.session_registry.get(
+                                                  self.REGISTRY_LOCAL_NODE_ID, name).permission_mode
+                                                  if self.session_registry.get(self.REGISTRY_LOCAL_NODE_ID, name)
+                                                  else None))
         result["reopened_from_metadata"] = used_saved_metadata_only
         if "error" not in result:
             self.killed_sessions.clear(name)
@@ -5253,6 +5257,7 @@ class TerminalService:
             # py's own migration docstring for what each of these means.
             "stable_session_id": record.stable_session_id, "worktree_path": record.worktree_path,
             "auto_recovery_enabled": record.auto_recovery_enabled,
+            "permission_mode": record.permission_mode,
             "last_checkpoint_at": record.last_checkpoint_at,
             "last_checkpoint_detail": record.last_checkpoint_detail,
             "recovery_generation": record.recovery_generation, "recovery_attempts": record.recovery_attempts,
@@ -5357,7 +5362,8 @@ class TerminalService:
                 detail=f"resuming conversation {resume_target}")
         result = self.terminal_create_session(session_name, effective_agent_type, effective_cwd,
                                               grant_mode=grant_mode, requested_by=requested_by,
-                                              resume_session_id=resume_target)
+                                              resume_session_id=resume_target,
+                                              permission_mode=record.permission_mode)
         result["recreated_from_registry"] = True
         if "error" in result:
             if resume_target:
@@ -5371,6 +5377,7 @@ class TerminalService:
         self.session_registry.upsert_seen(
             self.REGISTRY_LOCAL_NODE_ID, session_name, backend_type=self._registry_backend_type(),
             cwd=effective_cwd, agent_type=effective_agent_type, conversation_id=resume_target,
+            permission_mode=record.permission_mode,
         )
         # Same watchdog close-out _reconcile_session_registry's own
         # ordinary ACTIVE path already does -- without this, a drop event

@@ -748,6 +748,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
             binding=body.get("binding"), requested_by=body.get("requested_by"),
             show_on_desktop=bool(body.get("show_on_desktop", False)),
             resume_session_id=body.get("resume_session_id"),
+            permission_mode=body.get("permission_mode"),
         ))
         return JSONResponse(result)
 

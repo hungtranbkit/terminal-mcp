@@ -717,11 +717,19 @@ class SessionLifecycleConfig:
     conversation continuity it can't verify)."""
     enabled: bool = False
     allowed_cwd_roots: tuple[str, ...] = ()
+    # Durable owner preference for newly-created and reopened agent sessions.
+    # `native` is an explicit per-session opt-out exposed by the create API.
+    # Project roots are exact canonical Git roots; linked worktrees are
+    # admitted only when their verified git-common-dir maps back to one of
+    # these roots.
+    trusted_project_roots: tuple[str, ...] = ()
+    default_permission_mode: str = "owner"
     protected_sessions: tuple[str, ...] = ("terminal-mcp",)
     launch_commands: tuple[tuple[str, str], ...] = (("claude", "claude"), ("codex", "codex"))
     resume_capable_agent_types: tuple[str, ...] = ("claude",)
     # Codex CLI's current, audited YOLO flag. Shared by create and
     # registry-reopen; never assembled by individual callers.
+    # Legacy compatibility only. New configuration uses default_permission_mode.
     codex_yolo: bool = False
     create_ready_timeout_seconds: float = 5.0
     default_grant_mode: str = "none"
@@ -2757,6 +2765,18 @@ def _load_session_lifecycle_config(raw: object) -> SessionLifecycleConfig:
     roots = raw.get("allowed_cwd_roots", [])
     if not isinstance(roots, list) or not all(isinstance(r, str) and r for r in roots):
         raise ValueError("session_lifecycle.allowed_cwd_roots must be a list of strings")
+    project_roots = raw.get("trusted_project_roots", [])
+    if not isinstance(project_roots, list) or not all(isinstance(p, str) and p.strip() for p in project_roots):
+        raise ValueError("session_lifecycle.trusted_project_roots must be a list of non-empty paths")
+    permission_mode = raw.get("default_permission_mode")
+    if permission_mode is None:
+        # Preserve explicit legacy opt-outs until operators migrate them;
+        # brand-new configurations inherit the durable owner preference.
+        permission_mode = ("owner" if raw.get("codex_yolo") is True else
+                           "native" if raw.get("codex_yolo") is False and "codex_yolo" in raw else
+                           SessionLifecycleConfig.default_permission_mode)
+    if permission_mode not in ("owner", "native"):
+        raise ValueError("session_lifecycle.default_permission_mode must be 'owner' or 'native'")
     protected = raw.get("protected_sessions", ["terminal-mcp"])
     if not isinstance(protected, list) or not all(isinstance(p, str) and p for p in protected):
         raise ValueError("session_lifecycle.protected_sessions must be a list of strings")
@@ -2823,8 +2843,11 @@ def _load_session_lifecycle_config(raw: object) -> SessionLifecycleConfig:
         raise ValueError("session_lifecycle.codex_yolo must be a boolean")
     if os.environ.get("TERMINAL_MCP_CODEX_YOLO") is not None:
         codex_yolo_raw = os.environ["TERMINAL_MCP_CODEX_YOLO"].strip().lower() == "true"
+        if "default_permission_mode" not in raw:
+            permission_mode = "owner" if codex_yolo_raw else "native"
     return SessionLifecycleConfig(
-        enabled=enabled, allowed_cwd_roots=tuple(roots), protected_sessions=protected_set,
+        enabled=enabled, allowed_cwd_roots=tuple(roots), trusted_project_roots=tuple(project_roots),
+        default_permission_mode=permission_mode, protected_sessions=protected_set,
         launch_commands=tuple(sorted(launch_raw.items())), create_ready_timeout_seconds=timeout,
         default_grant_mode=grant_mode, resume_capable_agent_types=tuple(resume_capable_raw),
         codex_yolo=codex_yolo_raw, max_sessions=max_sessions,

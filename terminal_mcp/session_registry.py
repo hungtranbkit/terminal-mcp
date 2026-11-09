@@ -170,6 +170,13 @@ def _add_tombstone_generation_columns(connection: sqlite3.Connection) -> None:
     connection.execute("ALTER TABLE session_records ADD COLUMN tombstone_identity TEXT")
 
 
+def _add_permission_mode_column(connection: sqlite3.Connection) -> None:
+    # Existing sessions were launched before this owner preference existed.
+    # Preserve their CLI-native mode until an operator deliberately recreates
+    # them after checkpointing, instead of silently changing a recovery path.
+    connection.execute("ALTER TABLE session_records ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'native'")
+
+
 REGISTRY_MIGRATIONS: list[Migration] = [
     Migration(1, "baseline: session_records", lambda connection: None),
     # Conversation-continuity follow-up (2026-09-07): `conversation_id`
@@ -191,6 +198,8 @@ REGISTRY_MIGRATIONS: list[Migration] = [
              _add_launch_provenance_column),
     Migration(5, "delete tombstone identity + per-name creation generation",
              _add_tombstone_generation_columns),
+    Migration(6, "persist per-session CLI permission mode",
+             _add_permission_mode_column),
 ]
 
 #: What this process called its own node before the deployment gave the
@@ -331,6 +340,7 @@ class SessionRecord:
     # explicit delete tombstoned -- see _add_tombstone_generation_columns.
     generation: int = 1
     tombstone_identity: str | None = None
+    permission_mode: str | None = None
 
     @property
     def recoverable(self) -> bool:
@@ -365,7 +375,7 @@ def _upsert_seen_params(node_id: str, session_name: str, existing: "SessionRecor
                         read_granted: bool, input_granted: bool,
                         binding_names: tuple[str, ...], backfill_project: bool,
                         conversation_id: str | None, worktree_path: str | None,
-                        created_by_controller: bool) -> tuple:
+                        created_by_controller: bool, permission_mode: str | None = None) -> tuple:
     """The parameter tuple for _UPSERT_SEEN_SQL, given the row already on disk.
 
     Pure: it does no database work at all, which is what lets the one-at-a-time
@@ -403,7 +413,8 @@ def _upsert_seen_params(node_id: str, session_name: str, existing: "SessionRecor
             git_branch, last_commit, agent_type, launch_command, launcher_type,
             created_at, now, now, last_known_state,
             int(metadata_complete), int(read_granted), int(input_granted), now, binding_json,
-            conversation_id, stable_session_id, worktree_path, int(created_by_controller))
+            conversation_id, stable_session_id, worktree_path, int(created_by_controller),
+            permission_mode or (existing.permission_mode if existing else None) or "native")
 
 
 _UPSERT_SEEN_SQL = (
@@ -413,9 +424,9 @@ _UPSERT_SEEN_SQL = (
                     created_at, last_seen_at, last_activity_at, last_known_state, status,
                     killed_at, deleted_at, offline_at, metadata_complete,
                     read_granted, input_granted, grant_updated_at, binding_names, conversation_id,
-                    stable_session_id, worktree_path, created_by_controller)
+                    stable_session_id, worktree_path, created_by_controller, permission_mode)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE',
-                           NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(node_id, session_name) DO UPDATE SET
                        node_name = excluded.node_name, backend_type = excluded.backend_type,
                        cwd = excluded.cwd, repo_root = excluded.repo_root,
@@ -431,6 +442,7 @@ _UPSERT_SEEN_SQL = (
                        grant_updated_at = excluded.grant_updated_at, binding_names = excluded.binding_names,
                        conversation_id = COALESCE(excluded.conversation_id, session_records.conversation_id),
                        worktree_path = COALESCE(excluded.worktree_path, session_records.worktree_path),
+                       permission_mode = COALESCE(excluded.permission_mode, session_records.permission_mode),
                        -- Latches TRUE and never back: a session this controller
                        -- created stays ours through every later discovery pass,
                        -- and a discovery pass can never claim one it did not.
@@ -477,6 +489,7 @@ def _from_row(row: sqlite3.Row | None) -> SessionRecord | None:
         recovery_generation=row["recovery_generation"], recovery_attempts=row["recovery_attempts"],
         created_by_controller=bool(row["created_by_controller"]),
         generation=int(row["generation"] or 1), tombstone_identity=row["tombstone_identity"],
+        permission_mode=row["permission_mode"],
     )
 
 
@@ -705,6 +718,7 @@ class SessionRegistryStore:
                     binding_names: tuple[str, ...] = (), backfill_project: bool = True,
                     conversation_id: str | None = None, worktree_path: str | None = None,
                     created_by_controller: bool = False,
+                    permission_mode: str | None = None,
                     identity: str | None = None, created_epoch: Any = None,
                     now: str | None = None) -> SessionRecord:
         """Called on every reconcile pass for a session CURRENTLY observed
@@ -740,7 +754,8 @@ class SessionRegistryStore:
             last_known_state=last_known_state, read_granted=read_granted,
             input_granted=input_granted, binding_names=binding_names,
             backfill_project=backfill_project, conversation_id=conversation_id,
-            worktree_path=worktree_path, created_by_controller=created_by_controller)
+            worktree_path=worktree_path, created_by_controller=created_by_controller,
+            permission_mode=permission_mode)
         with self._connection() as connection:
             connection.execute(_UPSERT_SEEN_SQL, params)
         return self.get(node_id, session_name)
@@ -803,7 +818,8 @@ class SessionRegistryStore:
                     backfill_project=bool(row.get("backfill_project", True)),
                     conversation_id=row.get("conversation_id"),
                     worktree_path=row.get("worktree_path"),
-                    created_by_controller=bool(row.get("created_by_controller", False)))
+                    created_by_controller=bool(row.get("created_by_controller", False)),
+                    permission_mode=row.get("permission_mode"))
                 for row in rows
             ]
             connection.executemany(_UPSERT_SEEN_SQL, params)

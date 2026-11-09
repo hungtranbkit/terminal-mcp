@@ -893,6 +893,7 @@ class CompactTerminalTools:
              overwrite: bool = False, mode: str | None = None,
              idempotency_key: str | None = None,
              agent_type: str = "shell", working_directory: str | None = None,
+             permission_mode: str | None = None,
              initial_prompt: str | None = None, grant_mode: str = "none",
              binding: str | None = None, node: str = "auto",
              title: str | None = None, priority: int = 0,
@@ -1000,7 +1001,8 @@ class CompactTerminalTools:
                 return {"error": "HEADLESS_REMOTE_NODE_UNSUPPORTED", "node": node}
             return manager.turn(normalized, target=target, text=text or initial_prompt,
                                 cwd=working_directory, key=idempotency_key or request_key,
-                                task_id=task_id, agent=agent_type)
+                                task_id=task_id, agent=agent_type,
+                                permission_mode=permission_mode)
 
         if normalized in TURN_HANDLER_ACTIONS:
             return self._handler_turn(
@@ -1759,7 +1761,7 @@ class CompactTerminalTools:
             "create_session": lambda: handler(
                 target.strip(), agent_type=agent_type, working_directory=working_directory,
                 initial_prompt=initial_prompt, grant_mode=grant_mode, binding=binding,
-                node=node),
+                node=node, permission_mode=permission_mode),
             "delete_session": lambda: (handler(target.strip(), confirm=args["confirm"])
                                         if args and "confirm" in args else handler(target.strip())),
             "enqueue_task": lambda: handler(

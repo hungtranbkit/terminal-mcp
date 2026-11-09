@@ -1,3 +1,5 @@
+import pytest
+
 from terminal_mcp.models import SessionInfo
 from terminal_mcp.status import (
     classify_status,
@@ -19,6 +21,27 @@ def test_waiting_prompt_near_bottom():
     waiting, reason = detect_waiting_input("work\nDo you want to continue? [y/N]")
     assert waiting
     assert "matched" in reason
+
+
+def test_powershell_continuation_is_waiting_not_idle_or_unknown():
+    state, required, reason = classify_status(info("powershell.exe", 1), "Write-Output 'unfinished\n>>", now=100)
+    assert state == "WAITING_INPUT"
+    assert required is True
+    assert "POWERSHELL_CONTINUATION_UNTERMINATED_COMMAND" in reason
+
+
+def test_auth_and_rate_limit_blocker_names_are_structured():
+    from terminal_mcp.status import prompt_blocker_reason
+    assert prompt_blocker_reason("codex", "Sign in to Codex to continue") == "NEEDS_LOGIN"
+    assert prompt_blocker_reason("claude", "Weekly limit reached; try again after reset") == "RATE_LIMITED"
+
+
+@pytest.mark.parametrize("command", ["codex.exe", "node.exe"])
+def test_windows_codex_executable_and_node_wrappers_use_codex_footer(command):
+    pane = "OpenAI Codex\n› Ask Codex to do anything"
+    state, required, _reason = classify_status(info(command, activity=0), pane, now=100)
+    assert state == "IDLE"
+    assert required is False
 
 
 def test_old_prompt_not_false_positive():

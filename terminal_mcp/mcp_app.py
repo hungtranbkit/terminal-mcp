@@ -817,6 +817,7 @@ def build_mcp(service: TerminalService | None = None,
                           "send/supervise: stable key; a retry with the same key returns the same "
                           "task/receipt and never sends twice. supervise_status also accepts it."))] = None,
                       agent_type: str = "shell", working_directory: str | None = None,
+                      permission_mode: str | None = None,
                       initial_prompt: str | None = None, grant_mode: str = "none",
                       binding: str | None = None, node: str = "auto",
                       title: str | None = None, priority: int = 0,
@@ -885,8 +886,10 @@ Direct actions:
                 States: DISPATCHING (persisted/submitted, execution not yet
                 observed) -> RUNNING (observed: busy footer or an answer after
                 the echoed prompt). STUCK_COMPOSER (prompt still in composer;
-                bounded Enter-only recovery), WAITING_INPUT (dialog/menu needs
-                a human -- never auto-answered), DISPATCH_UNCERTAIN (no evidence;
+                bounded Enter-only recovery), WAITING_INPUT (unrecognized,
+                authentication, or ambiguous prompt needs a human; owner-mode
+                launch resolves only exact non-granting startup choices),
+                DISPATCH_UNCERTAIN (no evidence;
                 not resent). Each task carries next_action and receipts.
   supervise_status/supervise_complete/supervise_cancel  (task_id; status also
                 takes idempotency_key or target)
@@ -923,6 +926,7 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
             compact=compact, idempotency_key=idempotency_key,
             path=path, content_b64=content_b64, overwrite=overwrite, mode=mode,
             confirm=confirm, agent_type=agent_type, working_directory=working_directory,
+            permission_mode=permission_mode,
             initial_prompt=initial_prompt, grant_mode=grant_mode, binding=binding,
             node=node, title=title, priority=priority, metadata=metadata,
             request_key=request_key, task_id=task_id, task_ids=task_ids,
@@ -1227,6 +1231,7 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
 
     @server.tool()
     def terminal_create_session(name: str, agent_type: str = "shell", working_directory: str | None = None,
+                                permission_mode: str | None = None,
                                 initial_prompt: str | None = None, grant_mode: str = "none",
                                 binding: str | None = None, node: str = "auto",
                                 show_on_desktop: bool = False) -> dict:
@@ -1281,6 +1286,7 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         result = controller.terminal_create_session(
             name, agent_type, working_directory, node=node, initial_prompt=initial_prompt,
             grant_mode=grant_mode, binding=binding, requested_by="mcp", show_on_desktop=show_on_desktop,
+            permission_mode=permission_mode,
         )
         if isinstance(result, dict) and "error" not in result:
             # A fresh session's label: its initial_prompt, else none (this

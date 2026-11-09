@@ -5164,9 +5164,16 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
         <div class="cs-hint" id="csNodeHint"></div>
       </div>
       <div>
-        <label for="csCwd">Working directory (tuỳ chọn)</label>
-        <input type="text" id="csCwd" maxlength="512" placeholder="Để trống = workspace mặc định của node" autocomplete="off">
-        <div class="cs-hint">Linux thêm qua Add Node mặc định dùng ~/workspace trên node đó (tự tạo và chỉ trust workspace này lần đầu). Có thể nhập thư mục khác nếu node cho phép.</div>
+        <label for="csCwd">Project/worktree path</label>
+        <input type="text" id="csCwd" maxlength="512" placeholder="Absolute path to an approved project/worktree" autocomplete="off">
+        <div class="cs-hint">Claude/Codex require an existing, configured trusted Git project path. There is no home-directory fallback.</div>
+      </div>
+      <div>
+        <label for="csPermissionMode">Agent permission mode</label>
+        <select id="csPermissionMode">
+          <option value="owner" selected>Owner preference (Claude skip-permissions / Codex YOLO)</option>
+          <option value="native">Use CLI-native permission prompts for this session</option>
+        </select>
       </div>
       <div>
         <label for="csGrant">Quyền truy cập cho bạn</label>
@@ -5204,6 +5211,7 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     const csFormEl = document.querySelector('#csForm');
     const csNameEl = document.querySelector('#csName');
     const csCwdEl = document.querySelector('#csCwd');
+    const csPermissionModeEl = document.querySelector('#csPermissionMode');
     const csGrantEl = document.querySelector('#csGrant');
     const csShowOnDesktopEl = document.querySelector('#csShowOnDesktop');
     const csAgentChoicesEl = document.querySelector('#csAgentChoices');
@@ -5512,6 +5520,11 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
         csErrorEl.textContent = 'Tên session không hợp lệ (chỉ chữ/số/._- , không bắt đầu bằng "-" hoặc ".").';
         return;
       }
+      if (csSelectedAgent !== 'shell' && !cwd) {
+        csErrorEl.textContent = 'Nhập đường dẫn tuyệt đối của project/worktree đã được cấu hình trust.';
+        csCwdEl.focus();
+        return;
+      }
       // Task item 7: re-validate the explicit node choice right before
       // submit -- it may have gone offline/overloaded/lost capability in
       // the time the form was open. Auto is always re-checked by the
@@ -5538,7 +5551,7 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       try {
         const response = await fetch('/dashboard/api/session/create', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({name, agent_type: csSelectedAgent, cwd: cwd || null, node: chosenNode, grant_mode: csGrantEl.value, show_on_desktop: csShowOnDesktopEl.checked}),
+          body: JSON.stringify({name, agent_type: csSelectedAgent, cwd: cwd || null, node: chosenNode, grant_mode: csGrantEl.value, permission_mode: csPermissionModeEl.value, show_on_desktop: csShowOnDesktopEl.checked}),
         });
         const result = await response.json().catch(() => ({}));
         if (result && result.error) {
@@ -17298,6 +17311,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
         if cwd is not None and not isinstance(cwd, str):
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        permission_mode = body.get("permission_mode", "owner") if isinstance(body, dict) else "owner"
+        if permission_mode not in ("owner", "native"):
+            return JSONResponse({"error": "INVALID_PERMISSION_MODE"}, status_code=400)
         # Real usability gap reported live: the dashboard's "Tạo session"
         # button never requested a grant, so a session created here always
         # started completely unreadable/un-sendable -- the operator had to
@@ -17323,12 +17339,12 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # says whether it really did.
         show_on_desktop = bool(body.get("show_on_desktop", False)) if isinstance(body, dict) else False
         granted_by = identity.email if identity else None
-        _log.info("dashboard create_session name=%s agent_type=%s node=%s grant_mode=%s show_on_desktop=%s identity=%s",
-                 name, agent_type, node, grant_mode, show_on_desktop, granted_by)
+        _log.info("dashboard create_session name=%s agent_type=%s node=%s grant_mode=%s permission_mode=%s show_on_desktop=%s identity=%s",
+                 name, agent_type, node, grant_mode, permission_mode, show_on_desktop, granted_by)
         result = await anyio.to_thread.run_sync(
             lambda: _routed(lambda: controller.terminal_create_session(
                 name, agent_type, cwd, node=node, grant_mode=grant_mode, requested_by=granted_by,
-                show_on_desktop=show_on_desktop))
+                show_on_desktop=show_on_desktop, permission_mode=permission_mode))
         )
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})

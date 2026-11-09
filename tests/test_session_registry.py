@@ -69,6 +69,15 @@ def test_upsert_seen_creates_active_record_with_backfilled_project(store, tmp_pa
     assert record.git_remote == "https://example.com/t/proj.git"
     assert record.metadata_complete is True
     assert record.key() == "local/myproj"
+    assert record.permission_mode == "native"  # pre-policy observed sessions keep their launch behavior
+
+
+def test_permission_mode_is_persisted_only_when_explicitly_changed(store):
+    created = store.upsert_seen("local", "agent", agent_type="codex", cwd="/tmp/project",
+                                permission_mode="owner")
+    observed = store.upsert_seen("local", "agent", agent_type="codex", cwd="/tmp/project")
+    assert created.permission_mode == "owner"
+    assert observed.permission_mode == "owner"
 
 
 def test_upsert_seen_shell_agent_is_metadata_complete_without_cwd(store):

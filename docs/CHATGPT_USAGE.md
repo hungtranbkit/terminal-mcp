@@ -149,7 +149,39 @@ not only after it. None of these checkpoint calls dispatches or changes project 
 
 At task completion, verify results, keep a recoverable checkpoint/commit and close its obsolete session. Audit again before the next create. Existing server-side `reap_idle_sessions` reclaims only a narrow category of idle shell/dead panes at capacity; it is **not a substitute** for this pre-create fleet audit. Config `session_lifecycle.agent_cleanup` is off by default and keeps unverified coding sessions open; do not flip it on as part of this rule.
 
-## 2b. Reading a repository directly (`repo_*` — READ-ONLY)
+## 2b. Persistent owner-authorized CLI launch policy
+
+The operator's persistent preference is `session_lifecycle.default_permission_mode: owner`.
+For a newly created or reopened Claude session, Terminal MCP passes the installed CLI's
+`--dangerously-skip-permissions`; for Codex it passes `--yolo`. A per-session
+`permission_mode="native"` is an explicit opt-out. This is scoped to the existing user
+process and OS account: it does not grant sudo/admin rights, alter account policy, or
+approve work outside the assigned task.
+
+Claude/Codex launch requires an explicit absolute project/worktree path under
+`allowed_cwd_roots`. Its Git common directory must map to an exact entry in
+`trusted_project_roots`; linked worktrees are accepted only after that mapping is
+verified. Terminal MCP records the supported exact-project CLI trust setting and
+verifies the requested mode flag in the spawned process tree. It never falls back to
+HOME or a generic workspace, and an unconfigured or missing project fails with a
+structured error. Add trusted roots one repository at a time; do not trust `/`, the
+whole home directory, or arbitrary tool-output paths.
+
+This owner policy handles ordinary CLI permission prompts within the assigned task.
+It may dismiss only recognized non-disruptive startup/update notices and may choose
+the explicit Codex "continue without trusting" option. It never chooses "Trust all",
+changes the selected model, saves newly expanded permissions, or submits arbitrary
+pane text. Login/OTP/password, missing credentials, usage limits, ambiguous choices,
+unowned commands, and destructive work outside the task remain single actionable
+blockers; preserve the session and its output while blocked.
+
+The dashboard create form defaults to owner mode and exposes `native` as a per-session
+choice. Existing registry entries migrate as `native` so reopening a legacy session
+does not silently change its CLI permission policy; newly created sessions default to
+the persistent owner preference. Always provide the exact project/worktree path for
+agent sessions. `shell` sessions retain their existing shell behavior.
+
+## 2c. Reading a repository directly (`repo_*` — READ-ONLY)
 
 **Use these instead of asking a session to read a file for you.** Before
 these existed, the only way to see code through this server was to send a
@@ -366,7 +398,7 @@ the same answer for the same `task_id` or key.
 |---|---|
 | `DISPATCHING` | persisted/submitted, execution not observed yet. Wait; do not resend. |
 | `RUNNING` | execution observed (`running_confirmed: true`). The server continues the task after each turn end. |
-| `WAITING_INPUT` | a dialog/menu needs a human. `wait_reason=SESSION_INPUT_BEFORE_DISPATCH` means nothing was typed yet (e.g. Codex "Hooks need review" -- a security prompt, never auto-trusted). Supervision resumes by itself once answered. |
+| `WAITING_INPUT` | an unrecognized, authentication, or ambiguous dialog needs a human. Owner-mode launches resolve only exact non-granting startup choices; Codex hook review may continue without trusting, never with "Trust all". Supervision resumes by itself once an unresolved prompt is answered. |
 | `STUCK_COMPOSER` | the prompt sits unsent in the composer. The server presses Enter (guarded activate-only, never retypes) at most 2 times, 10s apart, only while the pane is not busy. Then a human presses Enter or `supervise_cancel`. |
 | `DISPATCH_UNCERTAIN` | 45s after submit with no evidence (e.g. a clone whose context stayed 0%). Not resent. Inspect; if truly not received, `supervise_cancel` and `supervise` again with a NEW key. |
 | `DONE` / `BLOCKED` | explicit outcome: `TMCP-DONE:<task_id>` / `TMCP-BLOCKED:<task_id> reason` printed by the agent, or `supervise_complete`. IDLE alone never completes a task. |
