@@ -723,7 +723,10 @@ class SessionLifecycleConfig:
     # admitted only when their verified git-common-dir maps back to one of
     # these roots.
     trusted_project_roots: tuple[str, ...] = ()
-    default_permission_mode: str = "owner"
+    # Code-created configs (including tests and embedded API callers) retain
+    # the historical native CLI behavior. Deployments opt in explicitly via
+    # config.yaml, where the operator's persistent owner preference lives.
+    default_permission_mode: str = "native"
     protected_sessions: tuple[str, ...] = ("terminal-mcp",)
     launch_commands: tuple[tuple[str, str], ...] = (("claude", "claude"), ("codex", "codex"))
     resume_capable_agent_types: tuple[str, ...] = ("claude",)
