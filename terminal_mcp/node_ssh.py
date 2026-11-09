@@ -127,7 +127,10 @@ class NodeSSHService:
         if len(parts) < 2:
             raise ValueError("invalid generated SSH public key")
         controller_id = str(getattr(self.controller, "local_node_id", "controller"))
-        comment = f"terminal-mcp:{controller_id}-{key_path.parent.name}:{datetime.now(timezone.utc):%Y%m%d}"
+        expected_prefix = f"terminal-mcp:{controller_id}-{key_path.parent.name}:"
+        existing_comment = parts[2] if len(parts) >= 3 else ""
+        comment = (existing_comment if re.fullmatch(re.escape(expected_prefix) + r"\d{8}", existing_comment)
+                   else f"{expected_prefix}{datetime.now(timezone.utc):%Y%m%d}")
         public_path.write_text(f"{parts[0]} {parts[1]} {comment}\n", encoding="utf-8")
         os.chmod(public_path, 0o600)
         return f"{parts[0]} {parts[1]} {comment}"

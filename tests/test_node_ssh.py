@@ -189,6 +189,27 @@ def test_controller_keypair_is_private_and_tagged_for_the_registered_target(tmp_
     assert "PRIVATE KEY" in key_path.read_text()
 
 
+def test_controller_managed_key_comment_is_stable_across_days(monkeypatch, tmp_path):
+    from datetime import datetime as real_datetime
+
+    controller = Controller(Client({"status": "ready"}))
+    controller.local_node_id = "hp-linux"
+    service = NodeSSHService(controller, tmp_path / "keys")
+    key_path, _known_hosts, _profile_path = service._paths("dell-linux")
+    first = service._ensure_key(key_path)
+
+    class NextDay:
+        @staticmethod
+        def now(_tz):
+            return real_datetime(2026, 11, 10, tzinfo=_tz)
+
+    monkeypatch.setattr("terminal_mcp.node_ssh.datetime", NextDay)
+    second = service._ensure_key(key_path)
+
+    assert second == first
+    assert Path(str(key_path) + ".pub").read_text().strip() == first
+
+
 def test_controller_key_store_refuses_orphaned_public_key_instead_of_overwriting(tmp_path):
     service = NodeSSHService(Controller(Client({"status": "ready"})), tmp_path / "keys")
     key_path, _known_hosts, _profile = service._paths("dell-linux")
