@@ -33,6 +33,7 @@ from .models import SessionIdentity
 from .permissions import (SENSITIVE_SESSION_WORDS, input_session_allowed,
                           require_input, require_read, require_session_lifecycle, session_allowed,
                           session_input_denied_by_pattern, valid_new_session_name, valid_session_name)
+from .prompt_resolution import prompt_fingerprint
 from .redaction import (redact_ansi_safe, redact_output, redact_text,
                         redaction_marker, strip_ansi)
 from .session_backend import SessionBackend
@@ -1557,6 +1558,12 @@ class TerminalService:
             payload = {
                 "session": session,
                 "exists": True,
+                "session_generation": {
+                    "session_id": getattr(info, "session_id", None),
+                    "pane_id": getattr(info, "pane_id", None),
+                    "created_epoch": getattr(info, "created_epoch", None),
+                },
+                "prompt_fingerprint": prompt_fingerprint(output.splitlines()),
                 "allowed": True,
                 "state": state,
                 "agent_type": select_adapter(info.pane_current_command or "").name,
@@ -1609,6 +1616,8 @@ class TerminalService:
             # on the next ordinary ACTIVE sighting -- see session_
             # registry.py's own upsert_seen docstring).
             record = self.session_registry.get(self.REGISTRY_LOCAL_NODE_ID, session)
+            if record is not None:
+                payload["permission_mode"] = record.permission_mode or "native"
             if record is not None and record.recovery_state:
                 payload["recovery_state"] = record.recovery_state
             # TMCP-SESSION-HEALTH-001: normalized session resource health,

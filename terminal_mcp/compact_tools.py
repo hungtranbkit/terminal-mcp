@@ -50,7 +50,7 @@ TURN_PANE_ACTIONS = ("inspect", "send", "send_wait", "wait", "resume", "start",
                      # Supervised direct tasks (direct_task.py): an agent turn
                      # ending (IDLE) is not the task ending.
                      "supervise", "supervise_status", "supervise_complete",
-                     "supervise_cancel")
+                     "supervise_cancel", "supervise_resolve_prompt")
 # How many QueueEngine ticks one `start` call may spend driving the lane from
 # QUEUED to actually dispatched. The engine makes at most ONE transition per
 # tick on purpose (claim -> coordinator gate -> dispatch), so a handful is the
@@ -581,6 +581,9 @@ class CompactTerminalTools:
                 "state": status.get("state", "UNKNOWN"),
                 "input_required": bool(status.get("input_required", False)),
             }
+            for key in ("session_generation", "prompt_fingerprint", "permission_mode"):
+                if status.get(key) is not None:
+                    row[key] = status[key]
             # TMCP-SESSION-HEALTH-001: pass the canonical status payload's
             # own `resource` block straight through, in BOTH compact and
             # full mode. It is the field a dispatcher needs precisely when
@@ -1221,6 +1224,9 @@ class CompactTerminalTools:
         - supervise_status: `task_id`, or `target` for its active tasks.
         - supervise_complete: `task_id`; args.outcome DONE|BLOCKED, args.reason.
         - supervise_cancel: `task_id`; args.reason.
+        - supervise_resolve_prompt: task_id + target + stable idempotency_key;
+          args.prompt_fingerprint, args.prompt_id, args.choice_id,
+          args.session_generation. Only exact allowlisted safe choices are accepted.
         """
         if self.direct_tasks is None:
             return {"status": "FAILED", "error": "ACTION_UNAVAILABLE", "action": action}
@@ -1265,6 +1271,24 @@ class CompactTerminalTools:
         elif action == "supervise_complete":
             result = self.direct_tasks.complete(task_id or "", outcome=str(args.get("outcome") or "DONE"),
                                                 reason=args.get("reason"))
+        elif action == "supervise_resolve_prompt":
+            allowed = {"prompt_fingerprint", "prompt_id", "choice_id", "session_generation"}
+            if not task_id or not target:
+                return {"status": "FAILED", "error": "TASK_ID_AND_TARGET_REQUIRED", "action": action}
+            if not idempotency_key:
+                return {"status": "FAILED", "error": "IDEMPOTENCY_KEY_REQUIRED", "action": action}
+            if set(args) != allowed:
+                return {"status": "FAILED", "error": "INVALID_ARGS", "action": action,
+                        "allowed": sorted(allowed)}
+            task = self.direct_tasks.get(task_id, refresh=False)
+            task_data = task.get("task") if isinstance(task, dict) else None
+            if (not isinstance(task_data, dict) or task_data.get("target") != target
+                    or task_data.get("completed_at") is not None):
+                return {"status": "FAILED", "error": "TASK_TARGET_OR_STATE_MISMATCH", "action": action}
+            result = self.direct_tasks.resolve_prompt(
+                task_id, expected_prompt_fingerprint=args["prompt_fingerprint"],
+                prompt_id=args["prompt_id"], choice_id=args["choice_id"],
+                session_generation=args["session_generation"], idempotency_key=idempotency_key)
         else:
             result = self.direct_tasks.cancel(task_id or "", reason=args.get("reason"))
         return {**result, "action": action}

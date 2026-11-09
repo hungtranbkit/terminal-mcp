@@ -174,7 +174,10 @@ def _add_permission_mode_column(connection: sqlite3.Connection) -> None:
     # Existing sessions were launched before this owner preference existed.
     # Preserve their CLI-native mode until an operator deliberately recreates
     # them after checkpointing, instead of silently changing a recovery path.
-    connection.execute("ALTER TABLE session_records ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'native'")
+    columns = {row["name"] for row in connection.execute(
+        "PRAGMA table_info(session_records)").fetchall()}
+    if "permission_mode" not in columns:
+        connection.execute("ALTER TABLE session_records ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'native'")
 
 
 REGISTRY_MIGRATIONS: list[Migration] = [

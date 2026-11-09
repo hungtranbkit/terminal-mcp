@@ -92,12 +92,14 @@ _DIRECT_ACTION_SCHEMA_HELP = (
     "idempotency_key), headless_status/list/checkpoint/cancel/cleanup. "
     "Direct Terminal MCP action. Normal public actions: start (idle local Codex, confirmed RUNNING or error), inspect, send, send_wait, wait, resume, "
     "supervise (long task continued server-side until explicit DONE), supervise_status, "
-    "supervise_complete, supervise_cancel, "
+    "supervise_complete, supervise_cancel, supervise_resolve_prompt, "
     "list_sessions, list_nodes, create_session, delete_session, task_status, task_batch_status, "
     "browser_verify, browser_screenshot, browser_status, browser_stop. "
     "Tracked work: create_session (no initial_prompt) -> supervise(text, title, idempotency_key) "
     "-> supervise_status(task_id or idempotency_key). Retired queue actions return "
     "QUEUE_DISABLED_USE_DIRECT_SESSION and create no task. RUNNING only after observed execution. "
+    "supervise_resolve_prompt accepts only a current fingerprinted, owner-mode harmless menu choice; "
+    "it cannot approve tool permissions, login, credentials, or arbitrary text. "
     "When assigning or changing a session's task (send/send_wait/supervise/create_session), "
     "pass title=\"<short task summary>\" so the live monitor shows it; omit title for "
     "continuations (y, continue, approvals, follow-ups)."
@@ -367,6 +369,9 @@ def build_mcp(service: TerminalService | None = None,
             # text + Enter) submits the composer's OWN content and refuses on
             # an empty composer -- it can never retype or duplicate a prompt.
             activate=lambda target, key: compact_tools.send_task(target, "", idempotency_key=key),
+            # A resolver may send only one key returned by the fixed safe-menu
+            # allowlist, through the ordinary input guard and lease.
+            prompt_key=lambda target, key: controller.terminal_send_keys(target, [key]),
             # In-call look for execution evidence so a fast start can say
             # RUNNING honestly; the loop carries the rest.
             accept_wait_seconds=float(os.environ.get("TERMINAL_MCP_SUPERVISE_ACCEPT_WAIT", "6")),
