@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from .adapters import codex_folder_trust_prompt
+from .prompt_resolution import classify_safe_prompt, prompt_fingerprint
 from .redaction import redact_text
 
 _log = logging.getLogger(__name__)
@@ -324,6 +325,7 @@ class DirectTaskStore:
         ("agent", "TEXT"), ("submission_id", "TEXT"), ("last_error", "TEXT"),
         ("last_error_hop", "TEXT"), ("unreachable_since", "REAL"), ("next_observe_at", "REAL"),
         ("late_completion", "INTEGER NOT NULL DEFAULT 0"),
+        ("session_generation", "TEXT"),
     )
 
     def __init__(self, path: str | Path | None = None) -> None:
@@ -363,6 +365,20 @@ class DirectTaskStore:
                 "ON direct_tasks(completed_at, target)")
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS direct_task_meta (key TEXT PRIMARY KEY, value TEXT)")
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS direct_prompt_responses ("
+                "idempotency_key TEXT PRIMARY KEY, task_id TEXT NOT NULL, target TEXT NOT NULL, "
+                "prompt_fingerprint TEXT NOT NULL, prompt_id TEXT, choice_id TEXT NOT NULL, "
+                "session_generation TEXT, state TEXT NOT NULL, "
+                "result_json TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL)")
+            prompt_columns = {row["name"] for row in connection.execute(
+                "PRAGMA table_info(direct_prompt_responses)").fetchall()}
+            for name, kind in (("prompt_id", "TEXT"), ("session_generation", "TEXT")):
+                if name not in prompt_columns:
+                    connection.execute(f"ALTER TABLE direct_prompt_responses ADD COLUMN {name} {kind}")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_direct_prompt_task "
+                "ON direct_prompt_responses(task_id, created_at)")
         with self._connection() as connection:
             # Serialized: two servers (stdio + HTTP) may open the store at once.
             connection.execute("BEGIN IMMEDIATE")
@@ -394,6 +410,11 @@ class DirectTaskStore:
             return None
         result = dict(row)
         result["steps"] = json.loads(result["steps"])
+        if result.get("session_generation"):
+            try:
+                result["session_generation"] = json.loads(result["session_generation"])
+            except (TypeError, ValueError):
+                result["session_generation"] = None
         return result
 
     def insert(self, task: dict[str, Any], *, exclusive_target: bool = False) -> dict[str, Any]:
@@ -414,6 +435,8 @@ class DirectTaskStore:
                 if active is not None:
                     return {**self._row(active), "conflict": True}
             values = {**task, "steps": json.dumps(task["steps"])}
+            if isinstance(values.get("session_generation"), dict):
+                values["session_generation"] = json.dumps(values["session_generation"], sort_keys=True)
             columns = ", ".join(values)
             marks = ", ".join("?" for _ in values)
             connection.execute(f"INSERT INTO direct_tasks ({columns}) VALUES ({marks})",
@@ -424,8 +447,68 @@ class DirectTaskStore:
 
     def get(self, task_id: str) -> dict[str, Any] | None:
         with self._connection() as connection:
-            return self._row(connection.execute(
+            result = self._row(connection.execute(
                 "SELECT * FROM direct_tasks WHERE task_id = ?", (task_id,)).fetchone())
+        return result
+
+    def claim_prompt_response(self, task_id: str, target: str, prompt_fingerprint: str,
+                              prompt_id: str, choice_id: str, session_generation: dict[str, Any],
+                              idempotency_key: str,
+                              *, max_attempts: int = 8) -> dict[str, Any]:
+        now = _now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task = connection.execute(
+                "SELECT completed_at FROM direct_tasks WHERE task_id = ?", (task_id,)).fetchone()
+            if task is None:
+                return {"error": "UNKNOWN_TASK_ID"}
+            if task["completed_at"] is not None:
+                return {"error": "TASK_NOT_ACTIVE"}
+            existing = connection.execute(
+                "SELECT * FROM direct_prompt_responses WHERE idempotency_key = ?",
+                (idempotency_key,)).fetchone()
+            if existing is not None:
+                prior_generation = (json.loads(existing["session_generation"])
+                                    if existing["session_generation"] else None)
+                if (existing["task_id"], existing["target"], existing["prompt_fingerprint"],
+                        existing["prompt_id"], existing["choice_id"], prior_generation) != (
+                        task_id, target, prompt_fingerprint, prompt_id, choice_id, session_generation):
+                    return {"error": "IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PROMPT"}
+                result = json.loads(existing["result_json"]) if existing["result_json"] else None
+                return {"deduplicated": True, "in_progress": existing["state"] == "CLAIMED",
+                        "result": result}
+            attempts = connection.execute(
+                "SELECT COUNT(*) FROM direct_prompt_responses WHERE task_id = ?", (task_id,)
+            ).fetchone()[0]
+            if attempts >= max_attempts:
+                return {"error": "PROMPT_RESPONSE_ATTEMPT_LIMIT", "max_attempts": max_attempts}
+            connection.execute(
+                "INSERT INTO direct_prompt_responses "
+                "(idempotency_key,task_id,target,prompt_fingerprint,prompt_id,choice_id,"
+                "session_generation,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,'CLAIMED',?,?)",
+                (idempotency_key, task_id, target, prompt_fingerprint, prompt_id, choice_id,
+                 json.dumps(session_generation, sort_keys=True), now, now))
+        return {"claimed": True}
+
+    def finish_prompt_response(self, idempotency_key: str, result: dict[str, Any]) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE direct_prompt_responses SET state='FINISHED',result_json=?,updated_at=? "
+                "WHERE idempotency_key=? AND state='CLAIMED'",
+                (json.dumps(result, sort_keys=True), _now(), idempotency_key))
+
+    def prompt_response(self, idempotency_key: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM direct_prompt_responses WHERE idempotency_key = ?",
+                (idempotency_key,)).fetchone()
+        if row is None:
+            return None
+        result = json.loads(row["result_json"]) if row["result_json"] else None
+        parsed = dict(row)
+        if parsed.get("session_generation"):
+            parsed["session_generation"] = json.loads(parsed["session_generation"])
+        return {**parsed, "result": result}
 
     def by_idempotency_key(self, key: str) -> dict[str, Any] | None:
         with self._connection() as connection:
@@ -492,9 +575,9 @@ _NEXT_ACTIONS = {
                     "prompt; check supervise_status(task_id) when asked. Do not resend."),
     "RUNNING": ("none -- execution was observed; the server continues the task until an "
                 "explicit TMCP-DONE/TMCP-BLOCKED. Check supervise_status(task_id) when asked."),
-    "WAITING_INPUT": ("a human must answer the session's prompt/dialog (inspect the target; "
-                      "never auto-trust a hooks review). Supervision resumes by itself; do not "
-                      "resend."),
+    "WAITING_INPUT": ("the server resolves only exact owner-authorized non-granting menus; if this "
+                      "prompt is unrecognized or requests permission/trust/auth, inspect it and "
+                      "provide the needed human decision. Do not resend."),
     "STUCK_COMPOSER": ("the prompt is sitting unsent in the agent composer; the server tries a "
                        "bounded Enter-only recovery. If it persists, press Enter in the session "
                        "or supervise_cancel. Never resend the text."),
@@ -529,6 +612,7 @@ class DirectTaskSupervisor:
     def __init__(self, store: DirectTaskStore, *, send: Callable[[str, str, str], dict],
                  status: Callable[[str], dict], tail: Callable[[str, int], dict],
                  activate: Callable[[str, str], dict] | None = None,
+                 prompt_key: Callable[[str, str], dict] | None = None,
                  clock: Callable[[], float] = _now,
                  settle_seconds: float = DEFAULT_SETTLE_SECONDS,
                  accept_wait_seconds: float = 0.0,
@@ -538,6 +622,7 @@ class DirectTaskSupervisor:
         self._status = status
         self._tail = tail
         self._activate = activate
+        self._prompt_key = prompt_key
         self.clock = clock
         self.settle_seconds = float(settle_seconds)
         self.accept_wait_seconds = float(accept_wait_seconds)
@@ -644,6 +729,107 @@ class DirectTaskSupervisor:
 
     def active_for(self, target: str) -> list[dict[str, Any]]:
         return [self._view(task) for task in self.store.active(target)]
+
+    def resolve_prompt(self, task_id: str, *, expected_prompt_fingerprint: str,
+                       prompt_id: str, choice_id: str, session_generation: dict[str, Any],
+                       idempotency_key: str | None = None) -> dict[str, Any]:
+        """Resolve one allowlisted routine prompt for an active task.
+
+        The caller supplies the prompt and process-generation evidence it
+        inspected. The method re-reads that evidence immediately before the
+        key write, records a durable idempotent claim, and verifies a visible
+        transition afterward. Free-form text is never accepted here.
+        """
+        if not isinstance(task_id, str) or not _TASK_ID.fullmatch(task_id):
+            return {"status": "FAILED", "error": "INVALID_TASK_ID"}
+        if not all(isinstance(value, str) and value for value in
+                   (expected_prompt_fingerprint, prompt_id, choice_id)):
+            return {"status": "FAILED", "error": "PROMPT_EVIDENCE_REQUIRED"}
+        if not isinstance(session_generation, dict):
+            return {"status": "FAILED", "error": "SESSION_GENERATION_REQUIRED"}
+        task = self.store.get(task_id)
+        if task is None:
+            return {"status": "FAILED", "error": "UNKNOWN_TASK_ID"}
+        if task.get("completed_at") is not None:
+            return {"status": "FAILED", "error": "TASK_NOT_ACTIVE"}
+        return self._resolve_safe_prompt(
+            task, expected_prompt_fingerprint=expected_prompt_fingerprint,
+            prompt_id=prompt_id, choice_id=choice_id,
+            session_generation=session_generation, idempotency_key=idempotency_key)
+
+    def _resolve_safe_prompt(self, task: dict[str, Any], *, expected_prompt_fingerprint: str,
+                             prompt_id: str, choice_id: str,
+                             session_generation: dict[str, Any],
+                             idempotency_key: str | None = None) -> dict[str, Any]:
+        if self._prompt_key is None:
+            return {"status": "FAILED", "error": "PROMPT_RESOLVER_UNAVAILABLE"}
+        task_id, target = task["task_id"], task["target"]
+        expected_generation = task.get("session_generation")
+        if not isinstance(expected_generation, dict) or expected_generation != session_generation:
+            return {"status": "FAILED", "error": "SESSION_GENERATION_MISMATCH"}
+        key_id = idempotency_key or f"direct-prompt:{task_id}:{expected_prompt_fingerprint}:{choice_id}"
+        prior = self.store.prompt_response(key_id)
+        if prior is not None:
+            if (prior["task_id"], prior["target"], prior["prompt_fingerprint"], prior["prompt_id"],
+                    prior["choice_id"], prior["session_generation"]) != (
+                    task_id, target, expected_prompt_fingerprint, prompt_id, choice_id, session_generation):
+                return {"status": "FAILED", "error": "IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PROMPT"}
+            return prior.get("result") or {"status": "BLOCKED", "error": "DUPLICATE_IN_PROGRESS"}
+        observed = self._status(target)
+        if observed.get("permission_mode") != "owner":
+            return {"status": "FAILED", "error": "OWNER_POLICY_REQUIRED"}
+        if observed.get("session_generation") != expected_generation:
+            return {"status": "FAILED", "error": "SESSION_GENERATION_MISMATCH"}
+        if str(observed.get("state") or "").upper() != "WAITING_INPUT":
+            return {"status": "FAILED", "error": "PROMPT_NOT_WAITING"}
+        tail = self._tail(target, DIALOG_TAIL_LINES)
+        lines = str(tail.get("output") or "").splitlines() if "error" not in tail else []
+        agent = task.get("agent") or observed.get("agent_type") or ""
+        candidate = classify_safe_prompt(lines, str(agent).casefold())
+        current_fingerprint = observed.get("prompt_fingerprint") or prompt_fingerprint(lines)
+        if (candidate is None or candidate.prompt_id != prompt_id or candidate.choice_id != choice_id
+                or current_fingerprint != expected_prompt_fingerprint):
+            return {"status": "FAILED", "error": "STALE_OR_UNSUPPORTED_PROMPT"}
+        claim = self.store.claim_prompt_response(
+            task_id, target, current_fingerprint, prompt_id, choice_id, expected_generation, key_id)
+        if claim.get("deduplicated"):
+            return claim.get("result") or {"status": "BLOCKED", "error": "DUPLICATE_IN_PROGRESS"}
+        if "claimed" not in claim:
+            return {"status": "FAILED", **claim}
+
+        # Revalidate identity and exact visible menu while holding the normal
+        # server input guard/lease for the one allowlisted key.
+        fresh = self._status(target)
+        fresh_tail = self._tail(target, DIALOG_TAIL_LINES)
+        fresh_lines = str(fresh_tail.get("output") or "").splitlines() if "error" not in fresh_tail else []
+        fresh_choice = classify_safe_prompt(fresh_lines, str(agent).casefold())
+        if (fresh.get("permission_mode") != "owner"
+                or fresh.get("session_generation") != expected_generation
+                or fresh.get("prompt_fingerprint") != current_fingerprint
+                or fresh_choice is None or (fresh_choice.prompt_id, fresh_choice.choice_id) != (prompt_id, choice_id)):
+            result = {"status": "BLOCKED", "error": "STALE_PROMPT_BEFORE_RESPONSE"}
+            self.store.finish_prompt_response(key_id, result)
+            return result
+        sent = self._prompt_key(target, candidate.key)
+        if not isinstance(sent, dict) or sent.get("error") or sent.get("sent") is False:
+            result = {"status": "BLOCKED", "error": str((sent or {}).get("error") or "KEY_RESPONSE_FAILED")}
+            self.store.finish_prompt_response(key_id, result)
+            return result
+        after = self._status(target)
+        after_tail = self._tail(target, DIALOG_TAIL_LINES)
+        after_lines = str(after_tail.get("output") or "").splitlines() if "error" not in after_tail else []
+        after_fingerprint = after.get("prompt_fingerprint") or prompt_fingerprint(after_lines)
+        transitioned = (after.get("session_generation") == expected_generation and
+                        (str(after.get("state") or "").upper() != "WAITING_INPUT"
+                         or after_fingerprint != current_fingerprint))
+        result = {"status": "RESOLVED" if transitioned else "BLOCKED",
+                  "error": None if transitioned else "PROMPT_TRANSITION_UNVERIFIED",
+                  "task_id": task_id, "target": target, "prompt_id": prompt_id,
+                  "choice_id": choice_id, "prompt_fingerprint": current_fingerprint,
+                  "session_generation": expected_generation,
+                  "transition_verified": transitioned, "idempotency_key": key_id}
+        self.store.finish_prompt_response(key_id, result)
+        return result
 
     def annotation(self, target: str) -> dict[str, Any] | None:
         """What a caller must know when a pane reads IDLE: the task is not over."""
@@ -887,6 +1073,11 @@ class DirectTaskSupervisor:
         observed = self._status(task["target"])
         if "error" in observed or observed.get("exists") is False:
             return self._observe_failed(task, observed, now)
+        generation = observed.get("session_generation")
+        if (not task.get("session_generation") and isinstance(generation, dict)
+                and all(generation.get(key) not in (None, "")
+                        for key in ("session_id", "pane_id", "created_epoch"))):
+            task = self.store.update(task["task_id"], session_generation=generation) or task
         turn_state = str(observed.get("state") or "UNKNOWN").upper()
         base = {"observe_failures": 0, "last_turn_state": turn_state, "unreachable_since": None,
                 "next_observe_at": None}
@@ -932,8 +1123,14 @@ class DirectTaskSupervisor:
         if (turn_state == "WAITING_INPUT" or _BOOT_DIALOG.search(bottom)
                 or (task.get("agent") == "codex"
                     and codex_folder_trust_prompt((output or "").splitlines()))):
+            response = self._auto_resolve_prompt(task, observed, output)
+            if response and response.get("status") == "RESOLVED" and response.get("transition_verified"):
+                return self.store.update(
+                    task["task_id"], **base, state="DISPATCHING", wait_reason=None,
+                    idle_since=None, reason="safe prompt choice verified; checking task composer")
             # Never type into a dialog -- in particular never let our Enter
-            # answer a hooks-review/trust menu. Nothing was sent.
+            # answer an unrecognized or granting prompt. Nothing is sent as a
+            # task until the next observation confirms a normal composer.
             return self.store.update(task["task_id"], **base, state="WAITING_INPUT",
                                      wait_reason="SESSION_INPUT_BEFORE_DISPATCH", idle_since=None,
                                      reason=_clip(observed.get("reason")))
@@ -944,6 +1141,19 @@ class DirectTaskSupervisor:
                                      wait_reason="TARGET_BUSY", idle_since=None)
         task = self.store.update(task["task_id"], **base, wait_reason=None)
         return self._dispatch(task, now)
+
+    def _auto_resolve_prompt(self, task, observed, output):
+        if (self._prompt_key is None or observed.get("permission_mode") != "owner"
+                or not isinstance(task.get("session_generation"), dict) or output is None):
+            return None
+        agent = task.get("agent") or observed.get("agent_type") or ""
+        choice = classify_safe_prompt(str(output).splitlines(), str(agent).casefold())
+        if choice is None:
+            return None
+        return self._resolve_safe_prompt(
+            task, expected_prompt_fingerprint=(observed.get("prompt_fingerprint") or choice.fingerprint),
+            prompt_id=choice.prompt_id, choice_id=choice.choice_id,
+            session_generation=task["session_generation"])
 
     def _verify_acceptance(self, task, base, turn_state, observed, output, now):
         """Independent evidence that the agent took the dispatched prompt."""
@@ -978,6 +1188,11 @@ class DirectTaskSupervisor:
                 accepted_at=now, wait_reason=None, idle_since=None, reason=None,
                 last_dispatch_at=now if turn_state != "RUNNING" else task.get("last_dispatch_at"))
         if turn_state == "WAITING_INPUT":
+            response = self._auto_resolve_prompt(task, observed, output)
+            if response and response.get("status") == "RESOLVED" and response.get("transition_verified"):
+                return self.store.update(
+                    task["task_id"], **base, state="EXECUTION_ACCEPTED", wait_reason=None,
+                    idle_since=None, reason="safe prompt choice verified; rechecking task execution")
             return self.store.update(task["task_id"], **base, state="WAITING_INPUT",
                                      wait_reason="SESSION_INPUT", idle_since=None,
                                      reason=_clip(observed.get("reason")))
@@ -1033,6 +1248,14 @@ class DirectTaskSupervisor:
 
     def _supervise_running(self, task, base, turn_state, observed, now):
         if turn_state == "WAITING_INPUT":
+            tail = self._tail(task["target"], DIALOG_TAIL_LINES)
+            output = str(tail.get("output") or "") if "error" not in tail else None
+            response = self._auto_resolve_prompt(task, observed, output)
+            if response and response.get("status") == "RESOLVED" and response.get("transition_verified"):
+                return self.store.update(
+                    task["task_id"], **base, state="EXECUTION_ACCEPTED",
+                    wait_reason=None, idle_since=None,
+                    reason="server resolved one allowlisted task prompt; rechecking execution")
             return self.store.update(task["task_id"], **base, state="WAITING_INPUT",
                                      wait_reason="SESSION_INPUT", idle_since=None,
                                      reason=_clip(observed.get("reason")))

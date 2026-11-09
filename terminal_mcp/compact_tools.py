@@ -50,7 +50,7 @@ TURN_PANE_ACTIONS = ("inspect", "send", "send_wait", "wait", "resume", "start",
                      # Supervised direct tasks (direct_task.py): an agent turn
                      # ending (IDLE) is not the task ending.
                      "supervise", "supervise_status", "supervise_complete",
-                     "supervise_cancel")
+                     "supervise_cancel", "supervise_resolve_prompt")
 # How many QueueEngine ticks one `start` call may spend driving the lane from
 # QUEUED to actually dispatched. The engine makes at most ONE transition per
 # tick on purpose (claim -> coordinator gate -> dispatch), so a handful is the
@@ -581,6 +581,9 @@ class CompactTerminalTools:
                 "state": status.get("state", "UNKNOWN"),
                 "input_required": bool(status.get("input_required", False)),
             }
+            for key in ("session_generation", "prompt_fingerprint", "permission_mode"):
+                if status.get(key) is not None:
+                    row[key] = status[key]
             # TMCP-SESSION-HEALTH-001: pass the canonical status payload's
             # own `resource` block straight through, in BOTH compact and
             # full mode. It is the field a dispatcher needs precisely when
@@ -893,6 +896,7 @@ class CompactTerminalTools:
              overwrite: bool = False, mode: str | None = None,
              idempotency_key: str | None = None,
              agent_type: str = "shell", working_directory: str | None = None,
+             permission_mode: str | None = None,
              initial_prompt: str | None = None, grant_mode: str = "none",
              binding: str | None = None, node: str = "auto",
              title: str | None = None, priority: int = 0,
@@ -1000,12 +1004,14 @@ class CompactTerminalTools:
                 return {"error": "HEADLESS_REMOTE_NODE_UNSUPPORTED", "node": node}
             return manager.turn(normalized, target=target, text=text or initial_prompt,
                                 cwd=working_directory, key=idempotency_key or request_key,
-                                task_id=task_id, agent=agent_type)
+                                task_id=task_id, agent=agent_type,
+                                permission_mode=permission_mode)
 
         if normalized in TURN_HANDLER_ACTIONS:
             return self._handler_turn(
                 normalized, target=target, text=text, agent_type=agent_type,
                 working_directory=working_directory, initial_prompt=initial_prompt,
+                permission_mode=permission_mode,
                 grant_mode=grant_mode, binding=binding, node=node, title=title,
                 priority=priority, metadata=metadata, request_key=request_key,
                 task_id=task_id, task_ids=task_ids, url=url, args=args,
@@ -1218,6 +1224,9 @@ class CompactTerminalTools:
         - supervise_status: `task_id`, or `target` for its active tasks.
         - supervise_complete: `task_id`; args.outcome DONE|BLOCKED, args.reason.
         - supervise_cancel: `task_id`; args.reason.
+        - supervise_resolve_prompt: task_id + target + stable idempotency_key;
+          args.prompt_fingerprint, args.prompt_id, args.choice_id,
+          args.session_generation. Only exact allowlisted safe choices are accepted.
         """
         if self.direct_tasks is None:
             return {"status": "FAILED", "error": "ACTION_UNAVAILABLE", "action": action}
@@ -1262,6 +1271,24 @@ class CompactTerminalTools:
         elif action == "supervise_complete":
             result = self.direct_tasks.complete(task_id or "", outcome=str(args.get("outcome") or "DONE"),
                                                 reason=args.get("reason"))
+        elif action == "supervise_resolve_prompt":
+            allowed = {"prompt_fingerprint", "prompt_id", "choice_id", "session_generation"}
+            if not task_id or not target:
+                return {"status": "FAILED", "error": "TASK_ID_AND_TARGET_REQUIRED", "action": action}
+            if not idempotency_key:
+                return {"status": "FAILED", "error": "IDEMPOTENCY_KEY_REQUIRED", "action": action}
+            if set(args) != allowed:
+                return {"status": "FAILED", "error": "INVALID_ARGS", "action": action,
+                        "allowed": sorted(allowed)}
+            task = self.direct_tasks.get(task_id, refresh=False)
+            task_data = task.get("task") if isinstance(task, dict) else None
+            if (not isinstance(task_data, dict) or task_data.get("target") != target
+                    or task_data.get("completed_at") is not None):
+                return {"status": "FAILED", "error": "TASK_TARGET_OR_STATE_MISMATCH", "action": action}
+            result = self.direct_tasks.resolve_prompt(
+                task_id, expected_prompt_fingerprint=args["prompt_fingerprint"],
+                prompt_id=args["prompt_id"], choice_id=args["choice_id"],
+                session_generation=args["session_generation"], idempotency_key=idempotency_key)
         else:
             result = self.direct_tasks.cancel(task_id or "", reason=args.get("reason"))
         return {**result, "action": action}
@@ -1581,6 +1608,7 @@ class CompactTerminalTools:
     def _handler_turn(self, action: str, *, target: str | None, text: str | None,
                       agent_type: str, working_directory: str | None,
                       initial_prompt: str | None, grant_mode: str,
+                      permission_mode: str | None = None,
                       binding: str | None, node: str, title: str | None,
                       priority: int, metadata: dict[str, Any] | None,
                       request_key: str | None, task_id: str | None,
@@ -1759,7 +1787,7 @@ class CompactTerminalTools:
             "create_session": lambda: handler(
                 target.strip(), agent_type=agent_type, working_directory=working_directory,
                 initial_prompt=initial_prompt, grant_mode=grant_mode, binding=binding,
-                node=node),
+                node=node, permission_mode=permission_mode),
             "delete_session": lambda: (handler(target.strip(), confirm=args["confirm"])
                                         if args and "confirm" in args else handler(target.strip())),
             "enqueue_task": lambda: handler(

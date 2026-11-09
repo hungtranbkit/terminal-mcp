@@ -20,11 +20,18 @@ from __future__ import annotations
 import time
 import re
 import subprocess
+import shlex
+import os
+import hashlib
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 
 from .config import AppConfig
+from .agent_launch_policy import (LaunchPolicyError, build_permission_args,
+                                  register_claude_project_trust,
+                                  register_codex_project_trust,
+                                  validate_project_directory)
 from .adapters import codex_folder_trust_prompt, tool_permission_prompt
 from .launcher_resolution import resolve_launcher
 from .permissions import SENSITIVE_SESSION_WORDS, valid_new_session_name, session_input_denied_by_pattern
@@ -33,6 +40,55 @@ from .tmux import TmuxError
 
 AGENT_TYPES = ("shell", "claude", "codex")
 CREATE_POLL_INTERVAL_SECONDS = 0.2
+
+
+def _process_argv(pid: int) -> list[str] | None:
+    """Read only a spawned CLI's argv; never expose or inspect its environment."""
+    if not pid:
+        return None
+    if os.name == "nt":
+        try:
+            from .windows_backend import _win32_process_command_line
+            command_line = _win32_process_command_line(pid)
+        except Exception:  # noqa: BLE001 - verification is best-effort per backend
+            return None
+        return shlex.split(command_line, posix=False) if command_line else None
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    return [part.decode(errors="replace") for part in raw.split(b"\0") if part]
+
+
+def _process_tree_has_flag(pid: int, flag: str) -> bool:
+    """Verify a launcher flag in the pane process or its CLI wrapper child."""
+    if not pid:
+        return False
+    pending = [(int(pid), 0)]
+    seen = set()
+    while pending and len(seen) < 32:
+        current, depth = pending.pop(0)
+        if current in seen:
+            continue
+        seen.add(current)
+        argv = _process_argv(current)
+        if argv and flag in argv:
+            return True
+        if depth >= 3 or os.name == "nt":
+            continue
+        try:
+            for item in Path("/proc").iterdir():
+                if not item.name.isdigit():
+                    continue
+                try:
+                    fields = (item / "stat").read_text().rsplit(")", 1)[1].split()
+                    if int(fields[1]) == current:
+                        pending.append((int(item.name), depth + 1))
+                except (OSError, IndexError, ValueError):
+                    continue
+        except OSError:
+            break
+    return False
 
 
 @lru_cache(maxsize=64)
@@ -94,7 +150,7 @@ def _codex_readiness(lines: list[str]) -> tuple[str, str | None]:
     return "STARTUP_CHECK", None
 
 
-def _authorized_startup_step(lines: list[str]) -> tuple[str, str] | None:
+def _authorized_startup_step(lines: list[str], agent_type: str = "codex") -> tuple[str, str] | None:
     """One key toward a known non-granting option, never a shared config change."""
     if tool_permission_prompt(lines):
         return None
@@ -103,6 +159,34 @@ def _authorized_startup_step(lines: list[str]) -> tuple[str, str] | None:
     if ("update now" in text and "2. skip" in text
             and "3. skip until next version" in text and "esc skip" in text):
         return "CODEX_UPDATE_MENU", "Escape"
+    if agent_type == "claude" and any(marker in text for marker in (
+            "teach auto mode", "save auto-mode settings", "save auto mode")):
+        options = {}
+        selected = []
+        for line in recent:
+            match = re.match(r"^\s*([›❯>])?\s*([1-4])\.\s+(.+?)\s*$", line)
+            if not match:
+                continue
+            mark, number, label = match.groups()
+            number = int(number)
+            if number in options:
+                return None
+            options[number] = label.casefold()
+            if mark:
+                selected.append(number)
+        if len(options) < 2 or len(selected) != 1:
+            return None
+        if "teach auto mode" in text:
+            safe = [number for number, label in options.items()
+                    if label in {"not now", "skip", "no thanks", "don't teach me"}]
+        else:
+            safe = [number for number, label in options.items()
+                    if label in {"don't save", "do not save", "not now", "no thanks"}]
+        if len(safe) != 1:
+            return None
+        current = selected[0]
+        return "CLAUDE_OPTIONAL_NOTICE_MENU", (
+            "Enter" if current == safe[0] else "Up" if current > safe[0] else "Down")
     options = {}
     selected = []
     for line in recent:
@@ -132,6 +216,11 @@ def _authorized_startup_step(lines: list[str]) -> tuple[str, str] | None:
 def _authorized_startup_choice(lines: list[str]) -> str | None:
     step = _authorized_startup_step(lines)
     return step[0] if step and step[1] == "Enter" else None
+
+
+def _startup_prompt_fingerprint(lines: list[str]) -> str:
+    visible = "\n".join(" ".join(line.split()) for line in lines[-12:] if line.strip())
+    return hashlib.sha256(visible.encode("utf-8", errors="replace")).hexdigest()
 
 
 def resolve_cwd(requested: str | None, config: AppConfig) -> tuple[Path | None, dict[str, Any] | None]:
@@ -205,7 +294,8 @@ class SessionLifecycleService:
         return None
 
     def create(self, name: str, agent_type: str, cwd: str | None, *,
-              show_on_desktop: bool = False, extra_args: tuple[str, ...] = ()) -> dict[str, Any]:
+              show_on_desktop: bool = False, extra_args: tuple[str, ...] = (),
+              permission_mode: str | None = None) -> dict[str, Any]:
         """Create one new detached session, then poll (bounded by
         config.session_lifecycle.create_ready_timeout_seconds) for
         evidence the launched process actually started. Returns a receipt
@@ -229,11 +319,10 @@ class SessionLifecycleService:
         before returning; a request that fails before create ever runs
         touches no session at all, disposable or otherwise.
 
-        `extra_args` (conversation-continuity follow-up, 2026-09-07):
-        passed straight through to the backend's own `new_session` --
-        see its docstring. core.py's terminal_create_session is the
-        only caller that ever populates this (`--session-id`/`--resume`
-        for a resume-capable agent_type), never derived here."""
+        `extra_args` are literal server-selected conversation tokens. The
+        owner permission mode is resolved here, after exact project/trust
+        validation, and is verified against the spawned process tree; a
+        native-mode session is an explicit per-session opt-out."""
         if (error := self.validate_create(name, agent_type)) is not None:
             return {**error, "state": "FAILED"}
         try:
@@ -244,15 +333,42 @@ class SessionLifecycleService:
         resolved_cwd, error = resolve_cwd(cwd, self.config)
         if error is not None:
             return {**error, "state": "FAILED"}
+        if agent_type in {"claude", "codex"} and not cwd:
+            return {"error": "WORKING_DIRECTORY_REQUIRED", "state": "FAILED",
+                    "detail": "Pass the exact existing project/worktree path; no home/workspace fallback is used."}
         command = self.launch_command_for(agent_type)
         if agent_type != "shell" and not command:
             return {"error": "LAUNCHER_NOT_CONFIGURED", "agent_type": agent_type, "state": "FAILED"}
         launch_args = extra_args
+        permission_mode = permission_mode or self.config.session_lifecycle.default_permission_mode
+        if permission_mode not in {"owner", "native"}:
+            return {"error": "INVALID_PERMISSION_MODE", "state": "FAILED"}
+        launch_evidence: dict[str, Any] = {"permission_mode": permission_mode, "flags": []}
+        if agent_type in {"claude", "codex"}:
+            try:
+                project = validate_project_directory(
+                    str(resolved_cwd),
+                    allowed_roots=self.config.session_lifecycle.allowed_cwd_roots,
+                    trusted_project_roots=self.config.session_lifecycle.trusted_project_roots,
+                )
+                if project.path != project.repo_root:
+                    return {"error": "CWD_NOT_PROJECT_ROOT", "state": "FAILED",
+                            "cwd": str(project.path), "repo_root": str(project.repo_root)}
+                trust = (register_claude_project_trust(project.path) if agent_type == "claude"
+                         else register_codex_project_trust(project.path))
+                launch_evidence["project_trust"] = trust
+                policy_args = build_permission_args(agent_type, permission_mode, command)
+                launch_args = (*policy_args, *extra_args)
+                launch_evidence["flags"] = list(launch_args)
+            except LaunchPolicyError as exc:
+                return {"error": exc.code, "state": "FAILED", "detail": exc.detail,
+                        "cwd": str(resolved_cwd)}
         if (agent_type == "codex" and command and "--no-daemon" not in extra_args
                 and _codex_supports_no_daemon(command)):
             # Safe scoped fallback for a shared daemon with incompatible
             # feature settings. Place before resume/session subcommands.
-            launch_args = ("--no-daemon", *extra_args)
+            launch_args = ("--no-daemon", *launch_args)
+            launch_evidence["flags"] = list(launch_args)
         try:
             spawn_result = self.tmux.new_session(name, str(resolved_cwd), command,
                                                  show_on_desktop=show_on_desktop, extra_args=launch_args)
@@ -264,6 +380,7 @@ class SessionLifecycleService:
         deadline = time.monotonic() + self.config.session_lifecycle.create_ready_timeout_seconds
         state = "CREATED"
         info = None
+        process_args_verified: bool | None = None
         startup_choices: set[str] = set()
         startup_key_count = 0
         composer_since = None
@@ -290,6 +407,20 @@ class SessionLifecycleService:
                         "reason": "launched process exited"}
             if expected_command is not None:
                 if info.pane_current_command.casefold() == expected_command:
+                    if permission_mode == "owner" and agent_type in {"claude", "codex"}:
+                        pane_pid = getattr(info, "pane_pid", 0)
+                        expected_flag = "--dangerously-skip-permissions" if agent_type == "claude" else "--yolo"
+                        process_args_verified = _process_tree_has_flag(pane_pid, expected_flag)
+                        if not process_args_verified:
+                            try:
+                                self.tmux.kill_session(name)
+                            except TmuxError:
+                                pass
+                            return {"error": "LAUNCH_POLICY_ARGV_UNVERIFIED", "state": "FAILED",
+                                    "session": name, "agent_type": agent_type,
+                                    "required_flag": expected_flag,
+                                    "detail": "The spawned process argv did not prove the requested permission flag."}
+                        launch_evidence["process_argv_verified"] = True
                     if agent_type == "codex":
                         try:
                             lines = self.tmux.capture_lines(name, 80)
@@ -299,14 +430,19 @@ class SessionLifecycleService:
                         if readiness != "READY":
                             composer_since = None
                             composer_snapshot = None
-                        step = _authorized_startup_step(lines)
+                        step = _authorized_startup_step(lines, "codex")
                         if step:
                             reason, key = step
+                            prompt_fingerprint = _startup_prompt_fingerprint(lines)
                             safe_daemon_fallback = (reason == "CODEX_STARTUP_MENU"
                                 and valid_new_session_name(name)
                                 and not session_input_denied_by_pattern(name, self.config)
                                 and not any(word in name.casefold() for word in SENSITIVE_SESSION_WORDS))
-                            permitted = (safe_daemon_fallback or (self.config.permissions.terminal_input
+                            safe_owner_choice = (permission_mode == "owner" and reason in {
+                                "CODEX_UPDATE_MENU", "CODEX_STARTUP_MENU", "CODEX_HOOK_REVIEW_MENU",
+                                "CLAUDE_OPTIONAL_NOTICE_MENU",
+                            })
+                            permitted = (safe_daemon_fallback or safe_owner_choice or (self.config.permissions.terminal_input
                                 and self.config.permissions.allow_send_keys
                                 and self._startup_input_authorized(name)
                                 and key in self.config.input_policy.allow_keys
@@ -321,12 +457,21 @@ class SessionLifecycleService:
                                         and fresh.pane_id == info.pane_id
                                         and fresh.created_epoch == info.created_epoch
                                         and fresh.pane_current_command.casefold() == expected_command
-                                        and _authorized_startup_step(fresh_lines) == step)
-                                    still_authorized = (safe_daemon_fallback or self._startup_input_authorized(name))
+                                        and _authorized_startup_step(fresh_lines, "codex") == step
+                                        and _startup_prompt_fingerprint(fresh_lines) == prompt_fingerprint)
+                                    still_authorized = (safe_daemon_fallback or safe_owner_choice
+                                                        or self._startup_input_authorized(name))
                                     if same and still_authorized:
                                         self.tmux.send_keys(name, [key])
                                         startup_key_count += 1
-                                        startup_actions.append({"menu": reason, "key": key})
+                                        startup_actions.append({
+                                            "menu": reason, "choice_id": reason.lower(), "key": key,
+                                            "prompt_fingerprint": prompt_fingerprint,
+                                            "session_generation": {
+                                                "session_id": info.session_id, "pane_id": info.pane_id,
+                                                "created_epoch": info.created_epoch},
+                                            "idempotency_key": f"launch:{name}:{info.created_epoch}:{reason}:{prompt_fingerprint[:16]}",
+                                        })
                                         if key == "Enter":
                                             startup_choices.add(reason)
                                         time.sleep(CREATE_POLL_INTERVAL_SECONDS)
@@ -369,6 +514,43 @@ class SessionLifecycleService:
                             elif time.monotonic() - composer_since >= settle_seconds:
                                 state = "READY"
                                 break
+                    elif agent_type == "claude":
+                        try:
+                            lines = self.tmux.capture_lines(name, 80)
+                        except TmuxError:
+                            lines = []
+                        step = _authorized_startup_step(lines, "claude")
+                        if step and permission_mode == "owner" and startup_key_count < 8:
+                            reason, key = step
+                            fingerprint = _startup_prompt_fingerprint(lines)
+                            try:
+                                fresh = self.tmux.get_session(name)
+                                fresh_lines = self.tmux.capture_lines(name, 80)
+                                same = (fresh is not None and not fresh.pane_dead
+                                    and fresh.session_id == info.session_id
+                                    and fresh.pane_id == info.pane_id
+                                    and fresh.created_epoch == info.created_epoch
+                                    and fresh.pane_current_command.casefold() == expected_command
+                                    and _authorized_startup_step(fresh_lines, "claude") == step
+                                    and _startup_prompt_fingerprint(fresh_lines) == fingerprint)
+                                if same:
+                                    self.tmux.send_keys(name, [key])
+                                    startup_key_count += 1
+                                    startup_actions.append({
+                                        "menu": reason,
+                                        "choice_id": "skip_optional_notice_without_saving",
+                                        "key": key, "prompt_fingerprint": fingerprint,
+                                        "session_generation": {
+                                            "session_id": info.session_id, "pane_id": info.pane_id,
+                                            "created_epoch": info.created_epoch},
+                                        "idempotency_key": f"launch:{name}:{info.created_epoch}:{reason}:{fingerprint[:16]}",
+                                    })
+                                    time.sleep(CREATE_POLL_INTERVAL_SECONDS)
+                                    continue
+                            except TmuxError:
+                                pass
+                        state = "READY"
+                        break
                     else:
                         state = "READY"
                         break
@@ -423,6 +605,8 @@ class SessionLifecycleService:
             "session_id": info.session_id, "pane_id": info.pane_id,
             "pane_current_command": info.pane_current_command, "created_epoch": info.created_epoch,
         }
+        result["launch_policy"] = {**launch_evidence, "cwd": str(resolved_cwd),
+                                    "process_argv_verified": process_args_verified}
         if agent_type in {"codex", "claude"}:
             task_ready = agent_type == "codex" and state == "READY"
             result.update(

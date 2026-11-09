@@ -20,6 +20,10 @@ import sys
 import time
 import uuid
 from .session_admission import serialized_admission
+from .agent_launch_policy import (LaunchPolicyError, build_permission_args,
+                                  register_claude_project_trust,
+                                  register_codex_project_trust,
+                                  validate_project_directory)
 
 
 def digest(value: str) -> str:
@@ -68,8 +72,9 @@ class HeadlessStore:
             conn.execute('INSERT INTO events(task_id,at,event) VALUES (?,?,?)', (task_id, time.time(), event))
         return data
 
-    def prepare(self, name, cwd, agent, prompt, key, *, limit=0, external_count=0):
-        fingerprint = digest(json.dumps([name, cwd, agent, prompt]))
+    def prepare(self, name, cwd, agent, prompt, key, *, limit=0, external_count=0,
+                permission_mode="owner", launch_flags=()):
+        fingerprint = digest(json.dumps([name, cwd, agent, prompt, permission_mode]))
         with self.connect() as conn:
             conn.execute('BEGIN IMMEDIATE')
             old = conn.execute('SELECT data FROM runs WHERE request_key=?', (key,)).fetchone()
@@ -88,6 +93,7 @@ class HeadlessStore:
             os.chmod(run_dir / 'prompt', 0o600)
             data = dict(task_id=task_id, session_id=task_id, target=name, cwd=cwd,
                         agent_type=agent, state='READY', request_key=key,
+                        permission_mode=permission_mode, launch_flags=list(launch_flags),
                         fingerprint=fingerprint, created_at=time.time(), updated_at=time.time(),
                         delivery_ack_at=None, execution_ack_at=None, exit_code=None,
                         turn_completed=False, reason=None, checkpoint_sha256=None)
@@ -158,15 +164,14 @@ class HeadlessStore:
 OUTCOME_SCHEMA = {'type': 'object', 'properties': {'outcome': {'type': 'string', 'enum': ['completed', 'blocked']}, 'summary': {'type': 'string'}}, 'required': ['outcome', 'summary'], 'additionalProperties': False}
 
 
-def codex_argv(cwd):
-    return ['codex', 'exec', '--disable', 'hooks', '--json', '--sandbox', 'workspace-write',
-            '-c', 'approval_policy="never"', '-C', cwd,
+def codex_argv(cwd, *, launch_flags=(), launcher='codex'):
+    return [launcher, 'exec', *launch_flags, '--disable', 'hooks', '--json', '-C', cwd,
             '--output-schema', str(Path(__file__).with_name('headless_outcome.schema.json')), '-']
 
 
-def claude_argv(cwd):
-    return ['claude', '-p', '--output-format', 'stream-json', '--verbose',
-            '--permission-mode', 'dontAsk', '--settings', '{"disableAllHooks":true}',
+def claude_argv(cwd, *, launch_flags=(), launcher='claude'):
+    return [launcher, *launch_flags, '-p', '--output-format', 'stream-json', '--verbose',
+            '--settings', '{"disableAllHooks":true}',
             '--json-schema', json.dumps(OUTCOME_SCHEMA)]
 
 
@@ -192,12 +197,28 @@ def run_worker(root, task_id, *, argv=None, startup_timeout=60, progress_timeout
     buffer = b''
     try:
         prompt_file = store.root / task_id / 'prompt'
+        launch_argv = argv or (claude_argv(row['cwd'], launch_flags=row.get('launch_flags', ()),
+                                            launcher=row.get('launcher', 'claude'))
+                               if row['agent_type'] == 'claude' else
+                               codex_argv(row['cwd'], launch_flags=row.get('launch_flags', ()),
+                                          launcher=row.get('launcher', 'codex')))
         with prompt_file.open('rb') as prompt:
-            proc = subprocess.Popen(argv or (claude_argv(row['cwd']) if row['agent_type'] == 'claude' else codex_argv(row['cwd'])), cwd=row['cwd'], stdin=prompt,
+            proc = subprocess.Popen(launch_argv,
+                                    cwd=row['cwd'], stdin=prompt,
                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                     start_new_session=True, close_fds=True)
         prompt_file.unlink(missing_ok=True)
-        store.update(task_id, 'CLI_SPAWNED', cli_pid=proc.pid)
+        expected_flags = row.get('launch_flags') or ()
+        expected_flag = expected_flags[0] if expected_flags else None
+        argv_verified = expected_flag is None or expected_flag in list(proc.args)
+        if not argv_verified:
+            proc.terminate()
+            store.update(task_id, 'LAUNCH_ARGV_UNVERIFIED', expected_states=('DISPATCH',),
+                         state='BLOCKED', reason='LAUNCH_POLICY_ARGV_UNVERIFIED',
+                         exit_code=None, finished_at=time.time())
+            return
+        store.update(task_id, 'CLI_SPAWNED', cli_pid=proc.pid,
+                     launch_policy_verified=argv_verified)
         selector = selectors.DefaultSelector()
         selector.register(proc.stdout, selectors.EVENT_READ)
         eof = False
@@ -341,7 +362,7 @@ class HeadlessManager:
         return None
 
     @serialized_admission
-    def start(self, name, prompt, cwd, key, *, agent='codex'):
+    def start(self, name, prompt, cwd, key, *, agent='codex', permission_mode=None):
         if not self.enabled:
             return {'error': 'HEADLESS_DISABLED'}
         if not isinstance(name, str) or not isinstance(prompt, str) or not prompt.strip() or len(prompt.encode()) > 65536:
@@ -353,9 +374,29 @@ class HeadlessManager:
         if error := self.guard(name, write=True):
             return error
         from .lifecycle import resolve_cwd
+        permission_mode = permission_mode or self.terminal.config.session_lifecycle.default_permission_mode
+        if permission_mode not in ('owner', 'native'):
+            return {'error': 'INVALID_PERMISSION_MODE'}
         resolved, error = resolve_cwd(cwd, self.terminal.config)
         if error:
             return error
+        try:
+            project = validate_project_directory(
+                str(resolved),
+                allowed_roots=self.terminal.config.session_lifecycle.allowed_cwd_roots,
+                trusted_project_roots=self.terminal.config.session_lifecycle.trusted_project_roots,
+            )
+            if project.path != project.repo_root:
+                return {'error': 'CWD_NOT_PROJECT_ROOT', 'cwd': str(project.path),
+                        'repo_root': str(project.repo_root)}
+            launcher = self.terminal.lifecycle.launch_command_for(agent)
+            if not launcher:
+                return {'error': 'LAUNCHER_NOT_CONFIGURED', 'agent_type': agent}
+            trust = (register_claude_project_trust(project.path) if agent == 'claude'
+                     else register_codex_project_trust(project.path))
+            launch_flags = build_permission_args(agent, permission_mode, launcher)
+        except LaunchPolicyError as exc:
+            return {'error': exc.code, 'detail': exc.detail}
         # Audit real inventory before admission; failure is never an empty node.
         try:
             sessions = self.terminal.tmux.list_sessions()
@@ -369,26 +410,30 @@ class HeadlessManager:
         # Idempotent retries never launch again, even after controller restart.
         old = next((r for r in self.store.rows() if r['request_key'] == key), None)
         if old:
-            expected = digest(json.dumps([name, str(resolved), agent, prompt]))
+            expected = digest(json.dumps([name, str(resolved), agent, prompt, permission_mode]))
             return self.status(old['task_id']) if old['fingerprint'] == expected else {'error': 'IDEMPOTENCY_CONFLICT'}
         try:
             if agent == 'codex':
-                help_result = subprocess.run(['codex', 'exec', '--help'], capture_output=True, text=True, timeout=10)
-                features = subprocess.run(['codex', '--disable', 'hooks', 'features', 'list'], capture_output=True, text=True, timeout=10)
+                help_result = subprocess.run([launcher, 'exec', '--help'], capture_output=True, text=True, timeout=10)
+                features = subprocess.run([launcher, '--disable', 'hooks', 'features', 'list'], capture_output=True, text=True, timeout=10)
                 supported = (help_result.returncode == features.returncode == 0 and '--json' in help_result.stdout and any(
                     line.startswith('hooks') and line.rstrip().endswith('false') for line in features.stdout.splitlines()))
             else:
-                help_result = subprocess.run(['claude', '--help'], capture_output=True, text=True, timeout=10)
-                supported = help_result.returncode == 0 and all(flag in help_result.stdout for flag in ('--settings', 'dontAsk', 'stream-json'))
+                help_result = subprocess.run([launcher, '--help'], capture_output=True, text=True, timeout=10)
+                supported = help_result.returncode == 0 and all(flag in help_result.stdout for flag in ('--settings', 'stream-json'))
             if not supported:
                 return {'error': 'HEADLESS_HOOK_ISOLATION_UNSUPPORTED'}
         except (OSError, subprocess.TimeoutExpired):
             return {'error': 'HEADLESS_CLI_PREFLIGHT_FAILED'}
-        row = self.store.prepare(name, str(resolved), agent, prompt, key, limit=limit, external_count=len(sessions))
+        row = self.store.prepare(name, str(resolved), agent, prompt, key,
+                                 limit=limit, external_count=len(sessions),
+                                 permission_mode=permission_mode, launch_flags=launch_flags)
         if 'error' in row:
             return row
         if not row.get('created'):
             return self.status(row['task_id'])
+        row = self.store.update(row['task_id'], 'LAUNCHER_SELECTED', launcher=launcher,
+                                project_trust=trust, launch_policy_verified=None)
         # Transactional worker claim also protects simultaneous identical calls.
         try:
             # A dedicated user unit avoids inheriting a controller's nested
@@ -441,9 +486,11 @@ class HeadlessManager:
             return error
         return {'status': 'OK', 'task': row}
 
-    def turn(self, action, *, target=None, text=None, cwd=None, key=None, task_id=None, agent='codex'):
+    def turn(self, action, *, target=None, text=None, cwd=None, key=None, task_id=None,
+             agent='codex', permission_mode=None):
         if action == 'headless_start':
-            return self.start(target, text, cwd, key, agent=agent)
+            return self.start(target, text, cwd, key, agent=agent,
+                              permission_mode=permission_mode)
         if action == 'headless_list':
             return {'status': 'OK', 'enabled': self.enabled, 'sessions': [
                 {key: row.get(key) for key in ('task_id', 'session_id', 'target', 'agent_type', 'state', 'reason', 'checkpoint_sha256')}

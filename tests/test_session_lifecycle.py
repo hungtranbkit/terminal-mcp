@@ -31,7 +31,8 @@ def _tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
 
 def _lifecycle_config(tmp_path, *, enabled: bool = True, protected=("terminal-mcp",),
                       launch_commands=(("claude", "claude"), ("codex", "codex")),
-                      timeout: float = 5.0, roots=None, codex_yolo: bool = False) -> AppConfig:
+                      timeout: float = 5.0, roots=None, codex_yolo: bool = False,
+                      trusted_roots=None) -> AppConfig:
     return AppConfig(
         permissions=PermissionsConfig(True, True),
         allowed_session_patterns=("lifecycle-*", "claude-lc-*", "codex-lc-*"),
@@ -41,12 +42,31 @@ def _lifecycle_config(tmp_path, *, enabled: bool = True, protected=("terminal-mc
         session_lifecycle=SessionLifecycleConfig(
             enabled=enabled,
             allowed_cwd_roots=(str(tmp_path),) if roots is None else roots,
+            trusted_project_roots=tuple(str(p) for p in (trusted_roots or ())),
+            default_permission_mode="owner",
             protected_sessions=protected,
             launch_commands=launch_commands,
             create_ready_timeout_seconds=timeout,
             codex_yolo=codex_yolo,
         ),
     )
+
+
+def _git_project(path):
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.name", "Test"], check=True)
+    (path / "README.md").write_text("fixture\n")
+    subprocess.run(["git", "-C", str(path), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-qm", "fixture"], check=True)
+    return path
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cli_trust_configs(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_PATH", str(tmp_path / "claude.json"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -216,10 +236,11 @@ def test_create_claude_and_codex_use_server_side_allowlisted_launcher(
     # a regression in launcher dispatch.
     if resolve_launcher(agent_type) is None:
         pytest.skip(f"{agent_type!r} is not installed on this host")
-    config = _lifecycle_config(tmp_path, timeout=8.0)
+    project = _git_project(tmp_path / "project")
+    config = _lifecycle_config(tmp_path, timeout=8.0, trusted_roots=(project,))
     service = TerminalService(config)
     name = lifecycle_session_factory("1", prefix=session_prefix.rstrip("-"))
-    result = service.terminal_create_session(name, agent_type)
+    result = service.terminal_create_session(name, agent_type, str(project))
     assert "error" not in result
     # This test checks launcher selection, not authorization of a fresh tmp cwd.
     # A real installed Codex can correctly stop at a startup/auth/trust gate.
@@ -244,9 +265,17 @@ def test_create_reports_launcher_not_configured_for_a_missing_binary(tmp_path, l
                                                 ("codex", "terminal-mcp-no-such-binary")))
     service = TerminalService(config)
     name = lifecycle_session_factory("codex-lc-missing")
-    result = service.terminal_create_session(name, "codex")
+    result = service.terminal_create_session(name, "codex", str(tmp_path))
     assert result["error"] == "LAUNCHER_NOT_CONFIGURED"
     assert result["state"] == "FAILED"
+    assert service.tmux.get_session(name) is None
+
+
+def test_agent_create_requires_exact_working_directory_without_home_fallback(tmp_path, lifecycle_session_factory):
+    service = TerminalService(_lifecycle_config(tmp_path))
+    name = lifecycle_session_factory("missing-cwd")
+    result = service.terminal_create_session(name, "claude")
+    assert result["error"] == "WORKING_DIRECTORY_REQUIRED"
     assert service.tmux.get_session(name) is None
 
 
@@ -266,12 +295,14 @@ def test_create_launcher_never_accepts_raw_command_from_caller(tmp_path, lifecyc
 
 
 def test_codex_resume_uses_bounded_workspace_argv_without_yolo(tmp_path, monkeypatch):
-    config = _lifecycle_config(tmp_path)
+    project = _git_project(tmp_path / "project")
+    config = _lifecycle_config(tmp_path, trusted_roots=(project,))
     service = TerminalService(config)
     captured = {}
 
-    def fake_create(name, agent_type, cwd, *, show_on_desktop=False, extra_args=()):
-        captured.update(name=name, agent_type=agent_type, cwd=cwd, extra_args=extra_args)
+    def fake_create(name, agent_type, cwd, *, show_on_desktop=False, extra_args=(), permission_mode=None):
+        captured.update(name=name, agent_type=agent_type, cwd=cwd, extra_args=extra_args,
+                        permission_mode=permission_mode)
         return {"session": name, "agent_type": agent_type, "cwd": str(tmp_path), "state": "READY"}
 
     monkeypatch.setattr(service.lifecycle, "create", fake_create)
@@ -280,15 +311,12 @@ def test_codex_resume_uses_bounded_workspace_argv_without_yolo(tmp_path, monkeyp
 
     conversation_id = "01a07b29-5e51-7e82-891d-2ebcef15419c"
     result = service.terminal_create_session(
-        "codex-lc-resume", "codex", str(tmp_path), resume_session_id=conversation_id,
+        "codex-lc-resume", "codex", str(project), resume_session_id=conversation_id,
     )
 
     assert "error" not in result
-    assert captured["extra_args"] == (
-        "--ask-for-approval", "never", "--sandbox", "workspace-write",
-        "resume", conversation_id,
-    )
-    assert "--dangerously-bypass-approvals-and-sandbox" not in captured["extra_args"]
+    assert captured["extra_args"] == ("resume", conversation_id)
+    assert captured["permission_mode"] == "owner"
     assert result["conversation_id"] == conversation_id
     assert result["resumed_from"] == conversation_id
 
@@ -311,10 +339,12 @@ def test_create_launch_fail_cleans_up_disposable_session(tmp_path, lifecycle_ses
     launcher = tmp_path / "immediate-failure"
     launcher.write_text("#!/bin/sh\nexit 1\n")
     launcher.chmod(0o755)
-    config = _lifecycle_config(tmp_path, launch_commands=(("codex", str(launcher)),), codex_yolo=True)
+    project = _git_project(tmp_path / "project")
+    config = _lifecycle_config(tmp_path, launch_commands=(("codex", str(launcher)),),
+                               codex_yolo=True, trusted_roots=(project,))
     service = TerminalService(config)
     name = lifecycle_session_factory("launchfail")
-    result = service.terminal_create_session(name, "codex")
+    result = service.terminal_create_session(name, "codex", str(project), permission_mode="native")
     assert result["error"] == "LAUNCH_FAILED"
     assert result["state"] == "FAILED"
     assert service.tmux.get_session(name) is None
@@ -324,8 +354,11 @@ def test_codex_startup_menu_is_blocked_instead_of_ready(tmp_path, lifecycle_sess
     """A live Codex process can still be waiting on its first-run menu."""
     from types import SimpleNamespace
     monkeypatch.setattr("terminal_mcp.lifecycle.resolve_launcher", lambda command: command)
+    monkeypatch.setattr("terminal_mcp.lifecycle.build_permission_args", lambda *_a, **_k: ("--yolo",))
+    monkeypatch.setattr("terminal_mcp.lifecycle._process_tree_has_flag", lambda *_: True)
 
-    config = _lifecycle_config(tmp_path, timeout=0.01)
+    project = _git_project(tmp_path / "project")
+    config = _lifecycle_config(tmp_path, timeout=0.01, trusted_roots=(project,))
     service = TerminalService(config)
     name = lifecycle_session_factory("codex-menu")
     info = SimpleNamespace(
@@ -353,7 +386,7 @@ def test_codex_startup_menu_is_blocked_instead_of_ready(tmp_path, lifecycle_sess
         "3. Cancel",
     ])
 
-    result = service.lifecycle.create(name, "codex", str(tmp_path))
+    result = service.lifecycle.create(name, "codex", str(project))
 
     assert result["state"] == "BLOCKED"
     assert result["blocked_reason"] == "CODEX_STARTUP_MENU"
@@ -368,8 +401,11 @@ def test_codex_selects_only_visible_authorized_non_granting_startup_choice(
         tmp_path, lifecycle_session_factory, monkeypatch, menu):
     from types import SimpleNamespace
     monkeypatch.setattr("terminal_mcp.lifecycle.resolve_launcher", lambda command: command)
+    monkeypatch.setattr("terminal_mcp.lifecycle.build_permission_args", lambda *_a, **_k: ("--yolo",))
+    monkeypatch.setattr("terminal_mcp.lifecycle._process_tree_has_flag", lambda *_: True)
 
-    service = TerminalService(_lifecycle_config(tmp_path, timeout=0.4))
+    project = _git_project(tmp_path / "project")
+    service = TerminalService(_lifecycle_config(tmp_path, timeout=0.4, trusted_roots=(project,)))
     name = lifecycle_session_factory("codex-safe-menu")
     info = SimpleNamespace(pane_dead=False, pane_current_command="codex", session_id="$7",
                            pane_id="%7", created_epoch=7)
@@ -394,12 +430,56 @@ def test_codex_selects_only_visible_authorized_non_granting_startup_choice(
     monkeypatch.setattr(service.tmux, "capture_lines", capture)
     monkeypatch.setattr(service.tmux, "send_keys", send_keys)
 
-    result = service.lifecycle.create(name, "codex", str(tmp_path))
+    result = service.lifecycle.create(name, "codex", str(project))
 
     assert result["state"] == "READY"
     assert result["composer_ready"] is True
     assert result["tool_ready"] is False
     assert state["keys"] == ["Enter"]
+    assert result["startup_actions"][0]["prompt_fingerprint"]
+    assert result["startup_actions"][0]["session_generation"]["session_id"] == info.session_id
+
+
+def test_codex_startup_choice_is_not_sent_after_prompt_fingerprint_changes(
+        tmp_path, lifecycle_session_factory, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr("terminal_mcp.lifecycle.resolve_launcher", lambda command: command)
+    monkeypatch.setattr("terminal_mcp.lifecycle.build_permission_args", lambda *_a, **_k: ("--yolo",))
+    monkeypatch.setattr("terminal_mcp.lifecycle._process_tree_has_flag", lambda *_: True)
+    project = _git_project(tmp_path / "project")
+    service = TerminalService(_lifecycle_config(tmp_path, timeout=0.4, trusted_roots=(project,)))
+    name = lifecycle_session_factory("codex-menu-stale")
+    info = SimpleNamespace(pane_dead=False, pane_current_command="codex", session_id="$8",
+                           pane_id="%8", created_epoch=8, pane_pid=0)
+    state = {"exists": False, "captures": 0, "keys": []}
+
+    monkeypatch.setattr(service.tmux, "get_session", lambda _name: info if state["exists"] else None)
+    def new_session(*_args, **_kwargs):
+        state["exists"] = True
+        return False, None
+    def capture(*_args, **_kwargs):
+        state["captures"] += 1
+        suffix = "" if state["captures"] == 1 else "\nCodex updated while this menu was open"
+        return ["› 1. Run without daemon this time", "2. Restart with these settings",
+                "3. Cancel" + suffix]
+    monkeypatch.setattr(service.tmux, "new_session", new_session)
+    monkeypatch.setattr(service.tmux, "capture_lines", capture)
+    monkeypatch.setattr(service.tmux, "send_keys", lambda _name, keys: state["keys"].extend(keys))
+
+    result = service.lifecycle.create(name, "codex", str(project))
+    assert state["keys"] == []
+    assert result["state"] == "BLOCKED"
+    assert result["blocked_reason"] == "CODEX_STARTUP_MENU"
+
+
+@pytest.mark.parametrize(("lines", "expected_key"), [
+    (["Teach auto mode", "1. Yes, teach me", "› 2. Not now"], "Enter"),
+    (["Save auto-mode settings?", "1. Save settings", "› 2. Don't save"], "Enter"),
+])
+def test_claude_optional_startup_notice_chooses_only_non_persistent_option(lines, expected_key):
+    from terminal_mcp.lifecycle import _authorized_startup_step
+    assert _authorized_startup_step(lines, "claude") == ("CLAUDE_OPTIONAL_NOTICE_MENU", expected_key)
+    assert _authorized_startup_step(["Teach auto mode", "1. Enable always", "› 2. Save all"], "claude") is None
 
 
 @pytest.mark.parametrize(("lines", "expected"), [
@@ -426,8 +506,11 @@ def test_codex_only_becomes_ready_at_its_composer():
 def test_codex_readiness_deadline_returns_structured_blocker(tmp_path, lifecycle_session_factory, monkeypatch):
     from types import SimpleNamespace
     monkeypatch.setattr("terminal_mcp.lifecycle.resolve_launcher", lambda command: command)
+    monkeypatch.setattr("terminal_mcp.lifecycle.build_permission_args", lambda *_a, **_k: ("--yolo",))
+    monkeypatch.setattr("terminal_mcp.lifecycle._process_tree_has_flag", lambda *_: True)
 
-    service = TerminalService(_lifecycle_config(tmp_path, timeout=0.01))
+    project = _git_project(tmp_path / "project")
+    service = TerminalService(_lifecycle_config(tmp_path, timeout=0.01, trusted_roots=(project,)))
     name = lifecycle_session_factory("codex-timeout")
     info = SimpleNamespace(
         pane_dead=False, pane_current_command="codex", session_id="$1",
@@ -447,7 +530,7 @@ def test_codex_readiness_deadline_returns_structured_blocker(tmp_path, lifecycle
     monkeypatch.setattr(service.tmux, "new_session", new_session)
     monkeypatch.setattr(service.tmux, "capture_lines", lambda *_a, **_k: ["Codex is starting"])
 
-    result = service.lifecycle.create(name, "codex", str(tmp_path))
+    result = service.lifecycle.create(name, "codex", str(project))
 
     assert result["state"] == "BLOCKED"
     assert result["readiness_stage"] == "STARTUP_CHECK"
@@ -849,10 +932,11 @@ def test_a_created_session_records_both_provenance_and_its_real_launcher(
     """
     if resolve_launcher("claude") is None:
         pytest.skip("claude is not installed on this host")
-    config = _lifecycle_config(tmp_path, timeout=8.0)
+    project = _git_project(tmp_path / "project")
+    config = _lifecycle_config(tmp_path, timeout=8.0, trusted_roots=(project,))
     service = TerminalService(config)
     name = lifecycle_session_factory("claude-lc-provenance")
-    assert "error" not in service.terminal_create_session(name, "claude")
+    assert "error" not in service.terminal_create_session(name, "claude", str(project))
 
     record = service.session_registry.get(service.REGISTRY_LOCAL_NODE_ID, name)
     assert record is not None
@@ -874,9 +958,18 @@ def test_a_session_merely_observed_records_neither(tmp_path, tmux_session_factor
     assert not record.launch_command
 
 
-def test_codex_yolo_defaults_to_least_privilege(tmp_path):
-    config = _lifecycle_config(tmp_path)
-    assert config.session_lifecycle.codex_yolo is False
+def test_code_constructed_lifecycle_config_defaults_to_native_mode(tmp_path):
+    assert SessionLifecycleConfig().codex_yolo is False
+    assert SessionLifecycleConfig().default_permission_mode == "native"
+
+
+def test_legacy_codex_yolo_opt_out_maps_to_native_unless_new_policy_is_explicit(monkeypatch):
+    from terminal_mcp.config import _load_session_lifecycle_config
+    assert _load_session_lifecycle_config({"codex_yolo": False}).default_permission_mode == "native"
+    assert _load_session_lifecycle_config({"codex_yolo": True}).default_permission_mode == "owner"
+    monkeypatch.setenv("TERMINAL_MCP_CODEX_YOLO", "false")
+    assert _load_session_lifecycle_config({}).default_permission_mode == "native"
+    assert _load_session_lifecycle_config({"default_permission_mode": "owner"}).default_permission_mode == "owner"
 
 
 def test_permission_during_initial_preflight_overrides_create_readiness(tmp_path, monkeypatch):

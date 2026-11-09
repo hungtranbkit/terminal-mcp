@@ -73,9 +73,11 @@ def test_restart_lost_worker_holds_work_and_never_replays(tmp_path):
 
 def test_hook_isolation_and_permissions_are_explicit():
     from terminal_mcp.headless import codex_argv
-    argv = codex_argv('/tmp/test')
+    argv = codex_argv('/tmp/test', launch_flags=('--yolo',))
     assert argv[argv.index('--disable') + 1] == 'hooks'
-    assert 'approval_policy="never"' in argv
+    assert '--yolo' in argv
+    assert '--sandbox' not in argv
+    assert 'approval_policy="never"' not in argv
     assert '--dangerously-bypass-approvals-and-sandbox' not in argv
 
 

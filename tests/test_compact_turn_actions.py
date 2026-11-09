@@ -156,13 +156,15 @@ def test_create_session_passes_every_lifecycle_argument_through():
     tools = _tools({"create_session": create})
     result = tools.turn(action="create", target="agent-new", agent_type="claude",
                         working_directory="/home/kimex/work", initial_prompt="hi",
-                        grant_mode="read", binding="primary", node="hp-linux")
+                        grant_mode="read", binding="primary", node="hp-linux",
+                        permission_mode="owner")
     assert result["status"] == "OK"
     args, kwargs = create.calls[0]
     assert args == ("agent-new",)
     assert kwargs == {"agent_type": "claude", "working_directory": "/home/kimex/work",
                       "initial_prompt": "hi", "grant_mode": "read",
-                      "binding": "primary", "node": "hp-linux"}
+                          "binding": "primary", "node": "hp-linux",
+                          "permission_mode": "owner"}
 
 
 def test_delete_session_uses_target_as_the_name():

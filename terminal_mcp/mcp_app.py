@@ -92,12 +92,14 @@ _DIRECT_ACTION_SCHEMA_HELP = (
     "idempotency_key), headless_status/list/checkpoint/cancel/cleanup. "
     "Direct Terminal MCP action. Normal public actions: start (idle local Codex, confirmed RUNNING or error), inspect, send, send_wait, wait, resume, "
     "supervise (long task continued server-side until explicit DONE), supervise_status, "
-    "supervise_complete, supervise_cancel, "
+    "supervise_complete, supervise_cancel, supervise_resolve_prompt, "
     "list_sessions, list_nodes, create_session, delete_session, task_status, task_batch_status, "
     "browser_verify, browser_screenshot, browser_status, browser_stop. "
     "Tracked work: create_session (no initial_prompt) -> supervise(text, title, idempotency_key) "
     "-> supervise_status(task_id or idempotency_key). Retired queue actions return "
     "QUEUE_DISABLED_USE_DIRECT_SESSION and create no task. RUNNING only after observed execution. "
+    "supervise_resolve_prompt accepts only a current fingerprinted, owner-mode harmless menu choice; "
+    "it cannot approve tool permissions, login, credentials, or arbitrary text. "
     "When assigning or changing a session's task (send/send_wait/supervise/create_session), "
     "pass title=\"<short task summary>\" so the live monitor shows it; omit title for "
     "continuations (y, continue, approvals, follow-ups)."
@@ -367,6 +369,9 @@ def build_mcp(service: TerminalService | None = None,
             # text + Enter) submits the composer's OWN content and refuses on
             # an empty composer -- it can never retype or duplicate a prompt.
             activate=lambda target, key: compact_tools.send_task(target, "", idempotency_key=key),
+            # A resolver may send only one key returned by the fixed safe-menu
+            # allowlist, through the ordinary input guard and lease.
+            prompt_key=lambda target, key: controller.terminal_send_keys(target, [key]),
             # In-call look for execution evidence so a fast start can say
             # RUNNING honestly; the loop carries the rest.
             accept_wait_seconds=float(os.environ.get("TERMINAL_MCP_SUPERVISE_ACCEPT_WAIT", "6")),
@@ -817,6 +822,7 @@ def build_mcp(service: TerminalService | None = None,
                           "send/supervise: stable key; a retry with the same key returns the same "
                           "task/receipt and never sends twice. supervise_status also accepts it."))] = None,
                       agent_type: str = "shell", working_directory: str | None = None,
+                      permission_mode: str | None = None,
                       initial_prompt: str | None = None, grant_mode: str = "none",
                       binding: str | None = None, node: str = "auto",
                       title: str | None = None, priority: int = 0,
@@ -885,8 +891,10 @@ Direct actions:
                 States: DISPATCHING (persisted/submitted, execution not yet
                 observed) -> RUNNING (observed: busy footer or an answer after
                 the echoed prompt). STUCK_COMPOSER (prompt still in composer;
-                bounded Enter-only recovery), WAITING_INPUT (dialog/menu needs
-                a human -- never auto-answered), DISPATCH_UNCERTAIN (no evidence;
+                bounded Enter-only recovery), WAITING_INPUT (unrecognized,
+                authentication, or ambiguous prompt needs a human; owner-mode
+                launch resolves only exact non-granting startup choices),
+                DISPATCH_UNCERTAIN (no evidence;
                 not resent). Each task carries next_action and receipts.
   supervise_status/supervise_complete/supervise_cancel  (task_id; status also
                 takes idempotency_key or target)
@@ -923,6 +931,7 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
             compact=compact, idempotency_key=idempotency_key,
             path=path, content_b64=content_b64, overwrite=overwrite, mode=mode,
             confirm=confirm, agent_type=agent_type, working_directory=working_directory,
+            permission_mode=permission_mode,
             initial_prompt=initial_prompt, grant_mode=grant_mode, binding=binding,
             node=node, title=title, priority=priority, metadata=metadata,
             request_key=request_key, task_id=task_id, task_ids=task_ids,
@@ -1227,6 +1236,7 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
 
     @server.tool()
     def terminal_create_session(name: str, agent_type: str = "shell", working_directory: str | None = None,
+                                permission_mode: str | None = None,
                                 initial_prompt: str | None = None, grant_mode: str = "none",
                                 binding: str | None = None, node: str = "auto",
                                 show_on_desktop: bool = False) -> dict:
@@ -1281,6 +1291,7 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         result = controller.terminal_create_session(
             name, agent_type, working_directory, node=node, initial_prompt=initial_prompt,
             grant_mode=grant_mode, binding=binding, requested_by="mcp", show_on_desktop=show_on_desktop,
+            permission_mode=permission_mode,
         )
         if isinstance(result, dict) and "error" not in result:
             # A fresh session's label: its initial_prompt, else none (this

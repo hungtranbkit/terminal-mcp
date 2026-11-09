@@ -31,11 +31,19 @@ session_lifecycle:
   # (symlinks followed). This node's own user profile, never a drive root.
   allowed_cwd_roots:
     - "__SESSION_ROOT__"
+  # Exact canonical Git project roots (linked worktrees are verified against
+  # their Git common-dir before the exact worktree path is trusted).
+  trusted_project_roots:
+    - "__SESSION_ROOT__/terminal-mcp"
+  default_permission_mode: owner
   protected_sessions:
     - terminal-mcp
   # The exact literal binaries, never anything a caller supplies as text.
   launch_commands:
     claude: claude
     codex: codex
+  # Legacy codex_yolo is retained for old config readers; new deployments use
+  # default_permission_mode above and may opt out per create_session call.
+  codex_yolo: true
   create_ready_timeout_seconds: 10
   default_grant_mode: none

@@ -62,7 +62,8 @@ class NodeClient(Protocol):
                        initial_prompt: str | None = None, grant_mode: str = "none",
                        binding: str | None = None, requested_by: str | None = None,
                        show_on_desktop: bool = False,
-                       resume_session_id: str | None = None) -> dict[str, Any]: ...
+                       resume_session_id: str | None = None,
+                       permission_mode: str | None = None) -> dict[str, Any]: ...
     def detach_session(self, name: str) -> dict[str, Any]: ...
     def set_task_label(self, session: str, summary: str, *, source: str = "title",
                        task_id: str | None = None, request_key: str | None = None,
@@ -162,11 +163,13 @@ class LocalNodeClient:
                        initial_prompt: str | None = None, grant_mode: str = "none",
                        binding: str | None = None, requested_by: str | None = None,
                        show_on_desktop: bool = False,
-                       resume_session_id: str | None = None) -> dict[str, Any]:
+                       resume_session_id: str | None = None,
+                       permission_mode: str | None = None) -> dict[str, Any]:
         return self._terminal.terminal_create_session(name, agent_type, cwd, initial_prompt=initial_prompt,
                                                        grant_mode=grant_mode, binding=binding,
                                                        requested_by=requested_by, show_on_desktop=show_on_desktop,
-                                                       resume_session_id=resume_session_id)
+                                                       resume_session_id=resume_session_id,
+                                                       permission_mode=permission_mode)
 
     def detach_session(self, name: str) -> dict[str, Any]:
         return self._terminal.terminal_detach_session(name)
@@ -550,11 +553,13 @@ class RemoteNodeClient:
                        initial_prompt: str | None = None, grant_mode: str = "none",
                        binding: str | None = None, requested_by: str | None = None,
                        show_on_desktop: bool = False,
-                       resume_session_id: str | None = None) -> dict[str, Any]:
+                       resume_session_id: str | None = None,
+                       permission_mode: str | None = None) -> dict[str, Any]:
         return self._request("POST", "/v1/sessions", body={
             "name": name, "agent_type": agent_type, "cwd": cwd, "initial_prompt": initial_prompt,
             "grant_mode": grant_mode, "binding": binding, "requested_by": requested_by,
             "show_on_desktop": show_on_desktop, "resume_session_id": resume_session_id,
+            "permission_mode": permission_mode,
         })
 
     def detach_session(self, name: str) -> dict[str, Any]:

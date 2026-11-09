@@ -89,7 +89,8 @@ ACTIVE_COMMANDS = {"claude", "codex", "python", "python3", "pytest", "node", "np
 _SHELL_PROMPT_READY = re.compile(
     r"^(?:\S+@\S+:\S*[$#]|PS [A-Za-z]:\\\S*>|[$#])\s*$"
 )
-_SHELLS = {"bash", "zsh", "sh", "fish", "dash"}
+_SHELLS = {"bash", "zsh", "sh", "fish", "dash", "powershell", "pwsh",
+           "powershell.exe", "pwsh.exe"}
 
 
 def shell_prompt_is_back(output: str) -> bool:
@@ -210,14 +211,53 @@ def detect_waiting_input(output: str) -> tuple[bool, str]:
     return False, "no high-confidence input prompt in the last four non-empty lines"
 
 
+def prompt_blocker_reason(command: str, output: str) -> str | None:
+    """Name common blockers without answering, dismissing, or changing choices."""
+    lines = [line.strip() for line in str(output or "").splitlines() if line.strip()][-12:]
+    text = "\n".join(lines).casefold()
+    if any(marker in text for marker in (
+            "sign in to claude", "log in to claude", "sign in to codex",
+            "log in to codex", "authentication required", "enter verification code",
+            "one-time password", "otp", "password:")):
+        return "NEEDS_LOGIN"
+    if any(marker in text for marker in (
+            "weekly limit reached", "usage limit reached", "rate limit reached",
+            "you've hit your limit", "quota exceeded", "try again after")):
+        return "RATE_LIMITED"
+    if command in {"powershell", "pwsh", "powershell.exe", "pwsh.exe"} and lines[-1:] == [">>"]:
+        return "POWERSHELL_CONTINUATION_UNTERMINATED_COMMAND"
+    if "model" in text and any(marker in text for marker in ("choose a model", "select model", "switch model")):
+        return "MODEL_CHOICE_REQUIRED"
+    if any(marker in text for marker in ("teach auto mode", "save auto-mode settings", "save auto mode")):
+        return "AUTO_MODE_SETTINGS_CONFIRMATION"
+    return None
+
+
+def _identify_cli_wrapper(command: str, output: str) -> str:
+    """Recognize a Node-hosted Codex TUI from its own stable footer chrome."""
+    if command == "node":
+        recent = "\n".join(line.casefold() for line in output.splitlines()[-12:])
+        if "ask codex to do anything" in recent or "openai codex" in recent:
+            return "codex"
+    return command
+
+
 def classify_status(session: SessionInfo, output: str, now: int | None = None) -> tuple[str, bool, str]:
-    command = normalize_command(session.pane_current_command)
+    raw_command = normalize_command(session.pane_current_command)
+    command = _identify_cli_wrapper(raw_command, output)
+    lines = [line.strip() for line in str(output or "").splitlines() if line.strip()]
+    if command in {"powershell", "pwsh", "powershell.exe", "pwsh.exe"} and lines[-1:] == [">>"]:
+        return "WAITING_INPUT", True, (
+            "POWERSHELL_CONTINUATION_UNTERMINATED_COMMAND: preserve the incomplete command; "
+            "inspect ownership/context before any response")
     waiting, reason = detect_waiting_input(output)
     if waiting:
         # The command is restated so a caller can tell an agent's dialog
         # (e.g. Codex's boot hooks menu) from a shell prompt (issue #52: a
         # supervised task on a Codex pane was misfiled as mode=shell).
-        return "WAITING_INPUT", True, f"{reason}; current command is {command or 'unknown'!r}"
+        blocker = prompt_blocker_reason(command, output)
+        label = f"{blocker}: " if blocker else ""
+        return "WAITING_INPUT", True, f"{label}{reason}; current command is {command or 'unknown'!r}"
     if session.pane_dead:
         return "IDLE", False, "tmux reports the active pane is dead"
     age = max(0, (now if now is not None else int(time.time())) - session.activity_epoch)

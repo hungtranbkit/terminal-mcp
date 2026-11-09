@@ -148,6 +148,9 @@ session_lifecycle:
   allowed_cwd_roots:
     - /home/dell/workspace
     - /home/dell
+  trusted_project_roots:
+    - /home/dell/workspace/terminal-mcp
+  default_permission_mode: owner
   protected_sessions:
     - terminal-mcp
     - codex-main
@@ -159,8 +162,10 @@ session_lifecycle:
   launch_commands:
     claude: claude
     codex: codex
-  # Least-privilege default. Set true only as an explicit trusted-environment opt-in.
-  codex_yolo: false
+  # Persistent operator preference: Claude skip-permissions and Codex YOLO
+  # apply only to exact trusted project roots above. Use permission_mode=native
+  # on one session for an explicit CLI-native opt-out.
+  codex_yolo: true
   create_ready_timeout_seconds: 6
   default_grant_mode: none
   # Admission control (2026-09-21). Without a ceiling this node grew to

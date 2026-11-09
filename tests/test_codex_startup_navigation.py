@@ -40,6 +40,17 @@ def configured(tmp_path):
     return AppConfig(permissions=PermissionsConfig(True, True), allowed_session_patterns=("codex-nav-*",), input_policy=InputPolicyConfig(allowed_session_patterns=("codex-nav-*",)), session_lifecycle=SessionLifecycleConfig(enabled=True, allowed_cwd_roots=(str(tmp_path),), launch_commands=(("codex", "codex"),), create_ready_timeout_seconds=2.0))
 
 def launch(tmp_path, monkeypatch, backend, config=None):
+    # These tests exercise startup/menu behavior. The project-root and CLI
+    # trust contract is covered by test_agent_launch_policy; keep its OS/Git
+    # preconditions out of this fake-backend suite.
+    from pathlib import Path
+    from terminal_mcp.agent_launch_policy import ProjectDirectory
+    project = ProjectDirectory(Path(tmp_path), Path(tmp_path), Path(tmp_path) / ".git",
+                               Path(tmp_path))
+    monkeypatch.setattr("terminal_mcp.lifecycle.validate_project_directory",
+                        lambda *_args, **_kwargs: project)
+    monkeypatch.setattr("terminal_mcp.lifecycle.register_codex_project_trust",
+                        lambda path: {"registered": True, "path": str(path)})
     svc = SessionLifecycleService(config or configured(tmp_path), backend)
     monkeypatch.setattr(svc, "launch_command_for", lambda agent: "codex")
     return svc.create("codex-nav-check", "codex", str(tmp_path))
@@ -134,6 +145,14 @@ def test_startup_open_default_does_not_require_retired_whitelist(tmp_path, monke
 
 
 def test_scoped_safe_daemon_choice_does_not_require_general_input_grant(tmp_path, monkeypatch):
+    from pathlib import Path
+    from terminal_mcp.agent_launch_policy import ProjectDirectory
+    project = ProjectDirectory(Path(tmp_path), Path(tmp_path), Path(tmp_path) / ".git",
+                               Path(tmp_path))
+    monkeypatch.setattr("terminal_mcp.lifecycle.validate_project_directory",
+                        lambda *_args, **_kwargs: project)
+    monkeypatch.setattr("terminal_mcp.lifecycle.register_codex_project_trust",
+                        lambda path: {"registered": True, "path": str(path)})
     backend = MenuBackend("daemon", 0)
     decisions = iter([True, False])
     svc = SessionLifecycleService(configured(tmp_path), backend,
@@ -239,6 +258,14 @@ def test_supported_codex_gets_scoped_no_daemon_before_resume_args(tmp_path, monk
     _codex_supports_no_daemon.cache_clear()
     monkeypatch.setattr("terminal_mcp.lifecycle.subprocess.run", lambda *a, **kw: SimpleNamespace(
         stdout="--no-daemon Run without shared background server", stderr="", returncode=0))
+    from pathlib import Path
+    from terminal_mcp.agent_launch_policy import ProjectDirectory
+    project = ProjectDirectory(Path(tmp_path), Path(tmp_path), Path(tmp_path) / ".git",
+                               Path(tmp_path))
+    monkeypatch.setattr("terminal_mcp.lifecycle.validate_project_directory",
+                        lambda *_args, **_kwargs: project)
+    monkeypatch.setattr("terminal_mcp.lifecycle.register_codex_project_trust",
+                        lambda path: {"registered": True, "path": str(path)})
     backend = MenuBackend("daemon", 0)
     backend.ready = True
     svc = SessionLifecycleService(configured(tmp_path), backend)

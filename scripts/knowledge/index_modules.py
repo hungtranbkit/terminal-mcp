@@ -46,7 +46,8 @@ from terminal_mcp.project_knowledge import ProjectKnowledge  # noqa: E402
 # once; the script enforces that rather than trusting this table.
 GROUPS: dict[str, list[str]] = {
     "session_ops": ["core.py", "tmux.py", "lifecycle.py", "session_backend.py",
-                    "models.py", "bindings.py", "killed_sessions.py"],
+                    "models.py", "bindings.py", "killed_sessions.py",
+                    "agent_launch_policy.py", "prompt_resolution.py"],
     "session_state": ["status.py", "adapters.py", "terminal_wall.py"],
     "prompt_submission": ["prompt_transport.py", "submit_flow.py",
                           "submit_watchdog.py", "verifier.py"],
