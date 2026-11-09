@@ -333,6 +333,9 @@ class SessionLifecycleService:
         resolved_cwd, error = resolve_cwd(cwd, self.config)
         if error is not None:
             return {**error, "state": "FAILED"}
+        if agent_type in {"claude", "codex"} and not cwd:
+            return {"error": "WORKING_DIRECTORY_REQUIRED", "state": "FAILED",
+                    "detail": "Pass the exact existing project/worktree path; no home/workspace fallback is used."}
         command = self.launch_command_for(agent_type)
         if agent_type != "shell" and not command:
             return {"error": "LAUNCHER_NOT_CONFIGURED", "agent_type": agent_type, "state": "FAILED"}
@@ -342,9 +345,6 @@ class SessionLifecycleService:
             return {"error": "INVALID_PERMISSION_MODE", "state": "FAILED"}
         launch_evidence: dict[str, Any] = {"permission_mode": permission_mode, "flags": []}
         if agent_type in {"claude", "codex"}:
-            if not cwd:
-                return {"error": "WORKING_DIRECTORY_REQUIRED", "state": "FAILED",
-                        "detail": "Pass the exact existing project/worktree path; no home/workspace fallback is used."}
             try:
                 project = validate_project_directory(
                     str(resolved_cwd),

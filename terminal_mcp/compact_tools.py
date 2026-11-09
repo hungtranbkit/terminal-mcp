@@ -1008,6 +1008,7 @@ class CompactTerminalTools:
             return self._handler_turn(
                 normalized, target=target, text=text, agent_type=agent_type,
                 working_directory=working_directory, initial_prompt=initial_prompt,
+                permission_mode=permission_mode,
                 grant_mode=grant_mode, binding=binding, node=node, title=title,
                 priority=priority, metadata=metadata, request_key=request_key,
                 task_id=task_id, task_ids=task_ids, url=url, args=args,
@@ -1583,6 +1584,7 @@ class CompactTerminalTools:
     def _handler_turn(self, action: str, *, target: str | None, text: str | None,
                       agent_type: str, working_directory: str | None,
                       initial_prompt: str | None, grant_mode: str,
+                      permission_mode: str | None = None,
                       binding: str | None, node: str, title: str | None,
                       priority: int, metadata: dict[str, Any] | None,
                       request_key: str | None, task_id: str | None,

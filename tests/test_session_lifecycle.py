@@ -265,7 +265,7 @@ def test_create_reports_launcher_not_configured_for_a_missing_binary(tmp_path, l
                                                 ("codex", "terminal-mcp-no-such-binary")))
     service = TerminalService(config)
     name = lifecycle_session_factory("codex-lc-missing")
-    result = service.terminal_create_session(name, "codex")
+    result = service.terminal_create_session(name, "codex", str(tmp_path))
     assert result["error"] == "LAUNCHER_NOT_CONFIGURED"
     assert result["state"] == "FAILED"
     assert service.tmux.get_session(name) is None
@@ -354,6 +354,7 @@ def test_codex_startup_menu_is_blocked_instead_of_ready(tmp_path, lifecycle_sess
     """A live Codex process can still be waiting on its first-run menu."""
     from types import SimpleNamespace
     monkeypatch.setattr("terminal_mcp.lifecycle.resolve_launcher", lambda command: command)
+    monkeypatch.setattr("terminal_mcp.lifecycle.build_permission_args", lambda *_a, **_k: ("--yolo",))
     monkeypatch.setattr("terminal_mcp.lifecycle._process_tree_has_flag", lambda *_: True)
 
     project = _git_project(tmp_path / "project")
@@ -400,6 +401,7 @@ def test_codex_selects_only_visible_authorized_non_granting_startup_choice(
         tmp_path, lifecycle_session_factory, monkeypatch, menu):
     from types import SimpleNamespace
     monkeypatch.setattr("terminal_mcp.lifecycle.resolve_launcher", lambda command: command)
+    monkeypatch.setattr("terminal_mcp.lifecycle.build_permission_args", lambda *_a, **_k: ("--yolo",))
     monkeypatch.setattr("terminal_mcp.lifecycle._process_tree_has_flag", lambda *_: True)
 
     project = _git_project(tmp_path / "project")
@@ -442,6 +444,7 @@ def test_codex_startup_choice_is_not_sent_after_prompt_fingerprint_changes(
         tmp_path, lifecycle_session_factory, monkeypatch):
     from types import SimpleNamespace
     monkeypatch.setattr("terminal_mcp.lifecycle.resolve_launcher", lambda command: command)
+    monkeypatch.setattr("terminal_mcp.lifecycle.build_permission_args", lambda *_a, **_k: ("--yolo",))
     monkeypatch.setattr("terminal_mcp.lifecycle._process_tree_has_flag", lambda *_: True)
     project = _git_project(tmp_path / "project")
     service = TerminalService(_lifecycle_config(tmp_path, timeout=0.4, trusted_roots=(project,)))
@@ -503,6 +506,7 @@ def test_codex_only_becomes_ready_at_its_composer():
 def test_codex_readiness_deadline_returns_structured_blocker(tmp_path, lifecycle_session_factory, monkeypatch):
     from types import SimpleNamespace
     monkeypatch.setattr("terminal_mcp.lifecycle.resolve_launcher", lambda command: command)
+    monkeypatch.setattr("terminal_mcp.lifecycle.build_permission_args", lambda *_a, **_k: ("--yolo",))
     monkeypatch.setattr("terminal_mcp.lifecycle._process_tree_has_flag", lambda *_: True)
 
     project = _git_project(tmp_path / "project")
@@ -954,10 +958,9 @@ def test_a_session_merely_observed_records_neither(tmp_path, tmux_session_factor
     assert not record.launch_command
 
 
-def test_codex_yolo_defaults_to_least_privilege(tmp_path):
-    config = _lifecycle_config(tmp_path)
-    assert config.session_lifecycle.codex_yolo is False
-    assert config.session_lifecycle.default_permission_mode == "owner"
+def test_code_constructed_lifecycle_config_defaults_to_native_mode(tmp_path):
+    assert SessionLifecycleConfig().codex_yolo is False
+    assert SessionLifecycleConfig().default_permission_mode == "native"
 
 
 def test_legacy_codex_yolo_opt_out_maps_to_native_unless_new_policy_is_explicit(monkeypatch):
