@@ -1387,3 +1387,23 @@ LAN afterward.
   task started) is still present, still local-only (never seen on a
   remote node), still not fixed here -- outside this task's stated
   multi-node-stability scope.
+
+## Linked-node SSH from Terminal MCP (2026-11-09)
+
+A controller can manage a dedicated SSH key for an already registered node without using SSH to bootstrap that node. The new authenticated node-agent operation is fixed to status, setup, or revoke; it does not accept a host, username, key path, service name, firewall change, or shell command. Setup modifies only one validated terminal-mcp:<controller-node>-<target-node>:YYYYMMDD public-key line in the effective user's authorized_keys, preserving other entries. Existing OpenSSH installation/service/admin configuration must already be usable; otherwise the node reports needs_admin with the specific prerequisite. Windows currently reports needs_admin until a real Windows OpenSSH account/ACL helper is available; Linux tests are not Windows proof.
+
+The controller writes one Ed25519 private key per target under the private state directory (0700 directory, 0600 key), persists a non-secret profile, and obtains the SSH host public key through the authenticated node channel. It refuses a changed pin. Verification uses an isolated client config, IdentityAgent=none, IdentitiesOnly=yes, BatchMode=yes, StrictHostKeyChecking=yes, and a dedicated known_hosts file; a nonce, SSH username, and node hostname must all match. No password prompt or machine-wide SSH config is used. terminal_turn(action=node_ssh, node_id=…, args={operation: status|setup|verify|connect|revoke}) exposes lifecycle; operation=exec takes a bounded structured argv (not a shell-string parameter) and returns a bounded result. The dashboard Nodes detail view has “Thiết lập SSH”, “Kiểm tra”, “Mở terminal”, and “Thu hồi key”. Its terminal opens a persistent remote tmux session: closing the browser detaches that SSH client and does not kill remote work. Dashboard WebSocket uses the existing login, origin, mutation, and terminal-input guards.
+
+### Current rollout evidence
+
+Owner reported (2026-11-09, 20:45 Asia/Ho_Chi_Minh) a successful manual HP→Dell canary through the existing authenticated node shell: target Dell 100.81.85.120:22, user dell; a dedicated private key remained on HP at /home/kimex/.local/state/terminal-mcp/node-ssh-canary/hp-to-dell-ed25519; host public key was obtained directly from Dell and pinned in the canary known_hosts; a managed public-key line was appended while preserving prior entries and an authorized-keys backup was retained. The real SSH nonce/identity command returned dell-Latitude-5511, user dell, exit 0, and ssh -F …/ssh_config dell-linux whoami returned dell, exit 0. Owner also reported default client config fails on a permissions problem in /etc/ssh/ssh_config.d/20-systemd-ssh-proxy.conf and the isolated config initially offered too many agent keys; the dedicated identity plus the strict options above resolved both. This canary is owner-verified evidence, not independently re-run by this source checkout. Product revoke only touches its own stored key and therefore does not delete that earlier canary key; do not copy or print its private key.
+
+| Node / path | Status | Evidence / next action |
+|---|---|---|
+| HP → Dell | Owner-verified manual SSH, exit 0 | Keep existing canary key, pin, profile, and Dell backup intact. The new product runtime has not been deployed there yet. |
+| HP, M910, MacBook, NEC1, Windows → their SSH setup | Pending | Requires rollout of node-agent /v1/ssh/manage; heartbeat alone is not authorization. Recheck admin/service capability per platform. |
+| Dell SSH server | Owner-verified target for canary | 100.81.85.120:22, user dell; not equivalent to the new MCP/dashboard path being deployed. |
+| Windows | Unverified/needs admin | Implement and validate Windows OpenSSH service identity, ACLs, authorized-key path, and detached terminal on a real Windows node. |
+| dell-5530, mac17-macbook-pro, local | Offline/pending | Do not claim setup or SSH verification. |
+
+Deployment/runtime version, service unit, browser terminal smoke, and all-node SSH verification remain rollout acceptance items. Source/test success alone does not mean the public controller has this feature. Use a canary update and health/version check before rolling any other node; never restart the fleet together.

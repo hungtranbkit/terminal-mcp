@@ -197,6 +197,7 @@ TURN_HANDLER_ACTIONS: dict[str, str] = {
     "put_file": "put_file",
     "list_sessions": "list_sessions",
     "list_nodes": "list_nodes",
+    "node_ssh": "node_ssh",
     "create_session": "create_session",
     "delete_session": "delete_session",
     "enqueue_task": "enqueue_task",
@@ -453,6 +454,7 @@ class CompactTerminalTools:
         # here, and the wrapper-layer side effects those tools already carry
         # (heartbeat refresh, supervisor-watch cleanup on delete) still run.
         self.handlers: dict[str, Callable[..., Any]] = dict(handlers or {})
+        self.node_ssh: Any = None
         from .context_pack import RepoContextCache
         self._repo_context_cache = RepoContextCache()
         self.monotonic = monotonic
@@ -901,7 +903,7 @@ class CompactTerminalTools:
              task_ids: list[str] | None = None,
              long_task: bool = False,
              url: str | None = None, args: dict | None = None,
-             confirm: bool | None = None) -> dict[str, Any]:
+             confirm: bool | None = None, node_id: str | None = None) -> dict[str, Any]:
         """One MCP-call surface for one logical terminal turn.
 
         Pane actions, implemented here:
@@ -939,6 +941,33 @@ class CompactTerminalTools:
         """
         normalized = str(action or "").strip().lower().replace("-", "_")
         normalized = TURN_ACTION_ALIASES.get(normalized, normalized)
+        if normalized == "node_ssh":
+            if not isinstance(node_id, str) or not node_id.strip():
+                return {"status": "FAILED", "error": "NODE_ID_REQUIRED", "action": normalized}
+            try:
+                from .remote_connect import validate_node_id
+                validate_node_id(node_id.strip())
+            except ValueError:
+                return {"status": "FAILED", "error": "INVALID_NODE_ID", "action": normalized}
+            if not isinstance(args, dict) or "operation" not in args:
+                return {"status": "FAILED", "error": "INVALID_ARGS", "action": normalized,
+                        "allowed": ["operation", "argv", "timeout"]}
+            operation = args.get("operation")
+            allowed = {"exec": {"operation", "argv", "timeout"},
+                       "status": {"operation"}, "setup": {"operation"}, "verify": {"operation"},
+                       "revoke": {"operation"}, "connect": {"operation"}}
+            if not isinstance(operation, str) or operation not in allowed:
+                return {"status": "FAILED", "error": "INVALID_OPERATION", "action": normalized}
+            if set(args) - allowed[operation]:
+                return {"status": "FAILED", "error": "INVALID_ARGS", "action": normalized,
+                        "allowed": sorted(allowed[operation])}
+            if self.node_ssh is None:
+                return {"status": "FAILED", "error": "ACTION_UNAVAILABLE", "action": normalized}
+            result = (self.node_ssh.exec(node_id.strip(), args.get("argv"), timeout=args.get("timeout", 15.0))
+                      if operation == "exec" else getattr(self.node_ssh, operation)(node_id.strip()))
+            return {"status": "OK" if result.get("status") not in {"error", "offline", "auth_failed", "unsupported", "needs_admin", "host_key_mismatch", "timeout", "port_closed", "not_configured", "command_failed"} else "FAILED",
+                    "action": normalized, "result": result}
+
         if normalized not in TURN_ACTIONS:
             # Recovery guidance is intentionally direct-only even when an
             # operator has temporarily opted the retired queue back in.  The

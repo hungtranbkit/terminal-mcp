@@ -323,6 +323,7 @@ def test_the_advertised_turn_schema_exposes_every_routed_argument():
     tools = {tool.name: tool for tool in asyncio.run(mcp_app.build_mcp().list_tools())}
     schema = tools["terminal_turn"].input_schema["properties"]
     for argument in ("action", "target", "targets", "text", "desired_states",
+                     "node_id", "args",
                      "resume_token", "agent_type", "working_directory",
                      "initial_prompt", "grant_mode", "binding", "node",
                      "title", "priority", "metadata", "request_key",
@@ -696,3 +697,26 @@ def test_queue_run_once_native_handler_checks_session_input_rights(monkeypatch, 
     assert calls == (["lane-a"] if allowed else [])
     if not allowed:
         assert reason in str(result)
+
+
+def test_node_ssh_turn_requires_node_id_and_fixed_operation_arguments():
+    tools = _tools()
+    assert tools.turn(action="node_ssh", args={"operation": "status"})["error"] == "NODE_ID_REQUIRED"
+    assert tools.turn(action="node_ssh", node_id="hp-linux",
+                      args={"operation": "setup", "host": "10.0.0.1"})["error"] == "INVALID_ARGS"
+    assert tools.turn(action="node_ssh", node_id="hp-linux",
+                      args={"operation": "exec"})["error"] == "ACTION_UNAVAILABLE"
+    assert tools.turn(action="node_ssh", node_id="hp-linux",
+                      args={"operation": "verify", "command": "id"})["error"] == "INVALID_ARGS"
+
+
+def test_node_ssh_exec_routes_only_structured_argv_to_verified_profile():
+    class SSH:
+        def exec(self, node_id, argv, *, timeout):
+            return {"node_id": node_id, "status": "completed", "exit_code": 0, "stdout": "ok"}
+    tools = _tools()
+    tools.node_ssh = SSH()
+    result = tools.turn(action="node_ssh", node_id="hp-linux",
+                        args={"operation": "exec", "argv": ["id", "-un"], "timeout": 5})
+    assert result["status"] == "OK"
+    assert result["result"]["exit_code"] == 0

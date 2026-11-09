@@ -849,3 +849,5 @@ output) and set the v2 policy's `blocked_reason`, so no further autonomous
 send happens until an operator fixes the underlying issue and explicitly
 `supervisor_watch`s the target again.
 # terminal-mcp
+
+For SSH access to already linked headless nodes, see the [Linked-node SSH from Terminal MCP](docs/multi-node.md#linked-node-ssh-from-terminal-mcp-2026-11-09) guide for the node-scoped setup/verification flow and rollout limits.

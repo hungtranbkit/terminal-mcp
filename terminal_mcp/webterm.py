@@ -266,3 +266,67 @@ def _handle_control_message(proc: WebTerminalProcess, text: str) -> None:
         proc.resize(payload.get("cols"), payload.get("rows"))
     # Every other/unknown message type is silently ignored -- see
     # pump_websocket's own docstring for why.
+
+
+class SshWebTerminalProcess:
+    """PTY for a strict SSH attach to a fixed managed tmux session.
+
+    The browser only owns the SSH attach process. Closing it disconnects
+    this tmux client and leaves the remote tmux session and jobs running.
+    """
+
+    def __init__(self, argv: list[str], *, readonly: bool) -> None:
+        import pty
+        self.session = "managed-ssh-terminal"
+        self.readonly = readonly
+        master_fd, slave_fd = pty.openpty()
+        try:
+            self._proc = subprocess.Popen(argv, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                                          start_new_session=True, close_fds=True,
+                                          env={**os.environ, "TERM": "xterm-256color"})
+        finally:
+            os.close(slave_fd)
+        self.master_fd = master_fd
+        self._closed = False
+
+    def resize(self, cols: object, rows: object) -> None:
+        import fcntl
+        import termios
+        if not isinstance(cols, int) or not isinstance(rows, int) or isinstance(cols, bool) or isinstance(rows, bool):
+            return
+        cols, rows = max(1, min(MAX_RESIZE_COLS, cols)), max(1, min(MAX_RESIZE_ROWS, rows))
+        with contextlib.suppress(OSError):
+            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+    def write(self, data: bytes) -> None:
+        if self.readonly or self._closed:
+            return
+        with contextlib.suppress(OSError):
+            os.write(self.master_fd, data[:MAX_INPUT_FRAME_BYTES])
+
+    def read(self, timeout: float = PTY_READ_POLL_SECONDS) -> bytes | None:
+        if self._closed:
+            return b""
+        try:
+            ready, _, _ = select.select([self.master_fd], [], [], timeout)
+            if not ready:
+                return None
+            return os.read(self.master_fd, READ_CHUNK_BYTES)
+        except OSError:
+            return b""
+
+    def alive(self) -> bool:
+        return not self._closed and self._proc.poll() is None
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        with contextlib.suppress(Exception):
+            self._proc.terminate()
+        with contextlib.suppress(Exception):
+            self._proc.wait(timeout=2)
+        with contextlib.suppress(Exception):
+            self._proc.kill()
+        with contextlib.suppress(OSError):
+            os.close(self.master_fd)

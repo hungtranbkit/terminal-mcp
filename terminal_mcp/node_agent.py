@@ -69,7 +69,7 @@ from .node_models import PLATFORM_LINUX, canonical_platform
 from .webterm import WebTerminalProcess, pump_websocket
 
 _log = logging.getLogger(__name__)
-_CONTROLLER_USER_AGENT = "TerminalMCP-node-agent/0.13"
+_CONTROLLER_USER_AGENT = "TerminalMCP-node-agent/0.14"
 
 
 def detect_platform() -> str:
@@ -359,6 +359,30 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
         request.app.state.shutdown_event.set()
         return JSONResponse({"shutdown_requested": True, "node_id": node_id,
                              "agent_generation": AGENT_GENERATION, **contract_describe()})
+
+    async def ssh_manage(request: Request) -> JSONResponse:
+        """Fixed node-scoped SSH setup operation; never a shell endpoint."""
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        try:
+            if int(request.headers.get("content-length", "0")) > 20000:
+                return JSONResponse({"error": "invalid_request", "node_id": node_id})
+        except ValueError:
+            return JSONResponse({"error": "invalid_request", "node_id": node_id})
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 -- malformed body is an app-level refusal
+            body = None
+        if (not isinstance(body, dict) or set(body) - {"action", "public_key"}
+                or body.get("action") not in {"status", "setup", "revoke"}
+                or (body.get("public_key") is not None and not isinstance(body.get("public_key"), str))):
+            return JSONResponse({"error": "invalid_request", "node_id": node_id})
+        from . import node_ssh_agent
+        result = await anyio.to_thread.run_sync(
+            lambda: node_ssh_agent.manage_ssh(body["action"], body.get("public_key")))
+        # The client receives only its own node's result. No caller-supplied
+        # host, username, path, command, or service name is accepted.
+        return JSONResponse({**result, "node_id": node_id})
 
     async def metrics(request: Request) -> JSONResponse:
         if (blocked := require_auth(request)) is not None:
@@ -1117,6 +1141,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
         Route("/v1/health", health, methods=["GET"]),
         Route("/v1/execution-health", execution_health, methods=["GET"]),
         Route("/v1/metrics", metrics, methods=["GET"]),
+        Route("/v1/ssh/manage", ssh_manage, methods=["POST"]),
         Route("/v1/environment", environment, methods=["GET"]),
         Route("/v1/repo-evidence", repo_evidence, methods=["GET"]),
         Route("/v1/repo/{op}", repo_op, methods=["GET"]),
