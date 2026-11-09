@@ -86,3 +86,62 @@ def test_sshd_policy_rejects_ambiguous_multiple_ports():
         "port 22 2222\npubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\n")
     assert ok is False
     assert "Multiple" in reason
+
+
+def test_sshd_preflight_retries_only_missing_hostkeys_with_temporary_validation_key(monkeypatch):
+    import subprocess
+
+    calls = []
+    temporary_key = []
+
+    def run(argv, **kwargs):
+        calls.append(list(argv))
+        if argv[0] == "/usr/sbin/sshd" and "-o" not in argv:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="sshd: no hostkeys available -- exiting.\n")
+        if argv[0] == "/usr/bin/ssh-keygen":
+            key = Path(argv[argv.index("-f") + 1])
+            temporary_key.append(key)
+            key.write_text("temporary validation key")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        if argv[0] == "/usr/sbin/sshd" and "-o" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0,
+                stdout="port 22\npubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\n",
+                stderr="",
+            )
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(node_ssh_agent.shutil, "which", lambda name: {
+        "ssh-keygen": "/usr/bin/ssh-keygen", "sshd": "/usr/sbin/sshd"}.get(name))
+    monkeypatch.setattr(node_ssh_agent.subprocess, "run", run)
+
+    result = node_ssh_agent._sshd_config_output(
+        "/usr/sbin/sshd", "user=dell,host=localhost,addr=127.0.0.1")
+
+    assert result.returncode == 0
+    assert "authorizedkeysfile .ssh/authorized_keys" in result.stdout
+    assert len(calls) == 3
+    assert calls[0] == ["/usr/sbin/sshd", "-T", "-C", "user=dell,host=localhost,addr=127.0.0.1"]
+    assert calls[1][:3] == ["/usr/bin/ssh-keygen", "-q", "-t"]
+    assert calls[2][0:2] == ["/usr/sbin/sshd", "-T"]
+    assert calls[2][2] == "-o"
+    assert temporary_key and not temporary_key[0].exists()
+
+
+def test_sshd_preflight_does_not_retry_other_configuration_errors(monkeypatch):
+    import subprocess
+
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="Bad configuration option\n")
+
+    monkeypatch.setattr(node_ssh_agent.shutil, "which", lambda name: "/usr/bin/ssh-keygen")
+    monkeypatch.setattr(node_ssh_agent.subprocess, "run", run)
+
+    result = node_ssh_agent._sshd_config_output(
+        "/usr/sbin/sshd", "user=dell,host=localhost,addr=127.0.0.1")
+
+    assert result.returncode == 1
+    assert len(calls) == 1

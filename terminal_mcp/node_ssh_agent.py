@@ -127,6 +127,31 @@ def _sshd_effective_policy(output: str) -> tuple[bool, int, str | None]:
     return True, ports[0], None
 
 
+def _sshd_config_output(sshd: str, connection_context: str) -> subprocess.CompletedProcess[str]:
+    """Read effective sshd policy without needing access to root-owned host keys.
+
+    Some installations make host private keys unreadable to the node-agent
+    user.  `sshd -T` then refuses to print policy even though the running
+    daemon is healthy.  Retry only that specific parser failure with an
+    ephemeral local validation key; this key is never installed or served.
+    """
+    result = subprocess.run([sshd, "-T", "-C", connection_context], capture_output=True,
+                           text=True, timeout=3, check=False)
+    if result.returncode == 0 or "no hostkeys available" not in (result.stderr or "").casefold():
+        return result
+    ssh_keygen = shutil.which("ssh-keygen")
+    if not ssh_keygen:
+        return result
+    with tempfile.TemporaryDirectory(prefix="terminal-mcp-sshd-preflight-") as temporary_dir:
+        key_path = str(Path(temporary_dir) / "validation-host-key")
+        generated = subprocess.run([ssh_keygen, "-q", "-t", "ed25519", "-N", "", "-f", key_path],
+                                   capture_output=True, text=True, timeout=3, check=False)
+        if generated.returncode != 0:
+            return result
+        return subprocess.run([sshd, "-T", "-o", f"HostKey={key_path}", "-C", connection_context],
+                              capture_output=True, text=True, timeout=3, check=False)
+
+
 def _platform_preflight() -> dict[str, object]:
     if os.name == "nt":
         return {"status": "needs_admin", "platform": "windows", "ssh_server": "unverified",
@@ -140,8 +165,7 @@ def _platform_preflight() -> dict[str, object]:
         return {"status": "needs_admin", "platform": platform, "ssh_server": "missing",
                 "reason": "OpenSSH server is not installed; install and enable sshd/sshd service as an administrator."}
     try:
-        result = subprocess.run([sshd, "-T", "-C", f"user={getpass.getuser()},host=localhost,addr=127.0.0.1"],
-                                capture_output=True, text=True, timeout=3, check=False)
+        result = _sshd_config_output(sshd, f"user={getpass.getuser()},host=localhost,addr=127.0.0.1")
     except (OSError, subprocess.TimeoutExpired):
         return {"status": "needs_admin", "platform": platform, "ssh_server": "unverified",
                 "reason": "Could not validate sshd configuration; administrator must inspect the service."}
