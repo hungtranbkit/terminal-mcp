@@ -1705,6 +1705,9 @@ def test_dashboard_mobile_batch_no_unexpected_route_changes(read_config):
         # Live Session Monitor (live_sessions.py), a later separate feature.
         "/dashboard/live": {"GET", "HEAD"},
         "/dashboard/api/live-sessions": {"GET", "HEAD"},
+        # Fleet-aware lifecycle preview and explicitly confirmed safe cleanup.
+        "/dashboard/api/session-cleanup-preview": {"GET", "HEAD"},
+        "/dashboard/api/session-cleanup-safe": {"POST"},
         # Auto Recovery -- another later, separate feature.
         "/dashboard/api/recovery": {"GET", "HEAD"},
         "/dashboard/api/recovery/recover": {"POST"},

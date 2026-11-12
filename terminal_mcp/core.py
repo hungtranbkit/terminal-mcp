@@ -40,7 +40,7 @@ from .session_knowledge import SessionKnowledgeStore, make_instance_id
 from .session_registry import SessionRegistryStore, instance_identity, linked_worktree_root
 from .session_resource import (ContextPolicy, build_resource_block,
                               parse_session_resources, probe_git_state)
-from .status import classify_status, detect_waiting_input
+from .status import classify_permission_request, classify_status, detect_waiting_input
 from .submit_watchdog import (ACK_ACCEPTED, ACK_NODE_UNAVAILABLE, ACK_RUNNING, ACK_STUCK, Submission,
                                SubmissionStore, SubmissionSweeper, VerifiedSubmitWatchdog, WatchdogConfig)
 from .tmux import SEND_TEXT_ENTER_SETTLE_SECONDS, TmuxClient, TmuxError, iso_timestamp
@@ -1554,6 +1554,14 @@ class TerminalService:
             output = "\n".join(self.tmux.capture_lines(session, 80))
             state, input_required, reason = classify_status(info, output)
             last_output = "\n".join(output.splitlines()[-20:])
+            permission_request = (
+                classify_permission_request(
+                    output,
+                    cwd=info.pane_current_path,
+                    allowed_roots=self.config.session_lifecycle.allowed_cwd_roots,
+                )
+                if state == "WAITING_INPUT" else None
+            )
             payload = {
                 "session": session,
                 "exists": True,
@@ -1582,6 +1590,8 @@ class TerminalService:
                 # response unchanged, same as every other field here).
                 "cwd": info.pane_current_path or None,
             }
+            if permission_request:
+                payload["permission_request"] = permission_request
             # P0 HOTFIX (task: "P0 WINDOWS SESSION STATE-LOSS / STALE
             # STREAM", item 7's own health-metadata requirement): only
             # ever present for a backend that actually supervises a real

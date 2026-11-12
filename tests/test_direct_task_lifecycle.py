@@ -155,6 +155,23 @@ def test_prompt_echo_never_completes_its_own_task():
     assert find_marker(f"TMCP-DONE:{task_id}ff", task_id) is None
 
 
+def test_permission_prompt_clear_does_not_automatically_retry_task(tmp_path):
+    clock = Clock()
+    pane = FakePane()
+    sup = _supervisor(tmp_path, pane, clock)
+    started = sup.start("permission-check", text="Read the referenced file")
+    task_id = started["task"]["task_id"]
+    attempts_before_wait = pane.send_attempts
+    sup.store.update(task_id, state="WAITING_INPUT", wait_reason="SESSION_INPUT_BEFORE_DISPATCH",
+                     receipt="PERSISTED", dispatches=0, next_step=0, completed_at=None)
+
+    sup.tick()
+    task = sup.get(task_id, refresh=False)["task"]
+    assert task["state"] == "WAITING_INPUT"
+    assert task["wait_reason"] == "EXPLICIT_RESUME_REQUIRED"
+    assert pane.send_attempts == attempts_before_wait
+
+
 def test_generic_finished_text_is_not_a_completion_receipt(tmp_path):
     task_id = "dt_0123456789abcdef"
     assert find_marker("● FINISHED\nThe task is complete.", task_id) is None

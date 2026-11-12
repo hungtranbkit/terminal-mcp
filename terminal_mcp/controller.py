@@ -199,6 +199,7 @@ class ControllerService:
                 session_health: Any = None,
                 ownership: SessionOwnershipStore | None = None) -> None:
         self.registry = registry
+        self.local_client = local_client
         # Durable positive ownership (session_ownership.py): the routing
         # evidence that survives cache expiry, a failed listing and a
         # controller restart. Lives next to nodes.db, like leases.db.
@@ -1744,6 +1745,27 @@ class ControllerService:
         client = self._clients.get(node_id)
         if client is None:
             return {"error": "NODE_UNREACHABLE", "node_id": node_id}
+        node_row = self.registry.get(node_id)
+        capacity_snapshot = {
+            "node_id": node_id,
+            "status": node_row.status if node_row else "unknown",
+            "capacity_status": node_row.capacity_status if node_row else "unknown",
+            "tmux_session_count": node_row.tmux_session_count if node_row else None,
+            "max_sessions": node_row.max_sessions if node_row else None,
+            "overload_reasons": list(node_row.overload_reasons) if node_row else [],
+        }
+        audit_terminal = getattr(self.local_client, "terminal", None)
+        audit = getattr(audit_terminal, "audit", None)
+        if audit is not None:
+            try:
+                import json
+
+                audit.record(action="session_create_capacity_check", session=name, result="TARGET_SELECTED",
+                             reason=json.dumps(capacity_snapshot, sort_keys=True, separators=(",", ":")),
+                             actor=requested_by or "controller", node_id=node_id)
+            except Exception as exc:  # noqa: BLE001 -- do not create without the requested admission audit
+                return {"error": "CAPACITY_AUDIT_FAILED", "session": name, "node_id": node_id,
+                        "detail": type(exc).__name__}
         try:
             result = client.create_session(name, agent_type, cwd, initial_prompt=initial_prompt,
                                            grant_mode=grant_mode, binding=binding, requested_by=requested_by,
@@ -1752,9 +1774,9 @@ class ControllerService:
             self._note_transport_failure(node_id, client, exc)
             return {"error": "NODE_UNREACHABLE", "node_id": node_id, "detail": str(exc)}
         if isinstance(result, dict) and "error" not in result:
-            node_row = self.registry.get(node_id)
             result.setdefault("node_id", node_id)
             result.setdefault("node_name", node_row.display_name if node_row else node_id)
+            result["capacity_snapshot"] = capacity_snapshot
             # Success is not reported until ownership is DURABLE: the cache
             # below expires in 20s and dies with the process.
             session_id, created_epoch = result.get("session_id"), result.get("created_epoch")
