@@ -73,6 +73,6 @@
 
 - [x] Run focused safety/race/cross-node tests, full pytest, real Chromium smoke, narrowed Ruff checks, and `git diff --check`. Full pytest has existing unrelated failures; broad Ruff has existing repository lint debt.
 - [x] Update `PROJECT_CONTEXT.md` with code, tests, runtime evidence, rollout state, and blockers.
-- [ ] Commit and push the isolated branch; open a PR.
+- [x] Commit and push the isolated branch (`837a413`); open PR #117.
 - [ ] Deploy only if the actual `terminal-mcp-fed-controller.service` is present and pins the reviewed worktree via `PYTHONPATH`; this unit was absent, so no service was restarted.
 
