@@ -13,14 +13,18 @@ from typing import Any
 
 import pytest
 
-from terminal_mcp.config import AppConfig, InputPolicyConfig, PermissionsConfig, SessionLifecycleConfig
+from terminal_mcp.config import (
+    AppConfig,
+    InputPolicyConfig,
+    PermissionsConfig,
+    SessionLifecycleConfig,
+)
 from terminal_mcp.controller import ControllerService
 from terminal_mcp.core import TerminalService
+from terminal_mcp.host_metrics import NodeMetrics
 from terminal_mcp.node_client import LocalNodeClient, NodeClientError
 from terminal_mcp.node_models import CAPACITY_HEALTHY
 from terminal_mcp.node_registry import NodeRegistry
-from terminal_mcp.host_metrics import NodeMetrics
-
 from tests.conftest import tmux_cmd
 
 
@@ -77,6 +81,29 @@ def test_legacy_local_qualified_name_aliases_canonical_local_node(tmp_path):
 def _heartbeat_local(controller: ControllerService, *, sessions: int = 0) -> None:
     controller.refresh_local_heartbeat(tmux_session_count=sessions, agent_counts={},
                                        agent_types=("shell", "claude"), agent_version="0.13.0")
+
+
+def test_create_records_node_capacity_snapshot_before_session_creation(tmp_path):
+    from types import SimpleNamespace
+
+    controller, service = _controller(tmp_path)
+    _heartbeat_local(controller, sessions=12)
+    events = []
+    service.audit = SimpleNamespace(record=lambda **kw: events.append(("audit", kw)))
+    controller.resolve_session = lambda name: {"error": "SESSION_NOT_FOUND", "session": name}
+
+    def create(*args, **kwargs):
+        events.append(("create", {}))
+        return {"session": args[0], "state": "READY", "session_id": "$7",
+                "created_epoch": "2026-11-12T00:00:00+00:00"}
+
+    service.terminal_create_session = create
+    result = controller.terminal_create_session("ctrl-capacity-audit", node="local")
+    assert [kind for kind, _ in events] == ["audit", "create"]
+    audit = events[0][1]
+    assert audit["action"] == "session_create_capacity_check"
+    assert '"tmux_session_count":12' in audit["reason"]
+    assert result["capacity_snapshot"]["tmux_session_count"] == 12
 
 
 class FakeNodeClient:

@@ -13,8 +13,14 @@ import pytest
 
 from terminal_mcp.chatgpt_sidecar import translate_legacy_call
 from terminal_mcp.compact_tools import CompactTerminalTools
-from terminal_mcp.config import (AgentCleanupConfig, AppConfig, PermissionsConfig, RequiredServiceConfig,
-                                 SessionLifecycleConfig, _load_session_lifecycle_config)
+from terminal_mcp.config import (
+    AgentCleanupConfig,
+    AppConfig,
+    PermissionsConfig,
+    RequiredServiceConfig,
+    SessionLifecycleConfig,
+    _load_session_lifecycle_config,
+)
 from terminal_mcp.core import TerminalService
 from terminal_mcp.session_reconciler import LifecycleStore, SessionReconciler, probe_git
 
@@ -230,18 +236,187 @@ def test_probe_git_reports_missing_path_as_proven_absent(tmp_path):
     assert probe_git(str(tmp_path / "nope")) == {"exists": False}
 
 
+def test_lifecycle_tombstone_retention_uses_configured_ttl(tmp_path):
+    store = LifecycleStore(tmp_path / "ttl.db")
+    store.put({"session": "old-closed", "identity": "$1@1", "state": "CLOSED",
+               "updated_at": NOW - 2 * 86400})
+    store.put({"session": "recent-closed", "identity": "$2@2", "state": "CLOSED",
+               "updated_at": NOW - 3600})
+    store.mark_gone(set(), NOW, retention_days=7)
+    assert store.get("old-closed") is not None
+    store.mark_gone(set(), NOW, retention_days=1)
+    assert store.get("old-closed") is None
+    assert store.get("recent-closed") is not None
+
+
 # -- configuration --------------------------------------------------------
 
 def test_agent_cleanup_config_defaults_off_and_parses():
     assert SessionLifecycleConfig().agent_cleanup.enabled is False
     cfg = _load_session_lifecycle_config({"enabled": True, "agent_cleanup": {
-        "enabled": True, "dry_run": False, "idle_hours": 3, "agent_commands": ["claude", "codex"]}})
+        "enabled": True, "dry_run": False, "idle_hours": 3, "agent_commands": ["claude", "codex"],
+        "tombstone_ttl_days": 7}})
     assert cfg.agent_cleanup.enabled and not cfg.agent_cleanup.dry_run
     assert cfg.agent_cleanup.idle_hours == 3.0
+    assert cfg.agent_cleanup.tombstone_ttl_days == 7
+    assert cfg.agent_cleanup.max_backoff_seconds == 3600.0
     with pytest.raises(ValueError):
         _load_session_lifecycle_config({"agent_cleanup": {"idle_hours": 0.1}})
     with pytest.raises(ValueError):
         _load_session_lifecycle_config({"agent_cleanup": {"agent_commands": []}})
+    with pytest.raises(ValueError):
+        _load_session_lifecycle_config({"agent_cleanup": {"tombstone_ttl_days": 0}})
+
+
+def test_reconcile_loop_backs_off_after_controller_busy_error():
+    from terminal_mcp.session_reconciler import SessionReconcileLoop
+
+    class FakeStop:
+        def __init__(self):
+            self.waits = []
+
+        def wait(self, timeout):
+            self.waits.append(timeout)
+            return len(self.waits) == 3
+
+        def set(self):
+            pass
+
+    class FakeReconciler:
+        policy = SimpleNamespace(max_backoff_seconds=300)
+
+        def __init__(self):
+            self.calls = 0
+
+        def run(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError("BACKEND_BUSY")
+            return {"dry_run": True, "close_candidates": [], "recovery_required": [], "blocked": [],
+                    "closed": []}
+
+    reconciler = FakeReconciler()
+    loop = SessionReconcileLoop(reconciler, 60)
+    loop._stop = FakeStop()
+    loop._run()
+    assert loop._stop.waits == [60, 120, 60]
+    assert reconciler.calls == 2
+
+
+def test_fleet_reconcile_fans_out_bounded_and_passes_active_refs():
+    from terminal_mcp.node_models import NODE_ONLINE
+    from terminal_mcp.session_reconciler import FleetSessionReconciler
+
+    class Node:
+        def __init__(self, node_id):
+            self.id, self.status = node_id, NODE_ONLINE
+
+    class Client:
+        def __init__(self, node_id):
+            self.node_id = node_id
+            self.calls = []
+
+        def list_sessions(self):
+            return {"sessions": [{"name": f"agent-{self.node_id}"}]}
+
+        def session_lifecycle(self, action, **kwargs):
+            self.calls.append((action, kwargs))
+            return {"sessions": [{"session": f"agent-{self.node_id}", "lifecycle_state": "CONTROLLED",
+                                  "reason": "active task", "action": "preserve"}], "closed": []}
+
+    class Controller:
+        local_node_id = "local"
+
+        def __init__(self):
+            self.clients = {name: Client(name) for name in ("worker-a", "worker-b")}
+
+        def list_nodes(self):
+            return [Node("local"), Node("worker-a"), Node("worker-b")]
+
+        def client_for(self, node_id):
+            return self.clients.get(node_id)
+
+    class Local:
+        policy = AgentCleanupConfig(enabled=True, dry_run=True)
+
+        def inspect(self, session=None, *, persist=False):
+            return {"sessions": [], "session_count": 0, "lifecycle_states": {}}
+
+        def run(self, dry_run=None):
+            return {"sessions": [], "closed": [], "refused": [], "checkpoints": [],
+                    "dry_run": True, "close_candidates": [], "recovery_required": [], "blocked": []}
+
+    controller = Controller()
+    fleet = FleetSessionReconciler(controller, Local(),
+                                   active_refs=lambda node, name: ["supervised task"])
+    report = fleet.inspect()
+    assert {row["node_id"] for row in report["sessions"]} == {"worker-a", "worker-b"}
+    assert all(client.calls[0][0] == "inspect" for client in controller.clients.values())
+    assert all(client.calls[0][1]["active_refs"] == {f"agent-{client.node_id}": ["supervised task"]}
+               for client in controller.clients.values())
+
+
+def test_fleet_reconcile_bounds_workers_and_isolates_backend_busy():
+    import threading
+    import time
+
+    from terminal_mcp.node_models import NODE_ONLINE
+    from terminal_mcp.session_reconciler import FleetSessionReconciler
+
+    state = {"active": 0, "maximum": 0}
+    lock = threading.Lock()
+
+    class Node:
+        status = NODE_ONLINE
+
+        def __init__(self, node_id):
+            self.id = node_id
+
+    class Client:
+        def __init__(self, node_id):
+            self.node_id = node_id
+
+        def list_sessions(self):
+            with lock:
+                state["active"] += 1
+                state["maximum"] = max(state["maximum"], state["active"])
+            time.sleep(.01)
+            with lock:
+                state["active"] -= 1
+            return {"sessions": [{"name": self.node_id}]}
+
+        def session_lifecycle(self, action, **kwargs):
+            if self.node_id == "busy-node":
+                raise TimeoutError("BACKEND_BUSY after 30 seconds")
+            return {"sessions": [{"session": self.node_id, "lifecycle_state": "CONTROLLED"}]}
+
+    class Controller:
+        local_node_id = "local"
+
+        def __init__(self):
+            ids = ["slow-a", "slow-b", "busy-node", "healthy-node", "slow-c"]
+            self.clients = {name: Client(name) for name in ids}
+            self.nodes = [Node(name) for name in ids]
+
+        def list_nodes(self):
+            return self.nodes
+
+        def client_for(self, node_id):
+            return self.clients[node_id]
+
+    class Local:
+        policy = AgentCleanupConfig(enabled=True, dry_run=True)
+
+        def inspect(self, session=None, *, persist=False):
+            return {"sessions": [], "session_count": 0, "lifecycle_states": {}}
+
+    controller = Controller()
+    fleet = FleetSessionReconciler(controller, Local(), max_concurrent_nodes=2)
+    report = fleet.inspect()
+    assert state["maximum"] <= 2
+    assert {row["node_id"] for row in report["sessions"]} >= {"slow-a", "healthy-node"}
+    assert any(item["node_id"] == "busy-node" and "BACKEND_BUSY" in item["reason"]
+               for item in report["skipped_nodes"])
 
 
 # -- delete confirmation paths ---------------------------------------------
@@ -463,9 +638,23 @@ def test_required_service_exempt_only_while_healthy(tmp_path):
     assert rows["stray-server"]["lifecycle_state"] == "RECOVERY_REQUIRED"  # not declared
     clock.now += GRACE_S + 1
     report = rec.run()
-    assert sorted(r["session"] for r in report["closed"]) == ["nf-tunnel", "stray-server"]
+    assert report["closed"] == []
+    assert set(report["recovery_required"]) == {"nf-tunnel", "stray-server"}
     assert by_name(report)["nf-live"]["lifecycle_state"] == "CONTROLLED"
     assert ("nf-live", "session-reconciler") not in term.deletes
+    assert term.deletes == []
+
+
+def test_replaced_tmux_session_is_not_deleted_after_preview_identity(repo, tmp_path):
+    wt = add_worktree(repo, "task-identity", commit=True, merge=True)
+    original = Info("identity-agent", "claude", str(wt), session_id="$1", created_epoch=100)
+    replacement = Info("identity-agent", "claude", str(wt), session_id="$2", created_epoch=200)
+    term = FakeTerminal([original])
+    term.tmux.get_session = lambda name: replacement
+    report = reconciler(term, tmp_path).run()
+    assert report["closed"] == []
+    assert report["refused"][0]["refused"] == "SESSION_IDENTITY_CHANGED"
+    assert term.deletes == []
 
 
 def test_recent_service_and_open_editor_are_not_closed(tmp_path):
@@ -489,18 +678,18 @@ def test_repeated_cleanup_is_idempotent_and_name_reuse_starts_fresh(tmp_path):
     rec = reconciler(term, tmp_path, clock=clock)
     rec.run()
     clock.now += GRACE_S + 1
-    assert len(rec.run()["closed"]) == 1
+    assert rec.run()["closed"] == []
     for _ in range(3):
         clock.now += GRACE_S + 1
         again = rec.run()
         assert again["closed"] == [] and again["refused"] == []
-    assert term.deletes == [("stray-service", "session-reconciler")]
-    assert rec.store.get("stray-service")["state"] == "CLOSED"
+    assert term.deletes == []
+    assert rec.store.get("stray-service")["state"] == "RECOVERY_REQUIRED"
     # A brand-new tmux session reusing the name does not inherit the old timer.
     term.tmux.sessions["stray-service"] = Info("stray-service", "node", str(loose), session_id="$9",
                                                  created_epoch=int(clock.now))
     row = by_name(rec.run())["stray-service"]
-    assert row["lifecycle_state"] == "RECOVERY_REQUIRED" and term.deletes == [("stray-service", "session-reconciler")]
+    assert row["lifecycle_state"] == "RECOVERY_REQUIRED" and term.deletes == []
 
 
 def test_grace_timer_survives_a_restart(tmp_path):

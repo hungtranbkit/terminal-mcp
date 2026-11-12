@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import os
 import re
 import time
+from pathlib import Path
 
 from . import adapters
 from .adapters import normalize_command, select_adapter
 from .models import SessionInfo
-
 
 WAIT_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
@@ -208,6 +210,56 @@ def detect_waiting_input(output: str) -> tuple[bool, str]:
             if pattern.search(line):
                 return True, f"recent prompt matched {pattern.pattern!r} at bottom offset {offset}"
     return False, "no high-confidence input prompt in the last four non-empty lines"
+
+
+def classify_permission_request(output: str, *, cwd: str | None,
+                                allowed_roots: tuple[str, ...] | list[str]) -> dict | None:
+    """Classify a visible tool permission prompt without approving it.
+
+    Only a read-only path outside cwd but contained by an explicitly allowed
+    root is marked eligible for one scoped retry *after the owner resolves the
+    prompt*. Secrets, command execution, writes, missing paths, and paths
+    outside allowed roots always require a human decision and are never retried.
+    """
+    lines = [line.strip() for line in str(output or "").splitlines() if line.strip()]
+    if not adapters.tool_permission_prompt(lines):
+        return None
+    normalized = "\n".join(lines[-16:])
+    fingerprint = hashlib.sha256(normalized.encode("utf-8", "replace")).hexdigest()
+    paths = re.findall(r"(?<![\w])(?:[A-Za-z]:[\\/][^\s\"'<>]+|/(?:[^\s\"'<>]+))", normalized)
+    path = paths[-1].rstrip(".,:;!?)]}") if paths else None
+    base = {"path": path, "fingerprint": fingerprint, "requires_human_approval": True,
+            "retry_allowed": False}
+    if not path:
+        return {**base, "classification": "HUMAN_APPROVAL", "reason": "approval prompt has no scoped path"}
+    lowered = path.casefold()
+    if any(marker in lowered for marker in (".env", ".ssh", "secret", "credential", "token", "id_rsa", "id_ed25519", "private_key")):
+        return {**base, "classification": "RISKY_PERMISSION", "reason": "sensitive path requires explicit owner approval"}
+    if not re.search(r"\b(?:read|open|view|list|inspect)\b", normalized, re.IGNORECASE) or re.search(
+            r"\b(?:write|edit|delete|remove|execute|run|shell|command|install)\b", normalized, re.IGNORECASE):
+        return {**base, "classification": "HUMAN_APPROVAL", "reason": "permission is not an isolated read"}
+    target = Path(os.path.expanduser(path)).resolve(strict=False)
+    roots = tuple(allowed_roots) or (str(Path.home()),)
+    contained = False
+    for root in roots:
+        try:
+            resolved_root = Path(os.path.expanduser(root)).resolve(strict=False)
+            contained = os.path.commonpath((str(target), str(resolved_root))) == str(resolved_root)
+        except (OSError, ValueError):
+            contained = False
+        if contained:
+            break
+    if not contained:
+        return {**base, "classification": "OUTSIDE_ALLOWED_ROOT", "reason": "requested path is outside allowed roots"}
+    if cwd:
+        try:
+            resolved_cwd = Path(os.path.expanduser(cwd)).resolve(strict=False)
+            if os.path.commonpath((str(target), str(resolved_cwd))) == str(resolved_cwd):
+                return {**base, "classification": "HUMAN_APPROVAL", "reason": "path is already inside the working directory"}
+        except (OSError, ValueError):
+            pass
+    return {**base, "classification": "SAFE_SCOPED_READ", "reason": "read path is outside cwd but inside an allowed root",
+            "retry_allowed": True}
 
 
 def classify_status(session: SessionInfo, output: str, now: int | None = None) -> tuple[str, bool, str]:

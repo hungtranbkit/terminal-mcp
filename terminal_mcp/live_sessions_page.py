@@ -98,10 +98,23 @@ LIVE_SESSIONS_HTML = r"""<!doctype html>
     .actions { display:flex; gap:8px; flex-wrap:wrap }
     .btn { background:#19243b; border:1px solid var(--line); color:var(--text); border-radius:8px; padding:5px 10px;
            font-size:12.5px; cursor:pointer; min-height:32px }
+    .cleanup { border:1px solid var(--line); background:var(--panel); border-radius:10px; padding:10px 12px; margin:0 0 10px }
+    .cleanup-head { display:flex; flex-wrap:wrap; align-items:center; gap:8px }
+    .cleanup-title { font-weight:700 }
+    .cleanup-summary { color:var(--muted); font-size:12px; flex:1; min-width:200px }
+    .cleanup-rows { margin-top:8px; display:grid; gap:4px; max-height:220px; overflow:auto }
+    .cleanup-row { font-size:12px; color:var(--muted); overflow-wrap:anywhere; border-top:1px solid var(--line); padding-top:4px }
+    .cleanup-row b { color:var(--text) }
+    .cleanup-row.candidate { color:var(--green) }
+    .cleanup-row.skip { color:var(--amber) }
+    .btn.safe { border-color:#438c61; color:#b6f3cb }
+    .btn:disabled { opacity:.45; cursor:not-allowed }
     .empty { color:var(--muted); padding:30px 8px; text-align:center }
     @media (max-width:640px) {
       .wrap { padding-top:6px } h1 { font-size:15px }
       pre.tail { max-height:10em }
+      .cleanup-head .btn { flex:1 1 130px; min-height:40px }
+      .cleanup-summary { flex-basis:100% }
     }
   </style>
 </head>
@@ -114,6 +127,15 @@ LIVE_SESSIONS_HTML = r"""<!doctype html>
     <input type="search" id="q" placeholder="Lọc session / node / repo…" aria-label="Lọc">
     <select id="node" aria-label="Node"><option value="">Mọi node</option></select>
   </div>
+  <section class="cleanup" aria-label="Session cleanup">
+    <div class="cleanup-head">
+      <span class="cleanup-title">Session lifecycle</span>
+      <span class="cleanup-summary" id="cleanup-summary">Chưa có cleanup preview.</span>
+      <button class="btn" id="cleanup-preview">Cleanup Preview</button>
+      <button class="btn safe" id="cleanup-safe" disabled>Cleanup Safe</button>
+    </div>
+    <div class="cleanup-rows" id="cleanup-rows" aria-live="polite"></div>
+  </section>
   <div class="chips" id="filters" role="tablist" style="margin-bottom:10px">
     <button class="chip on" data-f="active">Đang chạy<b id="c-active">0</b></button>
     <button class="chip" data-f="recent">Gần đây<b id="c-recent">0</b></button>
@@ -136,6 +158,7 @@ LIVE_SESSIONS_HTML = r"""<!doctype html>
   const labels = new Map();     // key -> current task signature (relabel highlight)
   const relabeledAt = new Map(); // key -> ms when its label last changed
   let first = true, inflight = false, lastOk = 0, data = null;
+  let cleanupPreview = null, cleanupBusy = false;
 
   const $ = (id) => document.getElementById(id);
   const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls;
@@ -326,6 +349,65 @@ LIVE_SESSIONS_HTML = r"""<!doctype html>
     $('empty').hidden = visible.length > 0;
     first = false;
   }
+  function renderCleanup(report) {
+    cleanupPreview = report;
+    const rows = report.sessions || [];
+    const count = (state) => rows.filter(r => r.lifecycle_state === state).length;
+    const candidates = report.close_candidates || [];
+    const capacity = (report.capacity_by_node || []).map(n =>
+      `${n.node_name || n.node_id}: ${n.sessions ?? '?'} / ${n.max_sessions ?? '?'} sessions`).join(' · ');
+    $('cleanup-summary').textContent = `Idle ${rows.filter(r => r.pane_state === 'IDLE').length} · blocked ${count('BLOCKED')} · protected ${rows.filter(r => r.classification === 'PROTECTED').length} · safe candidates ${candidates.length}`
+      + (capacity ? ` · ${capacity}` : '');
+    $('cleanup-safe').disabled = cleanupBusy || candidates.length === 0;
+    const list = $('cleanup-rows'); list.textContent = '';
+    for (const row of rows) {
+      const candidate = row.action === 'close';
+      const line = el('div', 'cleanup-row ' + (candidate ? 'candidate' : 'skip'));
+      const target = [row.node_id, row.session].filter(Boolean).join('/');
+      line.append(el('b', null, candidate ? 'CANDIDATE · ' + target : 'SKIP · ' + target));
+      line.append(' — ' + (row.reason || row.lifecycle?.reason || row.classification || 'reason unavailable'));
+      list.append(line);
+    }
+    for (const item of report.skipped_nodes || []) {
+      list.append(el('div', 'cleanup-row skip', `SKIP · ${item.node_id}: ${item.reason}`));
+    }
+  }
+  async function loadCleanupPreview() {
+    cleanupBusy = true; $('cleanup-preview').disabled = true; $('cleanup-safe').disabled = true;
+    try {
+      const res = await fetch('/dashboard/api/session-cleanup-preview', {credentials:'same-origin', cache:'no-store'});
+      const report = await res.json();
+      if (!res.ok || report.error) throw new Error(report.detail || report.error || `HTTP ${res.status}`);
+      renderCleanup(report);
+    } catch (error) {
+      $('cleanup-summary').textContent = 'Preview failed: ' + error.message;
+      cleanupPreview = null;
+    } finally { cleanupBusy = false; $('cleanup-preview').disabled = false;
+      $('cleanup-safe').disabled = !cleanupPreview || !(cleanupPreview.close_candidates || []).length; }
+  }
+  async function cleanupSafe() {
+    if (!cleanupPreview) { await loadCleanupPreview(); return; }
+    const candidates = cleanupPreview.close_candidates || [];
+    if (!candidates.length) return;
+    const names = candidates.slice(0, 12).join('\n') + (candidates.length > 12 ? `\n… and ${candidates.length - 12} more` : '');
+    if (!window.confirm(`Close only these revalidated, proven-finished sessions?\n\n${names}`)) return;
+    cleanupBusy = true; $('cleanup-safe').disabled = true; $('cleanup-preview').disabled = true;
+    try {
+      const res = await fetch('/dashboard/api/session-cleanup-safe', {method:'POST', credentials:'same-origin',
+        headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm:true})});
+      const report = await res.json();
+      if (!res.ok || report.error) throw new Error(report.detail || report.error || `HTTP ${res.status}`);
+      $('cleanup-summary').textContent = `Closed ${(report.closed || []).length}; skipped ${(report.skipped_nodes || []).length} nodes.`;
+      renderCleanup(await (async () => {
+        const preview = await fetch('/dashboard/api/session-cleanup-preview', {credentials:'same-origin', cache:'no-store'});
+        const body = await preview.json(); if (!preview.ok || body.error) throw new Error(body.detail || body.error);
+        return body;
+      })());
+    } catch (error) {
+      $('cleanup-summary').textContent = 'Cleanup stopped: ' + error.message;
+    } finally { cleanupBusy = false; $('cleanup-preview').disabled = false;
+      $('cleanup-safe').disabled = !cleanupPreview || !(cleanupPreview.close_candidates || []).length; }
+  }
   async function poll(force) {
     if (inflight) return;
     if (document.hidden && !force) return;
@@ -354,6 +436,9 @@ LIVE_SESSIONS_HTML = r"""<!doctype html>
       for (const x of document.querySelectorAll('#filters .chip')) x.classList.toggle('on', x === b); render(); };
   }
   $('q').oninput = render; $('node').onchange = render;
+  $('cleanup-preview').onclick = loadCleanupPreview;
+  $('cleanup-safe').onclick = cleanupSafe;
+  loadCleanupPreview();
   document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(true); });
   poll(true);
   setInterval(() => poll(false), POLL_MS);

@@ -667,6 +667,13 @@ class AgentCleanupConfig:
     idle_hours: float = 2.0
     interval_seconds: float = 900.0
     max_closes_per_run: int = 10
+    max_concurrent_nodes: int = 4
+    # Terminal lifecycle rows are audit tombstones. Keep them long enough to
+    # explain a cleanup decision, then bound database growth.
+    tombstone_ttl_days: int = 14
+    # A failed controller/backend pass increases the next interval up to this
+    # cap; success resets it to interval_seconds.
+    max_backoff_seconds: float = 3600.0
     agent_commands: tuple[str, ...] = ("claude", "codex")
     close_clean_primary_checkouts: bool = False
     scrollback_dir: str = "~/tmux-reaped"
@@ -2855,6 +2862,15 @@ def _load_agent_cleanup_config(raw: object) -> AgentCleanupConfig:
     max_closes = raw.get("max_closes_per_run", defaults.max_closes_per_run)
     if isinstance(max_closes, bool) or not isinstance(max_closes, int) or not 1 <= max_closes <= 100:
         raise ValueError("session_lifecycle.agent_cleanup.max_closes_per_run must be an integer 1..100")
+    max_nodes = raw.get("max_concurrent_nodes", defaults.max_concurrent_nodes)
+    if isinstance(max_nodes, bool) or not isinstance(max_nodes, int) or not 1 <= max_nodes <= 16:
+        raise ValueError("session_lifecycle.agent_cleanup.max_concurrent_nodes must be an integer 1..16")
+    tombstone_ttl = raw.get("tombstone_ttl_days", defaults.tombstone_ttl_days)
+    if isinstance(tombstone_ttl, bool) or not isinstance(tombstone_ttl, int) or not 1 <= tombstone_ttl <= 365:
+        raise ValueError("session_lifecycle.agent_cleanup.tombstone_ttl_days must be an integer 1..365")
+    max_backoff = raw.get("max_backoff_seconds", defaults.max_backoff_seconds)
+    if isinstance(max_backoff, bool) or not isinstance(max_backoff, (int, float)) or not 60 <= max_backoff <= 86400:
+        raise ValueError("session_lifecycle.agent_cleanup.max_backoff_seconds must be a number 60..86400")
     commands = raw.get("agent_commands", list(defaults.agent_commands))
     if not isinstance(commands, list) or not commands or not all(isinstance(c, str) and c for c in commands):
         raise ValueError("session_lifecycle.agent_cleanup.agent_commands must be a non-empty list of strings")
@@ -2886,6 +2902,8 @@ def _load_agent_cleanup_config(raw: object) -> AgentCleanupConfig:
         enabled=raw.get("enabled", defaults.enabled), dry_run=raw.get("dry_run", defaults.dry_run),
         idle_hours=float(idle_hours), interval_seconds=float(interval),
         max_closes_per_run=max_closes, agent_commands=tuple(commands),
+        max_concurrent_nodes=max_nodes,
+        tombstone_ttl_days=tombstone_ttl, max_backoff_seconds=float(max_backoff),
         close_clean_primary_checkouts=raw.get("close_clean_primary_checkouts",
                                               defaults.close_clean_primary_checkouts),
         scrollback_dir=scrollback_dir, recovery_grace_minutes=float(grace),

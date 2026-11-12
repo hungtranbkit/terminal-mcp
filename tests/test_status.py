@@ -3,10 +3,9 @@ from terminal_mcp.status import (
     classify_status,
     classify_supervisor_state,
     detect_agent_ui_state,
-
-    shell_prompt_is_back,
     detect_waiting_input,
     parse_completion_marker,
+    shell_prompt_is_back,
     verify_completion_marker,
 )
 
@@ -202,6 +201,36 @@ def test_claude_permission_menu_is_waiting_input():
         info("claude", activity=0), CLAUDE_PERMISSION_MENU, now=5)
     assert state == "WAITING_INPUT"
     assert input_required is True
+
+
+def test_permission_request_scopes_read_retries_to_allowed_roots(tmp_path):
+    from terminal_mcp.status import classify_permission_request
+
+    workspace = tmp_path / "workspace"
+    sibling = tmp_path / "shared"
+    workspace.mkdir()
+    sibling.mkdir()
+    prompt = (f"Read {sibling / 'notes.txt'}?\n❯ 1. Allow once\n2. Always allow\n"
+              "3. Cancel\nEsc to cancel")
+    scoped = classify_permission_request(prompt, cwd=str(workspace), allowed_roots=(str(tmp_path),))
+    assert scoped["classification"] == "SAFE_SCOPED_READ"
+    assert scoped["retry_allowed"] is True
+
+    outside = classify_permission_request(prompt, cwd=str(workspace), allowed_roots=(str(workspace),))
+    assert outside["classification"] == "OUTSIDE_ALLOWED_ROOT"
+    assert outside["retry_allowed"] is False
+
+
+def test_permission_request_never_marks_secret_paths_safe(tmp_path):
+    from terminal_mcp.status import classify_permission_request
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    prompt = (f"Read {root / '.env'}?\n❯ 1. Allow once\n2. Always allow\n"
+              "3. Cancel\nEsc to cancel")
+    result = classify_permission_request(prompt, cwd=str(root), allowed_roots=(str(root),))
+    assert result["classification"] == "RISKY_PERMISSION"
+    assert result["retry_allowed"] is False
 
 
 # Two more LIVE captures, 2026-09-19, both sessions genuinely stuck on a real
