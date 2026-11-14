@@ -28,12 +28,17 @@ def deletion_preflight(session: str, *, queue: Any, run_journal: Any,
                              for row in direct_refs],
     }
     if supervisor is not None:
-        listed = supervisor.list_watches()
+        try:
+            listed = supervisor.list_watches()
+        except Exception as exc:  # noqa: BLE001 -- cannot prove unpinned when inventory is unavailable
+            return {"error": "SUPERVISOR_WATCH_LOOKUP_FAILED", "session": session,
+                    "detail": type(exc).__name__, "references": references}
         watches = listed.get("watches", []) if isinstance(listed, dict) else listed
         bare = session.split("/", 1)[-1]
         references["supervisor_watches"] = [
             {"watch_key": row.get("watch_key"), "enabled": bool(row.get("enabled"))}
-            for row in watches if row.get("target") in {session, bare}
+            for row in watches if (row.get("kind") or "session") == "session"
+            and row.get("target") in {session, bare}
         ]
     if task_refs:
         return {"error": "SESSION_HAS_ACTIVE_TASK", "session": session, "references": references}
@@ -43,6 +48,10 @@ def deletion_preflight(session: str, *, queue: Any, run_journal: Any,
         return {"error": "SESSION_HAS_ACTIVE_SUPERVISED_TASK", "session": session,
                 "references": references,
                 "next_action": "supervise_complete or supervise_cancel the task, then delete"}
+    if references["supervisor_watches"]:
+        return {"error": "SESSION_PINNED_BY_SUPERVISOR_WATCH", "session": session,
+                "references": references,
+                "next_action": "unwatch the session only after its pinned owner confirms it is no longer needed"}
     if run_journal is not None and hasattr(run_journal, "cancel_waits_for_target"):
         references["cancelled_waits"] = run_journal.cancel_waits_for_target(
             session, reason="session deletion requested")
