@@ -54,7 +54,10 @@ LIVE_SESSIONS_HTML = r"""<!doctype html>
     .banner { border:1px solid var(--line); background:var(--panel2); border-radius:10px; padding:8px 12px;
               margin:0 0 10px; font-size:13px }
     .banner.warn { border-color:#6b4f12; color:var(--amber) }
-    #list { display:grid; gap:10px; grid-template-columns:repeat(auto-fill, minmax(min(100%, 430px), 1fr)) }
+    .session-grid { display:grid; gap:10px; grid-template-columns:repeat(auto-fill, minmax(min(100%, 430px), 1fr)) }
+    .group { margin:0 0 12px }
+    .group h2, summary { font-size:14px; margin:8px 0; color:var(--muted) }
+    summary { cursor:pointer; padding:8px 10px; background:var(--panel2); border:1px solid var(--line); border-radius:9px }
     .card { background:var(--panel); border:1px solid var(--line); border-left:4px solid var(--line);
             border-radius:12px; padding:10px 12px; min-width:0; display:flex; flex-direction:column; gap:6px }
     .card.s-RUNNING { border-left-color:var(--green) }
@@ -115,21 +118,25 @@ LIVE_SESSIONS_HTML = r"""<!doctype html>
     <select id="node" aria-label="Node"><option value="">Mọi node</option></select>
   </div>
   <div class="chips" id="filters" role="tablist" style="margin-bottom:10px">
-    <button class="chip on" data-f="active">Đang chạy<b id="c-active">0</b></button>
-    <button class="chip" data-f="recent">Gần đây<b id="c-recent">0</b></button>
-    <button class="chip" data-f="idle">Idle / xong<b id="c-idle">0</b></button>
-    <button class="chip" data-f="all">Tất cả<b id="c-all">0</b></button>
+    <button class="chip" data-f="active">Active<b id="c-active">0</b></button>
+    <button class="chip" data-f="attention">Needs attention<b id="c-attention">0</b></button>
+    <button class="chip" data-f="history">History<b id="c-history-filter">0</b></button>
+    <button class="chip on" data-f="all">All<b id="c-all">0</b></button>
   </div>
+  <div class="banner">Registered or online means the node is reachable; it does not mean its session is executing. RUNNING is based on session activity evidence.</div>
+  <div class="meta" id="breakdown" aria-live="polite"></div>
   <div id="banners"></div>
-  <div id="list" aria-live="polite"></div>
+  <section class="group"><h2>Active</h2><div id="activeList" class="session-grid" aria-live="polite"></div></section>
+  <section class="group"><h2>Needs attention</h2><div id="attentionList" class="session-grid" aria-live="polite"></div></section>
+  <details id="historyGroup"><summary>Inactive history <span id="c-history">0</span></summary><div id="historyList" class="session-grid"></div></details>
   <div class="empty" id="empty" hidden>Không có session nào khớp bộ lọc.</div>
 </div>
 <script>
 (() => {
   const API = '/dashboard/api/live-sessions';
-  const POLL_MS = 2000;
+  const POLL_MS = 5000;
   let filter = 'active';
-  try { filter = localStorage.getItem('tmcp-live-filter') || 'active'; } catch (e) {}
+  try { filter = localStorage.getItem('tmcp-live-filter') || 'all'; } catch (e) {}
   const expanded = new Set();
   const cards = new Map();      // key -> {el, token}
   const known = new Set();      // keys seen in an earlier poll (arrival flash)
@@ -138,6 +145,7 @@ LIVE_SESSIONS_HTML = r"""<!doctype html>
   let first = true, inflight = false, lastOk = 0, data = null;
 
   const $ = (id) => document.getElementById(id);
+  if (filter === 'history') $('historyGroup').open = true;
   const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls;
     if (text !== undefined && text !== null) n.textContent = String(text); return n; };
 
@@ -156,9 +164,7 @@ LIVE_SESSIONS_HTML = r"""<!doctype html>
       + (Date.now() - d > 86400000 ? ' ' + d.toLocaleDateString('vi-VN') : '');
   }
   function matches(s) {
-    if (filter === 'active' && !s.active) return false;
-    if (filter === 'recent' && !(s.recent || s.is_new)) return false;
-    if (filter === 'idle' && s.active) return false;
+    if (filter !== 'all' && s.lifecycle_group !== filter) return false;
     const node = $('node').value;
     if (node && s.node_id !== node) return false;
     const q = $('q').value.trim().toLowerCase();
@@ -281,9 +287,17 @@ LIVE_SESSIONS_HTML = r"""<!doctype html>
     const sessions = data.sessions || [];
     const c = data.counts || {};
     $('c-active').textContent = c.active || 0;
-    $('c-recent').textContent = sessions.filter(s => s.recent || s.is_new).length;
-    $('c-idle').textContent = c.idle || 0;
+    $('c-attention').textContent = (data.groups || {}).attention || 0;
+    $('c-history-filter').textContent = (data.groups || {}).history || 0;
+    $('c-history').textContent = (data.groups || {}).history || 0;
     $('c-all').textContent = c.total || 0;
+    const breakdown = $('breakdown'); breakdown.textContent = '';
+    for (const [field, title] of [['node_name', 'Node'], ['repo', 'Project'], ['agent', 'Agent']]) {
+      const values = Object.entries(((data.counts_by || {})[field]) || {}).sort((a, b) => b[1] - a[1]);
+      const item = el('span', null, title + ': ' + (values.slice(0, 5).map(([name, count]) => name + ' ' + count).join(' · ') || '—'));
+      item.title = values.map(([name, count]) => name + ': ' + count).join('\n');
+      breakdown.append(item);
+    }
     const nodes = [...new Map(sessions.map(s => [s.node_id, s.node_name || s.node_id])).entries()];
     const sel = $('node'), cur = sel.value;
     if (sel.options.length - 1 !== nodes.length) {
@@ -297,11 +311,11 @@ LIVE_SESSIONS_HTML = r"""<!doctype html>
     for (const e of data.source_errors || []) banners.append(el('div', 'banner warn', 'Nguồn dữ liệu lỗi: ' + e));
     if (data.error) banners.append(el('div', 'banner warn', data.error + ': ' + (data.detail || '')));
 
-    const list = $('list');
     const visible = sessions.filter(matches);
     const keep = new Set(visible.map(s => s.key));
     for (const [key, c2] of cards) if (!keep.has(key)) { c2.el.remove(); cards.delete(key); }
-    let prev = null;
+    const lists = {active: $('activeList'), attention: $('attentionList'), history: $('historyList')};
+    for (const list of Object.values(lists)) list.textContent = '';
     for (const s of sessions) {
       const sig = labelSig(s), before = labels.get(s.key);
       if (!first && before !== undefined && before !== sig && sig) relabeledAt.set(s.key, Date.now());
@@ -316,12 +330,13 @@ LIVE_SESSIONS_HTML = r"""<!doctype html>
         entry = {el: node, token: s.change_token};
         cards.set(s.key, entry);
       }
-      const want = prev ? prev.nextSibling : list.firstChild;
-      if (want !== entry.el) list.insertBefore(entry.el, want);
-      prev = entry.el;
+      (lists[s.lifecycle_group] || lists.attention).append(entry.el);
     }
-    for (const span of list.querySelectorAll('.cur-age[data-at]'))
+    for (const list of Object.values(lists)) for (const span of list.querySelectorAll('.cur-age[data-at]'))
       span.textContent = 'cập nhật ' + age(now - Number(span.dataset.at)) + ' trước';
+    $('activeList').parentElement.hidden = filter !== 'all' && filter !== 'active';
+    $('attentionList').parentElement.hidden = filter !== 'all' && filter !== 'attention';
+    $('historyGroup').hidden = filter !== 'all' && filter !== 'history';
     for (const s of sessions) known.add(s.key);
     $('empty').hidden = visible.length > 0;
     first = false;
@@ -351,6 +366,7 @@ LIVE_SESSIONS_HTML = r"""<!doctype html>
   for (const b of document.querySelectorAll('#filters .chip')) {
     b.classList.toggle('on', b.dataset.f === filter);
     b.onclick = () => { filter = b.dataset.f; try { localStorage.setItem('tmcp-live-filter', filter); } catch (e) {}
+      if (filter === 'history') $('historyGroup').open = true;
       for (const x of document.querySelectorAll('#filters .chip')) x.classList.toggle('on', x === b); render(); };
   }
   $('q').oninput = render; $('node').onchange = render;

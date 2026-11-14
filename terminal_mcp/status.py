@@ -20,6 +20,12 @@ WAIT_PATTERNS = tuple(
         r"\[Y/n\]",
         r"continue\?\s*$",
         r"waiting for input",
+        # Authentication and quota dialogs, matched only as recent UI text.
+        r"enter the code from your browser",
+        r"press enter to open the browser",
+        r"authentication required.*(?:sign in|log in)",
+        r"weekly usage limit.*(?:resets|try again)",
+        r"usage limit reached.*(?:resets|try again)",
         # Claude Code's own multi-choice selection widget (numbered options,
         # arrow-key/Tab navigation, Enter to accept the highlighted choice).
         # These three are the widget's UI-chrome strings, live-verified
@@ -67,7 +73,8 @@ DIALOG_CHROME = re.compile(
     r"|hooks need review",
     re.IGNORECASE)
 
-ACTIVE_COMMANDS = {"claude", "codex", "python", "python3", "pytest", "node", "npm", "bash", "zsh"}
+ACTIVE_COMMANDS = {"claude", "codex", "python", "python3", "pytest", "node", "npm", "bash", "zsh",
+                   "powershell", "pwsh", "cmd"}
 
 
 # The shell counterpart of detect_agent_ui_state() below: same principle --
@@ -87,9 +94,9 @@ ACTIVE_COMMANDS = {"claude", "codex", "python", "python3", "pytest", "node", "np
 # waiting for input, not idle. An unrecognised prompt does not match and falls
 # back to the old timer -- degrading to today's behaviour, never a wrong answer.
 _SHELL_PROMPT_READY = re.compile(
-    r"^(?:\S+@\S+:\S*[$#]|PS [A-Za-z]:\\\S*>|[$#])\s*$"
+    r"^(?:\S+@\S+:\S*[$#]|PS [A-Za-z]:\\.*>|[A-Za-z]:\\.*>|[$#])\s*$"
 )
-_SHELLS = {"bash", "zsh", "sh", "fish", "dash"}
+_SHELLS = {"bash", "zsh", "sh", "fish", "dash", "powershell", "pwsh", "cmd"}
 
 
 def shell_prompt_is_back(output: str) -> bool:
@@ -181,8 +188,10 @@ def detect_agent_ui_state(output: str) -> tuple[str | None, str]:
     return None, "no high-confidence agent CLI state marker near the pane bottom"
 
 
-def detect_waiting_input(output: str) -> tuple[bool, str]:
+def detect_waiting_input(output: str, *, command: str | None = None) -> tuple[bool, str]:
     lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if normalize_command(command or "") in {"powershell", "pwsh"} and lines and lines[-1] == ">>":
+        return True, "PowerShell continuation prompt is waiting for a closing token or more input"
     if adapters.tool_permission_prompt(lines):
         return True, "tool approval requires an explicit owner decision; no automatic permission grant"
     if adapters.codex_folder_trust_prompt(lines):
@@ -212,7 +221,7 @@ def detect_waiting_input(output: str) -> tuple[bool, str]:
 
 def classify_status(session: SessionInfo, output: str, now: int | None = None) -> tuple[str, bool, str]:
     command = normalize_command(session.pane_current_command)
-    waiting, reason = detect_waiting_input(output)
+    waiting, reason = detect_waiting_input(output, command=command)
     if waiting:
         # The command is restated so a caller can tell an agent's dialog
         # (e.g. Codex's boot hooks menu) from a shell prompt (issue #52: a

@@ -566,6 +566,40 @@ def test_powershell_prompt_counts_as_ready():
     assert shell_prompt_is_back(pane) is True
 
 
+def test_windows_powershell_and_pwsh_prompt_classify_idle():
+    pane = "command output\nPS C:\\Users\\tranv\\workspace>"
+    for command in ("powershell.exe", "pwsh.exe"):
+        state, waiting, reason = classify_status(_shell(10, cmd=command), pane, now=1_000_000)
+        assert state == "IDLE", (command, state, reason)
+        assert waiting is False
+
+
+def test_powershell_continuation_prompt_is_waiting_not_running_or_idle():
+    pane = "PS C:\\Users\\tranv> $config = @'\n>>"
+    state, waiting, reason = classify_status(_shell(10, cmd="pwsh.exe"), pane, now=1_000_000)
+    assert state == "WAITING_INPUT"
+    assert waiting is True
+    assert "continuation" in reason.lower()
+
+
+def test_cmd_prompt_is_idle_and_continuation_is_not_idle():
+    prompt = "command output\nC:\\Users\\tranv>"
+    assert classify_status(_shell(10, cmd="cmd.exe"), prompt, now=1_000_000)[0] == "IDLE"
+    continuation = "C:\\Users\\tranv> echo ^\nMore?"
+    assert classify_status(_shell(10, cmd="cmd.exe"), continuation, now=1_000_000)[0] != "IDLE"
+
+
+def test_auth_and_quota_dialogs_are_waiting_input_but_transcript_mentions_are_not():
+    auth = "Open https://example.test\nEnter the code from your browser to sign in"
+    quota = "Usage limit reached; try again when your weekly usage resets"
+    for pane in (auth, quota):
+        state, required, _reason = classify_status(info("codex", 0), pane, now=1_000_000)
+        assert state == "WAITING_INPUT"
+        assert required is True
+    prose = "The README explains that the account login may hit a weekly usage limit.\n❯"
+    assert classify_status(info("codex", 0), prose, now=1_000_000)[0] != "WAITING_INPUT"
+
+
 def test_an_agent_pane_is_never_short_circuited_by_a_prompt_line():
     # claude/codex are not shells: a prompt-looking line in their output must
     # not make a thinking agent look finished.

@@ -9,6 +9,7 @@ audit/queue/direct-task stores in tmp_path, then check the HTTP surfaces.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import time
 
 import pytest
 from starlette.testclient import TestClient
@@ -206,6 +207,24 @@ def test_stale_input_alone_does_not_keep_a_session_active():
     assert state != "RUNNING" and src is None
 
 
+def test_snapshot_groups_running_attention_and_inactive_history(rig):
+    clock, controller, *_rest, monitor = rig
+    controller.add("running", status=SLEEP_RUNNING, output="working")
+    controller.add("waiting", status={"exists": True, "state": "WAITING_INPUT",
+                                      "reason": "permission prompt"})
+    controller.add("idle", created=NOW - 86400,
+                   status={**SHELL_IDLE, "current_command": "bash"}, output="$ ")
+
+    monitor.snapshot()  # adopt the first output as a baseline
+    clock.at += 91
+    payload = monitor.snapshot()
+
+    assert payload["groups"] == {"active": 1, "attention": 1, "history": 1}
+    assert {s["session"]: s["lifecycle_group"] for s in payload["sessions"]} == {
+        "running": "active", "waiting": "attention", "idle": "history"}
+    assert payload["counts_by"]["node_name"] == {"LOCAL": 3}
+
+
 # -- durable task mapping ----------------------------------------------------
 
 def test_queue_task_is_mapped_by_session(rig):
@@ -245,11 +264,34 @@ def test_one_failing_status_does_not_blank_the_others(rig):
     payload = monitor.snapshot()
     assert _by(payload, "good")["state"] == "RUNNING"
     bad = _by(payload, "bad")
-    assert bad["state"] == "OFFLINE"
+    assert bad["state"] == "UNKNOWN"
     assert "timed out" in (bad["error"] or bad["reason"])
     assert bad["qualified"] == "m910/bad"
     assert "m910/bad" in controller.status_calls           # remote rows are node-qualified
     assert payload["unreachable_nodes"][0]["node_id"] == "dell-5530"
+
+
+def test_slow_status_probe_is_bounded_and_reported_unknown(rig):
+    _clock, controller, *_rest, _monitor = rig
+    controller.add("slow", node_id="m910")
+    controller.add("fast", status=SLEEP_RUNNING, output="working")
+    original = controller.terminal_status
+
+    def delayed(target):
+        if target == "m910/slow":
+            time.sleep(0.25)
+        return original(target)
+
+    controller.terminal_status = delayed
+    monitor = LiveSessionMonitor(controller, status_budget_seconds=0.03, ttl_seconds=0,
+                                 clock=lambda: NOW)
+    started = time.monotonic()
+    payload = monitor.snapshot()
+
+    assert time.monotonic() - started < 0.2
+    assert _by(payload, "slow")["state"] == "UNKNOWN"
+    assert "fanout budget" in _by(payload, "slow")["reason"]
+    assert _by(payload, "fast")["state"] != "UNKNOWN"
 
 
 def test_listing_failure_returns_an_empty_degraded_payload(rig):
@@ -338,6 +380,9 @@ def test_dashboard_live_page_and_api(tmp_path):
     page = client.get("/dashboard/live")
     assert page.status_code == 200
     assert "/dashboard/api/live-sessions" in page.text
+    assert "Inactive history" in page.text
+    assert "lifecycle_group" in page.text
+    assert "does not mean its session is executing" in page.text
     assert "data-global-nav" in page.text
     assert 'href="/dashboard/live"' in page.text
     api = client.get("/dashboard/api/live-sessions")

@@ -24,7 +24,7 @@ from __future__ import annotations
 import hashlib
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -45,7 +45,8 @@ DEFAULT_TAIL_LINES = 20
 MAX_TAIL_LINES = 20          # what one status call already carries
 EXPANDED_TAIL_LINES = 120    # an explicitly expanded card
 MAX_EXPANDED = 6             # bound on extra tail reads per poll
-DEFAULT_TTL_SECONDS = 1.5    # page polls every ~2s; shared by every open tab
+DEFAULT_TTL_SECONDS = 10.0  # share one fleet inspection across tabs and 5s page polls
+STATUS_FANOUT_BUDGET_SECONDS = 5.0
 # A session created or newly activated within this window is highlighted NEW.
 NEW_WINDOW_SECONDS = 600.0
 # Input delivered this recently counts as work in flight until the pane says
@@ -66,6 +67,20 @@ LABEL_ORPHAN_SKEW_SECONDS = 5.0
 
 _SHELLS = {"bash", "zsh", "sh", "fish", "dash"}
 _TERMINAL_TASK_STATUSES = {"COMPLETED", "FAILED", "CANCELLED", "SKIPPED", "DONE", "BLOCKED"}
+
+
+def lifecycle_group(entry: dict[str, Any]) -> str:
+    """Group sessions by observed work state, never by node registration.
+
+    A listed session is merely present. Only RUNNING evidence or an open
+    durable task is active; unresolved states stay visible as attention.
+    """
+    state = str(entry.get("state") or STATE_UNKNOWN).upper()
+    if state in (STATE_WAITING, STATE_ERROR, STATE_UNKNOWN, STATE_OFFLINE, STATE_RESTRICTED):
+        return "attention"
+    if state == STATE_RUNNING or entry.get("active"):
+        return "active"
+    return "history"
 
 
 def _epoch(value: Any) -> float | None:
@@ -102,6 +117,8 @@ def live_state(status: dict[str, Any], output: str, *, change: Any,
       * delivered input is activity, so a direct send shows as RUNNING before
         the agent has printed its first line.
     """
+    if status.get("error"):
+        return STATE_UNKNOWN, f"status unavailable: {status['error']}", None
     witnessed = bool(change and change.witnessed)
     age = change.age_seconds if change else None
     state, reason = derive_state(status, output, age_seconds=age, witnessed=witnessed,
@@ -137,6 +154,7 @@ class LiveSessionMonitor:
                  direct_tasks: Callable[[], Any] | Any = None,
                  git_probe: Callable[[str | None], dict[str, Any]] | None = None,
                  ttl_seconds: float = DEFAULT_TTL_SECONDS,
+                 status_budget_seconds: float = STATUS_FANOUT_BUDGET_SECONDS,
                  clock: Callable[[], float] = time.time) -> None:
         self.controller = controller
         self.audit = audit
@@ -145,6 +163,7 @@ class LiveSessionMonitor:
         self._direct_tasks = direct_tasks
         self._git_probe = git_probe
         self.ttl = ttl_seconds
+        self.status_budget = max(0.01, float(status_budget_seconds))
         self.clock = clock
         self.tracker = OutputChangeTracker()
         self._lock = threading.Lock()
@@ -154,6 +173,10 @@ class LiveSessionMonitor:
         self._last_state: dict[str, str] = {}
         self._finished_at: dict[str, float] = {}
         self._started_at: float | None = None
+        self._status_pool = ThreadPoolExecutor(max_workers=FANOUT_WORKERS,
+                                               thread_name_prefix="live-session-status")
+        self._status_futures: dict[str, tuple[float, Any]] = {}
+        self._prepared_status: dict[str, dict[str, Any]] = {}
 
     # -- public -------------------------------------------------------------
 
@@ -262,6 +285,41 @@ class LiveSessionMonitor:
         runs = self._run_index(errors)
         labels = self._label_index(errors)
 
+        # Session status calls are independent, but a single broken node must
+        # not hold the dashboard request open. Reuse any in-flight probe so a
+        # slow controller cannot accumulate duplicate probe threads every poll.
+        local_node_id = getattr(self.controller, "local_node_id", "local")
+        targets = {}
+        for row in rows:
+            if not bool(row.get("effective_read", row.get("read_allowed", True))):
+                continue
+            name = row.get("name") or "?"
+            node_id = row.get("node_id") or local_node_id
+            target = name if node_id == local_node_id else f"{node_id}/{name}"
+            targets[target] = target
+        now_mono = time.monotonic()
+        for target in targets:
+            pending = self._status_futures.get(target)
+            if pending is None or (pending[1].done() and now_mono - pending[0] > self.ttl):
+                self._status_futures[target] = (now_mono, self._status_pool.submit(
+                    self.controller.terminal_status, target))
+        done, _pending = wait([self._status_futures[t][1] for t in targets],
+                              timeout=self.status_budget)
+        prepared: dict[str, dict[str, Any]] = {}
+        for target in targets:
+            started, future = self._status_futures[target]
+            if future not in done:
+                prepared[target] = {"error": "status probe exceeded dashboard fanout budget",
+                                    "state": STATE_UNKNOWN}
+                continue
+            try:
+                prepared[target] = future.result() or {}
+            except Exception as exc:  # noqa: BLE001 -- one row never blanks the page
+                prepared[target] = {"error": f"{type(exc).__name__}: {exc}",
+                                    "state": STATE_OFFLINE}
+            self._status_futures.pop(target, None)
+        self._prepared_status = prepared
+
         def fetch(row: dict[str, Any]) -> dict[str, Any]:
             try:
                 return self._session_entry(row, now=now, local_node_id=local_node_id,
@@ -298,16 +356,27 @@ class LiveSessionMonitor:
                   "offline": 0}
         by_state: dict[str, int] = {}
         for entry in entries:
+            entry["lifecycle_group"] = lifecycle_group(entry)
             by_state[entry["state"]] = by_state.get(entry["state"], 0) + 1
             counts["active"] += 1 if entry.get("active") else 0
             counts["new"] += 1 if entry.get("is_new") else 0
             counts["waiting"] += 1 if entry["state"] == STATE_WAITING else 0
             counts["idle"] += 0 if entry.get("active") else 1
             counts["offline"] += 1 if entry["state"] == STATE_OFFLINE else 0
+        grouped = {key: sum(1 for entry in entries if entry["lifecycle_group"] == key)
+                   for key in ("active", "attention", "history")}
+        counts_by = {}
+        for field in ("node_name", "repo", "agent"):
+            counts_by[field] = {}
+            for entry in entries:
+                label = str(entry.get(field) or "unknown")
+                counts_by[field][label] = counts_by[field].get(label, 0) + 1
         return {
             "generated_at": now,
             "sessions": entries,
             "counts": counts,
+            "groups": grouped,
+            "counts_by": counts_by,
             "by_state": by_state,
             "unreachable_nodes": unreachable,
             "source_errors": errors,
@@ -319,6 +388,8 @@ class LiveSessionMonitor:
 
     def _status(self, name: str, node_id: str, local_node_id: str) -> dict[str, Any]:
         target = name if node_id == local_node_id else f"{node_id}/{name}"
+        if target in self._prepared_status:
+            return self._prepared_status[target]
         try:
             return self.controller.terminal_status(target) or {}
         except Exception as exc:  # noqa: BLE001

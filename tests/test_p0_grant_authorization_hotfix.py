@@ -140,6 +140,7 @@ def test_revoked_session_reports_and_behaves_consistently_denied(tmp_path, tmux_
     assert listed["input_allowed"] is False
     assert listed["effective_read"] is False
     assert listed["effective_input"] is False
+    assert listed["cwd"] is None  # project paths follow the same read grant
     assert service.terminal_status(session)["error"] == "ACCESS_DENIED"
     assert service.terminal_send_text(session, "x")["error"] == "ACCESS_DENIED"
 

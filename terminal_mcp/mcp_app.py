@@ -1236,7 +1236,8 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
     def terminal_create_session(name: str, agent_type: str = "shell", working_directory: str | None = None,
                                 initial_prompt: str | None = None, grant_mode: str = "none",
                                 binding: str | None = None, node: str = "auto",
-                                show_on_desktop: bool = False) -> dict:
+                                show_on_desktop: bool = False,
+                                confirm_advisories: bool = False) -> dict:
         """Create a new, detached tmux session -- agent_type is "shell"
         (plain default shell), "claude", or "codex" (launched via a fixed,
         server-side-only command from config, never anything this caller
@@ -1250,6 +1251,12 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         session this call itself made is already cleaned up). Duplicate
         names fail explicitly (SESSION_ALREADY_EXISTS) -- this never
         attaches to or overwrites an existing session.
+
+        Before creating, the MCP path serializes a bounded live-session
+        check. A matching live task label in the same working directory
+        returns a reuse advisory, and a fourth session in that directory
+        returns a project-sprawl advisory before creation. Review the advice
+        and retry with confirm_advisories=true only for intentional parallel work.
 
         node ("auto" default): on a single-node deployment (the default
         today) this has no effect -- there is only ever one place to put
@@ -1285,19 +1292,22 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         failing the create outright. Always False (no-op) on Linux/tmux
         nodes, which have no such concept."""
         _refresh_local_heartbeat()
-        result = controller.terminal_create_session(
-            name, agent_type, working_directory, node=node, initial_prompt=initial_prompt,
-            grant_mode=grant_mode, binding=binding, requested_by="mcp", show_on_desktop=show_on_desktop,
-        )
-        if isinstance(result, dict) and "error" not in result:
-            # A fresh session's label: its initial_prompt, else none (this
-            # also clears a label left by an earlier session of this name).
-            label = task_labels.on_create(node_id=result.get("node_id"),
-                                          session=result.get("session") or name,
+        from .session_advisory import create_session_with_advisories
+        def _label_created(created: dict[str, Any]) -> None:
+            label = task_labels.on_create(node_id=created.get("node_id"),
+                                          session=created.get("session") or name,
                                           initial_prompt=initial_prompt)
             if label is not None:
-                result["current_task"] = {key: label.get(key) for key in
-                                          ("summary", "source", "updated_at", "task_id")}
+                created["current_task"] = {key: label.get(key) for key in
+                                           ("summary", "source", "updated_at", "task_id")}
+
+        result = create_session_with_advisories(
+            controller, name=name, agent_type=agent_type, cwd=working_directory,
+            initial_prompt=initial_prompt, label_index=task_labels.store.task_label_index,
+            on_created=_label_created,
+            confirm_advisories=confirm_advisories,
+            node=node, grant_mode=grant_mode, binding=binding, requested_by="mcp",
+            show_on_desktop=show_on_desktop)
         return result
 
     @server.tool()

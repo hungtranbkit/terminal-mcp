@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import subprocess
 import time
+import uuid
 
 import pytest
 
@@ -111,6 +112,46 @@ async def test_full_recovery_round_trip_through_real_mcp_tools(rig):
     status_after = await _call(server, "terminal_recovery_status", node_id="local", session_name="mcprec-a")
     assert status_after["status"] == "ACTIVE"
     assert status_after["recovery_generation"] == 1
+
+
+@pytest.mark.anyio
+async def test_session_create_warns_about_same_task_and_project_sprawl(rig):
+    server, service = rig
+    root = str(service.config.session_lifecycle.allowed_cwd_roots[0])
+    suffix = uuid.uuid4().hex[:10]
+    names = [f"mcprec-{suffix}-{letter}" for letter in "abcd"]
+    try:
+        for name in names[:3]:
+            created = await _call(server, "terminal_create_session", name=name,
+                                  agent_type="shell", working_directory=root)
+            assert "error" not in created
+        server.task_labels.on_task(node_id="local", session=names[0], text="same task",
+                                   title="echo duplicate task")
+        assert any(key[1] == names[0] for key in server.task_labels.store.task_label_index())
+        listing = await _call(server, "terminal_list_sessions")
+        assert len(listing["sessions"]) >= 3, listing
+        assert any(row.get("cwd") == root for row in listing["sessions"]), listing
+
+        advisory = await _call(server, "terminal_create_session", name=names[3],
+                               agent_type="shell", working_directory=root,
+                               initial_prompt="echo duplicate task")
+        assert advisory["error"] == "SESSION_CREATE_ADVISORY"
+        assert advisory["created"] is False
+        assert _tmux("has-session", "-t", names[3], check=False).returncode != 0
+        created = await _call(server, "terminal_create_session", name=names[3],
+                              agent_type="shell", working_directory=root,
+                              initial_prompt="echo duplicate task", confirm_advisories=True)
+        assert "error" not in created
+        assert "advisories" in created, created
+        codes = {advice["code"] for advice in created["advisories"]}
+        assert codes == {"SAME_TASK_SESSION_EXISTS", "PROJECT_SESSION_SPRAWL"}
+        reuse = next(advice for advice in created["advisories"]
+                     if advice["code"] == "SAME_TASK_SESSION_EXISTS")
+        assert reuse["sessions"] == [names[0]]
+        assert "reuse" in reuse["recommendation"]
+    finally:
+        for name in names:
+            _tmux("kill-session", "-t", name, check=False)
 
 
 @pytest.mark.anyio
