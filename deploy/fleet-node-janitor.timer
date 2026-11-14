@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Terminal MCP Node Janitor hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=120s
+AccuracySec=1min
+Unit=terminal-mcp-node-janitor.service
+
+[Install]
+WantedBy=timers.target

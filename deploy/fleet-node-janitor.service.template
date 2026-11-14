@@ -1,0 +1,10 @@
+[Unit]
+Description=Terminal MCP Node Janitor (@NODE@)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.local/bin/terminal-mcp-node-janitor.py --node @NODE@ --cap @CAP@ --apply --limit 6
+TimeoutStartSec=120
+NoNewPrivileges=true
+UMask=0077
