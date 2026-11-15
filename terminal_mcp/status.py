@@ -272,20 +272,18 @@ def classify_status(session: SessionInfo, output: str, now: int | None = None) -
         return "WAITING_INPUT", True, f"{reason}; current command is {command or 'unknown'!r}"
     if session.pane_dead:
         return "IDLE", False, "tmux reports the active pane is dead"
-    # Git/grdctl credential prompts must not disappear into UNKNOWN.  A shell
-    # command can wait indefinitely without changing the tmux activity time.
-    # Scope these exact bottom-of-pane prompts to the current foreground
-    # command: historical output, documentation, and unrelated agent prose
-    # must never be classified as an outstanding credential request.
     # Claude is visibly unusable until its owner completes /login.  This
     # is an authentication blocker, not a running task or an empty composer.
     # Only trust the CLI's exact status chrome close to the pane footer.
     if not session.pane_dead and command == "claude":
         footer = [line.strip() for line in output.splitlines() if line.strip()][-8:]
-        if any(re.fullmatch(r"Not logged in\\s*·\\s*Run /login", line, re.IGNORECASE)
+        if any(re.fullmatch(r"Not logged in\s*·\s*Run /login", line, re.IGNORECASE)
                for line in footer):
             return ("WAITING_INPUT", True,
                     "Claude login required; owner must authenticate, never autofill credentials")
+    # Git/grdctl credential prompts must not disappear into UNKNOWN.  A shell
+    # command can wait indefinitely without changing the tmux activity time.
+    # Scope exact bottom-of-pane prompts to the current foreground command.
     if not session.pane_dead and command in {"git", "grdctl"}:
         nonempty = [line.strip() for line in output.splitlines() if line.strip()]
         if nonempty:
