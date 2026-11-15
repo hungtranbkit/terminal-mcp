@@ -31,7 +31,7 @@ def test_git_credential_prompt_at_pane_bottom_is_waiting_input():
         "Password for 'https://github.com': ",
     ):
         state, required, reason = classify_status(
-            info("git", activity=0), "git clone started\\n" + prompt, now=10_000)
+            info("git", activity=0), "git clone started\n" + prompt, now=10_000)
         assert state == "WAITING_INPUT"
         assert required is True
         assert "credential prompt" in reason
@@ -39,13 +39,13 @@ def test_git_credential_prompt_at_pane_bottom_is_waiting_input():
 
 def test_grdctl_credential_prompt_at_pane_bottom_is_waiting_input():
     state, required, _ = classify_status(
-        info("grdctl", activity=0), "Configuring remote access\\nUsername: ", now=10_000)
+        info("grdctl", activity=0), "Configuring remote access\nUsername: ", now=10_000)
     assert state == "WAITING_INPUT"
     assert required is True
 
 
 def test_credential_mention_in_old_output_or_unrelated_command_not_waiting():
-    historical = "Username for 'https://github.com': \\nstep 2: response emitted\\n"
+    historical = "Username for 'https://github.com': \nstep 2: response emitted\n"
     for command in ("git", "grdctl", "bash", "claude"):
         state, required, _ = classify_status(
             info(command, activity=0), historical, now=10_000)
