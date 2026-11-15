@@ -72,7 +72,7 @@ def test_claude_expired_login_banner_requires_input():
 
 
 def test_claude_login_text_is_not_recognized_in_old_logs_or_shell():
-    prior = "Not logged in · Run /login\n" + "\\n".join(f"line {i}" for i in range(12))
+    prior = "Not logged in · Run /login\n" + "\n".join(f"line {i}" for i in range(12))
     for command in ("claude", "bash", "git"):
         state, required, _ = classify_status(
             info(command, activity=0), prior, now=10_000)
