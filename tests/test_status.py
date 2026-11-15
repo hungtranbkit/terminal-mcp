@@ -57,6 +57,29 @@ def test_credential_mention_in_old_output_or_unrelated_command_not_waiting():
     assert required is False
 
 
+def test_claude_expired_login_banner_requires_input():
+    output = (
+        "✻ Cogitated for 0s · done 10:32 AM\n"
+        "Not logged in · Run /login\n"
+        "────────────────────────────────────\n"
+        "❯\n"
+        "⏵⏵ auto mode on (shift+tab to cycle)"
+    )
+    state, required, reason = classify_status(
+        info("claude", activity=0), output, now=10_000)
+    assert (state, required) == ("WAITING_INPUT", True)
+    assert "login required" in reason
+
+
+def test_claude_login_text_is_not_recognized_in_old_logs_or_shell():
+    prior = "Not logged in · Run /login\n" + "\\n".join(f"line {i}" for i in range(12))
+    for command in ("claude", "bash", "git"):
+        state, required, _ = classify_status(
+            info(command, activity=0), prior, now=10_000)
+        assert state != "WAITING_INPUT"
+        assert not required
+
+
 def test_running_and_idle_classification():
     assert classify_status(info("python", 95), "working", now=100)[0] == "RUNNING"
     assert classify_status(info("bash", 1), "$", now=100)[0] == "IDLE"
