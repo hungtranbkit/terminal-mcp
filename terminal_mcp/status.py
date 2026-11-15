@@ -272,6 +272,22 @@ def classify_status(session: SessionInfo, output: str, now: int | None = None) -
         return "WAITING_INPUT", True, f"{reason}; current command is {command or 'unknown'!r}"
     if session.pane_dead:
         return "IDLE", False, "tmux reports the active pane is dead"
+    # Git/grdctl credential prompts must not disappear into UNKNOWN.  A shell
+    # command can wait indefinitely without changing the tmux activity time.
+    # Scope these exact bottom-of-pane prompts to the current foreground
+    # command: historical output, documentation, and unrelated agent prose
+    # must never be classified as an outstanding credential request.
+    if not session.pane_dead and command in {"git", "grdctl"}:
+        nonempty = [line.strip() for line in output.splitlines() if line.strip()]
+        if nonempty:
+            last = nonempty[-1]
+            if (command == "git" and re.fullmatch(
+                r"(?:Username|Password) for '[^']{1,200}':", last, re.IGNORECASE
+            )) or (command == "grdctl" and re.fullmatch(
+                r"(?:Username|Password):", last, re.IGNORECASE
+            )):
+                return ("WAITING_INPUT", True,
+                        f"{command} credential prompt at pane bottom; human authentication required")
     age = max(0, (now if now is not None else int(time.time())) - session.activity_epoch)
     # Checked BEFORE the activity-age rules below, not after: the pane's own
     # footer is direct evidence of what the target is doing right now, while
