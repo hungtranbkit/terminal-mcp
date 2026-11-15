@@ -111,6 +111,9 @@ supervisor:
 #     idle_hours: 2
 #     interval_seconds: 900
 #     max_closes_per_run: 10
+#     max_concurrent_nodes: 4              # bounded fleet fanout (1..16)
+#     tombstone_ttl_days: 14               # lifecycle audit rows (1..365)
+#     max_backoff_seconds: 3600            # retry cap after backend errors
 #     agent_commands: [claude, codex]
 #     close_clean_primary_checkouts: false
 #     scrollback_dir: ~/tmux-reaped

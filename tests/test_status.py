@@ -3,10 +3,9 @@ from terminal_mcp.status import (
     classify_status,
     classify_supervisor_state,
     detect_agent_ui_state,
-
-    shell_prompt_is_back,
     detect_waiting_input,
     parse_completion_marker,
+    shell_prompt_is_back,
     verify_completion_marker,
 )
 
@@ -24,6 +23,61 @@ def test_waiting_prompt_near_bottom():
 def test_old_prompt_not_false_positive():
     output = "Do you want to continue? [y/N]\n" + "\n".join(f"line {i}" for i in range(20))
     assert not detect_waiting_input(output)[0]
+
+
+def test_git_credential_prompt_at_pane_bottom_is_waiting_input():
+    for prompt in (
+        "Username for 'https://github.com': ",
+        "Password for 'https://github.com': ",
+    ):
+        state, required, reason = classify_status(
+            info("git", activity=0), "git clone started\n" + prompt, now=10_000)
+        assert state == "WAITING_INPUT"
+        assert required is True
+        assert "credential prompt" in reason
+
+
+def test_grdctl_credential_prompt_at_pane_bottom_is_waiting_input():
+    state, required, _ = classify_status(
+        info("grdctl", activity=0), "Configuring remote access\nUsername: ", now=10_000)
+    assert state == "WAITING_INPUT"
+    assert required is True
+
+
+def test_credential_mention_in_old_output_or_unrelated_command_not_waiting():
+    historical = "Username for 'https://github.com': \nstep 2: response emitted\n"
+    for command in ("git", "grdctl", "bash", "claude"):
+        state, required, _ = classify_status(
+            info(command, activity=0), historical, now=10_000)
+        assert state != "WAITING_INPUT"
+        assert required is False
+    state, required, _ = classify_status(
+        info("bash", activity=0), "Username: ", now=10_000)
+    assert state != "WAITING_INPUT"
+    assert required is False
+
+
+def test_claude_expired_login_banner_requires_input():
+    output = (
+        "✻ Cogitated for 0s · done 10:32 AM\n"
+        "Not logged in · Run /login\n"
+        "────────────────────────────────────\n"
+        "❯\n"
+        "⏵⏵ auto mode on (shift+tab to cycle)"
+    )
+    state, required, reason = classify_status(
+        info("claude", activity=0), output, now=10_000)
+    assert (state, required) == ("WAITING_INPUT", True)
+    assert "login required" in reason
+
+
+def test_claude_login_text_is_not_recognized_in_old_logs_or_shell():
+    prior = "Not logged in · Run /login\n" + "\n".join(f"line {i}" for i in range(12))
+    for command in ("claude", "bash", "git"):
+        state, required, _ = classify_status(
+            info(command, activity=0), prior, now=10_000)
+        assert state != "WAITING_INPUT"
+        assert not required
 
 
 def test_running_and_idle_classification():
@@ -202,6 +256,36 @@ def test_claude_permission_menu_is_waiting_input():
         info("claude", activity=0), CLAUDE_PERMISSION_MENU, now=5)
     assert state == "WAITING_INPUT"
     assert input_required is True
+
+
+def test_permission_request_scopes_read_retries_to_allowed_roots(tmp_path):
+    from terminal_mcp.status import classify_permission_request
+
+    workspace = tmp_path / "workspace"
+    sibling = tmp_path / "shared"
+    workspace.mkdir()
+    sibling.mkdir()
+    prompt = (f"Read {sibling / 'notes.txt'}?\n❯ 1. Allow once\n2. Always allow\n"
+              "3. Cancel\nEsc to cancel")
+    scoped = classify_permission_request(prompt, cwd=str(workspace), allowed_roots=(str(tmp_path),))
+    assert scoped["classification"] == "SAFE_SCOPED_READ"
+    assert scoped["retry_allowed"] is True
+
+    outside = classify_permission_request(prompt, cwd=str(workspace), allowed_roots=(str(workspace),))
+    assert outside["classification"] == "OUTSIDE_ALLOWED_ROOT"
+    assert outside["retry_allowed"] is False
+
+
+def test_permission_request_never_marks_secret_paths_safe(tmp_path):
+    from terminal_mcp.status import classify_permission_request
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    prompt = (f"Read {root / '.env'}?\n❯ 1. Allow once\n2. Always allow\n"
+              "3. Cancel\nEsc to cancel")
+    result = classify_permission_request(prompt, cwd=str(root), allowed_roots=(str(root),))
+    assert result["classification"] == "RISKY_PERMISSION"
+    assert result["retry_allowed"] is False
 
 
 # Two more LIVE captures, 2026-09-19, both sessions genuinely stuck on a real

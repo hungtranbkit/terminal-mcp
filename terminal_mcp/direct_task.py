@@ -492,9 +492,10 @@ _NEXT_ACTIONS = {
                     "prompt; check supervise_status(task_id) when asked. Do not resend."),
     "RUNNING": ("none -- execution was observed; the server continues the task until an "
                 "explicit TMCP-DONE/TMCP-BLOCKED. Check supervise_status(task_id) when asked."),
-    "WAITING_INPUT": ("a human must answer the session's prompt/dialog (inspect the target; "
-                      "never auto-trust a hooks review). Supervision resumes by itself; do not "
-                      "resend."),
+    "WAITING_INPUT": ("a human must resolve the session's prompt/dialog (inspect the target; "
+                      "never auto-trust a hooks review). If it clears before dispatch, supervision "
+                      "stays parked to prevent repeating the prompt; cancel before starting an "
+                      "explicitly approved retry."),
     "STUCK_COMPOSER": ("the prompt is sitting unsent in the agent composer; the server tries a "
                        "bounded Enter-only recovery. If it persists, press Enter in the session "
                        "or supervise_cancel. Never resend the text."),
@@ -929,6 +930,15 @@ class DirectTaskSupervisor:
     def _first_dispatch(self, task, base, turn_state, observed, output, now):
         bottom = "\n".join([line for line in (output or "").splitlines()
                              if line.strip()][-DIALOG_TAIL_LINES:])
+        if (task.get("wait_reason") == "SESSION_INPUT_BEFORE_DISPATCH"
+                and turn_state != "WAITING_INPUT"):
+            # A dialog disappearing does not prove that its permission was
+            # granted. Keep the durable task parked until an owner explicitly
+            # starts a new attempt; otherwise a declined/out-of-root request
+            # can be prompted again by the supervisor.
+            return self.store.update(task["task_id"], **base, state="WAITING_INPUT",
+                                     wait_reason="EXPLICIT_RESUME_REQUIRED", idle_since=None,
+                                     reason="Permission/dialog cleared; explicit owner retry required")
         if (turn_state == "WAITING_INPUT" or _BOOT_DIALOG.search(bottom)
                 or (task.get("agent") == "codex"
                     and codex_folder_trust_prompt((output or "").splitlines()))):
@@ -1036,6 +1046,15 @@ class DirectTaskSupervisor:
             return self.store.update(task["task_id"], **base, state="WAITING_INPUT",
                                      wait_reason="SESSION_INPUT", idle_since=None,
                                      reason=_clip(observed.get("reason")))
+        if (task["state"] == "WAITING_INPUT"
+                and task.get("wait_reason") == "SESSION_INPUT_BEFORE_DISPATCH"):
+            # A dialog disappearing does not prove that its permission was
+            # granted. Keep the durable task parked until an owner explicitly
+            # starts a new attempt; otherwise a declined/out-of-root request
+            # can be prompted again by the supervisor.
+            return self.store.update(task["task_id"], **base, state="WAITING_INPUT",
+                                     wait_reason="EXPLICIT_RESUME_REQUIRED", idle_since=None,
+                                     reason="Permission/dialog cleared; explicit owner retry required")
         if task["state"] == "WAITING_INPUT" and task.get("wait_reason") == "AWAITING_EXPLICIT_COMPLETION":
             return self.store.update(task["task_id"], **base)
         if task["state"] in ("WAITING_INPUT", "STUCK_COMPOSER", "DISPATCH_UNCERTAIN"):

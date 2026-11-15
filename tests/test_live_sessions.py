@@ -15,8 +15,12 @@ from starlette.testclient import TestClient
 
 from terminal_mcp.audit import AuditStore
 from terminal_mcp.direct_task import DirectTaskStore
-from terminal_mcp.live_sessions import (INPUT_ACTIVE_SECONDS, SETTLE_SECONDS, LiveSessionMonitor,
-                                        live_state)
+from terminal_mcp.live_sessions import (
+    INPUT_ACTIVE_SECONDS,
+    SETTLE_SECONDS,
+    LiveSessionMonitor,
+    live_state,
+)
 from terminal_mcp.queue_store import QueueStore
 
 NOW = 1_800_000_000.0
@@ -338,6 +342,8 @@ def test_dashboard_live_page_and_api(tmp_path):
     page = client.get("/dashboard/live")
     assert page.status_code == 200
     assert "/dashboard/api/live-sessions" in page.text
+    assert "Cleanup Preview" in page.text and "Cleanup Safe" in page.text
+    assert "@media (max-width:640px)" in page.text
     assert "data-global-nav" in page.text
     assert 'href="/dashboard/live"' in page.text
     api = client.get("/dashboard/api/live-sessions")
@@ -348,6 +354,17 @@ def test_dashboard_live_page_and_api(tmp_path):
     assert api.headers["cache-control"] == "no-store"
     # Both surfaces share one monitor (one change tracker).
     assert getattr(server, "live_session_monitor", None) is not None
+
+
+def test_session_cleanup_preview_reports_fleet_capacity_and_safe_reasons(tmp_path):
+    server = _servers(tmp_path)
+    client = TestClient(server.streamable_http_app(), base_url="https://testserver")
+    response = client.get("/dashboard/api/session-cleanup-preview")
+    assert response.status_code == 200
+    report = response.json()
+    assert isinstance(report["capacity_by_node"], list)
+    assert "skipped_nodes" in report
+    assert "close_candidates" in report
 
 
 def test_app_live_mirror_requires_login_and_rewrites_api(tmp_path):
@@ -369,8 +386,12 @@ def test_app_live_mirror_requires_login_and_rewrites_api(tmp_path):
 
 
 def test_dashboard_live_routes_are_read_guarded_when_access_is_configured(tmp_path):
-    from terminal_mcp.config import (AppConfig, DashboardConfig, InputPolicyConfig,
-                                     PermissionsConfig)
+    from terminal_mcp.config import (
+        AppConfig,
+        DashboardConfig,
+        InputPolicyConfig,
+        PermissionsConfig,
+    )
     from terminal_mcp.core import TerminalService
     from terminal_mcp.dashboard import register_dashboard
     from terminal_mcp.grants import SessionGrantStore

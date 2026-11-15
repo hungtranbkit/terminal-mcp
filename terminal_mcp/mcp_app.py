@@ -3829,21 +3829,40 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
             refs.append("supervised task")
         if run_journal is not None and run_journal.active_for_session(name):
             refs.append("active run")
+        if supervisor is not None:
+            try:
+                listed = supervisor.list_watches()
+                watches = listed.get("watches", []) if isinstance(listed, dict) else listed
+                bare = name.split("/", 1)[-1]
+                if any(row.get("target") in {name, bare} for row in watches):
+                    refs.append("supervisor watch")
+            except Exception:  # noqa: BLE001 -- unreadable watch state preserves
+                refs.append("supervisor watch lookup failed")
         return refs
 
     terminal.durable_deletion_guard = lambda name: deletion_preflight(
         name, queue=queue, run_journal=run_journal, supervisor=supervisor, direct_tasks=direct_tasks)
 
-    from .session_reconciler import SessionReconciler
-    session_reconciler = SessionReconciler(
+    from .session_reconciler import FleetSessionReconciler, SessionReconciler
+    local_session_reconciler = SessionReconciler(
         terminal, active_refs=_reconcile_active_refs,
         preflight=lambda name: deletion_preflight(name, queue=queue, run_journal=run_journal,
                                                   supervisor=supervisor, direct_tasks=direct_tasks),
         after_delete=lambda name: supervisor.unwatch(session=name, delete=False))
+    def _fleet_reconcile_active_refs(node_id: str, name: str) -> list[str]:
+        targets = [f"{node_id}/{name}", name]
+        refs = []
+        for target in dict.fromkeys(targets):
+            refs.extend(_reconcile_active_refs(target))
+        return list(dict.fromkeys(refs))
+
+    session_reconciler = FleetSessionReconciler(
+        controller, local_session_reconciler, active_refs=_fleet_reconcile_active_refs,
+        max_concurrent_nodes=terminal.config.session_lifecycle.agent_cleanup.max_concurrent_nodes)
 
     @server.tool()
     def terminal_session_lifecycle(session: str | None = None) -> dict:
-        """Lifecycle classification + reason for this host's tmux sessions
+        """Fleet lifecycle classification + skip reason for tmux sessions
         (one, or all). Read-only. Classes: PROTECTED, ATTACHED, SERVICE, SHELL,
         ACTIVE_TASK, AGENT_RECENT, AGENT_NOT_IDLE, DIRTY_WORKTREE,
         UNMERGED_BRANCH, NO_REPO, NO_BASE_REF, IDLE_PRIMARY_CHECKOUT, UNKNOWN_CWD
@@ -3858,7 +3877,7 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
 
     @server.tool()
     def terminal_session_reconcile(dry_run: bool = True, confirm: bool = False) -> dict:
-        """Drive the agent-session lifecycle rule on this host: provably
+        """Drive the fleet agent-session lifecycle rule: provably
         complete sessions (merged clean tree, worktree gone) close at once;
         unproven Claude/Codex work remains RECOVERY_REQUIRED after the grace
         period because a checkpoint is not task completion. Unverified

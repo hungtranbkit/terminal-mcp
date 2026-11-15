@@ -695,6 +695,55 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
         result = await anyio.to_thread.run_sync(client.list_sessions)
         return JSONResponse(result)
 
+    async def session_lifecycle(request: Request) -> JSONResponse:
+        """Node-local lifecycle evidence and guarded cleanup for the controller.
+
+        Active references are supplied by the controller's durable task and
+        watch stores; local leases and delete guards are rechecked here.
+        """
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        action = request.path_params["action"]
+        if action not in {"inspect", "reconcile"}:
+            return JSONResponse({"error": "INVALID_ACTION"}, status_code=400)
+        active_refs = body.get("active_refs", {})
+        if (not isinstance(active_refs, dict) or len(active_refs) > 2000
+                or any(not isinstance(name, str) or not isinstance(refs, list)
+                       or len(refs) > 50 or any(not isinstance(ref, str) for ref in refs)
+                       for name, refs in active_refs.items())):
+            return JSONResponse({"error": "INVALID_ACTIVE_REFERENCES"}, status_code=400)
+        session = body.get("session")
+        if session is not None and not isinstance(session, str):
+            return JSONResponse({"error": "INVALID_SESSION"}, status_code=400)
+        dry_run = body.get("dry_run", True)
+        confirm = body.get("confirm", False)
+        if not isinstance(dry_run, bool) or not isinstance(confirm, bool):
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+        if action == "reconcile" and not dry_run and not confirm:
+            return JSONResponse({"error": "CONFIRMATION_REQUIRED"}, status_code=400)
+        def run_lifecycle():
+            from .session_reconciler import SessionReconciler
+
+            def runtime_preflight(name):
+                info = terminal.tmux.get_session(name)
+                blocker = terminal._session_delete_runtime_blocker(name, info)
+                return {"error": blocker} if blocker else {}
+
+            reconciler = SessionReconciler(terminal,
+                active_refs=lambda name: list(active_refs.get(name, [])), preflight=runtime_preflight)
+            if action == "inspect":
+                return reconciler.inspect(session)
+            return reconciler.run(dry_run=dry_run)
+
+        result = await anyio.to_thread.run_sync(run_lifecycle)
+        return JSONResponse(result)
+
     async def session_status(request: Request) -> JSONResponse:
         if (blocked := require_auth(request)) is not None:
             return blocked
@@ -732,6 +781,29 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
         result = await anyio.to_thread.run_sync(lambda: client.send_text(
             name, body.get("text", ""), bool(body.get("press_enter", False)), bool(body.get("dry_run", False)),
             idempotency_key=body.get("idempotency_key"),
+            prompt_response=bool(body.get("prompt_response", False)), origin=body.get("origin"),
+            trace_id=body.get("trace_id"), parent_turn_id=body.get("parent_turn_id"),
+            depth=int(body.get("depth") or 0),
+        ))
+        return JSONResponse(result)
+
+    async def session_send_guarded(request: Request) -> JSONResponse:
+        """Direct-start endpoint for controllers that require an idle pane.
+
+        Kept separate from the legacy send route so an older worker returns
+        404 instead of silently discarding the safety guard. The core holds
+        the pane lease while it checks IDLE and persists the idempotent receipt.
+        """
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        name = request.path_params["name"]
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        result = await anyio.to_thread.run_sync(lambda: client.send_text(
+            name, body.get("text", ""), bool(body.get("press_enter", False)), bool(body.get("dry_run", False)),
+            idempotency_key=body.get("idempotency_key"), require_idle=True,
             prompt_response=bool(body.get("prompt_response", False)), origin=body.get("origin"),
             trace_id=body.get("trace_id"), parent_turn_id=body.get("parent_turn_id"),
             depth=int(body.get("depth") or 0),
@@ -1149,11 +1221,13 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
         Route("/v1/worktree/cleanup", worktree_cleanup, methods=["POST"]),
         Route("/v1/capabilities/refresh", refresh_capabilities, methods=["POST"]),
         Route("/v1/sessions", list_sessions, methods=["GET"]),
+        Route("/v1/session-lifecycle/{action}", session_lifecycle, methods=["POST"]),
         Route("/v1/sessions", create_session, methods=["POST"]),
         Route("/v1/sessions/{name}/status", session_status, methods=["GET"]),
         Route("/v1/sessions/{name}/tail", session_tail, methods=["GET"]),
         Route("/v1/sessions/{name}/capture", session_capture, methods=["GET"]),
         Route("/v1/sessions/{name}/send", session_send, methods=["POST"]),
+        Route("/v1/sessions/{name}/send-guarded", session_send_guarded, methods=["POST"]),
         Route("/v1/sessions/{name}/send-keys", session_send_keys, methods=["POST"]),
         Route("/v1/input-context", input_context, methods=["GET"]),
         Route("/v1/sessions/{name}/detach", detach_session, methods=["POST"]),

@@ -14832,6 +14832,57 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         payload["expanded_tail_lines"] = EXPANDED_TAIL_LINES
         return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
+    @server.custom_route("/dashboard/api/session-cleanup-preview", methods=["GET"], include_in_schema=False)
+    async def dashboard_session_cleanup_preview(request: Request) -> JSONResponse:
+        blocked, _identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        reconciler = getattr(server, "session_reconciler", None)
+        if reconciler is None:
+            return JSONResponse({"error": "SESSION_LIFECYCLE_UNAVAILABLE"}, status_code=503)
+        try:
+            report = await anyio.to_thread.run_sync(reconciler.inspect)
+            rows = report.get("sessions", [])
+            capacity = []
+            for node in controller.list_nodes():
+                node_id = node.id
+                node_rows = [row for row in rows if row.get("node_id") == node_id and row.get("session") != "*"]
+                count = node.tmux_session_count
+                limit = node.max_sessions
+                capacity.append({"node_id": node_id, "node_name": node.display_name, "status": node.status,
+                                 "capacity_status": node.capacity_status, "sessions": count,
+                                 "max_sessions": limit,
+                                 "available": max(0, limit - count) if isinstance(limit, int)
+                                 and isinstance(count, int) else None,
+                                 "cleanup_candidates": sum(row.get("action") == "close" for row in node_rows),
+                                 "idle": sum(row.get("pane_state") == "IDLE" for row in node_rows),
+                                 "blocked": sum(row.get("lifecycle_state") == "BLOCKED" for row in node_rows),
+                                 "protected": sum(row.get("classification") == "PROTECTED" for row in node_rows)})
+            return JSONResponse({**report, "capacity_by_node": capacity},
+                                headers={"Cache-Control": "no-store"})
+        except Exception as exc:  # noqa: BLE001 -- preserve preview as an explicit error
+            return JSONResponse({"error": "SESSION_CLEANUP_PREVIEW_FAILED",
+                                 "detail": f"{type(exc).__name__}: {exc}"}, status_code=503)
+
+    @server.custom_route("/dashboard/api/session-cleanup-safe", methods=["POST"], include_in_schema=False)
+    async def dashboard_session_cleanup_safe(request: Request) -> JSONResponse:
+        blocked, identity = _mutation_guard(request)
+        if blocked is not None:
+            return blocked
+        if _role(identity) not in ("operator", "owner"):
+            return JSONResponse({"error": "OPERATOR_REQUIRED"}, status_code=403)
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict) or body.get("confirm") is not True:
+            return JSONResponse({"error": "CONFIRMATION_REQUIRED"}, status_code=400)
+        reconciler = getattr(server, "session_reconciler", None)
+        if reconciler is None:
+            return JSONResponse({"error": "SESSION_LIFECYCLE_UNAVAILABLE"}, status_code=503)
+        result = await anyio.to_thread.run_sync(lambda: reconciler.run(dry_run=False))
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
     @server.custom_route("/dashboard/ai-usage", methods=["GET"], include_in_schema=False)
     async def dashboard_ai_usage_page(request: Request) -> HTMLResponse | JSONResponse:
         # Same _read_guard as every other dashboard view. Read-only: the page

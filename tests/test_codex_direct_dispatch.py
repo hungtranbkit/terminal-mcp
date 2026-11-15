@@ -126,6 +126,7 @@ def test_crash_after_input_leaves_durable_no_replay_receipt(rig, monkeypatch):
 def test_concurrent_distinct_starts_recheck_idle_under_the_pane_lease(tmp_path, monkeypatch):
     import time
     from concurrent.futures import ThreadPoolExecutor
+
     from tests.test_codex_paste_settle import ComposerTransport, submit_service
 
     service = submit_service(tmp_path, ComposerTransport([]))
@@ -169,6 +170,7 @@ def test_real_disposable_tmux_direct_start_and_replay(tmp_path, tmux_session_fac
     import shlex
     import time
     from pathlib import Path
+
     from terminal_mcp.compact_tools import CompactTerminalTools
     from terminal_mcp.tmux import TmuxClient
     from tests.test_codex_paste_settle import PROMPT, submit_service
@@ -195,13 +197,24 @@ def test_real_disposable_tmux_direct_start_and_replay(tmp_path, tmux_session_fac
     assert hashlib.sha256(PROMPT.encode()).hexdigest() in pane
 
 
-def test_remote_guard_refuses_before_any_http_request(monkeypatch):
+def test_remote_guard_uses_a_guarded_endpoint_with_the_idempotency_key(monkeypatch):
     from terminal_mcp.node_client import RemoteNodeClient
     client = RemoteNodeClient("http://node.test:8790", "inert-test-token")
-    monkeypatch.setattr(client, '_request', lambda *a, **kw: pytest.fail('must not send HTTP'))
-    result = client.send_text('codex', 'inert', True, require_idle=True)
-    assert result['error'] == 'IDLE_GUARD_UNSUPPORTED'
-    assert result['sent'] is False
+    calls = []
+    monkeypatch.setattr(client, '_request', lambda *a, **kw: calls.append((a, kw)) or {"sent": True})
+    result = client.send_text('codex', 'inert', True, require_idle=True, idempotency_key='once')
+    assert result == {"sent": True}
+    assert calls[0][0][:2] == ('POST', '/v1/sessions/codex/send-guarded')
+    assert calls[0][1]['body']['idempotency_key'] == 'once'
+
+
+def test_remote_unguarded_send_keeps_the_legacy_endpoint(monkeypatch):
+    from terminal_mcp.node_client import RemoteNodeClient
+    client = RemoteNodeClient("http://node.test:8790", "inert-test-token")
+    calls = []
+    monkeypatch.setattr(client, '_request', lambda *a, **kw: calls.append((a, kw)) or {"sent": True})
+    client.send_text('codex', 'inert', True, require_idle=False)
+    assert calls[0][0][:2] == ('POST', '/v1/sessions/codex/send')
 
 
 def test_explicit_idempotency_key_takes_precedence_over_legacy_request_key(rig):

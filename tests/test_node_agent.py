@@ -19,11 +19,19 @@ import pytest
 from starlette.testclient import TestClient
 
 from terminal_mcp.config import (
-    AppConfig, InputPolicyConfig, PermissionsConfig, SessionKnowledgeConfig, SessionLifecycleConfig,
+    AppConfig,
+    InputPolicyConfig,
+    PermissionsConfig,
+    SessionKnowledgeConfig,
+    SessionLifecycleConfig,
 )
 from terminal_mcp.core import TerminalService
-from terminal_mcp.node_agent import AGENT_GENERATION, _heartbeat_loop, build_node_agent, watch_for_shutdown
-
+from terminal_mcp.node_agent import (
+    AGENT_GENERATION,
+    _heartbeat_loop,
+    build_node_agent,
+    watch_for_shutdown,
+)
 from tests.conftest import tmux_cmd
 
 TOKEN = "test-node-token-abc123"
@@ -79,6 +87,31 @@ def test_health_needs_no_auth(agent_client):
     response = agent_client.get("/v1/health")
     assert response.status_code == 200
     assert response.json()["node_id"] == "test-node"
+
+
+def test_guarded_send_route_forces_idle_check_and_forwards_receipt(agent_client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(agent_client.terminal, "terminal_send_text",
+                        lambda *a, **kw: calls.append((a, kw)) or {"sent": True})
+    response = agent_client.post("/v1/sessions/agent-guarded/send-guarded", headers=_auth(), json={
+        "text": "inert", "press_enter": True, "idempotency_key": "once", "require_idle": False,
+    })
+    assert response.status_code == 200
+    assert response.json() == {"sent": True}
+    assert calls[0][1]["require_idle"] is True
+    assert calls[0][1]["idempotency_key"] == "once"
+
+
+def test_remote_lifecycle_cleanup_requires_explicit_confirmation(agent_client):
+    missing_confirmation = agent_client.post("/v1/session-lifecycle/reconcile", headers=_auth(), json={
+        "dry_run": False, "confirm": False, "active_refs": {},
+    })
+    assert missing_confirmation.status_code == 400
+    assert missing_confirmation.json()["error"] == "CONFIRMATION_REQUIRED"
+    confirmed = agent_client.post("/v1/session-lifecycle/reconcile", headers=_auth(), json={
+        "dry_run": False, "confirm": True, "active_refs": {},
+    })
+    assert confirmed.status_code == 200
 
 
 def test_node_agent_runs_submission_sweeper_for_its_lifetime(tmp_path, monkeypatch):
@@ -416,6 +449,7 @@ async def test_heartbeat_loop_survives_unreachable_controller():
 @pytest.mark.anyio
 async def test_heartbeat_post_uses_explicit_controller_user_agent(monkeypatch, caplog):
     import urllib.error
+
     import terminal_mcp.node_agent as node_agent
 
     requests = []

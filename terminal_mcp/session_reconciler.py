@@ -82,6 +82,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -463,7 +464,7 @@ class LifecycleStore:
                 f"({', '.join('?' for _ in self._COLUMNS)})",
                 tuple(values.get(column) for column in self._COLUMNS))
 
-    def mark_gone(self, present: set[str], now: float) -> list[str]:
+    def mark_gone(self, present: set[str], now: float, *, retention_days: int = 14) -> list[str]:
         """Open records whose session vanished become GONE; old terminal rows are pruned."""
         gone = []
         with self._connection() as connection:
@@ -473,7 +474,7 @@ class LifecycleStore:
                                        "WHERE session = ?", (GONE, now, row["session"]))
                     gone.append(row["session"])
             connection.execute("DELETE FROM session_lifecycle WHERE state IN (?, ?) AND updated_at < ?",
-                               (CLOSED, GONE, now - _RETENTION_SECONDS))
+                               (CLOSED, GONE, now - retention_days * 86400))
         return gone
 
 
@@ -555,7 +556,14 @@ class SessionReconciler:
             if self.terminal._session_delete_runtime_blocker(name, info):
                 refs.append("lease/recovery in progress")
         except Exception:  # noqa: BLE001
-            pass
+            refs.append("runtime ownership lookup failed")
+        try:
+            bindings = getattr(self.terminal, "bindings", None)
+            if bindings is not None and any(getattr(binding, "session", None) == name
+                                            for binding in bindings.list()):
+                refs.append("session has an active binding")
+        except Exception:  # noqa: BLE001 -- unknown binding state preserves
+            refs.append("binding lookup failed")
         return refs
 
     def _pane(self, name: str, lines: int) -> str | None:
@@ -722,8 +730,12 @@ class SessionReconciler:
                        reason=f"uncontrolled ({cls}) beyond {grace / 60:.0f}min grace; "
                               f"retained because task completion is unproven: {row['reason']}")
         else:
-            new.update(state=CLEANUP_ELIGIBLE,
-                       reason=f"uncontrolled ({cls}) beyond {grace / 60:.0f}min grace: {row['reason']}")
+            # Elapsed time is never enough to prove a service/session is
+            # disposable. Only the two explicit CLOSE_CLASSES above may
+            # enter CLEANUP_ELIGIBLE.
+            new.update(state=RECOVERY_REQUIRED,
+                       reason=f"uncontrolled ({cls}) beyond {grace / 60:.0f}min grace; "
+                              f"retained because cleanup eligibility is unproven: {row['reason']}")
         if previous_state == BLOCKED and record.get("reason", "").startswith("checkpoint failed"):
             new.update(state=BLOCKED, reason=record["reason"])
         return new
@@ -755,7 +767,8 @@ class SessionReconciler:
                 self.store.put(record)
             rows.append(self._annotate(row, record))
         if persist and session is None:
-            self.store.mark_gone({info.name for info in sessions}, now)
+            self.store.mark_gone({info.name for info in sessions}, now,
+                                 retention_days=int(getattr(self.policy, "tombstone_ttl_days", 14)))
         states: dict[str, int] = {}
         for row in rows:
             states[row["lifecycle_state"]] = states.get(row["lifecycle_state"], 0) + 1
@@ -851,6 +864,10 @@ class SessionReconciler:
                 info = self.terminal.tmux.get_session(name)
                 if info is None:
                     continue
+                if self._identity(info) != record.get("identity"):
+                    refused.append({**row, "refused": "SESSION_IDENTITY_CHANGED",
+                                    "reason": "tmux session id or creation time changed since preview"})
+                    continue
                 fresh = self.classify_session(info)
                 fresh_record = self._evaluate(fresh, self._identity(info), record, self._clock())
                 if not (fresh_record["state"] == CLEANUP_ELIGIBLE or _checkpoint_blocked(fresh_record)):
@@ -876,6 +893,29 @@ class SessionReconciler:
                         refused.append({**self._annotate(fresh, fresh_record), "refused": pre["error"]})
                         continue
                 scrollback = self._capture(name)
+                # The identity read above can be separated from deletion by
+                # git/checkpoint work and scrollback I/O. Confirm it again at
+                # the final boundary and repeat the ownership preflight.
+                final_info = self.terminal.tmux.get_session(name)
+                if final_info is None or self._identity(final_info) != self._identity(info):
+                    refused.append({**self._annotate(fresh, fresh_record),
+                                    "refused": "SESSION_IDENTITY_CHANGED",
+                                    "reason": "tmux identity changed at the delete boundary"})
+                    continue
+                final_facts = self.classify_session(final_info)
+                final_record = self._evaluate(final_facts, self._identity(final_info), fresh_record,
+                                              self._clock())
+                if final_record["state"] != CLEANUP_ELIGIBLE:
+                    self.store.put(final_record)
+                    refused.append({**self._annotate(final_facts, final_record),
+                                    "refused": "NO_LONGER_CANDIDATE"})
+                    continue
+                if self._preflight is not None:
+                    pre = self._preflight(name)
+                    if "error" in pre:
+                        refused.append({**self._annotate(final_facts, final_record),
+                                        "refused": pre["error"]})
+                        continue
                 result = self.terminal.terminal_delete_session(name, confirm=True, requested_by=ACTOR)
                 if "error" in result:  # an already-gone session is success-shaped
                     self.store.put(fresh_record)
@@ -887,14 +927,14 @@ class SessionReconciler:
                     except Exception:  # noqa: BLE001 -- the session is already gone
                         _log.exception("session reconciler: after_delete failed for %s", name)
                 now = self._clock()
-                fresh_record.update(state=CLOSED, closed_at=now, updated_at=now,
-                                    reason=f"closed: {fresh_record['reason']}")
-                self.store.put(fresh_record)
+                final_record.update(state=CLOSED, closed_at=now, updated_at=now,
+                                    reason=f"closed: {final_record['reason']}")
+                self.store.put(final_record)
                 self.terminal.audit.record(action="reconcile_agent_session", session=name,
                                            result="DELETED",
                                            reason=f"{CLEANUP_ELIGIBLE}:{fresh['classification']}",
                                            actor=ACTOR)
-                closed.append({**self._annotate(fresh, fresh_record), "scrollback": scrollback,
+                closed.append({**self._annotate(final_facts, final_record), "scrollback": scrollback,
                                "checkpoint": checkpoint})
         report.update({"dry_run": dry, "closed": closed, "refused": refused, "checkpoints": checkpoints,
                        "policy": {"enabled": policy.enabled, "idle_hours": policy.idle_hours,
@@ -905,6 +945,171 @@ class SessionReconciler:
                                   "close_clean_primary_checkouts": policy.close_clean_primary_checkouts,
                                   "max_closes_per_run": policy.max_closes_per_run}})
         return report
+
+
+class FleetSessionReconciler:
+    """Run node-local lifecycle decisions across a controller's online fleet.
+
+    Each worker classifies and deletes on its own filesystem. The controller
+    supplies current task/watch references; per-node fanout is bounded and a
+    slow/offline worker cannot prevent another worker from being inspected.
+    """
+
+    def __init__(self, controller: Any, local_reconciler: SessionReconciler, *,
+                 active_refs: Callable[[str, str], list[str]] | None = None,
+                 max_concurrent_nodes: int | None = None,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self.controller = controller
+        self.local = local_reconciler
+        self.policy = local_reconciler.policy
+        self._active_refs = active_refs
+        self._max_workers = max(1, min(16, int(max_concurrent_nodes or
+                                               getattr(self.policy, "max_concurrent_nodes", 4))))
+        self._clock = clock
+        self._retry: dict[str, tuple[float, float]] = {}
+        self._retry_lock = threading.Lock()
+
+    def _active_map(self, node_id: str, names: list[str]) -> dict[str, list[str]]:
+        refs: dict[str, list[str]] = {}
+        for name in names:
+            if self._active_refs is None:
+                refs[name] = []
+                continue
+            try:
+                refs[name] = list(self._active_refs(node_id, name) or [])
+            except Exception as exc:  # noqa: BLE001 -- reference lookup failure preserves
+                refs[name] = [f"active-reference lookup failed ({type(exc).__name__})"]
+        return refs
+
+    def _remote(self, node: Any, action: str, *, session: str | None = None,
+                dry_run: bool = True) -> tuple[str, dict[str, Any]]:
+        node_id = str(getattr(node, "id", ""))
+        now = self._clock()
+        with self._retry_lock:
+            retry = self._retry.get(node_id)
+            if retry and now < retry[0]:
+                return node_id, {"error": "BACKOFF_ACTIVE", "retry_in_seconds": round(retry[0] - now)}
+        client = self.controller.client_for(node_id)
+        if client is None:
+            return node_id, {"error": "NODE_UNREACHABLE"}
+        try:
+            listed = client.list_sessions()
+            if not isinstance(listed, dict) or "error" in listed:
+                raise RuntimeError((listed or {}).get("error", "SESSION_LIST_FAILED"))
+            names = [str(row["name"]) for row in listed.get("sessions", [])
+                     if isinstance(row, dict) and row.get("name")
+                     and (session is None or row.get("name") == session)]
+            active_refs = self._active_map(node_id, names)
+            result = client.session_lifecycle(action, session=session, active_refs=active_refs,
+                                              dry_run=dry_run, confirm=not dry_run)
+            if not isinstance(result, dict):
+                raise RuntimeError("INVALID_LIFECYCLE_RESPONSE")
+            if result.get("error"):
+                raise RuntimeError(str(result["error"]))
+        except Exception as exc:  # noqa: BLE001 -- isolate one worker
+            reason = str(exc)
+            transient = not any(token in reason for token in ("404", "NOT_FOUND", "INVALID_ACTION"))
+            if transient:
+                with self._retry_lock:
+                    previous = self._retry.get(node_id, (0.0, 0.0))[1]
+                    delay = min(float(getattr(self.policy, "max_backoff_seconds", 3600)),
+                                max(30.0, previous * 2 if previous else 30.0))
+                    self._retry[node_id] = (now + delay, delay)
+            return node_id, {"error": "NODE_LIFECYCLE_UNAVAILABLE", "reason": reason}
+        with self._retry_lock:
+            self._retry.pop(node_id, None)
+        for row in result.get("sessions", []):
+            row.setdefault("node_id", node_id)
+        result["node_id"] = node_id
+        return node_id, result
+
+    def _remote_nodes(self, only_node: str | None = None) -> tuple[list[Any], list[dict[str, Any]]]:
+        nodes = self.controller.list_nodes()
+        local_id = self.controller.local_node_id
+        selected = []
+        skipped = []
+        for node in nodes:
+            node_id = str(getattr(node, "id", ""))
+            if node_id == local_id or (only_node is not None and node_id != only_node):
+                continue
+            if getattr(node, "status", None) != "online":
+                skipped.append({"node_id": node_id, "reason": f"SKIP: node status is {getattr(node, 'status', 'unknown')}"})
+                continue
+            selected.append(node)
+        return selected, skipped
+
+    def _fanout(self, action: str, *, only_node: str | None = None,
+                session: str | None = None, dry_run: bool = True) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        nodes, skipped = self._remote_nodes(only_node)
+        results: list[dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix="tmcp-lifecycle") as pool:
+            futures = [pool.submit(self._remote, node, action, session=session, dry_run=dry_run) for node in nodes]
+            for future in as_completed(futures):
+                node_id, result = future.result()
+                if result.get("error"):
+                    skipped.append({"node_id": node_id, "reason": f"SKIP: {result['error']}"
+                                    + (f" ({result.get('reason')})" if result.get("reason") else "")})
+                    continue
+                results.append(result)
+        return results, skipped
+
+    @staticmethod
+    def _merge(local: dict[str, Any], remote: list[dict[str, Any]], skipped: list[dict[str, Any]],
+               *, dry_run: bool | None = None) -> dict[str, Any]:
+        result = dict(local)
+        rows = list(local.get("sessions", []))
+        closed = list(local.get("closed", []))
+        refused = list(local.get("refused", []))
+        candidates = [f"{local.get('node_id', 'local')}/{name}" for name in local.get("close_candidates", [])]
+        recovery = [f"{local.get('node_id', 'local')}/{name}" for name in local.get("recovery_required", [])]
+        blocked = [f"{local.get('node_id', 'local')}/{name}" for name in local.get("blocked", [])]
+        for report in remote:
+            node_id = report.get("node_id", "unknown")
+            rows.extend(report.get("sessions", []))
+            closed.extend([{**row, "node_id": node_id} for row in report.get("closed", [])])
+            refused.extend([{**row, "node_id": node_id} for row in report.get("refused", [])])
+            candidates.extend(f"{node_id}/{name}" for name in report.get("close_candidates", []))
+            recovery.extend(f"{node_id}/{name}" for name in report.get("recovery_required", []))
+            blocked.extend(f"{node_id}/{name}" for name in report.get("blocked", []))
+        for item in skipped:
+            rows.append({"session": "*", **item, "lifecycle_state": "UNKNOWN", "action": "preserve"})
+        result.update(sessions=rows, session_count=len(rows), closed=closed, refused=refused,
+                      close_candidates=candidates, recovery_required=recovery, blocked=blocked,
+                      skipped_nodes=skipped, node_reports=remote)
+        if dry_run is not None:
+            result["dry_run"] = dry_run
+        return result
+
+    def inspect(self, session: str | None = None, *, persist: bool = False) -> dict[str, Any]:
+        only_node, bare = (session.split("/", 1) if session and "/" in session else (None, session))
+        local_id = self.controller.local_node_id
+        local_selected = only_node is None or only_node == local_id
+        if local_selected:
+            local = self.local.inspect(bare, persist=persist)
+        else:
+            local = {"sessions": [], "session_count": 0, "lifecycle_states": {},
+                     "close_candidates": [], "recovery_required": [], "blocked": []}
+        local["node_id"] = local_id
+        for row in local.get("sessions", []):
+            row.setdefault("node_id", local_id)
+        if only_node is None or only_node != local_id:
+            remote, skipped = self._fanout("inspect", only_node=only_node, session=bare)
+        else:
+            remote, skipped = [], []
+        return self._merge(local, remote, skipped)
+
+    def run(self, *, dry_run: bool | None = None) -> dict[str, Any]:
+        dry = bool(self.policy.dry_run if dry_run is None else dry_run)
+        local = self.local.run(dry_run=dry)
+        local["node_id"] = self.controller.local_node_id
+        remote, skipped = self._fanout("reconcile", dry_run=dry)
+        return self._merge(local, remote, skipped, dry_run=dry)
+
+    def lifecycle_for(self, session: str) -> dict[str, Any] | None:
+        return self.local.lifecycle_for(session)
+
+    def lifecycle_index(self) -> dict[str, dict[str, Any]]:
+        return self.local.lifecycle_index()
 
 
 class SessionReconcileLoop:
@@ -928,9 +1133,12 @@ class SessionReconcileLoop:
             self._thread.join(timeout)
 
     def _run(self) -> None:
-        while not self._stop.wait(self._interval):
+        delay = self._interval
+        maximum = max(self._interval, float(getattr(self._reconciler.policy, "max_backoff_seconds", 3600)))
+        while not self._stop.wait(delay):
             try:
                 report = self._reconciler.run()
+                delay = self._interval
                 self.last_report = {key: report[key] for key in
                                     ("dry_run", "close_candidates", "recovery_required", "blocked")}
                 self.last_report["closed"] = [row["session"] for row in report["closed"]]
@@ -938,5 +1146,8 @@ class SessionReconcileLoop:
                     _log.info("session reconciler: dry_run=%s recovery_required=%s candidates=%s "
                               "closed=%s blocked=%s", report["dry_run"], report["recovery_required"],
                               report["close_candidates"], self.last_report["closed"], report["blocked"])
-            except Exception:  # noqa: BLE001 -- a failed pass must not kill the loop
+            except Exception as exc:  # noqa: BLE001 -- a failed pass must not kill the loop
                 _log.exception("session reconciler pass failed")
+                delay = min(maximum, max(self._interval, delay * 2))
+                self.last_report = {"error": f"{type(exc).__name__}: {exc}",
+                                    "retry_in_seconds": delay}

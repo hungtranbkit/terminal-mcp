@@ -518,6 +518,16 @@ class RemoteNodeClient:
     def list_sessions(self, *, timeout_seconds: float | None = None) -> dict[str, Any]:
         return self._request("GET", "/v1/sessions", timeout_seconds=timeout_seconds)
 
+    def session_lifecycle(self, action: str, *, session: str | None = None,
+                          active_refs: dict[str, list[str]] | None = None,
+                          dry_run: bool = True, confirm: bool = False) -> dict[str, Any]:
+        if action not in {"inspect", "reconcile"}:
+            return {"error": "INVALID_ACTION", "action": action}
+        return self._request("POST", f"/v1/session-lifecycle/{action}", body={
+            "session": session, "active_refs": active_refs or {},
+            "dry_run": dry_run, "confirm": confirm,
+        })
+
     def status(self, session: str, *, timeout_seconds: float | None = None) -> dict[str, Any]:
         return self._request("GET", f"/v1/sessions/{urllib.parse.quote(session)}/status",
                              timeout_seconds=timeout_seconds)
@@ -534,11 +544,11 @@ class RemoteNodeClient:
                   prompt_response: bool = False, require_idle: bool = False,
                   idempotency_key: str | None = None, origin: str | None = None, trace_id: str | None = None,
                   parent_turn_id: str | None = None, depth: int = 0) -> dict[str, Any]:
-        if require_idle:
-            # Older node agents ignore unknown request fields. Never silently
-            # drop an idle-only guard across that compatibility boundary.
-            return {"error": "IDLE_GUARD_UNSUPPORTED", "sent": False, "enter_sent": False}
-        return self._request("POST", f"/v1/sessions/{urllib.parse.quote(session)}/send", body={
+        # Guarded starts use a distinct endpoint so an older worker cannot
+        # silently ignore require_idle and turn this into an unguarded send.
+        # Its 404 is surfaced as unsupported before any pane input occurs.
+        endpoint = "send-guarded" if require_idle else "send"
+        return self._request("POST", f"/v1/sessions/{urllib.parse.quote(session)}/{endpoint}", body={
             "text": text, "press_enter": press_enter, "dry_run": dry_run,
             "prompt_response": prompt_response, "idempotency_key": idempotency_key,
             "origin": origin, "trace_id": trace_id, "parent_turn_id": parent_turn_id, "depth": depth,
