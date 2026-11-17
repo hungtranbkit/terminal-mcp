@@ -1,5 +1,28 @@
 # PROJECT_CONTEXT.md
 
+## 2026-11-17 — Issue #118: IDLE_GUARD_UNSUPPORTED root cause (branch `agent/claude/dispatch-guard-118`, draft PR)
+
+- **Root cause (read-only evidence).** The HP canonical controller `/version` reports `5d4ee0a` (PID 1197300, started 2026-11-10). It runs `release-5d4ee0a29f2b`, with `TERMINAL_MCP_ENABLE_QUEUE=0`. In 5d4ee0a, `RemoteNodeClient.send_text(require_idle=True)` returns `IDLE_GUARD_UNSUPPORTED` before sending any request. `action=start` on an idle Codex calls `_codex_direct_start` → `send_task(require_idle=True)`. So every guarded start to a session on a remote node (the Zalo Hub and Screen Remote Dell Codex sessions) fails with `dispatched=false` and no task_id. Both monitors share this path. Whether the automation connector really hits the HP controller was not read from the ChatGPT side.
+- **56ccb14 is necessary but not sufficient.** It calls `/v1/sessions/{name}/send-guarded`. The Dell node agent runs `release-5bd67451e974`, which has no such route. Without this branch, the old node's 404 surfaces as `NODE_UNREACHABLE`, a mislabel. Both the controller AND the node agent must be upgraded. Upgrade the node first: the route is additive, and the old controller never calls it.
+- **Fix in this branch.** `RemoteNodeClient.send_text` maps a 404 on a guarded send to `IDLE_GUARD_UNSUPPORTED` + `upgrade_required=node_agent`. It never falls back to `/send`, and other HTTP errors still raise. `_codex_direct_start` returns error `IDLE_GUARD_UNSUPPORTED`, `dispatched=false`, no task_id, and a `next_action` (upgrade the node agent, or use `supervise`). Idempotent replay sends nothing again. Test: `tests/test_issue118_remote_idle_guard.py`. Its real HTTP stub failed 2/5 before the fix (RED).
+- **Durable path that exists on live 5d4ee0a:** `terminal_turn(action="supervise")` (`DirectTaskSupervisor`). It persists a `dt_…` id first, then DISPATCHING → EXECUTION_ACCEPTED → RUNNING, but only after a RUNNING signal is observed. It sends via `send_task` WITHOUT `require_idle`, so it is not blocked by this bug.
+  - Its own guards: settled IDLE observed through status, one active task per target, idempotency key, and DISPATCH_UNCERTAIN is never resent.
+  - It is NOT the atomic node-side idle guard. There is a status→send window, so it is an owner decision, not equivalent.
+  - Not live-canaried by this agent: no authorized MCP client in this session, and tokens were not read.
+- **Verification** (local only; commit message carries `[skip ci]`):
+  - new file + direct/supervised/node_agent suites: 119 passed;
+  - local mirror of the submit-invariant/compact-turn PR gates + the new test: 302 passed;
+  - unified-memory gate tests: 25 passed;
+  - 62 related test files: 1798 passed / 9 failed. The 9 failures (dashboard SSH connect, transports, windows installer) are IDENTICAL on unmodified 56ccb14 (pre-existing);
+  - mutation 3/3 killed; `git diff --check` ok.
+- **No change** to production, services, schedule, queue flag, node janitor or branch protection.
+- **Owner actions:**
+  1. Approve deploying `release-56ccb14` (+ this PR) to the Dell node agent first, then the HP controller, via the rollback-guarded plan in #118.
+  2. Then run the canary: a disposable dell-linux shell session, `supervise` with steps `sleep 20` + `printf 'TMCP-%s:%s\n' DONE {TMCP_TASK_ID}`. Expect a `dt_` task_id → EXECUTION_ACCEPTED → RUNNING → DONE, read via `supervise_status` from a second client; then `delete_session confirm=true`.
+  3. Plus a guarded `start` on a disposable idle Codex session, which should give TASK_STARTED.
+  4. Separately, decide whether monitors may use `supervise` before the upgrade.
+- **Next after dispatch works:** monitor → agent → test → acceptance via Harness, where submit or ACK is never "done".
+
 ## 2026-11-12 — P0 fleet session lifecycle (PR #117, not deployed)
 
 - Work is isolated from the starting checkout (`fix/codex-session-readiness-20261016`) at `/home/dell/workspace/.terminal-mcp-worktrees/p0-session-lifecycle-20261112`, branch `fix/p0-session-lifecycle-20261112`, based on `origin/main` `5d4ee0a`. Implementation commit `837a413` is pushed and PR #117 is open: https://github.com/hungtranbkit/terminal-mcp/pull/117. Remote guarded direct-start now uses the node agent's dedicated `/v1/sessions/{name}/send-guarded` route; legacy workers fail closed before input rather than silently dropping `require_idle`.

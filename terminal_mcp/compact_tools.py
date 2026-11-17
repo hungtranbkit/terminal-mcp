@@ -1365,6 +1365,13 @@ class CompactTerminalTools:
             sent = self.send_task(target, text, timeout=float(timeout), idempotency_key=cache_key + ":send",
                                   require_idle=True)
             base = {**base, "send": sent, "submission_id": sent.get("submission_id")}
+            if sent.get("reason") == "IDLE_GUARD_UNSUPPORTED":
+                # Nothing reached the pane. Name the capability gap and the
+                # durable alternative instead of a generic failure (issue #118).
+                return finish({**base, "status": "FAILED", "error": "IDLE_GUARD_UNSUPPORTED",
+                               "next_action": ("Do not retry start on this node: the node agent "
+                                               "lacks the idle-guarded route. Upgrade the node agent, "
+                                               "or use action=supervise for a durable task_id.")})
             if sent.get("status") != "SUBMIT_CONFIRMED":
                 return finish({**base, "status": "FAILED", "error": "DIRECT_SUBMIT_NOT_ACCEPTED",
                                "next_action": "Inspect submission evidence; do not retype the prompt."})
