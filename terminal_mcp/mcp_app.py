@@ -357,21 +357,11 @@ def build_mcp(service: TerminalService | None = None,
     compact_tools.node_ssh = NodeSSHService(controller, default_connection_store_path().parent / "node-ssh", audit=terminal.audit)
     # Supervised direct tasks (direct_task.py). Every dispatch/observation
     # goes through compact_tools' own guarded, bounded send/status/tail.
-    from .direct_task import DirectTaskStore, DirectTaskSupervisor
+    from .direct_task import DirectTaskStore
     try:
-        direct_tasks = DirectTaskSupervisor(
-            DirectTaskStore(),
-            send=lambda target, text, key: compact_tools.send_task(target, text, idempotency_key=key),
-            status=lambda target: compact_tools._bounded_read(
-                ("direct-task-status", target),
-                lambda: compact_tools._status(target, timeout_seconds=8), 10),
-            tail=lambda target, lines: compact_tools._bounded_read(
-                ("direct-task-tail", target, lines),
-                lambda: compact_tools._tail(target, lines), 10),
-            # Stuck-composer recovery: the guarded activate-only send (empty
-            # text + Enter) submits the composer's OWN content and refuses on
-            # an empty composer -- it can never retype or duplicate a prompt.
-            activate=lambda target, key: compact_tools.send_task(target, "", idempotency_key=key),
+        from .compact_tools import make_direct_task_supervisor
+        direct_tasks = make_direct_task_supervisor(
+            compact_tools, DirectTaskStore(),
             # In-call look for execution evidence so a fast start can say
             # RUNNING honestly; the loop carries the rest.
             accept_wait_seconds=float(os.environ.get("TERMINAL_MCP_SUPERVISE_ACCEPT_WAIT", "6")),

@@ -147,7 +147,20 @@ async def test_queue_disabled_compatibility_and_history_do_not_write_queue_db(tm
             return list(conn.iterdump())
 
     before = snapshot()
-    for action, long_task in (("start", False), ("send", True), ("send_wait", True)):
+    # Issue #118: `start` no longer degrades to an untracked send. With the
+    # queue off it is a supervised direct task with a durable dt_ task_id --
+    # still never a queue row (the snapshot below proves that).
+    started = await _call(server, "terminal_turn", action="start", target="lane-a",
+                          text="new work", request_key="retry", timeout=0.01)
+    assert started["mode"] == "supervised"
+    assert started["task_id"].startswith("dt_")
+    replay = await _call(server, "terminal_turn", action="start", target="lane-a",
+                         text="new work", request_key="retry", timeout=0.01)
+    assert replay["task_id"] == started["task_id"] and replay["deduplicated"] is True
+    start_calls = len(calls)
+    assert start_calls <= 1
+    assert all(call[2].get("require_idle") is True for call in calls)
+    for action, long_task in (("send", True), ("send_wait", True)):
         result = await _call(server, "terminal_turn", action=action, target="lane-a",
                              text="new work", long_task=long_task, request_key="retry", timeout=0.01)
         if delivery == "BLOCKED":
@@ -163,6 +176,6 @@ async def test_queue_disabled_compatibility_and_history_do_not_write_queue_db(tm
     for name in ("terminal_queue_status", "terminal_queue_events", "terminal_queue_metrics"):
         result = await _call(server, name, session="lane-a")
         assert "error" not in result
-    assert len(calls) == 3
-    assert all(call[2]["idempotency_key"] == "retry" for call in calls)
+    assert len(calls) == start_calls + 2
+    assert all(call[2]["idempotency_key"] == "retry" for call in calls[start_calls:])
     assert snapshot() == before

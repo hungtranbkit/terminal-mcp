@@ -1,5 +1,27 @@
 # PROJECT_CONTEXT.md
 
+## 2026-11-17 ~22:30 ICT — Issue #118: `action=start` now returns a durable task_id (code only, NOT deployed)
+
+- **Symptom (live, after the 56ccb14 deploy).** `start` returned `TASK_STARTED` (Codex) or `SUBMIT_CONFIRMED` (other panes) with `task_id=null` and no persisted row.
+- **Root cause.** Production runs with the legacy queue off (`TERMINAL_MCP_ENABLE_QUEUE=0`). In that mode `turn(action="start")` either took `_codex_direct_start`, a bare direct send that never had a task id, or was translated into `send`. The durable `DirectTaskSupervisor` (`dt_` ids, persist-before-send, `TMCP-DONE` marker, `DirectTaskLoop` running in `server_http`) was only reachable through `action=supervise`.
+- **Fix.**
+  - In `compact_tools.turn`, when the queue is off and `direct_tasks` exists, `start` routes to `_supervised_start`.
+  - `_supervised_start` checks in this order:
+    1. A replay of the same request key returns the same task and sends nothing. The key is stored as `turn-start:<key>`. A different target or text under the same key is `IDEMPOTENCY_CONFLICT`. A key already used by the old direct start or the legacy queue is never re-sent.
+    2. The status preflight refuses without persisting or sending when the target is missing, unauthorized (`allowed`/`exists` false) or not IDLE.
+    3. `DirectTaskSupervisor.start(require_idle=True)` persists the row first, then types through `send_guarded` only.
+  - `send_guarded` is `send_task(require_idle=True)`, the atomic node-side idle guard.
+  - In `direct_task.py`: new column `require_idle`. A guarded task without a guarded sender becomes BLOCKED with nothing sent. A node guard refusal (`BLOCKED` or `IDLE_GUARD_UNSUPPORTED`) is terminal BLOCKED and never resent by the loop.
+  - The production wiring is now one factory, `compact_tools.make_direct_task_supervisor`, used by `mcp_app` and by the tests.
+  - With the queue opted in, the legacy paths are unchanged.
+- **Tests.**
+  - `tests/test_issue118_durable_start.py` has 12 tests: task_id persisted before send, guarded send only, the RUNNING→DONE marker lifecycle, replay dedup, conflict, dedup across a restart (new store and tools on the same files), permission and missing-target refusal, busy refusal, and guard refusal being terminal. It was RED before the fix.
+  - 5 mutants were all killed.
+  - `tests/test_queue_persist_mcp_tools.py::test_queue_disabled_compatibility…` pinned the old untracked `SUBMIT_CONFIRMED` for `start`. It now asserts the `dt_` receipt and replay dedup, and still checks that the queue DB is byte-identical.
+  - Related set: 518 passed.
+- **Runtime.** Not deployed, no live canary. The HP controller rejects tailnet MCP calls with 403 ("node heartbeat and enrollment routes only… must arrive over loopback (the authenticated tunnel)"). This session has no authenticated tunnel client, and loopback-over-SSH would skip that authentication, so I did not use it.
+- **Next.** Owner reviews PR #120, deploys it with the same Dell-then-HP rollback plan, then runs the canary (start → `dt_` → EXECUTION_ACCEPTED → RUNNING → `TMCP-DONE` → replay dedup → cleanup).
+
 ## 2026-11-17 18:28–18:34 ICT — Issue #118 deployed: Dell node then HP controller at main `56ccb14` (canary pending)
 
 - **Dell node agent.** `rollout-dell-node-56ccb14.sh` added drop-in `zzzzzz-dispatch-guard-56ccb14ded9b.conf` → `release-56ccb14ded9b`, a clean detached worktree of `~/workspace/terminal-mcp`. Result: PID 872171, health ok, `/send-guarded` answers 401 (was 404), `/send` 401, 10/10 tmux panes kept, NRestarts 0. The HP controller is calling the node and getting 200s.
