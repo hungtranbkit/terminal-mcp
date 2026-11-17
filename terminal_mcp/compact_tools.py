@@ -983,8 +983,11 @@ class CompactTerminalTools:
         # persists a supervised direct task FIRST and returns its durable
         # task_id; the send is the atomic node-side idle guard only. Before
         # this, start returned TASK_STARTED/SUBMIT_CONFIRMED with task_id=null.
-        if (normalized == "start" and target and text
-                and self.direct_tasks is not None and not queue_submission_enabled()):
+        if normalized == "start" and target and text and not queue_submission_enabled():
+            if self.direct_tasks is None:
+                return {"status": "FAILED", "error": "DURABLE_SUPERVISOR_UNAVAILABLE",
+                        "action": "start", "dispatched": False,
+                        "next_action": "Restore the durable supervisor before starting work; nothing was sent."}
             return self._supervised_start(
                 target, text, timeout=timeout,
                 request_key=idempotency_key if idempotency_key is not None else request_key)
@@ -1328,7 +1331,11 @@ class CompactTerminalTools:
         task_key = "turn-start:" + key
         existing = supervisor.store.by_idempotency_key(task_key)
         if existing is not None:
-            if existing["target"] != target or (existing["steps"] or [None])[0] != text:
+            from .direct_task import TASK_ID_PLACEHOLDER
+            # The supervisor stores executable steps with its generated ID
+            # substituted. Compare the replay in that same representation.
+            replay_text = text.replace(TASK_ID_PLACEHOLDER, existing["task_id"])
+            if existing["target"] != target or (existing["steps"] or [None])[0] != replay_text:
                 return {**base, "status": "FAILED", "error": "IDEMPOTENCY_CONFLICT",
                         "task_id": existing["task_id"]}
             return self._supervised_receipt(base, supervisor.get(existing["task_id"]),

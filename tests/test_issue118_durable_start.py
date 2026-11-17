@@ -185,3 +185,52 @@ def test_queue_opt_in_keeps_legacy_paths(rig, monkeypatch):
     result = start(tools)
     assert result["mode"] == "direct" and result.get("task_id") is None
     assert tools.direct_tasks.store.active() == []
+
+
+@pytest.mark.parametrize("agent_type", ["codex", "shell"])
+def test_start_without_supervisor_fails_closed_without_sending(rig, agent_type):
+    tools, controller, _ = rig
+    tools.direct_tasks = None  # e.g. DirectTaskStore initialization failed
+    controller.statuses["codex"] = [{**IDLE, "agent_type": agent_type}]
+    result = start(tools)
+    assert result["status"] == "FAILED"
+    assert result["error"] == "DURABLE_SUPERVISOR_UNAVAILABLE"
+    assert result["dispatched"] is False
+    assert result.get("task_id") is None
+    assert controller.send_calls == []
+
+
+def test_durable_start_keeps_explicit_idempotency_key_precedence(rig):
+    tools, controller, _ = rig
+    result = tools.turn(action="start", target="codex", text="inert",
+                        timeout=1, request_key="legacy", idempotency_key="explicit")
+    assert tools.direct_tasks.store.by_idempotency_key("turn-start:explicit")["task_id"] == result["task_id"]
+    assert tools.direct_tasks.store.by_idempotency_key("turn-start:legacy") is None
+    replay = tools.turn(action="start", target="codex", text="inert",
+                        timeout=1, request_key="changed", idempotency_key="explicit")
+    assert replay["task_id"] == result["task_id"] and replay["deduplicated"] is True
+    assert len(controller.send_calls) == 1
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_placeholder_request_replay_preserves_task_id_without_resend(rig, tmp_path, restart):
+    tools, controller, _ = rig
+    text = "printf 'TMCP-%s:%s\\n' DONE {TMCP_TASK_ID}"
+    first = start(tools, text=text)
+    assert first["task_id"].startswith("dt_")
+    assert "{TMCP_TASK_ID}" not in controller.send_calls[0][1]
+    if restart:
+        tools, replay_controller, _ = build(tmp_path)
+    else:
+        replay_controller = controller
+    replay_controller.statuses["codex"] = [RUNNING]
+    replay_controller.tails["codex"] = ""
+    again = start(tools, text=text)
+    assert again["task_id"] == first["task_id"]
+    assert again["deduplicated"] is True
+    assert len(controller.send_calls) == 1
+    if restart:
+        assert replay_controller.send_calls == []
+    conflict = start(tools, text=text + " different")
+    assert conflict["error"] == "IDEMPOTENCY_CONFLICT"
+    assert len(controller.send_calls) == 1
