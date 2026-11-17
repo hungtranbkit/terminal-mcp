@@ -1,5 +1,21 @@
 # PROJECT_CONTEXT.md
 
+## 2026-11-18 — Issue #118 PR #120 follow-up: race fix + real-tmux end-to-end (code only, NOT deployed)
+
+- **Owner commit `e715a5a`.**
+  - With the queue off and no supervisor, `start` now fails closed with `DURABLE_SUPERVISOR_UNAVAILABLE` and sends nothing.
+  - Replay compares the prompt with the `{TMCP_TASK_ID}` placeholder substituted.
+- **Race fix (this commit).** Two concurrent `start` calls with the same key and different text could both pass the replay check before either row existed. `DirectTaskStore.insert` dedups on the key alone, so the loser was told `deduplicated` for a prompt that was never persisted or sent. `_supervised_start` now re-checks content after a deduplicated insert (`_same_start`) and returns `IDEMPOTENCY_CONFLICT` with nothing sent. RED→GREEN: `test_concurrent_same_key_with_different_text_is_a_conflict`.
+- **Real tmux end-to-end.** `test_real_tmux_codex_durable_start_done_and_replay` uses the inert fixture `tests/fixtures/codex_marker_agent.py`, which runs nothing from the prompt and prints `TMCP-DONE:<dt_ id>`. The test checks:
+  1. `start` returns a `dt_` id, EXECUTION_ACCEPTED/RUNNING;
+  2. `running_confirmed` → DONE through the marker;
+  3. a replay from a fresh process over the same store is `deduplicated` with status DONE;
+  4. the pane has exactly one `SUBMITTED[1]`.
+
+  The fixture must clear scrollback on redraw (`ESC[3J`), because a stale "esc to interrupt" line keeps the status classifier on RUNNING.
+- **`task_status` answers `dt_` ids.** `turn(action="task"|"task_status", task_id="dt_…")` reads `DirectTaskSupervisor.get`, so the reply carries `target`, `agent`, `mode`, `state`, `running_confirmed`, `turn_state` and `watcher`. Before this, it went to the legacy queue handler and answered `ACTION_UNAVAILABLE`/unknown. This is how ProjectFlow `harness_monitor_bridge` verifies receipts (ProjectFlow PR #54, execution-first `dispatch`). Test: `test_task_status_reads_back_a_durable_start_by_dt_id`, RED → GREEN.
+- **Runtime.** Not deployed, no live canary. HP tailnet `:8766` answers 403 for non-heartbeat routes. The public MCP is served by `tunnel-client --profile terminal-mcp`, whose credential sits in `tunnel.env` and was not read. Loopback `/mcp` over `ssh hp-net` accepts unauthenticated JSON-RPC, but it was not used without an explicit owner grant.
+
 ## 2026-11-17 ~22:30 ICT — Issue #118: `action=start` now returns a durable task_id (code only, NOT deployed)
 
 - **Symptom (live, after the 56ccb14 deploy).** `start` returned `TASK_STARTED` (Codex) or `SUBMIT_CONFIRMED` (other panes) with `task_id=null` and no persisted row.

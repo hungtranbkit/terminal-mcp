@@ -234,3 +234,102 @@ def test_placeholder_request_replay_preserves_task_id_without_resend(rig, tmp_pa
     conflict = start(tools, text=text + " different")
     assert conflict["error"] == "IDEMPOTENCY_CONFLICT"
     assert len(controller.send_calls) == 1
+
+
+def test_concurrent_same_key_with_different_text_is_a_conflict(rig, monkeypatch):
+    """Race: both callers pass the replay check before either row exists.
+    The loser's insert dedups on the key alone, so without a post-insert
+    content check it was told `deduplicated=True` for a prompt that was never
+    persisted or sent."""
+    tools, controller, _ = rig
+    first = start(tools)
+    store = tools.direct_tasks.store
+    real = store.by_idempotency_key
+    hidden = {"once": True}
+
+    def racing_lookup(key):
+        if hidden.pop("once", False):
+            return None   # the second caller looked before the first committed
+        return real(key)
+
+    monkeypatch.setattr(store, "by_idempotency_key", racing_lookup)
+    controller.statuses["codex"] = [IDLE]
+    other = start(tools, text="a different prompt")
+    assert other["status"] == "FAILED" and other["error"] == "IDEMPOTENCY_CONFLICT"
+    assert other["task_id"] == first["task_id"]
+    assert len(controller.send_calls) == 1
+
+
+def test_real_tmux_codex_durable_start_done_and_replay(tmp_path, tmux_session_factory, monkeypatch):
+    """Local end-to-end on a real disposable tmux pane running an inert
+    Codex-like fixture: durable dt_ id -> EXECUTION_ACCEPTED -> RUNNING
+    verified -> DONE via TMCP-DONE marker -> replay dedup from a fresh
+    process over the same store, with exactly one submission in the pane."""
+    import shlex
+    import time
+    from pathlib import Path
+
+    from terminal_mcp.compact_tools import CompactTerminalTools
+    from terminal_mcp.tmux import TmuxClient
+    from tests.test_codex_paste_settle import submit_service
+
+    monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "0")
+    fixture = Path(__file__).parent / "fixtures" / "codex_marker_agent.py"
+    command = f"exec -a codex python3 -u {shlex.quote(str(fixture))}"
+    session = tmux_session_factory("test-durable-start", f"bash -c {shlex.quote(command)}")
+    terminal = submit_service(tmp_path, TmuxClient())
+
+    def tools_for_process():
+        tools = CompactTerminalTools(terminal, terminal)
+        tools.handlers["legacy_task_by_request_key"] = lambda key: None
+        tools.handlers["enqueue_task"] = lambda *a, **kw: pytest.fail("must not enqueue")
+        tools.direct_tasks = make_direct_task_supervisor(
+            tools, DirectTaskStore(tmp_path / "direct.db"), accept_wait_seconds=0)
+        return tools
+
+    tools = tools_for_process()
+    limit = time.monotonic() + 5
+    while tools._status(session).get("state") != "IDLE":
+        assert time.monotonic() < limit, repr({k: v for k, v in tools._status(session).items()
+                                               if k in ("state", "reason", "agent_type")})
+        time.sleep(.1)
+    text = "inert canary: reply ok only"
+    started = tools.turn(action="start", target=session, text=text,
+                         request_key="live-durable", timeout=5)
+    assert started["mode"] == "supervised", started
+    task_id = started["task_id"]
+    assert task_id.startswith("dt_") and started["dispatched"] is True, started
+    assert started["task_state"] in ("EXECUTION_ACCEPTED", "RUNNING"), (started["receipt"], started["reason"], started["task"].get("turn_state"))
+    seen, deadline = {started["task_state"]}, time.monotonic() + 20
+    task = tools.direct_tasks.get(task_id)["task"]
+    while task["state"] != "DONE":
+        assert time.monotonic() < deadline, (task["state"], task["receipt"], task["reason"], task["turn_state"], "\n".join(terminal.tmux.capture_lines(session, 60)))
+        seen.add(task["state"])
+        time.sleep(.3)
+        task = tools.direct_tasks.get(task_id)["task"]
+    assert task["running_confirmed"] is True and task["business_complete"] is True, task
+    replay = tools_for_process().turn(action="start", target=session, text=text,
+                                      request_key="live-durable", timeout=5)
+    assert replay["task_id"] == task_id and replay["deduplicated"] is True, replay
+    assert replay["status"] == "DONE"
+    pane = "\n".join(terminal.tmux.capture_lines(session, 50))
+    assert "SUBMITTED[1]" in pane and "SUBMITTED[2]" not in pane, pane
+    assert pane.count(f"TMCP-DONE:{task_id}") == 1, pane
+
+
+def test_task_status_reads_back_a_durable_start_by_dt_id(rig):
+    """ProjectFlow's monitor bridge verifies receipts with
+    `terminal_turn(action="task", task_id=...)`; a dt_ id from `start` must be
+    answerable there, with the supervisor view (target/agent/mode/state)."""
+    tools, controller, _ = rig
+    started = start(tools)
+    for action in ("task", "task_status"):
+        status = tools.turn(action=action, task_id=started["task_id"])
+        assert status["status"] == "OK", status
+        task = status["result"]["task"]
+        assert task["task_id"] == started["task_id"] and task["target"] == "codex"
+        assert task["mode"] == "agent" and task["agent"] == "codex"
+        assert task["state"] == "EXECUTION_ACCEPTED"
+    unknown = tools.turn(action="task", task_id="dt_ffffffffffffffff")
+    assert unknown["status"] == "FAILED" and unknown["result"]["error"] == "UNKNOWN_TASK_ID"
+    assert len(controller.send_calls) == 1

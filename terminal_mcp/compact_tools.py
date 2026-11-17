@@ -1331,11 +1331,7 @@ class CompactTerminalTools:
         task_key = "turn-start:" + key
         existing = supervisor.store.by_idempotency_key(task_key)
         if existing is not None:
-            from .direct_task import TASK_ID_PLACEHOLDER
-            # The supervisor stores executable steps with its generated ID
-            # substituted. Compare the replay in that same representation.
-            replay_text = text.replace(TASK_ID_PLACEHOLDER, existing["task_id"])
-            if existing["target"] != target or (existing["steps"] or [None])[0] != replay_text:
+            if not self._same_start(existing, target, text):
                 return {**base, "status": "FAILED", "error": "IDEMPOTENCY_CONFLICT",
                         "task_id": existing["task_id"]}
             return self._supervised_receipt(base, supervisor.get(existing["task_id"]),
@@ -1368,11 +1364,27 @@ class CompactTerminalTools:
             return {**base, "status": "FAILED", "error": "DIRECT_TARGET_NOT_IDLE", "dispatched": False,
                     "task_state": before.get("state", "UNKNOWN")}
         result = supervisor.start(target, text=text, idempotency_key=task_key, require_idle=True)
+        if result.get("deduplicated"):
+            # Lost a race with a concurrent start under the same key: the
+            # store dedups on the key alone, so re-check the content here or
+            # this caller would be told its never-persisted prompt is running.
+            winner = supervisor.store.by_idempotency_key(task_key)
+            if winner is not None and not self._same_start(winner, target, text):
+                return {**base, "status": "FAILED", "error": "IDEMPOTENCY_CONFLICT",
+                        "task_id": winner["task_id"], "dispatched": False}
         if result.get("status") == "FAILED" and "task" not in result:
             return {**base, **result, "dispatched": False}
         if result.get("error") == "TARGET_HAS_ACTIVE_SUPERVISED_TASK":
             return {**base, **result, "dispatched": False}
         return self._supervised_receipt(base, result, deduplicated=bool(result.get("deduplicated")))
+
+    @staticmethod
+    def _same_start(task: dict[str, Any], target: str, text: str) -> bool:
+        from .direct_task import TASK_ID_PLACEHOLDER
+        # The supervisor stores executable steps with its generated ID
+        # substituted. Compare the replay in that same representation.
+        replay_text = text.replace(TASK_ID_PLACEHOLDER, task["task_id"])
+        return task["target"] == target and (task["steps"] or [None])[0] == replay_text
 
     @staticmethod
     def _supervised_receipt(base: dict[str, Any], result: dict[str, Any], *,
@@ -1739,6 +1751,13 @@ class CompactTerminalTools:
         is the same function the standalone tool calls -- so routing a verb
         through `turn` can never be a weaker path than calling it directly.
         """
+        if (action == "task_status" and isinstance(task_id, str)
+                and task_id.strip().startswith("dt_") and self.direct_tasks is not None):
+            # Issue #118: `start` returns supervised dt_ ids. The monitor
+            # bridge (ProjectFlow) reads receipts back through task_status, so
+            # answer them from the durable supervisor, not the legacy queue.
+            result = self.direct_tasks.get(task_id.strip())
+            return {"status": result.get("status", "FAILED"), "action": action, "result": result}
         handler = self.handlers.get(TURN_HANDLER_ACTIONS[action])
         if handler is None:
             # An honest refusal, not a silent no-op: this deployment did not
