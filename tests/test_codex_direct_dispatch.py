@@ -40,9 +40,11 @@ def test_idle_codex_starts_without_queue_and_observes_running(rig):
     assert len(controller.send_calls) == 1
 
 
-def test_direct_codex_does_not_require_enabling_legacy_queue(rig, monkeypatch):
+def test_queue_disabled_codex_requires_durable_supervisor(rig, monkeypatch):
     monkeypatch.delenv('TERMINAL_MCP_ENABLE_QUEUE')
-    assert start(rig[0])['status'] == 'TASK_STARTED'
+    result = start(rig[0])
+    assert result['error'] == 'DURABLE_SUPERVISOR_UNAVAILABLE'
+    assert result['dispatched'] is False and rig[2].send_calls == []
 
 
 @pytest.mark.parametrize('state', ['RUNNING', 'WAITING_INPUT', 'UNKNOWN'])
@@ -165,7 +167,10 @@ def test_stalled_status_probe_has_a_bound_and_never_sends(rig, monkeypatch):
         release.set()
 
 
-def test_real_disposable_tmux_direct_start_and_replay(tmp_path, tmux_session_factory):
+def test_real_disposable_tmux_direct_start_and_replay(tmp_path, tmux_session_factory, monkeypatch):
+    # This exercises the explicitly opted-in legacy direct path. Queue-off
+    # durable starts are covered by test_issue118_durable_start.py.
+    monkeypatch.setenv('TERMINAL_MCP_ENABLE_QUEUE', '1')
     import hashlib
     import shlex
     import time

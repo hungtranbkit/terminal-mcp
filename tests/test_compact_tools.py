@@ -614,6 +614,10 @@ def test_direct_compatibility_uses_guarded_send_without_queue(monkeypatch, queue
         ("enqueue_task", "dispatch_tick", "follow_task", "create_session", "task_status"), forbidden)
     result = compact.turn(action=action, target="node/worker", text="do work",
                           long_task=long_task, request_key="retry-1")
+    if action in {"start", "run", "dispatch", "start_task"}:
+        assert result["error"] == "DURABLE_SUPERVISOR_UNAVAILABLE"
+        assert result["dispatched"] is False and controller.send_calls == []
+        return
     assert result["status"] in {"SUBMIT_CONFIRMED", "MATCHED"}
     assert result["action"] == ("send_wait" if action == "send_wait" else "send")
     assert controller.send_calls == [
@@ -629,6 +633,10 @@ def test_direct_compatibility_preserves_guard_refusals(monkeypatch, action, long
     controller.statuses["worker"] = {"state": "IDLE", "agent_type": "shell"}
     controller.send_result = {"delivery_state": "BLOCKED", "error": error, "enter_sent": False}
     result = compact.turn(action=action, target="worker", text="do work", long_task=long_task)
+    if action == "start":
+        assert result["error"] == "DURABLE_SUPERVISOR_UNAVAILABLE"
+        assert result["dispatched"] is False and controller.send_calls == []
+        return
     assert result["status"] == "BLOCKED"
     assert (result.get("result") or result.get("send"))["reason"] == error
     assert len(controller.send_calls) == 1
@@ -646,11 +654,11 @@ def test_direct_start_requires_existing_target_and_text(monkeypatch, target, tex
     assert controller.send_calls == []
 
 
-def test_direct_start_keeps_explicit_idempotency_key(monkeypatch):
+def test_direct_send_keeps_explicit_idempotency_key(monkeypatch):
     monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "0")
     compact, _terminal, controller = service()
     controller.statuses["worker"] = {"state": "IDLE", "agent_type": "shell"}
-    compact.turn(action="start", target="worker", text="work",
+    compact.turn(action="send", target="worker", text="work",
                  request_key="legacy", idempotency_key="explicit")
     assert controller.send_calls[0][-1] == {"idempotency_key": "explicit"}
 
@@ -667,8 +675,13 @@ def test_direct_compatibility_keeps_binding_guard_and_task_label(monkeypatch, ac
     compact.task_labels = Mock()
     compact.task_labels.split_target.return_value = (None, "worker")
     compact.task_labels.on_send.return_value = {"title": "Feature"}
-    compact.turn(action=action, target="binding:primary", text="implement feature",
+    result = compact.turn(action=action, target="binding:primary", text="implement feature",
                  long_task=long_task, title="Feature", metadata={"task_summary": "Feature"})
+    if action == "start":
+        assert result["error"] == "DURABLE_SUPERVISOR_UNAVAILABLE"
+        assert terminal.send_calls == [] and controller.send_calls == []
+        compact.task_labels.on_send.assert_not_called()
+        return
     assert len(terminal.send_calls) == 1
     assert terminal.send_calls[0][:4] == ("primary", "implement feature", True, False)
     assert controller.send_calls == []
@@ -687,6 +700,11 @@ def test_direct_compatibility_does_not_confirm_or_retry_unknown_delivery(monkeyp
     compact.task_labels = Mock()
     result = compact.turn(action=action, target="worker", text="work", long_task=long_task)
     assert result["status"] == "FAILED"
+    if action == "start":
+        assert result["error"] == "DURABLE_SUPERVISOR_UNAVAILABLE"
+        assert controller.send_calls == []
+        compact.task_labels.on_send.assert_not_called()
+        return
     assert len(controller.send_calls) == 1
     assert controller.status_calls == (1 if action == "start" else 0)
     compact.task_labels.on_send.assert_not_called()
