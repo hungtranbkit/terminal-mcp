@@ -1,5 +1,18 @@
 # PROJECT_CONTEXT.md
 
+## 2026-11-17 18:28–18:34 ICT — Issue #118 deployed: Dell node then HP controller at main `56ccb14` (canary pending)
+
+- **Dell node agent.** `rollout-dell-node-56ccb14.sh` added drop-in `zzzzzz-dispatch-guard-56ccb14ded9b.conf` → `release-56ccb14ded9b`, a clean detached worktree of `~/workspace/terminal-mcp`. Result: PID 872171, health ok, `/send-guarded` answers 401 (was 404), `/send` 401, 10/10 tmux panes kept, NRestarts 0. The HP controller is calling the node and getting 200s.
+  - Snapshot and rollback: `~/.cache/terminal-mcp/rollbacks/dispatch-guard-56ccb14ded9b/rollback.sh` (removes the drop-in → back to 5bd6745).
+- **HP controller.** `rollout-hp-56ccb14ded9b.sh` added drop-in `zzzzzzzzzzzzzzzzzzzzzzzzz-dispatch-guard-56ccb14ded9b.conf`; the 5d4ee0a drop-in is kept. Result: `/version` = `56ccb14ded9be3dd337a7dcf6ac64f94f6873b12`, `/health/ready` ready, PID 1156806, NRestarts 0.
+  - HP has no tmux server (0 panes before and after).
+  - Config loaded with the new code; `agent_cleanup.enabled=False`, so no reaper was enabled.
+  - Warnings after restart (fleet projection legacy ids, LAN bind) were already present on 5d4ee0a.
+  - First attempt aborted in preflight (no tmux server → pipefail) with no change.
+  - Rollback: `~/.cache/terminal-mcp/rollbacks/dispatch-guard-56ccb14ded9b/rollback.sh` on HP.
+- **PR #120 is NOT deployed** (main 56ccb14 only). It is still needed: m910, mac-macbookpro14-3 and rag-pc node agents still answer 404 on `/send-guarded`, which 56ccb14 mislabels as NODE_UNREACHABLE.
+- **NOT DONE:** the live durable dispatch canary. This agent has no authorized Terminal MCP client and does not read tokens. Until a canary shows a `dt_` task_id → EXECUTION_ACCEPTED → RUNNING → DONE and a guarded `start` → TASK_STARTED on Dell, do not reopen monitor dispatch.
+
 ## 2026-11-17 — Issue #118: IDLE_GUARD_UNSUPPORTED root cause (branch `agent/claude/dispatch-guard-118`, draft PR)
 
 - **Root cause (read-only evidence).** The HP canonical controller `/version` reports `5d4ee0a` (PID 1197300, started 2026-11-10). It runs `release-5d4ee0a29f2b`, with `TERMINAL_MCP_ENABLE_QUEUE=0`. In 5d4ee0a, `RemoteNodeClient.send_text(require_idle=True)` returns `IDLE_GUARD_UNSUPPORTED` before sending any request. `action=start` on an idle Codex calls `_codex_direct_start` → `send_task(require_idle=True)`. So every guarded start to a session on a remote node (the Zalo Hub and Screen Remote Dell Codex sessions) fails with `dispatched=false` and no task_id. Both monitors share this path. Whether the automation connector really hits the HP controller was not read from the ChatGPT side.
