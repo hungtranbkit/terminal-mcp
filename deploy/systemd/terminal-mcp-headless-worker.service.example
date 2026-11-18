@@ -1,0 +1,29 @@
+# Headless agent worker (issue #106): runs durable headless_start tasks with
+# `claude -p` / `codex exec` -- no tmux, no keypresses. Pairs with an MCP
+# process started with TERMINAL_MCP_HEADLESS_ENABLED=1 and
+# TERMINAL_MCP_HEADLESS_DISPATCH=service (+ TERMINAL_MCP_HEADLESS_WORKTREE=1
+# for a per-task git worktree). Both must share TERMINAL_MCP_HEADLESS_STATE_DIR.
+# Each task runs in its own transient unit tmcp-hd_<id>, so restarting this
+# service never kills in-flight agents; claimed work whose worker died is held
+# as BLOCKED/WORKER_LOST_NO_REPLAY, never re-run.
+#
+# Install: cp to ~/.config/systemd/user/terminal-mcp-headless-worker.service
+#          systemctl --user daemon-reload && systemctl --user enable --now terminal-mcp-headless-worker
+[Unit]
+Description=Terminal MCP headless agent worker (claude -p / codex exec)
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspace/terminal-mcp
+Environment=PYTHONPATH=%h/workspace/terminal-mcp
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=TERMINAL_MCP_HEADLESS_STATE_DIR=%h/.local/state/terminal-mcp/headless
+Environment=TERMINAL_MCP_HEADLESS_MAX_PARALLEL=2
+ExecStart=%h/workspace/terminal-mcp/.venv/bin/python -m terminal_mcp.headless_worker
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=default.target

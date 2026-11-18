@@ -386,7 +386,11 @@ def build_mcp(service: TerminalService | None = None,
             terminal, Path(os.environ.get("TERMINAL_MCP_HEADLESS_STATE_DIR",
                                          str(Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "terminal-mcp/headless"))),
             direct=direct_tasks,
-            enabled=os.environ.get("TERMINAL_MCP_HEADLESS_ENABLED") == "1")
+            enabled=os.environ.get("TERMINAL_MCP_HEADLESS_ENABLED") == "1",
+            # service = persist READY only; terminal_mcp.headless_worker runs it.
+            dispatch=os.environ.get("TERMINAL_MCP_HEADLESS_DISPATCH", "unit"),
+            # 1 = every task runs in its own git worktree on headless/<task_id>.
+            sandbox=os.environ.get("TERMINAL_MCP_HEADLESS_WORKTREE") == "1")
     # Per-session "current task" label (task_labels.py) in the audit DB,
     # mirrored best-effort to the node that owns the session (node_sync) so
     # that host's own Live Monitor sees work assigned through this controller.
