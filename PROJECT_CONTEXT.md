@@ -1,5 +1,37 @@
 # PROJECT_CONTEXT.md
 
+## 2026-11-18 — Issue #106 headless CLI agent worker (branch `agent/claude/headless-worker-106`, draft PR; staging only, NOT deployed)
+
+- **What**: noninteractive agent worker (`claude -p` / `codex exec`) on the EXISTING durable `HeadlessStore` (`headless.sqlite3`); no new queue, no tmux, no keypresses.
+  - `terminal_mcp/headless_worker.py`: systemd user service (`python -m terminal_mcp.headless_worker [--max-parallel N]`). Each tick:
+    - `recover_lost`, then launch queued READY rows, oldest first, up to `max_parallel` active.
+    - Each task runs in its own transient unit `tmcp-hd_<id>` (`launch_unit`), so restarting the service never kills in-flight agents.
+    - An unclaimed launch is retried after 60s, at most 3 times (`launch_attempts` persisted), then BLOCKED `WORKER_UNIT_START_FAILED`.
+    - Health is written to `<state>/worker-service.json`.
+    - Unit template: `deploy/systemd/terminal-mcp-headless-worker.service.example`.
+  - `terminal_mcp/headless.py`:
+    - `TERMINAL_MCP_HEADLESS_DISPATCH=service`: `headless_start` only persists READY.
+    - `TERMINAL_MCP_HEADLESS_WORKTREE=1`: pins `{repo, base_sha}` at start; after the atomic claim, the worker creates `<state>/worktrees/<id>` on branch `headless/<id>`. A setup failure is BLOCKED `SANDBOX_SETUP_FAILED` and the CLI never runs. Claude gets `acceptEdits` ONLY there (`dontAsk` otherwise).
+    - Every 5s the row gets `worker_pid`, `cli_pid` and `heartbeat_at`.
+    - At exit it records `exit_code`, `head_sha` and `changed_files`.
+    - `headless_status`/`task_status` returns `liveness.running_verified` = RUNNING + exec ack + held flock + fresh beat + cli_pid.
+  - Invariant to keep: claim (READY→DISPATCH) is atomic before CLI spawn, so READY is always safe to (re)launch. Claimed work whose worker flock is free is BLOCKED `WORKER_LOST_NO_REPLAY` and is never re-run. Service-queued READY rows are not "lost".
+  - Worktrees are never removed by cleanup.
+- **Tests**:
+  - `tests/test_headless_worker.py`: 10 tests, RED on main (missing API). Mutation check: 5/5 mutants killed.
+  - `tests/test_headless.py`: still green.
+  - Focused run of headless/task_lookup/compact/server files: 407 passed. The 1 failure is the known baseline `test_windows_onboarding::test_linux_installer_runtime_writes_complete_quoted_unit_without_running_comments`.
+- **Staging canary @10fe300**, Dell, loopback `:18799`, isolated state, disposable canary repo. Evidence is in `~/.cache/terminal-mcp/staging-hd106-10fe300dd4f1/` (`evidence.txt`, `calls.jsonl`, `watch.log`, `crash.log`).
+  - 10 real tasks (5 claude, 5 codex) were submitted through MCP `headless_start`. The controller was restarted and all 10 keys replayed: same `hd_` ids. Same key with a different prompt: `IDEMPOTENCY_CONFLICT`.
+  - Worker service: `--max-parallel 3`, peak concurrency 3. It was restarted while 3 tasks were running; the units survived and completed.
+  - Result: 10/10 COMPLETED, exit 0, exactly 1 claim and 1 CLI spawn each, `running_verified` observed for all 10. Each worktree changed only `canary/task-N.txt`; the source repo stayed clean. Replay after completion returned the same ids with no new run.
+  - Crash test: a running task's unit was SIGKILLed. 16s later it was BLOCKED `WORKER_LOST_NO_REPLAY`, with 1 spawn only, and replay returned the same id with no rerun.
+  - Staging units were stopped afterwards.
+- **Not done / next**:
+  - Production enable needs owner approval: env flags on the MCP unit and installing the worker unit.
+  - Codex in a worktree cannot commit: the `.git` metadata is outside the workspace-write root. Agents leave changes uncommitted, and `changed_files` is the evidence.
+  - ProjectFlow/monitor dispatch (PR #54) still targets `start`/`dt_`; routing it to `headless_start` is a follow-up.
+
 ## 2026-11-12 — P0 fleet session lifecycle (PR #117, not deployed)
 
 - Work is isolated from the starting checkout (`fix/codex-session-readiness-20261016`) at `/home/dell/workspace/.terminal-mcp-worktrees/p0-session-lifecycle-20261112`, branch `fix/p0-session-lifecycle-20261112`, based on `origin/main` `5d4ee0a`. Implementation commit `837a413` is pushed and PR #117 is open: https://github.com/hungtranbkit/terminal-mcp/pull/117. Remote guarded direct-start now uses the node agent's dedicated `/v1/sessions/{name}/send-guarded` route; legacy workers fail closed before input rather than silently dropping `require_idle`.
