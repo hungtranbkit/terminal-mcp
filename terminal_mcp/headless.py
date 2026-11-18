@@ -68,7 +68,8 @@ class HeadlessStore:
             conn.execute('INSERT INTO events(task_id,at,event) VALUES (?,?,?)', (task_id, time.time(), event))
         return data
 
-    def prepare(self, name, cwd, agent, prompt, key, *, limit=0, external_count=0):
+    def prepare(self, name, cwd, agent, prompt, key, *, limit=0, external_count=0,
+                dispatch='unit', sandbox=None):
         fingerprint = digest(json.dumps([name, cwd, agent, prompt]))
         with self.connect() as conn:
             conn.execute('BEGIN IMMEDIATE')
@@ -90,7 +91,11 @@ class HeadlessStore:
                         agent_type=agent, state='READY', request_key=key,
                         fingerprint=fingerprint, created_at=time.time(), updated_at=time.time(),
                         delivery_ack_at=None, execution_ack_at=None, exit_code=None,
-                        turn_completed=False, reason=None, checkpoint_sha256=None)
+                        turn_completed=False, reason=None, checkpoint_sha256=None,
+                        # 'service': the headless_worker service pulls READY rows;
+                        # 'unit': the caller launched a transient unit itself.
+                        dispatch=dispatch, sandbox=sandbox, heartbeat_at=None,
+                        worker_pid=None, cli_pid=None)
             conn.execute('INSERT INTO runs VALUES (?,?,?,?,?)', (task_id, key, name, 'READY', json.dumps(data)))
             conn.execute('INSERT INTO events(task_id,at,event) VALUES (?,?,?)', (task_id, time.time(), 'PREFLIGHT_READY'))
         return dict(data, created=True)
@@ -164,13 +169,141 @@ def codex_argv(cwd):
             '--output-schema', str(Path(__file__).with_name('headless_outcome.schema.json')), '-']
 
 
-def claude_argv(cwd):
+def claude_argv(cwd, *, sandboxed=False):
+    # dontAsk denies every tool that is not pre-approved. Inside a disposable
+    # per-task git worktree, file edits under cwd are accepted; shell and
+    # network tools stay denied either way.
+    mode = 'acceptEdits' if sandboxed else 'dontAsk'
     return ['claude', '-p', '--output-format', 'stream-json', '--verbose',
-            '--permission-mode', 'dontAsk', '--settings', '{"disableAllHooks":true}',
+            '--permission-mode', mode, '--settings', '{"disableAllHooks":true}',
             '--json-schema', json.dumps(OUTCOME_SCHEMA)]
 
 
-def run_worker(root, task_id, *, argv=None, startup_timeout=60, progress_timeout=300, total_timeout=3600):
+ACTIVE_STATES = ('DISPATCH', 'ACKNOWLEDGED', 'RUNNING')
+HEARTBEAT_SECONDS = 5.0
+
+
+def _git(*args, timeout=60):
+    return subprocess.run(['git', *args], capture_output=True, text=True, timeout=timeout,
+                          stdin=subprocess.DEVNULL)
+
+
+def sandbox_source(cwd):
+    """Pin a git checkout for an isolated per-task worktree, or None."""
+    top = _git('-C', str(cwd), 'rev-parse', '--show-toplevel', timeout=15)
+    head = _git('-C', str(cwd), 'rev-parse', '--verify', 'HEAD^{commit}', timeout=15)
+    if top.returncode or head.returncode:
+        return None
+    return {'repo': top.stdout.strip(), 'base_sha': head.stdout.strip()}
+
+
+def create_sandbox(store, row):
+    """Create the task's own worktree on a new branch at the pinned base.
+
+    Runs once, after the atomic claim, so a crash afterwards holds the task
+    (no replay) and the worktree stays for inspection. Never removed here.
+    """
+    sandbox = row['sandbox']
+    path = store.root / 'worktrees' / row['task_id']
+    branch = 'headless/' + row['task_id']
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    made = _git('-C', sandbox['repo'], 'worktree', 'add', '-b', branch, str(path), sandbox['base_sha'])
+    if made.returncode:
+        return None
+    return {'worktree': str(path), 'branch': branch}
+
+
+def sandbox_evidence(path):
+    head = _git('-C', path, 'rev-parse', 'HEAD', timeout=15)
+    status = _git('-C', path, 'status', '--porcelain', '--untracked-files=all', timeout=30)
+    changed = [line[3:] for line in status.stdout.splitlines()][:200] if not status.returncode else None
+    return {'head_sha': head.stdout.strip() or None, 'changed_files': changed}
+
+
+def lock_held(store, task_id):
+    """True while a live worker owns the task (the flock dies with it)."""
+    path = store.root / task_id / 'worker.lock'
+    if not path.exists():
+        return False
+    with path.open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(lock, fcntl.LOCK_UN)
+    return False
+
+
+def liveness(store, row, *, now=None):
+    """RUNNING_VERIFIED needs execution evidence AND a live, beating worker."""
+    now = time.time() if now is None else now
+    held = row['state'] in ACTIVE_STATES and lock_held(store, row['task_id'])
+    beat = row.get('heartbeat_at')
+    fresh = bool(beat) and now - beat < 6 * HEARTBEAT_SECONDS
+    return {'worker_lock_held': held, 'heartbeat_age_seconds': round(now - beat, 1) if beat else None,
+            'running_verified': bool(held and fresh and row['state'] == 'RUNNING'
+                                     and row.get('execution_ack_at') and row.get('cli_pid'))}
+
+
+def recover_lost(store, *, stale_seconds=15):
+    """Hold work whose worker died. Never replays a claimed task.
+
+    A queued READY row owned by the worker service is NOT lost: the claim is
+    atomic and happens before the CLI starts, so it is still safe to run.
+    """
+    held = []
+    for row in store.rows():
+        if row['state'] not in ('READY',) + ACTIVE_STATES:
+            continue
+        if row['state'] == 'READY' and row.get('dispatch') == 'service':
+            continue
+        if time.time() - row['updated_at'] < stale_seconds:
+            continue
+        lock = (store.root / row['task_id'] / 'worker.lock').open('a')
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.close()
+            continue
+        try:
+            fresh = store.get(row['task_id'])
+            if time.time() - fresh['updated_at'] >= stale_seconds:
+                after = store.update(row['task_id'], 'RESTART_RECOVERY_HOLD',
+                                     expected_states=('READY',) + ACTIVE_STATES,
+                                     state='BLOCKED', reason='WORKER_LOST_NO_REPLAY')
+                if after['state'] == 'BLOCKED':
+                    held.append(row['task_id'])
+        finally:
+            lock.close()
+    return held
+
+
+def launch_unit(root, task_id):
+    """Run one task in its own transient user unit.
+
+    The unit outlives the MCP process and the worker service, so restarting
+    either never kills in-flight work. A dedicated unit also avoids inheriting
+    a controller's nested namespace/seccomp restrictions; no sandbox policy is
+    weakened (Codex still enforces workspace-write and never approvals).
+    Returns the systemd-run exit code, or None when the outcome is unknown.
+    """
+    try:
+        return subprocess.run([
+            'systemd-run', '--user', '--quiet', '--collect', '--unit=tmcp-' + task_id,
+            '--property=MemoryMax=2G', '--property=CPUQuota=200%',
+            '--property=NoNewPrivileges=yes', '--property=UMask=0077',
+            '--setenv=PYTHONPATH=' + str(Path(__file__).resolve().parent.parent),
+            '--setenv=PATH=' + os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin'),
+            sys.executable, '-m', 'terminal_mcp.headless', str(root), task_id],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=15, close_fds=True).returncode
+    except (OSError, subprocess.TimeoutExpired):
+        # A timeout may still have created the unit. Reconcile, never replay.
+        return None
+
+
+def run_worker(root, task_id, *, argv=None, startup_timeout=60, progress_timeout=300, total_timeout=3600,
+               heartbeat_seconds=HEARTBEAT_SECONDS):
     store = HeadlessStore(Path(root))
     row = store.get(task_id)
     if row is None:
@@ -189,15 +322,29 @@ def run_worker(root, task_id, *, argv=None, startup_timeout=60, progress_timeout
     final_text = None
     started = time.monotonic()
     last_progress = started
+    last_beat = 0.0
     buffer = b''
+    workdir = row['cwd']
     try:
+        if row.get('sandbox'):
+            made = create_sandbox(store, row)
+            if made is None:
+                store.update(task_id, 'SANDBOX_FAILED', state='BLOCKED', reason='SANDBOX_SETUP_FAILED',
+                             finished_at=time.time())
+                return
+            row = store.update(task_id, 'SANDBOX_READY', **made)
+            workdir = made['worktree']
+        if argv is None:
+            argv = (claude_argv(workdir, sandboxed=bool(row.get('sandbox'))) if row['agent_type'] == 'claude'
+                    else codex_argv(workdir))
         prompt_file = store.root / task_id / 'prompt'
         with prompt_file.open('rb') as prompt:
-            proc = subprocess.Popen(argv or (claude_argv(row['cwd']) if row['agent_type'] == 'claude' else codex_argv(row['cwd'])), cwd=row['cwd'], stdin=prompt,
+            proc = subprocess.Popen(argv, cwd=workdir, stdin=prompt,
                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                     start_new_session=True, close_fds=True)
         prompt_file.unlink(missing_ok=True)
-        store.update(task_id, 'CLI_SPAWNED', cli_pid=proc.pid)
+        store.update(task_id, 'CLI_SPAWNED', cli_pid=proc.pid, worker_pid=os.getpid(),
+                     heartbeat_at=time.time())
         selector = selectors.DefaultSelector()
         selector.register(proc.stdout, selectors.EVENT_READ)
         eof = False
@@ -214,6 +361,11 @@ def run_worker(root, task_id, *, argv=None, startup_timeout=60, progress_timeout
                 reason = 'EXECUTION_ACK_TIMEOUT' if not current['execution_ack_at'] else 'NO_PROGRESS_TIMEOUT'
             if reason:
                 break
+            if now - last_beat >= heartbeat_seconds:
+                # Liveness independent of agent output: PIDs + time.
+                last_beat = now
+                store.update(task_id, 'HEARTBEAT', heartbeat_at=time.time(),
+                             worker_pid=os.getpid(), cli_pid=proc.pid)
             for key, _ in selector.select(.1):
                 chunk = os.read(key.fd, 65536)
                 if not chunk:
@@ -285,8 +437,9 @@ def run_worker(root, task_id, *, argv=None, startup_timeout=60, progress_timeout
         success = (outcome.get('outcome') == 'completed' and isinstance(outcome.get('summary'), str)
                    and not reason and exit_code == 0 and current['delivery_ack_at'] and
                    current['execution_ack_at'] and current['turn_completed'] and final_text is not None)
+        evidence = sandbox_evidence(workdir) if row.get('sandbox') else {}
         store.update(task_id, 'PROCESS_EXIT', state='COMPLETED' if success else ('CANCELLED' if reason == 'OPERATOR_CANCELLED' else 'BLOCKED'),
-                     exit_code=exit_code, result=final_text,
+                     exit_code=exit_code, result=final_text, heartbeat_at=time.time(), **evidence,
                      reason=None if success else reason or 'MISSING_STRUCTURED_COMPLETION',
                      finished_at=time.time())
     except Exception:
@@ -311,11 +464,14 @@ class HeadlessManager:
     process identities. Initially requires the operator's default read+input
     policy; explicit denials still win. Never silently moves remote work here.
     """
-    def __init__(self, terminal, root, *, direct=None, enabled=False):
+    def __init__(self, terminal, root, *, direct=None, enabled=False, dispatch='unit', sandbox=False):
         self.terminal = terminal
         self.store = HeadlessStore(Path(root))
         self.direct = direct
         self.enabled = enabled
+        # 'service': only persist READY; terminal_mcp.headless_worker runs it.
+        self.dispatch = dispatch if dispatch in ('unit', 'service') else 'unit'
+        self.sandbox = sandbox
         self.children = []
         if terminal is not None:
             terminal.headless_store = self.store
@@ -384,54 +540,25 @@ class HeadlessManager:
                 return {'error': 'HEADLESS_HOOK_ISOLATION_UNSUPPORTED'}
         except (OSError, subprocess.TimeoutExpired):
             return {'error': 'HEADLESS_CLI_PREFLIGHT_FAILED'}
-        row = self.store.prepare(name, str(resolved), agent, prompt, key, limit=limit, external_count=len(sessions))
+        sandbox = None
+        if self.sandbox:
+            sandbox = sandbox_source(resolved)
+            if sandbox is None:
+                return {'error': 'HEADLESS_SANDBOX_REQUIRES_GIT_CHECKOUT', 'cwd': str(resolved)}
+        row = self.store.prepare(name, str(resolved), agent, prompt, key, limit=limit, external_count=len(sessions),
+                                 dispatch=self.dispatch, sandbox=sandbox)
         if 'error' in row:
             return row
-        if not row.get('created'):
+        if not row.get('created') or self.dispatch == 'service':
             return self.status(row['task_id'])
         # Transactional worker claim also protects simultaneous identical calls.
-        try:
-            # A dedicated user unit avoids inheriting a controller's nested
-            # namespace/seccomp restrictions. No sandbox policy is weakened:
-            # Codex still enforces workspace-write and never approvals.
-            unit = 'tmcp-' + row['task_id']
-            launched = subprocess.run([
-                'systemd-run', '--user', '--quiet', '--collect', '--unit=' + unit,
-                '--property=MemoryMax=2G', '--property=CPUQuota=200%',
-                '--property=NoNewPrivileges=yes', '--property=UMask=0077',
-                '--setenv=PYTHONPATH=' + str(Path(__file__).resolve().parent.parent),
-                '--setenv=PATH=' + os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin'),
-                sys.executable, '-m', 'terminal_mcp.headless', str(self.store.root), row['task_id']],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=15, close_fds=True)
-            if launched.returncode:
-                self.store.update(row['task_id'], 'SPAWN_FAILED', expected_states=('READY',), state='BLOCKED', reason='WORKER_UNIT_START_FAILED')
-        except (OSError, subprocess.TimeoutExpired):
-            # A timeout may still have created the unit. Reconcile, never replay.
-            pass
+        if launch_unit(self.store.root, row['task_id']):
+            self.store.update(row['task_id'], 'SPAWN_FAILED', expected_states=('READY',), state='BLOCKED', reason='WORKER_UNIT_START_FAILED')
         return self.status(row['task_id'])
 
     def reconcile(self):
         self.children = [child for child in self.children if child.poll() is None]
-        for row in self.store.rows():
-            if row['state'] not in ('READY', 'DISPATCH', 'ACKNOWLEDGED', 'RUNNING'):
-                continue
-            if time.time() - row['updated_at'] < 15:
-                continue
-            lock = (self.store.root / row['task_id'] / 'worker.lock').open('a')
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                lock.close()
-                continue
-            try:
-                fresh = self.store.get(row['task_id'])
-                if time.time() - fresh['updated_at'] >= 15:
-                    self.store.update(row['task_id'], 'RESTART_RECOVERY_HOLD',
-                                      expected_states=('READY', 'DISPATCH', 'ACKNOWLEDGED', 'RUNNING'),
-                                      state='BLOCKED', reason='WORKER_LOST_NO_REPLAY')
-            finally:
-                lock.close()
+        recover_lost(self.store)
 
     def status(self, task_id):
         row = self.store.get(task_id)
@@ -439,7 +566,7 @@ class HeadlessManager:
             return {'error': 'TASK_NOT_FOUND'}
         if error := self.guard(row['target']):
             return error
-        return {'status': 'OK', 'task': row}
+        return {'status': 'OK', 'task': row, 'liveness': liveness(self.store, row)}
 
     def turn(self, action, *, target=None, text=None, cwd=None, key=None, task_id=None, agent='codex'):
         if action == 'headless_start':
