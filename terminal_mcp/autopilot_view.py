@@ -236,6 +236,12 @@ class ControlTower:
         if task.status == qs.COMPLETED and task.verification_evidence:
             evidence = {k: _safe(task.verification_evidence[k])
                         for k in _EVIDENCE_KEYS if k in task.verification_evidence}
+        worker = (task.metadata or {}).get("cli_worker")
+        worker_view = None
+        if isinstance(worker, dict):
+            worker_view = {key: _safe(worker[key]) for key in (
+                "state", "pid", "heartbeat_at", "exit_code", "commit_sha", "test_sha", "blocker")
+                if key in worker}
         return {
             "id": task.id, "title": _safe(task.title), "status": task.status,
             "display_status": display, "stale": stale, "lane": task.session,
@@ -244,6 +250,7 @@ class ControlTower:
             "started_at": task.started_at, "completed_at": task.completed_at,
             "updated_at": task.updated_at, "last_error": _safe(task.last_error),
             "qa": self._qa_view(task, jobs[0], report if fresh else None) if jobs else None,
+            "cli_worker": worker_view,
             "evidence_ref": evidence,
             "proof": proof,
         }
@@ -464,9 +471,17 @@ def build_autopilot_runtime(config: Any, *, queue: Any, bus: Any, outcomes: Any,
     verify = getattr(queue, "verify_queue", None)
     loop = None
     if policy.enabled and policy.projects and direct_tasks is not None and verify is not None:
+        from .queue_cli_worker import QueueStoreCLIWorker
+        workers = {}
+        for project in policy.projects:
+            if project.dispatch and project.cli_worker and project.cli_worker.get("enabled") is True:
+                for lane in project.lanes:
+                    workers[lane] = QueueStoreCLIWorker(
+                        queue.store, project_id=project.project_id, lane=lane,
+                        config=project.cli_worker)
         autopilot = ap.ProjectAutopilot(
             store=queue.store, verify=verify, outcomes=outcomes, bus=bus, locks=locks,
-            dispatcher=ap.DirectTaskDispatcher(direct_tasks), policy=policy,
+            dispatcher=ap.ProjectDispatcher(ap.DirectTaskDispatcher(direct_tasks), workers), policy=policy,
             instance_id=instance_id,
             workspace_probe=(build_workspace_probe(session_ops, repo_evidence)
                              if session_ops is not None and repo_evidence is not None else None),

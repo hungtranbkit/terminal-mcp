@@ -3010,7 +3010,8 @@ class QueueStore:
         return QueueTask.from_row(row)
 
     def claim_cli_worker(self, task_id: str, *, dispatch_key: str, worker_id: str,
-                         pid: int, lease_seconds: float = 60.0) -> dict[str, Any] | None:
+                         pid: int, lease_seconds: float = 60.0,
+                         baseline_commit_sha: str | None = None) -> dict[str, Any] | None:
         """Atomically claim one already-dispatching task for its CLI worker.
 
         The receipt lives in queue_tasks.metadata: this is deliberately not a
@@ -3018,8 +3019,8 @@ class QueueStore:
         never spawn again. A receipt without a live owner is reconciled to
         BLOCKED by the worker; it is never replayed after a crash.
         """
-        if not dispatch_key or not worker_id or int(pid) <= 0:
-            raise ValueError("dispatch_key, worker_id and positive pid are required")
+        if not dispatch_key or not worker_id or int(pid) < 0:
+            raise ValueError("dispatch_key, worker_id and non-negative pid are required")
         now = time.time()
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -3032,10 +3033,11 @@ class QueueStore:
             receipt = metadata.get("cli_worker")
             if isinstance(receipt, dict):
                 return dict(receipt)
-            receipt = {"state": "RUNNING", "dispatch_key": dispatch_key,
-                       "worker_id": worker_id, "pid": int(pid), "heartbeat_at": now,
+            receipt = {"state": "RUNNING" if pid else "STARTING", "dispatch_key": dispatch_key,
+                       "worker_id": worker_id, "pid": int(pid) or None, "heartbeat_at": now,
                        "lease_expires_at": now + max(1.0, float(lease_seconds)),
-                       "exit_code": None, "commit_sha": None, "test_sha": None}
+                       "exit_code": None, "commit_sha": None, "test_sha": None,
+                       "baseline_commit_sha": baseline_commit_sha}
             metadata["cli_worker"] = receipt
             connection.execute("UPDATE queue_tasks SET metadata = ?, updated_at = ? WHERE id = ?",
                                (json.dumps(metadata), iso_now(), task_id))
@@ -3046,7 +3048,7 @@ class QueueStore:
     def update_cli_worker(self, task_id: str, *, worker_id: str,
                           changes: dict[str, Any]) -> dict[str, Any] | None:
         allowed = {"state", "pid", "heartbeat_at", "lease_expires_at", "exit_code",
-                   "commit_sha", "test_sha", "blocker"}
+                   "commit_sha", "test_sha", "blocker", "log_path", "baseline_commit_sha"}
         if set(changes) - allowed:
             raise ValueError("unsupported CLI worker receipt field")
         with self._connection() as connection:
