@@ -771,3 +771,42 @@ def _marker(task_id: str, attempt: int, nonce: str) -> str:
     return (f"###TERMINAL_MCP_COMPLETION protocol=terminal-mcp-completion/v1 task_id={task_id} "
             f"attempt={attempt} nonce={nonce} status=completion_candidate "
             f"summary_sha256=deadbeef###")
+
+
+# -- Autopilot QA dispatch hooks (#106) ------------------------------------
+
+def _running_in_project(store, session, project_id):
+    (task_id,) = store.set_tasks(session, [{"title": "impl", "prompt": "do the work",
+                                            "project_id": project_id}])
+    store.transition_task(task_id, qs.DISPATCHING, event_type="DISPATCHING")
+    return store.mark_running_with_evidence(task_id, evidence={
+        "accepted": True, "signal": "explicit_running_signal"})
+
+
+def test_reconcile_scoped_to_a_project_leaves_other_projects_alone(store, verify):
+    mine = verify.ensure_verify_job(_running_in_project(store, "lane-a", "p/mine"))
+    theirs = verify.ensure_verify_job(_running_in_project(store, "lane-b", "p/theirs"))
+    for job in (mine, theirs):
+        verify.claim_next(verifier="crashed", job_id=job.id, lease_seconds=-5)
+    result = verify.reconcile(project_id="p/mine")
+    assert result["leases_expired"] == [mine.id]
+    assert verify.get(theirs.id).status == VERIFY_CLAIMED
+
+
+def test_require_commit_evidence_needs_a_commit(store, verify):
+    task = make_running_task(store)
+    with pytest.raises(ValueError):
+        verify.ensure_verify_job(task, require_commit_evidence=True)
+    assert store.get_task(task.id).status == qs.RUNNING
+
+
+def test_pass_for_a_different_commit_is_refused_even_without_the_requirement(store, verify):
+    job = verify.ensure_verify_job(make_running_task(store), commit_sha="c" * 40)
+    claimed = verify.claim_next(verifier="v1")
+    refused = verify.complete(job.id, claimed.claim_token, evidence={
+        "command": "pytest", "exit_code": 0, "commit_sha": "d" * 40})
+    assert refused["ok"] is False and refused["reason"].startswith("STALE_COMMIT")
+    # A short SHA of the right commit is the same commit.
+    ok = verify.complete(job.id, claimed.claim_token, evidence={
+        "command": "pytest", "exit_code": 0, "commit_sha": "c" * 9})
+    assert ok["ok"] is True

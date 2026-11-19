@@ -190,3 +190,16 @@ async def test_reconcile_through_the_tool_recovers_a_dead_verifier(rig):
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+@pytest.mark.anyio
+async def test_claim_by_job_id_gets_that_job_or_nothing(rig):
+    server, queue = rig
+    first = (await _call(server, "terminal_verify_request", task_id=running_task(queue, session="a")))
+    second = (await _call(server, "terminal_verify_request", task_id=running_task(queue, session="b")))
+    wrong = await _call(server, "terminal_verify_claim", verifier="v1", job_id="0" * 32)
+    assert wrong["claimed"] is False
+    claimed = await _call(server, "terminal_verify_claim", verifier="v1",
+                          job_id=second["job"]["id"])
+    assert claimed["claimed"] is True and claimed["job"]["id"] == second["job"]["id"]
+    assert queue.verify_queue.get(first["job"]["id"]).status == "VERIFY_PENDING"

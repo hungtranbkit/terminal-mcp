@@ -399,3 +399,62 @@ The controller's own in-process `SubmissionSweeper` and the durable
 per-submission Enter cap are unaffected, and no submission can be duplicated by
 either the removal or the re-install -- the cap lives in the store, not in the
 timer. See `docs/prompt-submission.md` for the full bound.
+
+# GitHub webhook ingress + local CI (#106, off by default)
+
+GitHub is only the source/PR/webhook transport here; build and test run
+locally. No new unit is needed: the ingress is a POST route on the existing
+`terminal-mcp-http` user service, registered only when `github_ingress.enabled`.
+The service already runs under the user manager; keep it running without a
+login session with:
+
+```bash
+loginctl enable-linger "$USER"          # once per host
+systemctl --user status terminal-mcp-http.service
+```
+
+Setup (staging first; do NOT disable any repository's GitHub Actions until
+its local replacement has been proved on that repository):
+
+```bash
+umask 077
+python3 -c 'import secrets; print(secrets.token_hex(32))' \
+  > ~/.config/terminal-mcp/github-webhook.secret          # mode 0600, never in git
+```
+
+```yaml
+github_ingress:
+  enabled: true
+  secret_file: ~/.config/terminal-mcp/github-webhook.secret
+  repos:
+    - repo: owner/app
+      project_id: owner/app          # an autopilot project
+      lane: app-work-1               # one of that project's lanes
+      branches: [main]
+      check: local-ci
+      script: scripts/ci/local-ci.sh # committed in the repo itself
+```
+
+- The route is `POST /github/webhook`. The server binds loopback; reach it
+  through an authenticated relay, never by publishing the controller port.
+  The HMAC (`X-Hub-Signature-256`) authenticates each request; a world- or
+  group-readable secret file is refused and the route is not registered.
+- Accepted: `push` to an allowed branch, `pull_request`
+  opened/synchronize/reopened into an allowed branch from the SAME repo.
+  Fork PRs, other events, tags and branch deletions are acknowledged and
+  ignored. A delivery older than 6 h (by the payload's own signed time), a
+  replayed body under a new delivery id, or a reused delivery id with a
+  different body is refused.
+- Each (repo, commit, check) becomes at most one queue task, recorded in the
+  event bus before the 2xx. Nothing runs until that lane's owner (the
+  autopilot, when its project is approved for dispatch) picks it up.
+- The task runs `python -m terminal_mcp.local_ci --repo <checkout> --sha <sha>
+  --script <script>`: the script must be tracked at that commit; it runs in a
+  fresh detached worktree with a minimal environment and a timeout; the log
+  stays local (0600) and the printed evidence (exit code, log hash, optional
+  `TMCP_CI_RESULT {"tests_passed": N, "tests_failed": M}`) is what
+  independent QA submits. A timeout or setup error is never a pass.
+
+Rollback: set `github_ingress.enabled: false` (or remove the block) and
+restart `terminal-mcp-http`; the route disappears. Recorded deliveries and
+tasks stay in the event bus and queue for audit.

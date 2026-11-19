@@ -518,3 +518,27 @@ session_health:
 #       public_probe_ids: []
 #       rollback_capture_method: git_head
 #       preview_safe: true
+
+# Noninteractive CLI worker is separately opt-in inside an approved Autopilot
+# project. The directory must be a clean named non-main git worktree. Task and
+# worker receipts stay in QueueStore; this adds no task DB or queue.
+# autopilot:
+#   enabled: true
+#   projects:
+#     - project_id: synthetic/canary
+#       dispatch: true
+#       approved_by: owner@example.test
+#       approval_ref: https://github.com/hungtranbkit/terminal-mcp/issues/106
+#       lanes: [synthetic-worker]
+#       cli_worker:
+#         enabled: true
+#         cli: codex                 # or claude
+#         working_directory: /tmp/synthetic-agent-worktree
+#         isolated_worktree: true
+#         test_command: [python3, -m, pytest, -q]
+#         timeout_seconds: 1800
+#         heartbeat_seconds: 5
+#         # Optional: let the trusted worker run git add/commit after path and
+#         # test validation. Default is agent; worker mode requires exact paths.
+#         commit_mode: worker
+#         allowed_paths: [src/feature.py, tests/test_feature.py]

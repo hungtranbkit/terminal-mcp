@@ -580,6 +580,14 @@ def _parse_json_object(raw: str | None) -> dict[str, Any]:
 
 _INTERNAL_TASK_METADATA_KEYS = frozenset({
     "execution_evidence", "dispatch_observation", "dispatch_reconciliation",
+    # ProjectFlow Autopilot ownership/repair budget: a creator who could seed
+    # it could claim autopilot ownership or reset the repair budget.
+    "autopilot",
+    # Noninteractive worker receipt/lease remains on the canonical task row.
+    "cli_worker",
+    # GitHub ingress provenance (#106): only the signed-webhook path writes
+    # it, so a task carrying it was created from a verified delivery.
+    "github_ingress",
 })
 
 
@@ -1746,7 +1754,8 @@ class QueueStore:
 
     # -- task CRUD ---------------------------------------------------------
 
-    def set_tasks(self, session: str, tasks: list[dict[str, Any]], *, replace_pending: bool = True) -> list[str]:
+    def set_tasks(self, session: str, tasks: list[dict[str, Any]], *, replace_pending: bool = True,
+                  internal_metadata: dict[str, Any] | None = None) -> list[str]:
         """queue_set: pushes an array of tasks into `session`'s lane in
         one call. replace_pending=True (queue_set's own default) cancels
         every currently-QUEUED (not yet dispatched) task first -- RUNNING/
@@ -1756,7 +1765,14 @@ class QueueStore:
         RUNNING task" (this call can't affect a RUNNING task either way).
         replace_pending=False is queue_append's own behavior: pure
         append, nothing existing is touched. Returns the new tasks' ids,
-        in the same order given."""
+        in the same order given.
+
+        `internal_metadata` (queue-owned keys only, for in-process producers)
+        is written in the SAME insert, so a task can never exist without it."""
+        internal = dict(internal_metadata or {})
+        foreign = set(internal) - _INTERNAL_TASK_METADATA_KEYS
+        if foreign:
+            raise ValueError(f"not queue-owned metadata key(s): {sorted(foreign)}")
         with self._connection() as connection:
             self._ensure_lane(connection, session)
             if replace_pending:
@@ -1782,7 +1798,7 @@ class QueueStore:
                     "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (task_id, session, next_position + offset, task.get("title") or "", task["prompt"], QUEUED, now,
                      int(task.get("max_attempts") or 3), json.dumps(task.get("completion_policy") or {}),
-                     json.dumps(_external_task_metadata(task.get("metadata") or {})),
+                     json.dumps({**_external_task_metadata(task.get("metadata") or {}), **internal}),
                      now, int(task.get("priority") or 0),
                      json.dumps(list(task.get("depends_on") or [])), session,
                      task.get("project_id"), task.get("request_key") or None,
@@ -1792,8 +1808,10 @@ class QueueStore:
                                           reason=None)
         return ids
 
-    def append_tasks(self, session: str, tasks: list[dict[str, Any]]) -> list[str]:
-        return self.set_tasks(session, tasks, replace_pending=False)
+    def append_tasks(self, session: str, tasks: list[dict[str, Any]], *,
+                     internal_metadata: dict[str, Any] | None = None) -> list[str]:
+        return self.set_tasks(session, tasks, replace_pending=False,
+                              internal_metadata=internal_metadata)
 
     def waiting_since(self, task_id: str, status: str) -> str | None:
         """When this task most recently ENTERED `status`, from its own events.
@@ -2970,6 +2988,87 @@ class QueueStore:
             connection.execute("UPDATE queue_tasks SET metadata = ?, updated_at = ? WHERE id = ?",
                                (json.dumps(metadata), iso_now(), task_id))
         return observation
+
+    def set_internal_metadata(self, task_id: str, key: str, value: Any, *, event_type: str,
+                              reason: str | None = None) -> QueueTask:
+        """Write ONE queue-owned metadata key (see _INTERNAL_TASK_METADATA_KEYS)
+        without a status change, paired with a queue_events row in the same
+        transaction. Refuses any key a task creator could also have supplied."""
+        if key not in _INTERNAL_TASK_METADATA_KEYS:
+            raise ValueError(f"{key!r} is not a queue-owned metadata key")
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            metadata = _parse_json_object(row["metadata"])
+            metadata[key] = value
+            connection.execute("UPDATE queue_tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+                               (json.dumps(metadata), iso_now(), task_id))
+            self._record_event_locked(connection, session=row["session"], task_id=task_id,
+                                      event_type=event_type, reason=reason)
+            row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+        return QueueTask.from_row(row)
+
+    def claim_cli_worker(self, task_id: str, *, dispatch_key: str, worker_id: str,
+                         pid: int, lease_seconds: float = 60.0,
+                         baseline_commit_sha: str | None = None) -> dict[str, Any] | None:
+        """Atomically claim one already-dispatching task for its CLI worker.
+
+        The receipt lives in queue_tasks.metadata: this is deliberately not a
+        second task table. A repeated key returns the existing receipt and may
+        never spawn again. A receipt without a live owner is reconciled to
+        BLOCKED by the worker; it is never replayed after a crash.
+        """
+        if not dispatch_key or not worker_id or int(pid) < 0:
+            raise ValueError("dispatch_key, worker_id and non-negative pid are required")
+        now = time.time()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            if row["status"] != DISPATCHING or row["dispatch_idempotency_key"] != dispatch_key:
+                return None
+            metadata = _parse_json_object(row["metadata"])
+            receipt = metadata.get("cli_worker")
+            if isinstance(receipt, dict):
+                return dict(receipt)
+            receipt = {"state": "RUNNING" if pid else "STARTING", "dispatch_key": dispatch_key,
+                       "worker_id": worker_id, "pid": int(pid) or None, "heartbeat_at": now,
+                       "lease_expires_at": now + max(1.0, float(lease_seconds)),
+                       "exit_code": None, "commit_sha": None, "test_sha": None,
+                       "baseline_commit_sha": baseline_commit_sha}
+            metadata["cli_worker"] = receipt
+            connection.execute("UPDATE queue_tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+                               (json.dumps(metadata), iso_now(), task_id))
+            self._record_event_locked(connection, session=row["session"], task_id=task_id,
+                                      event_type="CLI_WORKER_CLAIMED", reason=worker_id)
+        return receipt
+
+    def update_cli_worker(self, task_id: str, *, worker_id: str,
+                          changes: dict[str, Any]) -> dict[str, Any] | None:
+        allowed = {"state", "pid", "heartbeat_at", "lease_expires_at", "exit_code",
+                   "commit_sha", "test_sha", "blocker", "log_path", "baseline_commit_sha"}
+        if set(changes) - allowed:
+            raise ValueError("unsupported CLI worker receipt field")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT session, metadata FROM queue_tasks WHERE id = ?",
+                                     (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            metadata = _parse_json_object(row["metadata"])
+            receipt = metadata.get("cli_worker")
+            if not isinstance(receipt, dict) or receipt.get("worker_id") != worker_id:
+                return None
+            receipt.update(changes)
+            metadata["cli_worker"] = receipt
+            connection.execute("UPDATE queue_tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+                               (json.dumps(metadata), iso_now(), task_id))
+            self._record_event_locked(connection, session=row["session"], task_id=task_id,
+                                      event_type="CLI_WORKER_" + str(changes.get("state", "HEARTBEAT")),
+                                      reason=str(changes.get("blocker") or worker_id))
+        return dict(receipt)
 
     def mark_running_with_evidence(self, task_id: str, *, evidence: dict[str, Any],
                                    reason: str | None = None) -> QueueTask:
