@@ -311,7 +311,7 @@ class ProjectAutopilot:
                     report["reconciled"].append({"task_id": task.id, "from": status, "to": qs.RUNNING})
                 if state == DONE:
                     fresh = self.store.get_task(task.id)
-                    commit = self._done_commit(task)
+                    commit = self._done_commit(fresh)
                     job = self.verify.ensure_verify_job(
                         fresh, required_capabilities=project.verify_required_capabilities,
                         require_independent=True, fallback=FALLBACK_HOLD, actor=ACTOR,
@@ -406,6 +406,10 @@ class ProjectAutopilot:
     def _done_commit(self, task: qs.QueueTask) -> str | None:
         """The commit QA will verify: the lane HEAD observed at DONE. An
         agent-reported SHA is deliberately not a source."""
+        worker = (task.metadata or {}).get("cli_worker") or {}
+        worker_sha = worker.get("commit_sha")
+        if worker.get("state") == "DONE" and isinstance(worker_sha, str) and _COMMIT_RE.fullmatch(worker_sha):
+            return worker_sha
         return self._lane_head((task.metadata.get(METADATA_KEY) or {}).get("lane") or task.session)
 
     def _observe_qa(self, key: str) -> Observation:
@@ -779,6 +783,32 @@ class DirectTaskDispatcher:
         if result.get("status") != "OK":
             return Observation(UNREACHABLE, reason=str(result.get("error")))
         return self._from_view(result.get("task"))
+
+
+class ProjectDispatcher:
+    """Routes explicitly opted-in project lanes to QueueStore CLI workers.
+
+    All other lanes retain the established DirectTaskSupervisor path. Worker
+    selection comes only from validated per-project config; there is no
+    second task registry or fallback from a failed CLI claim to direct send.
+    """
+
+    def __init__(self, direct: Any, workers: Mapping[str, Any]) -> None:
+        self.direct = direct
+        self.workers = dict(workers)
+
+    def dispatch(self, *, target: str, text: str, idempotency_key: str) -> Observation:
+        worker = self.workers.get(target)
+        if worker is None:
+            return self.direct.dispatch(target=target, text=text, idempotency_key=idempotency_key)
+        return worker.dispatch(target=target, text=text, idempotency_key=idempotency_key)
+
+    def observe(self, *, idempotency_key: str) -> Observation:
+        for worker in self.workers.values():
+            observation = worker.observe(idempotency_key=idempotency_key)
+            if observation.state != NOT_FOUND:
+                return observation
+        return self.direct.observe(idempotency_key=idempotency_key)
 
 
 class AutopilotLoop:

@@ -91,6 +91,18 @@ def test_snapshot_contract_and_no_fabricated_percent(tower):
     assert "Implement A" not in json.dumps(snap)  # prompts are not in the read model
 
 
+def test_snapshot_reports_cli_worker_process_and_verification_receipt(tower):
+    task_id = _add(tower, "p1-work", "CLI task")
+    tower.test["store"].set_internal_metadata(task_id, "cli_worker", {
+        "state": "DONE", "pid": 4321, "heartbeat_at": 1234.5, "exit_code": 0,
+        "commit_sha": "a" * 40, "test_sha": "b" * 64,
+        "log_path": "/tmp/private-log-must-not-be-exposed"}, event_type="TEST_CLI_RECEIPT")
+    item = tower.snapshot(P1)["tasks"][0]
+    assert item["cli_worker"] == {"state": "DONE", "pid": 4321,
+                                  "heartbeat_at": 1234.5, "exit_code": 0,
+                                  "commit_sha": "a" * 40, "test_sha": "b" * 64}
+
+
 def test_readiness_gates_are_separate_and_unknown_without_evidence(tower):
     assert tower.snapshot(P1)["readiness"] == {
         "CODE_READY": "UNKNOWN", "DEVICE_QA": "UNKNOWN", "RELEASE_READY": "UNKNOWN"}

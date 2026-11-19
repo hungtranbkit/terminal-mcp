@@ -73,6 +73,7 @@ class AutopilotProjectPolicy:
     verifiers: tuple[VerifierSessionPolicy, ...] = ()
     max_qa_dispatches: int = 2
     qa_require_commit: bool = True
+    cli_worker: dict[str, Any] | None = None
 
     @property
     def qa_dispatch_enabled(self) -> bool:
@@ -110,6 +111,41 @@ class AutopilotProjectPolicy:
                              f"-- QA must be independent of the work it checks")
         if not 1 <= int(self.max_qa_dispatches) <= 5:
             raise ValueError("max_qa_dispatches must be 1..5")
+        if self.cli_worker is not None:
+            worker = self.cli_worker
+            if not isinstance(worker, dict) or worker.get("enabled") is not True:
+                raise ValueError("cli_worker must be an explicitly enabled mapping")
+            if worker.get("cli") not in ("codex", "claude"):
+                raise ValueError("cli_worker.cli must be codex or claude")
+            if not str(worker.get("working_directory") or "").startswith("/"):
+                raise ValueError("cli_worker.working_directory must be an absolute path")
+            if self.dispatch is not True or worker.get("isolated_worktree") is not True:
+                raise ValueError("cli_worker requires approved project dispatch and isolated_worktree=true")
+            if int(self.max_in_flight) != 1:
+                raise ValueError("cli_worker requires max_in_flight=1 for a shared project worktree")
+            command = worker.get("test_command")
+            if not isinstance(command, list) or not command or not all(isinstance(x, str) and x for x in command):
+                raise ValueError("cli_worker.test_command must be a non-empty argv list")
+            commit_mode = worker.get("commit_mode", "agent")
+            if commit_mode not in ("agent", "worker"):
+                raise ValueError("cli_worker.commit_mode must be agent or worker")
+            if commit_mode == "worker":
+                paths = worker.get("allowed_paths")
+                if not isinstance(paths, list) or not paths or not all(isinstance(x, str) and x for x in paths):
+                    raise ValueError("worker commit_mode requires allowed_paths as a non-empty list")
+                if len(paths) != len(set(paths)):
+                    raise ValueError("cli_worker.allowed_paths must be unique")
+                from pathlib import PurePosixPath
+                for value in paths:
+                    path = PurePosixPath(value)
+                    if ("\\" in value or path.is_absolute() or path.as_posix() != value
+                            or any(part in ("", ".", "..") for part in path.parts)
+                            or path.parts[0] == ".git"):
+                        raise ValueError(f"unsafe cli_worker.allowed_paths entry: {value!r}")
+            if set(worker) - {"enabled", "cli", "executable", "working_directory", "isolated_worktree",
+                              "test_command", "timeout_seconds", "heartbeat_seconds", "commit_mode",
+                              "allowed_paths"}:
+                raise ValueError("cli_worker contains unsupported configuration keys")
 
 
 @dataclass(frozen=True)
@@ -166,7 +202,8 @@ def load_autopilot_config(raw: Any) -> AutopilotPolicy:
             verify_required_capabilities=tuple(str(c) for c in caps),
             owners=tuple(str(o) for o in (item.get("owners") or [])),
             verifiers=verifiers, max_qa_dispatches=int(item.get("max_qa_dispatches", 2)),
-            qa_require_commit=item.get("qa_require_commit", True) is not False))
+            qa_require_commit=item.get("qa_require_commit", True) is not False,
+            cli_worker=item.get("cli_worker")))
     ids = [p.project_id for p in projects]
     if len(ids) != len(set(ids)):
         raise ValueError("autopilot.projects has duplicate project_id")

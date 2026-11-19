@@ -46,6 +46,32 @@ def test_dispatch_must_be_literal_true():
     assert policy.project("synthetic/p").dispatch is False
 
 
+def test_cli_worker_is_project_opt_in_and_requires_isolated_worktree_and_argv_tests():
+    worker = {"enabled": True, "cli": "codex", "working_directory": "/tmp/synthetic",
+              "isolated_worktree": True, "test_command": ["python3", "-m", "pytest"]}
+    policy = load_autopilot_config({"enabled": True, "projects": [
+        {**APPROVED, "cli_worker": worker}]})
+    assert policy.project("synthetic/p").cli_worker["enabled"] is True
+    for invalid in (
+        {**worker, "isolated_worktree": False},
+        {**worker, "test_command": "pytest"},
+        {**worker, "secret": "must-not-accept"},
+    ):
+        with pytest.raises(ValueError):
+            load_autopilot_config({"enabled": True, "projects": [
+                {**APPROVED, "cli_worker": invalid}]})
+    worker_mode = {**worker, "commit_mode": "worker", "allowed_paths": ["src/feature.py"]}
+    assert load_autopilot_config({"enabled": True, "projects": [
+        {**APPROVED, "cli_worker": worker_mode}]}).project("synthetic/p").cli_worker["commit_mode"] == "worker"
+    for path in ("../escape", "/absolute", ".git/config", "src/../escape"):
+        with pytest.raises(ValueError, match="allowed_paths"):
+            load_autopilot_config({"enabled": True, "projects": [
+                {**APPROVED, "cli_worker": {**worker_mode, "allowed_paths": [path]}}]})
+    with pytest.raises(ValueError, match="max_in_flight=1"):
+        load_autopilot_config({"enabled": True, "projects": [
+            {**APPROVED, "max_in_flight": 2, "cli_worker": worker}]})
+
+
 def test_lane_cannot_belong_to_two_projects():
     other = {**APPROVED, "project_id": "synthetic/q"}
     with pytest.raises(ValueError, match="two projects"):
