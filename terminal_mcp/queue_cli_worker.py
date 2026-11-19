@@ -153,7 +153,9 @@ class QueueStoreCLIWorker:
                 return
             test = subprocess.run(self.test_command, cwd=self.cwd, capture_output=True,
                                   text=True, timeout=self.timeout, shell=False)
-            test_sha = hashlib.sha256((test.stdout + test.stderr).encode()).hexdigest()
+            test_material = ("\0".join(self.test_command) + "\0" + str(test.returncode)
+                             + "\0" + test.stdout + test.stderr)
+            test_sha = hashlib.sha256(test_material.encode()).hexdigest()
             if test.returncode != 0:
                 self.store.update_cli_worker(task_id, worker_id=self.worker_id, changes={
                     "state": "BLOCKED", "exit_code": exit_code, "test_sha": test_sha,

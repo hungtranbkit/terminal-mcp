@@ -144,6 +144,13 @@ def test_autopilot_cli_a_qa_b_runs_without_manual_redispatch(tmp_path):
     assert a_receipt["pid"] != b_receipt["pid"]
     assert a_receipt["commit_sha"] != b_receipt["commit_sha"]
     assert a_receipt["test_sha"] and b_receipt["test_sha"]
+    job_b = world.verify.claim_next(verifier="independent-synthetic-qa", project_id=PROJECT)
+    assert job_b and job_b.task_id == b and job_b.commit_sha == b_receipt["commit_sha"]
+    assert world.verify.complete(job_b.id, job_b.claim_token, evidence={
+        "tests_passed": 1, "tests_failed": 0, "exit_code": 0,
+        "command": "independent synthetic acceptance check B", "commit_sha": job_b.commit_sha})["ok"]
+    autopilot.tick(PROJECT)
+    assert world.status(b) == "COMPLETED"
 
 
 def test_explicit_cli_blocker_is_persisted_as_owner_action(tmp_path):
