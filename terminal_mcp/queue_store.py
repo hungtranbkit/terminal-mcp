@@ -583,6 +583,8 @@ _INTERNAL_TASK_METADATA_KEYS = frozenset({
     # ProjectFlow Autopilot ownership/repair budget: a creator who could seed
     # it could claim autopilot ownership or reset the repair budget.
     "autopilot",
+    # Noninteractive worker receipt/lease remains on the canonical task row.
+    "cli_worker",
     # GitHub ingress provenance (#106): only the signed-webhook path writes
     # it, so a task carrying it was created from a verified delivery.
     "github_ingress",
@@ -3006,6 +3008,65 @@ class QueueStore:
                                       event_type=event_type, reason=reason)
             row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
         return QueueTask.from_row(row)
+
+    def claim_cli_worker(self, task_id: str, *, dispatch_key: str, worker_id: str,
+                         pid: int, lease_seconds: float = 60.0) -> dict[str, Any] | None:
+        """Atomically claim one already-dispatching task for its CLI worker.
+
+        The receipt lives in queue_tasks.metadata: this is deliberately not a
+        second task table. A repeated key returns the existing receipt and may
+        never spawn again. A receipt without a live owner is reconciled to
+        BLOCKED by the worker; it is never replayed after a crash.
+        """
+        if not dispatch_key or not worker_id or int(pid) <= 0:
+            raise ValueError("dispatch_key, worker_id and positive pid are required")
+        now = time.time()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            if row["status"] != DISPATCHING or row["dispatch_idempotency_key"] != dispatch_key:
+                return None
+            metadata = _parse_json_object(row["metadata"])
+            receipt = metadata.get("cli_worker")
+            if isinstance(receipt, dict):
+                return dict(receipt)
+            receipt = {"state": "RUNNING", "dispatch_key": dispatch_key,
+                       "worker_id": worker_id, "pid": int(pid), "heartbeat_at": now,
+                       "lease_expires_at": now + max(1.0, float(lease_seconds)),
+                       "exit_code": None, "commit_sha": None, "test_sha": None}
+            metadata["cli_worker"] = receipt
+            connection.execute("UPDATE queue_tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+                               (json.dumps(metadata), iso_now(), task_id))
+            self._record_event_locked(connection, session=row["session"], task_id=task_id,
+                                      event_type="CLI_WORKER_CLAIMED", reason=worker_id)
+        return receipt
+
+    def update_cli_worker(self, task_id: str, *, worker_id: str,
+                          changes: dict[str, Any]) -> dict[str, Any] | None:
+        allowed = {"state", "pid", "heartbeat_at", "lease_expires_at", "exit_code",
+                   "commit_sha", "test_sha", "blocker"}
+        if set(changes) - allowed:
+            raise ValueError("unsupported CLI worker receipt field")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT session, metadata FROM queue_tasks WHERE id = ?",
+                                     (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            metadata = _parse_json_object(row["metadata"])
+            receipt = metadata.get("cli_worker")
+            if not isinstance(receipt, dict) or receipt.get("worker_id") != worker_id:
+                return None
+            receipt.update(changes)
+            metadata["cli_worker"] = receipt
+            connection.execute("UPDATE queue_tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+                               (json.dumps(metadata), iso_now(), task_id))
+            self._record_event_locked(connection, session=row["session"], task_id=task_id,
+                                      event_type="CLI_WORKER_" + str(changes.get("state", "HEARTBEAT")),
+                                      reason=str(changes.get("blocker") or worker_id))
+        return dict(receipt)
 
     def mark_running_with_evidence(self, task_id: str, *, evidence: dict[str, Any],
                                    reason: str | None = None) -> QueueTask:
