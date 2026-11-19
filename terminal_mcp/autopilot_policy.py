@@ -126,8 +126,25 @@ class AutopilotProjectPolicy:
             command = worker.get("test_command")
             if not isinstance(command, list) or not command or not all(isinstance(x, str) and x for x in command):
                 raise ValueError("cli_worker.test_command must be a non-empty argv list")
+            commit_mode = worker.get("commit_mode", "agent")
+            if commit_mode not in ("agent", "worker"):
+                raise ValueError("cli_worker.commit_mode must be agent or worker")
+            if commit_mode == "worker":
+                paths = worker.get("allowed_paths")
+                if not isinstance(paths, list) or not paths or not all(isinstance(x, str) and x for x in paths):
+                    raise ValueError("worker commit_mode requires allowed_paths as a non-empty list")
+                if len(paths) != len(set(paths)):
+                    raise ValueError("cli_worker.allowed_paths must be unique")
+                from pathlib import PurePosixPath
+                for value in paths:
+                    path = PurePosixPath(value)
+                    if ("\\" in value or path.is_absolute() or path.as_posix() != value
+                            or any(part in ("", ".", "..") for part in path.parts)
+                            or path.parts[0] == ".git"):
+                        raise ValueError(f"unsafe cli_worker.allowed_paths entry: {value!r}")
             if set(worker) - {"enabled", "cli", "executable", "working_directory", "isolated_worktree",
-                              "test_command", "timeout_seconds", "heartbeat_seconds"}:
+                              "test_command", "timeout_seconds", "heartbeat_seconds", "commit_mode",
+                              "allowed_paths"}:
                 raise ValueError("cli_worker contains unsupported configuration keys")
 
 

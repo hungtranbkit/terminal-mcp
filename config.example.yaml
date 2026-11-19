@@ -535,3 +535,7 @@ session_health:
 #         test_command: [python3, -m, pytest, -q]
 #         timeout_seconds: 1800
 #         heartbeat_seconds: 5
+#         # Optional: let the trusted worker run git add/commit after path and
+#         # test validation. Default is agent; worker mode requires exact paths.
+#         commit_mode: worker
+#         allowed_paths: [src/feature.py, tests/test_feature.py]

@@ -60,6 +60,13 @@ def test_cli_worker_is_project_opt_in_and_requires_isolated_worktree_and_argv_te
         with pytest.raises(ValueError):
             load_autopilot_config({"enabled": True, "projects": [
                 {**APPROVED, "cli_worker": invalid}]})
+    worker_mode = {**worker, "commit_mode": "worker", "allowed_paths": ["src/feature.py"]}
+    assert load_autopilot_config({"enabled": True, "projects": [
+        {**APPROVED, "cli_worker": worker_mode}]}).project("synthetic/p").cli_worker["commit_mode"] == "worker"
+    for path in ("../escape", "/absolute", ".git/config", "src/../escape"):
+        with pytest.raises(ValueError, match="allowed_paths"):
+            load_autopilot_config({"enabled": True, "projects": [
+                {**APPROVED, "cli_worker": {**worker_mode, "allowed_paths": [path]}}]})
     with pytest.raises(ValueError, match="max_in_flight=1"):
         load_autopilot_config({"enabled": True, "projects": [
             {**APPROVED, "max_in_flight": 2, "cli_worker": worker}]})

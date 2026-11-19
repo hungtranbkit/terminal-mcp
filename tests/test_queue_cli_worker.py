@@ -23,6 +23,25 @@ def _git(cwd, *args):
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
 
 
+def _clean_repo(path):
+    path.mkdir()
+    _git(path, "init", "-q")
+    _git(path, "switch", "-c", "staging/synthetic")
+    _git(path, "config", "user.email", "fixture@example.invalid")
+    _git(path, "config", "user.name", "Fixture")
+    (path / "fixture.txt").write_text("baseline\n")
+    _git(path, "add", "fixture.txt")
+    _git(path, "commit", "-qm", "baseline")
+    return _git(path, "rev-parse", "HEAD")
+
+
+def _file_writer(path, code):
+    path.write_text("#!/usr/bin/env python3\nimport re,sys\nfrom pathlib import Path\n"
+                    "p=sys.stdin.read(); m=re.search(r'task id ([0-9a-f]{32})', p)\n" + code +
+                    "\nprint('TMCP-DONE: '+m.group(1))\n")
+    path.chmod(0o700)
+
+
 def test_noninteractive_cli_runner_records_pid_heartbeat_exit_and_exact_shas(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -49,6 +68,8 @@ def test_noninteractive_cli_runner_records_pid_heartbeat_exit_and_exact_shas(tmp
         "test_command": [sys.executable, "-c", "from pathlib import Path; assert Path('A.txt').is_file() or Path('B.txt').is_file()"],
         "timeout_seconds": 60, "heartbeat_seconds": 1,
     }, worker_id="staging-worker")
+    assert worker._argv()[1:] == ["exec", "--ephemeral", "--cd", str(repo),
+                                  "--sandbox", "workspace-write", "-"]
     sent = worker.dispatch(target="synthetic-lane", text="Implement synthetic A",
                            idempotency_key="key-a")
     assert sent.state == ap.PENDING and sent.ref.startswith("pid:")
@@ -64,6 +85,139 @@ def test_noninteractive_cli_runner_records_pid_heartbeat_exit_and_exact_shas(tmp
     assert re.fullmatch(r"[0-9a-f]{40}", receipt["commit_sha"])
     assert re.fullmatch(r"[0-9a-f]{64}", receipt["test_sha"])
     assert store.get_task(task_id).status == DISPATCHING  # independent QA still owns completion
+
+
+def test_worker_commit_mode_commits_only_allowlisted_file_after_tests(tmp_path):
+    repo = tmp_path / "repo"
+    baseline = _clean_repo(repo)
+    cli = tmp_path / "file-writer"
+    _file_writer(cli, "Path('A.txt').write_text('accepted\\n')")
+    store = QueueStore(tmp_path / "queue.db")
+    task_id = _task(store, "synthetic-lane", "key-worker", "Write A.txt")
+    worker = QueueStoreCLIWorker(store, project_id="synthetic", lane="synthetic-lane", config={
+        "enabled": True, "cli": "claude", "executable": str(cli),
+        "working_directory": str(repo), "isolated_worktree": True,
+        "commit_mode": "worker", "allowed_paths": ["A.txt"],
+        "test_command": [sys.executable, "-c", "from pathlib import Path; assert Path('A.txt').read_text() == 'accepted\\n'"],
+    }, worker_id="trusted-worker")
+    assert worker._argv()[1:] == ["-p", "--permission-mode", "acceptEdits",
+                                  "--allowedTools", "Read", "Write", "Edit"]
+    sent = worker.dispatch(target="synthetic-lane", text="Write A.txt", idempotency_key="key-worker")
+    assert sent.state == ap.PENDING
+    deadline = time.monotonic() + 10
+    observation = worker.observe(idempotency_key="key-worker")
+    while observation.state == ap.PENDING and time.monotonic() < deadline:
+        time.sleep(.05)
+        observation = worker.observe(idempotency_key="key-worker")
+    assert observation.state == ap.DONE, store.get_task(task_id).metadata["cli_worker"]
+    receipt = store.get_task(task_id).metadata["cli_worker"]
+    assert receipt["baseline_commit_sha"] == baseline
+    assert receipt["commit_sha"] != baseline and receipt["exit_code"] == 0
+    assert re.fullmatch(r"[0-9a-f]{64}", receipt["test_sha"])
+    assert _git(repo, "diff", "HEAD", "--name-only") == ""
+    assert _git(repo, "log", "-1", "--format=%an <%ae>") == "Terminal MCP Worker <terminal-mcp-worker@localhost>"
+
+
+def test_worker_commit_mode_duplicate_dispatch_does_not_spawn_twice(tmp_path):
+    repo = tmp_path / "repo"
+    _clean_repo(repo)
+    cli = tmp_path / "slow-writer"
+    _file_writer(cli, "import time; time.sleep(.2); Path('A.txt').write_text('once\\n')")
+    store = QueueStore(tmp_path / "queue.db")
+    task_id = _task(store, "synthetic-lane", "key-once", "Write A.txt")
+    worker = QueueStoreCLIWorker(store, project_id="synthetic", lane="synthetic-lane", config={
+        "enabled": True, "cli": "claude", "executable": str(cli),
+        "working_directory": str(repo), "isolated_worktree": True,
+        "commit_mode": "worker", "allowed_paths": ["A.txt"],
+        "test_command": [sys.executable, "-c", "from pathlib import Path; assert Path('A.txt').exists()"],
+        "heartbeat_seconds": 1,
+    }, worker_id="exactly-once-worker")
+    first = worker.dispatch(target="synthetic-lane", text="Write A.txt", idempotency_key="key-once")
+    second = worker.dispatch(target="synthetic-lane", text="Write A.txt", idempotency_key="key-once")
+    assert first.state == ap.PENDING and second.state == ap.PENDING
+    assert first.ref == second.ref
+    deadline = time.monotonic() + 15
+    observation = worker.observe(idempotency_key="key-once")
+    while observation.state == ap.PENDING and time.monotonic() < deadline:
+        time.sleep(.05)
+        observation = worker.observe(idempotency_key="key-once")
+    assert observation.state == ap.DONE
+    assert _git(repo, "rev-list", "--count", "HEAD") == "2"
+    assert store.get_task(task_id).metadata["cli_worker"]["pid"] == int(first.ref.removeprefix("pid:"))
+
+
+def test_worker_commit_mode_blocks_unexpected_dirty_path_without_committing(tmp_path):
+    repo = tmp_path / "repo"
+    _clean_repo(repo)
+    cli = tmp_path / "file-writer"
+    _file_writer(cli, "Path('A.txt').write_text('allowed\\n'); Path('surprise.txt').write_text('no\\n')")
+    store = QueueStore(tmp_path / "queue.db")
+    task_id = _task(store, "synthetic-lane", "key-worker", "Write A.txt")
+    worker = QueueStoreCLIWorker(store, project_id="synthetic", lane="synthetic-lane", config={
+        "enabled": True, "cli": "claude", "executable": str(cli),
+        "working_directory": str(repo), "isolated_worktree": True,
+        "commit_mode": "worker", "allowed_paths": ["A.txt"],
+        "test_command": [sys.executable, "-c", "pass"],
+    }, worker_id="trusted-worker")
+    worker.dispatch(target="synthetic-lane", text="Write A.txt", idempotency_key="key-worker")
+    deadline = time.monotonic() + 15
+    observation = worker.observe(idempotency_key="key-worker")
+    while observation.state == ap.PENDING and time.monotonic() < deadline:
+        time.sleep(.05)
+        observation = worker.observe(idempotency_key="key-worker")
+    receipt = store.get_task(task_id).metadata["cli_worker"]
+    assert observation.state == ap.BLOCKED and observation.reason == "UNAUTHORIZED_PATHS:surprise.txt"
+    assert receipt["commit_sha"] is None
+    assert _git(repo, "rev-parse", "HEAD") == receipt["baseline_commit_sha"]
+
+
+def test_worker_commit_mode_blocks_symlink_escape_and_failed_tests(tmp_path):
+    repo = tmp_path / "repo"
+    baseline = _clean_repo(repo)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("must stay outside\n")
+    cli = tmp_path / "symlink-writer"
+    _file_writer(cli, f"Path('A.txt').symlink_to({str(outside)!r})")
+    store = QueueStore(tmp_path / "queue.db")
+    task_id = _task(store, "synthetic-lane", "key-symlink", "Write A.txt")
+    worker = QueueStoreCLIWorker(store, project_id="synthetic", lane="synthetic-lane", config={
+        "enabled": True, "cli": "claude", "executable": str(cli),
+        "working_directory": str(repo), "isolated_worktree": True,
+        "commit_mode": "worker", "allowed_paths": ["A.txt"],
+        "test_command": [sys.executable, "-c", "pass"],
+    }, worker_id="trusted-worker")
+    worker.dispatch(target="synthetic-lane", text="Write A.txt", idempotency_key="key-symlink")
+    deadline = time.monotonic() + 15
+    observation = worker.observe(idempotency_key="key-symlink")
+    while observation.state == ap.PENDING and time.monotonic() < deadline:
+        time.sleep(.05)
+        observation = worker.observe(idempotency_key="key-symlink")
+    assert observation.state == ap.BLOCKED and observation.reason == "SYMLINK_PATH_BLOCKED:A.txt"
+    assert _git(repo, "rev-parse", "HEAD") == baseline
+    assert outside.read_text() == "must stay outside\n"
+
+    # A failing pinned test command prevents the worker from staging/committing.
+    repo2 = tmp_path / "repo-failing-test"
+    baseline2 = _clean_repo(repo2)
+    cli2 = tmp_path / "writer2"
+    _file_writer(cli2, "Path('A.txt').write_text('not accepted\\n')")
+    store2 = QueueStore(tmp_path / "queue2.db")
+    task2 = _task(store2, "synthetic-lane", "key-fail", "Write A.txt")
+    worker2 = QueueStoreCLIWorker(store2, project_id="synthetic", lane="synthetic-lane", config={
+        "enabled": True, "cli": "claude", "executable": str(cli2),
+        "working_directory": str(repo2), "isolated_worktree": True,
+        "commit_mode": "worker", "allowed_paths": ["A.txt"],
+        "test_command": [sys.executable, "-c", "raise SystemExit(7)"],
+    }, worker_id="trusted-worker-2")
+    worker2.dispatch(target="synthetic-lane", text="Write A.txt", idempotency_key="key-fail")
+    deadline = time.monotonic() + 15
+    observation2 = worker2.observe(idempotency_key="key-fail")
+    while observation2.state == ap.PENDING and time.monotonic() < deadline:
+        time.sleep(.05)
+        observation2 = worker2.observe(idempotency_key="key-fail")
+    assert observation2.state == ap.BLOCKED
+    assert store2.get_task(task2).metadata["cli_worker"]["blocker"] == "CONFIGURED_TEST_COMMAND_FAILED"
+    assert _git(repo2, "rev-parse", "HEAD") == baseline2
 
 
 def test_worker_restart_holds_claimed_dead_process_without_replay(tmp_path):
@@ -176,7 +330,7 @@ def test_explicit_cli_blocker_is_persisted_as_owner_action(tmp_path):
         "test_command": [sys.executable, "-c", "pass"],
     }, worker_id="blocked-worker")
     worker.dispatch(target="synthetic-lane", text="Synthetic blocked task", idempotency_key="key-a")
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 15
     observation = worker.observe(idempotency_key="key-a")
     while observation.state == ap.PENDING and time.monotonic() < deadline:
         time.sleep(.05)
