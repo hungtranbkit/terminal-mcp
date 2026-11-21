@@ -885,7 +885,13 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
         if (blocked := require_auth(request)) is not None:
             return blocked
         name = request.path_params["name"]
-        if request.method == "DELETE":
+        if request.method == "GET":
+            # Authenticated, read-only node-local label. Unlike POST/DELETE,
+            # it neither changes audit state nor exposes prompt-derived labels.
+            # LocalNodeClient additionally verifies the current session still
+            # exists, is readable and is not a newer session of the same name.
+            result = await anyio.to_thread.run_sync(lambda: client.get_task_label(name))
+        elif request.method == "DELETE":
             result = await anyio.to_thread.run_sync(lambda: client.clear_task_label(name))
         else:
             try:
@@ -1231,7 +1237,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
         Route("/v1/sessions/{name}/send-keys", session_send_keys, methods=["POST"]),
         Route("/v1/input-context", input_context, methods=["GET"]),
         Route("/v1/sessions/{name}/detach", detach_session, methods=["POST"]),
-        Route("/v1/sessions/{name}/task-label", session_task_label, methods=["POST", "DELETE"]),
+        Route("/v1/sessions/{name}/task-label", session_task_label, methods=["GET", "POST", "DELETE"]),
         Route("/v1/sessions/{name}", delete_session, methods=["DELETE"]),
         Route("/v1/files", put_file, methods=["POST"]),
         Route("/v1/sessions/{name}/kill", kill_session, methods=["POST"]),
