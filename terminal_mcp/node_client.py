@@ -50,6 +50,7 @@ class NodeClient(Protocol):
 
     def list_sessions(self, *, timeout_seconds: float | None = None) -> dict[str, Any]: ...
     def status(self, session: str, *, timeout_seconds: float | None = None) -> dict[str, Any]: ...
+    def get_task_label(self, session: str, *, timeout_seconds: float | None = None) -> dict[str, Any]: ...
     def tail(self, session: str, lines: int | None = None, *, ansi: bool = False) -> dict[str, Any]: ...
     def capture(self, session: str, start_line: int | None = None) -> dict[str, Any]: ...
     def send_text(self, session: str, text: str, press_enter: bool = False, dry_run: bool = False, *,
@@ -185,6 +186,55 @@ class LocalNodeClient:
             return {"error": error, "session": session}
         row = self._terminal.audit.set_task_label(node_id=NODE_LOCAL_LABEL_ID, **fields)
         return {"status": "OK", "label": row}
+
+    def get_task_label(self, session: str, *, timeout_seconds: float | None = None) -> dict[str, Any]:
+        """Read this session's last explicitly assigned task; never raw prompts.
+
+        This is the node-local 'local' mirror and is only returned for an
+        existing, readable session of the SAME instance. Failure is
+        indistinguishable from no label to avoid leaking private metadata.
+        """
+        from datetime import datetime, timezone
+        from .permissions import valid_session_name
+        from .task_labels import NODE_LOCAL_LABEL_ID, SOURCE_TITLE, normalize_title
+
+        empty = {"status": "OK", "label": None}
+        if not isinstance(session, str) or not valid_session_name(session):
+            return empty
+        state = self.status(session, timeout_seconds=timeout_seconds)
+        if not isinstance(state, dict) or state.get("exists") is not True or state.get("allowed") is not True:
+            return empty
+        listing = self.list_sessions(timeout_seconds=timeout_seconds)
+        candidates = listing.get("sessions", []) if isinstance(listing, dict) else []
+        current = next((item for item in candidates if isinstance(item, dict)
+                        and item.get("name") == session), None)
+        if current is None or current.get("effective_read") is False:
+            return empty
+        row = self._terminal.audit.get_task_label(NODE_LOCAL_LABEL_ID, session)
+        if not isinstance(row, dict) or row.get("source") != SOURCE_TITLE:
+            return empty
+        updated_raw = row.get("updated_at")
+        try:
+            updated = datetime.fromisoformat(updated_raw.replace("Z", "+00:00"))
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=timezone.utc)
+            created = current.get("created")
+            if isinstance(created, (int, float, str)) and created is not None:
+                if updated.timestamp() + 5 < float(created):
+                    return empty
+        except (TypeError, AttributeError, ValueError, OverflowError):
+            return empty
+        summary = normalize_title(row.get("summary"))
+        if summary is None:
+            return empty
+        task_id = row.get("task_id")
+        if not isinstance(task_id, str) or not 1 <= len(task_id) <= 128 or not all(
+                c.isascii() and (c.isalnum() or c in "._-") for c in task_id):
+            task_id = None
+        return {"status": "OK", "label": {
+            "summary": summary, "source": SOURCE_TITLE, "updated_at": updated.isoformat(),
+            "task_id": task_id,
+        }}
 
     def clear_task_label(self, session: str, *, timeout_seconds: float | None = None) -> dict[str, Any]:
         from .permissions import valid_session_name
@@ -581,6 +631,11 @@ class RemoteNodeClient:
         return self._request("POST", f"/v1/sessions/{urllib.parse.quote(session)}/task-label", body={
             "summary": summary, "source": source, "task_id": task_id, "request_key": request_key,
         }, timeout_seconds=timeout_seconds)
+
+    def get_task_label(self, session: str, *, timeout_seconds: float | None = None) -> dict[str, Any]:
+        """Authenticated node-local task label read; no terminal transcript."""
+        return self._request("GET", f"/v1/sessions/{urllib.parse.quote(session, safe='')}/task-label",
+                             timeout_seconds=timeout_seconds)
 
     def clear_task_label(self, session: str, *, timeout_seconds: float | None = None) -> dict[str, Any]:
         return self._request("DELETE", f"/v1/sessions/{urllib.parse.quote(session)}/task-label",
