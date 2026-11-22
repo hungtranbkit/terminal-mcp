@@ -515,6 +515,10 @@ class RemoteNodeClient:
         except (ValueError, TimeoutError) as exc:
             raise NodeClientError(f"{method} {path} -> {type(exc).__name__}: {exc}") from exc
 
+    def public_ai_usage(self, *, timeout_seconds: float | None = None) -> dict[str, Any]:
+        """Read the owning node's bounded aggregate, never raw provider data."""
+        return self._request("GET", "/v1/ai-usage/summary", timeout_seconds=timeout_seconds)
+
     def list_sessions(self, *, timeout_seconds: float | None = None) -> dict[str, Any]:
         return self._request("GET", "/v1/sessions", timeout_seconds=timeout_seconds)
 
