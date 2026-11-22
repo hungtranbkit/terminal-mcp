@@ -227,13 +227,17 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
                      workspace_root: str = "/",
                      fleet: "FleetService | None" = None,
                      throttle: "AuthThrottle | None" = None,
-                     trust_forwarded_for: bool = False, memory=None) -> Starlette:
+                     trust_forwarded_for: bool = False, memory=None, ai_usage_service=None) -> Starlette:
     # A plain string still works (every existing caller and test passes
     # one); it is wrapped so that THIS process has exactly one credential
     # object, and a rotation adopted by the heartbeat loop is immediately
     # true for every route below.
     credential = AgentCredential.of(token)
     client = LocalNodeClient(terminal)
+    # Only a cached, locally sourced public-safe projection. Never reads or
+    # returns provider OAuth tokens, account identifiers or raw usage data.
+    from .ai_usage_public import PublicUsageService
+    usage_reader = ai_usage_service if ai_usage_service is not None else PublicUsageService()
     # Brute-force protection for the shared bearer secret. Default-on: an
     # opt-in guard protects only the deployments that already thought about
     # it, which are not the ones that need it.
@@ -297,6 +301,18 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
     async def health(request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok", "node_id": node_id, "version": __version__,
                              "agent_generation": AGENT_GENERATION, **contract_describe()})
+
+    async def public_ai_usage(request: Request) -> JSONResponse:
+        """Authenticated GET-only Dell usage summary, never the raw monitor."""
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        try:
+            data = await anyio.to_thread.run_sync(usage_reader.get)
+        except Exception:
+            # Fail closed if an injected or future adapter raises. No exception
+            # or account detail is returned over the node REST API.
+            return JSONResponse({"error": "USAGE_UNAVAILABLE"}, status_code=503)
+        return JSONResponse(data)
 
     async def execution_health(request: Request) -> JSONResponse:
         """Cheap authenticated proof that the execution backend answers.
@@ -1213,6 +1229,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
         Route("/v1/health", health, methods=["GET"]),
         Route("/v1/execution-health", execution_health, methods=["GET"]),
         Route("/v1/metrics", metrics, methods=["GET"]),
+        Route("/v1/ai-usage/summary", public_ai_usage, methods=["GET"]),
         Route("/v1/ssh/manage", ssh_manage, methods=["POST"]),
         Route("/v1/environment", environment, methods=["GET"]),
         Route("/v1/repo-evidence", repo_evidence, methods=["GET"]),
