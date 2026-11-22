@@ -18,7 +18,7 @@ from .ai_usage_client import fetch_usage
 _PROVIDERS = ("codex", "claude", "gemini", "antigravity")
 _WINDOWS = ("five_hour", "weekly")
 _LOCAL_MONITOR = "http://127.0.0.1:8787"
-_MAX_TIMEOUT_SECONDS = 2.0
+_MAX_TIMEOUT_SECONDS = 3.5
 
 
 def _percentage(value: Any) -> float | None:
@@ -126,5 +126,8 @@ class PublicUsageService:
                 # No raw exception (may contain paths/account details) escapes.
                 value = safe_public_usage(None, sampled_at=sampled_at)
                 value["source_status"] = "unavailable"
-            self._cached, self._last_at = value, tick
+            self._cached = value
+            # A transient cold-start/provider timeout must not hide real
+            # quota metrics for a full minute. Retry a failed read in 15s.
+            self._last_at = tick if value["source_status"] == "ok" else tick - self._ttl + 15.0
             return copy.deepcopy(value)
