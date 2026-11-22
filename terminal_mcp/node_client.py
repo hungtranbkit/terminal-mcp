@@ -218,9 +218,20 @@ class LocalNodeClient:
             if updated.tzinfo is None:
                 updated = updated.replace(tzinfo=timezone.utc)
             created = current.get("created")
-            if isinstance(created, (int, float, str)) and created is not None:
-                if updated.timestamp() + 5 < float(created):
-                    return empty
+            if isinstance(created, (int, float)):
+                created_epoch = float(created)
+            elif isinstance(created, str):
+                try:
+                    created_epoch = float(created)
+                except ValueError:
+                    parsed = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    created_epoch = parsed.timestamp()
+            else:
+                return empty
+            if updated.timestamp() + 5 < created_epoch:
+                return empty
         except (TypeError, AttributeError, ValueError, OverflowError):
             return empty
         summary = normalize_title(row.get("summary"))
