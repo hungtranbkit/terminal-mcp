@@ -1408,3 +1408,28 @@ Owner reported (2026-11-09, 20:45 Asia/Ho_Chi_Minh) a successful manual HP→Del
 | dell-5530, mac17-macbook-pro, local | Offline/pending | Do not claim setup or SSH verification. |
 
 HP→Dell product status, setup, strict verification, and bounded exec are live-accepted with the stated repeated-setup profile-status gap. Next deploy PR #115 and repeat setup/status/verify; then browser terminal attach/detach requires an authenticated dashboard session and a working browser runtime. Other online nodes and Windows remain unconfigured/unverified; offline nodes stay pending. Do not infer SSH readiness from node heartbeat, and never restart the fleet together.
+
+
+## Read-only current task title for an authenticated node (2026-11-22)
+
+`GET /v1/sessions/{name}/task-label` uses the same bearer token and node
+permissions as the existing node-agent status and task-label write routes.
+It is an **optional** capability; older node agents respond 404 and the
+controller must fail closed rather than guessing a task.
+
+The GET handler checks that the named session currently exists and is
+readable, then reads the node-local mirror from `AuditStore`. Only an
+explicitly supplied owner title (`source=title`) is returned, capped,
+re-normalized and redacted; prompt-derived summaries never leave the node
+through this endpoint. An orphan task label older than the current session's
+creation is rejected. The response may contain the optional private task ID
+for authenticated callers, but never a prompt, request key, command, terminal
+tail, cwd, path or credential. Unauthorized requests receive HTTP 401.
+
+`RemoteNodeClient.get_task_label()` is a thin authenticated reader, not a
+new command channel. The public ProjectFlow/CrommaCode projector maps the
+title to a fixed, server-owned broad category and intentionally removes raw
+titles and IDs. It must keep task assignment independent of execution state:
+a labelled but idle session is still IDLE, and a labelled UNKNOWN session is
+not RUNNING. Roll out the node-agent endpoint to one canary node at a time;
+the existing POST/DELETE label and every other node route are unchanged.
