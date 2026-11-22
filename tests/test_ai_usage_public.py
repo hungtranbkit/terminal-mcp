@@ -87,7 +87,7 @@ def test_caching_is_read_only_and_source_failure_is_explicit():
     assert failure["source_status"] == "unavailable"
     assert all(p["windows"] == {} for p in failure["providers"])
     assert "PermissionError" not in json.dumps(failure)
-    assert calls == [("http://127.0.0.1:8787", 2.0)] * 2
+    assert calls == [("http://127.0.0.1:8787", 3.5)] * 2
 
 
 def test_node_route_requires_bearer_and_only_allows_get(tmp_path):
