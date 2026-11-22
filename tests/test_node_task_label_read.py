@@ -90,3 +90,15 @@ def test_remote_client_reads_bearer_authenticated_task_label(tmp_path):
     result = remote.get_task_label("agent-worker", timeout_seconds=2.0)
     assert result["label"]["summary"] == "CrommaCode status verification"
     assert seen == [("GET", _url(), 2.0)]
+
+
+def test_iso_created_times_from_live_node_listing(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    client, terminal, _, born = _client(tmp_path)
+    terminal.audit.set_task_label(node_id="local", session="agent-worker",
+                                  summary="Verify project observability", source="title")
+    headers = {"Authorization": "Bearer " + TOKEN}
+    born[0] = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+    assert client.get(_url(), headers=headers).json()["label"]["summary"] == "Verify project observability"
+    born[0] = (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()
+    assert client.get(_url(), headers=headers).json()["label"] is None
