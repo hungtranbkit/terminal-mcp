@@ -720,3 +720,21 @@ def test_node_ssh_exec_routes_only_structured_argv_to_verified_profile():
                         args={"operation": "exec", "argv": ["id", "-un"], "timeout": 5})
     assert result["status"] == "OK"
     assert result["result"]["exit_code"] == 0
+
+
+@pytest.mark.parametrize("route_status", [
+    "route_collision", "route_banner_mismatch", "route_unreachable",
+])
+def test_node_ssh_route_failures_are_never_reported_as_top_level_ok(route_status):
+    class SSH:
+        def status(self, node_id):
+            return {"node_id": node_id, "status": route_status, "error": route_status}
+
+    tools = _tools()
+    tools.node_ssh = SSH()
+
+    result = tools.turn(action="node_ssh", node_id="macbook",
+                        args={"operation": "status"})
+
+    assert result["status"] == "FAILED"
+    assert result["result"]["status"] == route_status

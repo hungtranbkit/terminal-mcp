@@ -10,6 +10,7 @@ import re
 import secrets
 import shutil
 import shlex
+import socket
 import subprocess
 import tempfile
 import threading
@@ -83,6 +84,29 @@ class NodeSSHService:
         except (OSError, ValueError):
             return {}
         return value if isinstance(value, dict) else {}
+
+    def _registered_route_diagnostic(self, host: str, port: int) -> dict[str, Any] | None:
+        """Fail closed when the registered address does not reach node OpenSSH."""
+        try:
+            with socket.create_connection((host, port), timeout=min(self.timeout, 2.0)) as stream:
+                stream.settimeout(min(self.timeout, 2.0))
+                raw = stream.recv(256)
+        except (OSError, socket.timeout):
+            return {"status": "route_unreachable", "error": "route_unreachable",
+                    "detail": "registered SSH route did not return an SSH banner"}
+        banner = raw.decode("ascii", errors="replace").splitlines()[0][:120] if raw else ""
+        if not banner:
+            return {"status": "route_unreachable", "error": "route_unreachable",
+                    "detail": "registered SSH route did not return an SSH banner"}
+        if banner.startswith("SSH-2.0-Tailscale"):
+            return {"status": "route_collision", "error": "route_collision",
+                    "route_banner": banner,
+                    "detail": "registered SSH route terminates at Tailscale SSH, not the node OpenSSH server"}
+        if not banner.startswith("SSH-"):
+            return {"status": "route_banner_mismatch", "error": "route_banner_mismatch",
+                    "route_banner": banner,
+                    "detail": "registered SSH route returned a non-SSH banner"}
+        return None
 
     def _store_profile(self, path: Path, profile: dict[str, Any]) -> None:
         fd, name = tempfile.mkstemp(prefix=".profile-", dir=str(path.parent))
@@ -160,6 +184,21 @@ class NodeSSHService:
                     "address": profile.get("address"), "username": profile.get("username"),
                     "port": profile.get("port"), "host_key_fingerprint": profile.get("host_key_fingerprint"),
                     "verified_at": profile.get("verified_at")}
+        if result.get("status") == "ready":
+            route_error = self._registered_route_diagnostic(
+                host, int(result.get("port") or port))
+            if route_error is not None:
+                return {"node_id": node_id, **route_error,
+                        "configured": profile.get("status") in {"configured", "verified"},
+                        "verified": False, "connect_available": False,
+                        "address": profile.get("address", host),
+                        "username": profile.get("username", result.get("username")),
+                        "port": profile.get("port", result.get("port", port)),
+                        "host_key_fingerprint": profile.get("host_key_fingerprint"),
+                        "verified_at": profile.get("verified_at"),
+                        "agent_preflight": result.get("status"),
+                        "private_key_present": key_path.exists(),
+                        "pinned_host_key": known_hosts.exists()}
         stored_status = profile.get("status")
         observed_status = stored_status or ("not_configured" if result.get("status") == "ready"
                                             else result.get("status", "unknown"))
@@ -198,6 +237,10 @@ class NodeSSHService:
                 preflight = client.ssh_manage("status")
                 if preflight.get("status") != "ready":
                     return {"node_id": node_id, **preflight}
+                route_error = self._registered_route_diagnostic(
+                    host, int(preflight.get("port") or port))
+                if route_error is not None:
+                    return {"node_id": node_id, **route_error}
                 pub = self._ensure_key(key_path)
                 host_public_key = str(preflight.get("host_public_key") or "")
                 fingerprint = self._fingerprint(host_public_key)
@@ -358,6 +401,12 @@ class NodeSSHService:
             validate_hostname_or_ip(host)
         except ValueError:
             return {"node_id": node_id, "status": "error", "error": "invalid_registered_address"}
+        route_error = self._registered_route_diagnostic(host, port)
+        if route_error is not None:
+            profile.update(status=route_error["status"], verified=False,
+                           error=route_error["error"])
+            self._store_profile(profile_path, profile)
+            return {"node_id": node_id, **route_error, "verified": False}
         argv = [self.ssh, "-F", os.devnull, "-i", str(key_path), "-p", str(port), "-o", "IdentityAgent=none",
                 "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}", "-o", "GlobalKnownHostsFile=/dev/null",
                 "-o", "ConnectTimeout=5", f"{user}@{host}",
