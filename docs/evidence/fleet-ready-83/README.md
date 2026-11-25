@@ -1,0 +1,15 @@
+# Fleet readiness V2 evidence, 2026-11-25
+
+Source gate: `cdccde24cda2a5263b1e31ba909367c0665fdd2b` after merging verified main `d1c6eae010b1758b08636f1923c98b2cf5d0aedb`. Focused local gate: **252 passed, 1 browser test deselected, 3 warnings, 20.47 s**. Scope: readiness, lifecycle, headless, node SSH, node agent SSH, compact tools/delete, Linux/node installers, PR131 browser file collection. This is not an all-suite PASS; the prior 30 broad failures have not all been rerun.
+
+Actual isolated TerminalService.create_session used real grants/binding and a private post-grant execution gate, verified pinned PF source `1cf9404434155fc743cee620846b0350c22d857e`, and non-root Docker Codex. It produced two files, passed shell syntax and three assertions, and independent host execution printed `PF83_MCP_V2_BUILD_TEST_PASS`. CLI exit 0 / 22.514 s; total 28.363 s. Wrapper exit alone remained UNVERIFIED; the independent artifacts establish local task success. Retry returned BINDING_EXISTS, session absence was verified, and rollback/repeated rollback passed. No routine permission prompt observed; raw CLI output remains private, with its SHA in the receipt.
+
+Normal host Git delivery then verified source/HP/remote SHA `129b171f437dd92e1feaf5af72da246e8985fd0b` and created [proof PR88](https://github.com/hungtranbkit/projectflow-workspace-manager/pull/88). Only the unpublished proof delta was rebased onto verified main before delivery; checkpoint preserves original commit and unchanged artifact hashes. No force push. Container execution and host delivery are separate proofs.
+
+Code review: skipped (ce-code-review unavailable). The attempted full reviewer/validator sequence exhausted capacity. A fresh bounded independent review found issues which were fixed; its final receipt reports no remaining concrete blocker but degraded coverage. The later three-way probe exception classification has targeted regression coverage. No full review or rollout approval is claimed.
+
+Before: optional scripts did not gate normal designated launches. After: exact owner-configured task launch reaches shared preflight, grants/binding gate and durable runner; ordinary unenrolled launches keep existing behavior. Missing executable, denied execution and probe timeout are distinct. Installers expose readiness-only audit/apply/check/rollback before pairing or service changes. A tracked policy symlink was initially over-rejected and the canonical worktree root initially misconfigured; both blocked before dispatch and are disclosed in the PF acceptance record.
+
+Not verified: authenticated live dashboard (Cloudflare Access login pending); dashboard form unattended launch (form lacks prompt/binding); remote V2 product launches; Claude auth/tools/connectors; macOS/Windows runtime. No live V2 rollout, service restart, key/token transfer, global trust, root agent, Actions dispatch or historical-task replay was performed. PR131's separate controller-only rollout is owner-coordinated and not this feature rollout.
+
+Related: hungtranbkit/projectflow-workspace-manager#83; hungtranbkit/projectflow-workspace-manager#84; #128; #118.
