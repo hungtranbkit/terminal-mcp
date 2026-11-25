@@ -1394,6 +1394,31 @@ A controller can manage a dedicated SSH key for an already registered node witho
 
 The controller writes one Ed25519 private key per target under the private state directory (0700 directory, 0600 key), persists a non-secret profile, and obtains the SSH host public key through the authenticated node channel. It refuses a changed pin. Verification uses an isolated client config, IdentityAgent=none, IdentitiesOnly=yes, BatchMode=yes, StrictHostKeyChecking=yes, and a dedicated known_hosts file; a nonce, SSH username, and node hostname must all match. No password prompt or machine-wide SSH config is used. terminal_turn(action=node_ssh, node_id=…, args={operation: status|setup|verify|connect|revoke}) exposes lifecycle; operation=exec takes a bounded structured argv (not a shell-string parameter) and returns a bounded result. The dashboard Nodes detail view has “Thiết lập SSH”, “Kiểm tra”, “Mở terminal”, and “Thu hồi key”. Its terminal opens a persistent remote tmux session: closing the browser detaches that SSH client and does not kill remote work. Dashboard WebSocket uses the existing login, origin, mutation, and terminal-input guards.
 
+The controller also reads the bounded SSH identification banner from the
+registered node address before setup or verification. `route_collision` means
+that address terminates at Tailscale SSH while the authenticated node channel
+reported the local OpenSSH host key; those identities must never be combined.
+`route_banner_mismatch` means a non-SSH service answered, and
+`route_unreachable` means no SSH banner arrived. None of these states falls
+back to an unregistered LAN address or installs a key.
+
+For an owner-approved Linux node whose tailnet port 22 is intercepted by
+Tailscale SSH, keep the tailnet network ACL in place and expose the already
+running local OpenSSH server with this one-time admin action on that node:
+
+```bash
+sudo tailscale set --ssh=false
+```
+
+Then confirm from the controller that the registered tailnet address returns
+an `SSH-2.0-OpenSSH...` banner before repeating managed setup/verify. Do not use
+a colliding LAN address, disable strict host checking, or change Docker routes.
+If the node has no OpenSSH server, the Ubuntu prerequisite is:
+
+```bash
+sudo apt-get update && sudo apt-get install -y openssh-server && sudo systemctl enable --now ssh
+```
+
 ### Current rollout evidence
 
 Owner reported (2026-11-09, 20:45 Asia/Ho_Chi_Minh) a successful manual HP→Dell canary through the existing authenticated node shell: target Dell 100.81.85.120:22, user dell; a dedicated private key remained on HP at /home/kimex/.local/state/terminal-mcp/node-ssh-canary/hp-to-dell-ed25519; host public key was obtained directly from Dell and pinned in the canary known_hosts; a managed public-key line was appended while preserving prior entries and an authorized-keys backup was retained. The real SSH nonce/identity command returned dell-Latitude-5511, user dell, exit 0, and ssh -F …/ssh_config dell-linux whoami returned dell, exit 0. Owner also reported default client config fails on a permissions problem in /etc/ssh/ssh_config.d/20-systemd-ssh-proxy.conf and the isolated config initially offered too many agent keys; the dedicated identity plus the strict options above resolved both. This canary is owner-verified evidence, not independently re-run by this source checkout. Product revoke only touches its own stored key and therefore does not delete that earlier canary key; do not copy or print its private key.

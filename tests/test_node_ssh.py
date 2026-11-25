@@ -3,10 +3,20 @@ from __future__ import annotations
 from types import SimpleNamespace
 import os
 from pathlib import Path
+import pytest
 
 from terminal_mcp.node_client import NodeClientError
 from terminal_mcp.node_client import RemoteNodeClient
 from terminal_mcp.node_ssh import NodeSSHService
+
+_REAL_ROUTE_DIAGNOSTIC = NodeSSHService._registered_route_diagnostic
+
+
+@pytest.fixture(autouse=True)
+def _default_registered_route_is_reachable(monkeypatch):
+    """Existing unit tests exercise SSH behavior, not the controller network."""
+    monkeypatch.setattr(NodeSSHService, "_registered_route_diagnostic",
+                        lambda self, host, port: None)
 
 
 class Registry:
@@ -41,6 +51,55 @@ def test_online_heartbeat_without_node_client_is_not_authorization(tmp_path):
     result = service.status("hp-linux")
     assert result["status"] == "offline"
     assert result["configured"] is False
+
+
+def test_status_surfaces_registered_route_collision(monkeypatch, tmp_path):
+    client = Client({"status": "ready", "host_public_key": "ssh-ed25519 dGVzdA== host",
+                     "username": "alice", "hostname": "node-a", "port": 22})
+    service = NodeSSHService(Controller(client), tmp_path / "keys")
+    monkeypatch.setattr(service, "_registered_route_diagnostic", lambda *_args: {
+        "status": "route_collision", "error": "route_collision",
+        "route_banner": "SSH-2.0-Tailscale",
+        "detail": "registered SSH route terminates at Tailscale SSH, not the node OpenSSH server",
+    })
+
+    result = service.status("hp-linux")
+
+    assert result["status"] == "route_collision"
+    assert result["route_banner"] == "SSH-2.0-Tailscale"
+    assert result["agent_preflight"] == "ready"
+
+
+@pytest.mark.parametrize(("banner", "expected"), [
+    (b"SSH-2.0-Tailscale\r\n", "route_collision"),
+    (b"HTTP/1.1 200 OK\r\n", "route_banner_mismatch"),
+    (b"", "route_unreachable"),
+    (b"SSH-2.0-OpenSSH_9.6p1 Ubuntu\r\n", None),
+])
+def test_registered_route_banner_diagnostics(monkeypatch, tmp_path, banner, expected):
+    class Connection:
+        def __enter__(self): return self
+        def __exit__(self, *_args): pass
+        def settimeout(self, _timeout): pass
+        def recv(self, _size): return banner
+
+    service = NodeSSHService(Controller(Client({"status": "ready"})), tmp_path / "keys")
+    monkeypatch.setattr("socket.create_connection", lambda *_args, **_kwargs: Connection())
+
+    result = _REAL_ROUTE_DIAGNOSTIC(service, "10.1.2.3", 22)
+
+    assert (result or {}).get("status") == expected
+
+
+def test_registered_route_connection_failure_is_bounded_and_actionable(monkeypatch, tmp_path):
+    service = NodeSSHService(Controller(Client({"status": "ready"})), tmp_path / "keys")
+    monkeypatch.setattr("socket.create_connection",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError()))
+
+    result = _REAL_ROUTE_DIAGNOSTIC(service, "10.1.2.3", 22)
+
+    assert result["status"] == "route_unreachable"
+    assert "did not return an SSH banner" in result["detail"]
 
 
 def test_profile_store_directory_is_private_and_never_contains_key_material(tmp_path):
@@ -156,6 +215,78 @@ def test_setup_never_mutates_node_when_authenticated_host_key_disagrees_with_pin
 
     assert result["status"] == "host_key_mismatch"
     assert client.calls == ["status"]
+
+
+def test_setup_fails_fast_when_registered_route_is_tailscale_ssh_proxy(monkeypatch, tmp_path):
+    """A node's local OpenSSH key must not be paired with a proxy SSH route."""
+    class RecordingClient:
+        def __init__(self): self.calls = []
+        def ssh_manage(self, action, public_key=None):
+            self.calls.append(action)
+            return {"status": "ready", "host_public_key": "ssh-ed25519 dGVzdA== host",
+                    "username": "alice", "hostname": "node-a", "port": 22}
+
+    client = RecordingClient()
+    service = NodeSSHService(Controller(client), tmp_path / "keys")
+    monkeypatch.setattr(service, "_registered_route_diagnostic", lambda *_args: {
+        "status": "route_collision", "error": "route_collision",
+        "route_banner": "SSH-2.0-Tailscale",
+        "detail": "registered SSH route terminates at Tailscale SSH, not the node OpenSSH server",
+    }, raising=False)
+
+    result = service.setup("hp-linux")
+
+    assert result == {
+        "node_id": "hp-linux", "status": "route_collision", "error": "route_collision",
+        "route_banner": "SSH-2.0-Tailscale",
+        "detail": "registered SSH route terminates at Tailscale SSH, not the node OpenSSH server",
+    }
+    assert client.calls == ["status"]
+    assert not list((tmp_path / "keys").glob("**/id_ed25519"))
+
+
+def test_registered_openssh_banner_allows_setup_to_continue(monkeypatch, tmp_path):
+    class SetupClient:
+        def ssh_manage(self, action, public_key=None):
+            if action == "status":
+                return {"status": "ready", "host_public_key": "ssh-ed25519 dGVzdA== host",
+                        "username": "alice", "hostname": "node-a", "port": 22}
+            return {"status": "configured", "changed": True, "username": "alice",
+                    "hostname": "node-a", "port": 22}
+
+    service = NodeSSHService(Controller(SetupClient()), tmp_path / "keys")
+    monkeypatch.setattr(service, "_registered_route_diagnostic", lambda *_args: None,
+                        raising=False)
+    monkeypatch.setattr(service, "_ensure_key", lambda _path:
+                        "ssh-ed25519 AAAA terminal-mcp:hp-linux-hp-linux:20261125")
+
+    result = service.setup("hp-linux")
+
+    assert result["status"] == "configured"
+
+
+def test_verify_reports_route_collision_before_starting_ssh(monkeypatch, tmp_path):
+    import json
+
+    service = NodeSSHService(Controller(Client({"status": "ready"})), tmp_path / "keys")
+    key, known_hosts, profile = service._paths("hp-linux")
+    key.write_text("private")
+    known_hosts.write_text("10.1.2.3 ssh-ed25519 dGVzdA==\n")
+    profile.write_text(json.dumps({"status": "configured", "verified": False,
+                                   "address": "10.1.2.3", "username": "alice", "port": 22}))
+    monkeypatch.setattr(service, "_registered_route_diagnostic", lambda *_args: {
+        "status": "route_collision", "error": "route_collision",
+        "route_banner": "SSH-2.0-Tailscale",
+        "detail": "registered SSH route terminates at Tailscale SSH, not the node OpenSSH server",
+    }, raising=False)
+    monkeypatch.setattr("terminal_mcp.node_ssh.subprocess.run",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("SSH must not run")))
+
+    result = service.verify("hp-linux")
+
+    assert result["status"] == "route_collision"
+    assert result["verified"] is False
+    assert result["route_banner"] == "SSH-2.0-Tailscale"
 
 
 def test_repeated_setup_preserves_verified_profile_when_identity_and_pin_are_unchanged(monkeypatch, tmp_path):
