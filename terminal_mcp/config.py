@@ -730,6 +730,7 @@ class SessionLifecycleConfig:
     # Codex CLI's current, audited YOLO flag. Shared by create and
     # registry-reopen; never assembled by individual callers.
     codex_yolo: bool = False
+    fleet_readiness: dict = field(default_factory=dict)
     create_ready_timeout_seconds: float = 5.0
     default_grant_mode: str = "none"
     # Admission control. A node with no ceiling does not fail loudly when
@@ -2835,6 +2836,7 @@ def _load_session_lifecycle_config(raw: object) -> SessionLifecycleConfig:
         launch_commands=tuple(sorted(launch_raw.items())), create_ready_timeout_seconds=timeout,
         default_grant_mode=grant_mode, resume_capable_agent_types=tuple(resume_capable_raw),
         codex_yolo=codex_yolo_raw, max_sessions=max_sessions,
+        fleet_readiness=_load_fleet_readiness(raw.get("fleet_readiness", {})),
         maintenance_reserve_sessions=maintenance_reserve,
         maintenance_session_prefixes=tuple(maintenance_prefixes),
         allow_put_file=allow_put_file, max_put_file_bytes=max_put_file_bytes,
@@ -2972,3 +2974,22 @@ def _load_dashboard_config(dashboard_raw: object) -> DashboardConfig:
         allowed_origins=tuple(origins),
         web_terminal_enabled=bool(dashboard_raw.get("web_terminal_enabled", False)),
     )
+
+
+def _load_fleet_readiness(raw):
+    if not isinstance(raw, dict):
+        raise ValueError('session_lifecycle.fleet_readiness must be a mapping')
+    if not isinstance(raw.get('enabled', False), bool):
+        raise ValueError('fleet_readiness.enabled must be boolean')
+    if raw.get('enabled'):
+        if not all(isinstance(raw.get(key), str) and raw[key] for key in ('source', 'source_sha')):
+            raise ValueError('fleet_readiness requires pinned source')
+        if not isinstance(raw.get('workspaces'), list):
+            raise ValueError('fleet_readiness.workspaces must be a list')
+        for entry in raw['workspaces']:
+            if not isinstance(entry, dict) or not all(isinstance(entry.get(key), str) and entry[key]
+                    for key in ('workspace', 'state', 'repo', 'binding', 'task_id')):
+                raise ValueError('fleet_readiness workspace requires workspace/state/repo/binding/task_id')
+            if entry.get('scope', 'local') not in ('local', 'delivery', 'hp-delivery'):
+                raise ValueError('fleet_readiness unknown scope')
+    return raw

@@ -6,6 +6,8 @@ executing the CLI. Checkpoint/cleanup never remove the working directory.
 """
 from __future__ import annotations
 
+from .launcher_resolution import effective_path
+
 import fcntl
 from contextlib import contextmanager
 import hashlib
@@ -400,7 +402,7 @@ class HeadlessManager:
                 '--property=MemoryMax=2G', '--property=CPUQuota=200%',
                 '--property=NoNewPrivileges=yes', '--property=UMask=0077',
                 '--setenv=PYTHONPATH=' + str(Path(__file__).resolve().parent.parent),
-                '--setenv=PATH=' + os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin'),
+                '--setenv=PATH=' + effective_path(),
                 sys.executable, '-m', 'terminal_mcp.headless', str(self.store.root), row['task_id']],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=15, close_fds=True)

@@ -24,7 +24,15 @@
 #                           systemd unit's own comment before changing this)
 #   --heartbeat-interval N  Seconds between heartbeat pushes to the controller (default: 20)
 #   --no-systemd            Print the commands instead of running systemctl (for a non-systemd host)
+# Readiness-only repair: --fleet-readiness-config FILE --fleet-workspace DIR
+# [--fleet-action audit|apply|check|rollback] [--authorize-trust]. Audit default;
+# exits before package/token/config/service changes. Source must be SHA-pinned.
 set -euo pipefail
+FLEET_CONFIG=""
+FLEET_WORKSPACE=""
+FLEET_ACTION="audit"
+FLEET_AUTHORIZE=()
+
 
 CONTROLLER_URL=""
 NODE_ID=""
@@ -39,6 +47,11 @@ PAIRED_MODE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --fleet-readiness-config) FLEET_CONFIG="$2"; shift 2 ;;
+    --fleet-workspace) FLEET_WORKSPACE="$2"; shift 2 ;;
+    --fleet-action) FLEET_ACTION="$2"; shift 2 ;;
+    --authorize-trust) FLEET_AUTHORIZE=(--authorize-trust); shift ;;
+
     --controller) CONTROLLER_URL="$2"; shift 2 ;;
     --node-id) NODE_ID="$2"; shift 2 ;;
     --repo-dir) REPO_DIR="$2"; shift 2 ;;
@@ -53,6 +66,13 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
+
+if [[ -n "$FLEET_CONFIG" ]]; then
+  FLEET_PYTHON="${PYTHON_BIN:-python3}"
+  if [[ -x "$REPO_DIR/.venv/bin/python" ]]; then FLEET_PYTHON="$REPO_DIR/.venv/bin/python"; fi
+  exec "$FLEET_PYTHON" "$(dirname "$0")/../scripts/fleet-readiness.py" \
+    --config "$FLEET_CONFIG" --workspace "$FLEET_WORKSPACE" --action "$FLEET_ACTION" "${FLEET_AUTHORIZE[@]}"
+fi
 
 if [[ -z "$CONTROLLER_URL" || -z "$NODE_ID" ]]; then
   echo "Error: --controller and --node-id are both required. See --help." >&2

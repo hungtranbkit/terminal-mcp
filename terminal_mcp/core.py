@@ -4518,6 +4518,12 @@ class TerminalService:
         if grant_mode not in ("none", "read", "read_send"):
             self.audit.record(action=action, session=name, result="BLOCKED", reason="INVALID_GRANT_MODE")
             return {"error": "INVALID_GRANT_MODE", "session": name}
+        from .fleet_readiness import FleetReadinessError, prepare_launch, selected_entry, release_dispatch_gate
+        fleet_config = self.config.session_lifecycle.fleet_readiness
+        try:
+            fleet_entry = selected_entry(fleet_config, cwd) if agent_type != 'shell' else None
+        except (FleetReadinessError, OSError, KeyError, ValueError):
+            return {'error': 'TRUST_REQUIRED', 'session': name, 'state': 'BLOCKED'}
         # Admission control, checked before anything is created. Without
         # it a node has no ceiling and does not fail loudly when it runs
         # out of room -- it degrades. On dell-linux (2026-09-21) the
@@ -4547,7 +4553,7 @@ class TerminalService:
         elif limit:
             current -= self._maintenance_session_count()  # the reserve is not user capacity
         reclaimed: list[str] = []
-        if limit and current >= limit:
+        if limit and current >= limit and fleet_entry is None:
             # Reclaim before refusing: an idle shell holding a slot should
             # lose it to real work, not block it. Only ever frees the
             # shortfall, never a blanket sweep.
@@ -4564,6 +4570,33 @@ class TerminalService:
                                f"{len(reclaimed)} idle session(s) reclaimed and it is "
                                "still full -- delete a session, or raise "
                                "session_lifecycle.max_sessions")}
+        # Exact server-selected trusted tasks use the shared PF contract. Check
+        # the existing grant/binding guards BEFORE any unattended prompt starts.
+        fleet_launch = None
+        try:
+            if fleet_entry is not None:
+                guard = (require_read(self.config) or
+                         self._input_grant_block_reason(name, pane_current_command=agent_type))
+                if not self.config.input_policy.allow_send_text:
+                    guard = 'ACTION_NOT_ALLOWED'
+                elif initial_prompt and ('\x00' in initial_prompt or len(initial_prompt) > self.config.input_policy.max_text_length):
+                    guard = 'INVALID_TEXT' if '\x00' in initial_prompt else 'INPUT_TOO_LARGE'
+                if guard or grant_mode != 'read_send':
+                    return {'error': guard or 'READ_SEND_REQUIRED', 'session': name, 'state': 'BLOCKED'}
+                if not binding or not valid_binding_name(binding):
+                    return {'error': 'BINDING_REQUIRED', 'session': name, 'state': 'BLOCKED'}
+                if self.bindings.get(binding) is not None:
+                    return {'error': 'BINDING_EXISTS', 'session': name, 'state': 'BLOCKED'}
+                if resume_session_id:
+                    return {'error': 'TRUSTED_RESUME_CHECKPOINT_REQUIRED', 'session': name, 'state': 'BLOCKED'}
+                fleet_launch = prepare_launch(fleet_config, cwd=cwd, agent=agent_type,
+                    prompt=initial_prompt, session=name, binding=binding,
+                    allowed_roots=lifecycle_cfg.allowed_cwd_roots)
+                if fleet_launch and not fleet_launch.argv:
+                    return {**fleet_launch.receipt, 'session': name}
+        except (FleetReadinessError, OSError, KeyError, ValueError) as exc:
+            code = str(exc) if isinstance(exc, FleetReadinessError) else 'TRUST_REQUIRED'
+            return {'error': code, 'session': name, 'state': 'BLOCKED'}
         conversation_id: str | None = None
         extra_args: tuple[str, ...] = ()
         if agent_type == "codex" and resume_session_id:
@@ -4585,8 +4618,13 @@ class TerminalService:
             else:
                 conversation_id = str(uuid.uuid4())
                 extra_args = ("--session-id", conversation_id)
-        result = self.lifecycle.create(name, agent_type, cwd, show_on_desktop=show_on_desktop,
-                                       extra_args=extra_args)
+        if fleet_launch:
+            result = self.lifecycle.create(name, agent_type, cwd, show_on_desktop=show_on_desktop,
+                                           prepared_fleet=fleet_launch)
+            conversation_id = None
+        else:
+            result = self.lifecycle.create(name, agent_type, cwd, show_on_desktop=show_on_desktop,
+                                           extra_args=extra_args)
         ok = "error" not in result
         self.audit.record(action=action, session=name, result="CREATED" if ok else "BLOCKED",
                           reason=result.get("error") or f"agent_type={agent_type}")
@@ -4611,7 +4649,7 @@ class TerminalService:
             # The launcher we ACTUALLY ran, from the same lookup that ran it --
             # now the only place a launch_command is ever written, which is
             # what its docstring always claimed.
-            launch_command=self.lifecycle.launch_command_for(agent_type),
+            launch_command=(fleet_launch.argv[0] if fleet_launch else self.lifecycle.launch_command_for(agent_type)),
             launcher_type=agent_type,
             # A session started inside a linked worktree owns that worktree;
             # the lifecycle reconciler reads this instead of guessing from a
@@ -4650,7 +4688,28 @@ class TerminalService:
             binding_result = self.terminal_bind(binding, name)
         result["binding"] = binding_result
 
-        if initial_prompt:
+        if fleet_launch:
+            # Runner is waiting at its private bounded gate. A failed grant or
+            # binding must never result in a prompt executing independently.
+            granted = (grant_result and grant_result.get('read', {}).get('read_enabled') is True
+                       and grant_result.get('input', {}).get('input_enabled') is True
+                       and binding_result and not binding_result.get('error')
+                       and binding_result.get('binding') == binding
+                       and binding_result.get('session') == name
+                       and self._input_authorized(name)[0])
+            if not granted:
+                result.update(error='GRANT_HANDOFF_DENIED', state='BLOCKED', execution_confirmed=False)
+                result['initial_prompt_result'] = {'sent': False, 'execution_confirmed': False}
+                return result
+            try:
+                release_dispatch_gate(fleet_launch, workspace=cwd, session=name, binding=binding)
+            except (OSError, FleetReadinessError):
+                result.update(error='GRANT_HANDOFF_DENIED', state='BLOCKED', execution_confirmed=False)
+                return result
+            result['fleet_readiness'] = fleet_launch.receipt
+            result['initial_prompt_result'] = {'status': 'SUBMITTED', 'execution_confirmed': False,
+                'request_key': fleet_launch.request_key, 'transport': 'shared_fleet_runner'}
+        elif initial_prompt:
             may_preflight = (result.get("state") == "READY" or
                              (agent_type in {"codex", "claude"} and result.get("state") == "CREATED"
                               and (result.get("agent_process_ready") is True or
