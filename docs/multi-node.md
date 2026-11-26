@@ -1402,7 +1402,36 @@ reported the local OpenSSH host key; those identities must never be combined.
 `route_unreachable` means no SSH banner arrived. None of these states falls
 back to an unregistered LAN address or installs a key.
 
-For an owner-approved Linux node whose tailnet port 22 is intercepted by
+An operator can instead configure `nodes.remote[].ssh_route` for an explicitly
+approved private IP/port that reaches the **same** node's OpenSSH server. This
+only changes SSH transport; the registered HTTP/agent endpoint is unchanged:
+
+```yaml
+# Inside the existing nodes.remote entry (example values; not discovery):
+ssh_route:
+  address: 192.168.100.97
+  port: 22
+  registered_endpoint: http://100.81.85.120:8790
+  username: dell
+  hostname: dell-Latitude-5511
+  host_key_fingerprint: SHA256:<existing-authenticated-43-character-fingerprint>
+```
+
+The route is server configuration, never a browser/API host override. Before
+status/setup/verify/exec/connect it must match the current registry endpoint,
+authenticated agent node ID/user/hostname/key, and the existing managed profile
+and known_hosts pin. Missing managed keys/pins are refused: route setup validates
+only and cannot install keys or trust a new endpoint. The original host alias is
+used with strict checking and `UpdateHostKeys=no`. Verification requires a fresh
+nonce/user/hostname proof. Changing or removing the route invalidates its prior
+proof; unreachable routes, identity drift and Tailscale banners fail closed with
+no fallback. `verify(..., persist=False)` supports a staged operator canary without
+changing the live profile; it does not enable connect. Configuration activation
+still requires the normal reviewed release and coordinated controller restart.
+Rollback restores the previous release/config; no keys or registry rows are edited.
+
+A separate option, requiring explicit owner approval and recovery planning:
+for an owner-approved Linux node whose tailnet port 22 is intercepted by
 Tailscale SSH, keep the tailnet network ACL in place and expose the already
 running local OpenSSH server with this one-time admin action on that node:
 

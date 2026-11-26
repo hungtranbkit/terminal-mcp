@@ -53,6 +53,24 @@ def test_nodes_ssh_web_opens_selected_node_or_explains_why_it_cannot_connect():
         page.goto("http://localhost/dashboard/nodes")
         playwright.expect(page.get_by_role("link", name="SSH Web")).to_have_count(2)
         assert status_requests == []
+        # Exercise the same real Nodes page at phone and desktop widths.
+        # Check scroll containers as well as the document: overflow:hidden
+        # on the document must not hide a too-wide toolbar or node grid.
+        for width in (320, 390, 1366):
+            page.set_viewport_size({"width": width, "height": 844})
+            for selector in ("html", "body", "main", "#cards", ".nodes-toolbar"):
+                geometry = page.locator(selector).evaluate(
+                    "(el) => ({scroll: el.scrollWidth, client: el.clientWidth})"
+                )
+                assert geometry["scroll"] <= geometry["client"] + 1, (
+                    width, selector, geometry
+                )
+            for link in page.get_by_role("link", name="SSH Web").all():
+                box = link.bounding_box()
+                assert box is not None and box["height"] >= 44
+                assert box["width"] >= 44
+                assert box["x"] >= 0 and box["x"] + box["width"] <= width + 1
+        assert status_requests == []
         detail_requests.clear()
 
         for node_id in ("worker", "other"):

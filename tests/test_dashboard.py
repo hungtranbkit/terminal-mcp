@@ -2659,3 +2659,22 @@ def test_ssh_websocket_requires_mutations_enabled_before_profile_use(monkeypatch
     with pytest.raises(Exception):
         with client.websocket_connect("/dashboard/ws/terminal?transport=ssh&node_id=hp-linux"):
             pass
+
+
+def test_node_ssh_operator_route_is_shared_by_mcp_and_dashboard():
+    from dataclasses import replace
+    from terminal_mcp.config import ManagedSSHRouteConfig, RemoteNodeConfig
+    route = ManagedSSHRouteConfig(address="192.168.100.97", username="dell",
+        hostname="node-dell", registered_endpoint="http://100.81.85.120:8790",
+        host_key_fingerprint="SHA256:" + "a" * 43)
+    config = AppConfig(PermissionsConfig(True, True), ("test-*",), 50, 20,
+                      InputPolicyConfig(allowed_session_patterns=("test-*",)))
+    config = replace(config, nodes=replace(config.nodes, remote_nodes=(RemoteNodeConfig(
+        node_id="dell-linux", display_name="Dell", hostname="node-dell",
+        endpoint=route.registered_endpoint, token_env="TEST_TOKEN", ssh_route=route),)))
+    service = TerminalService(config)
+    server = build_mcp(service)
+    shared = server.node_ssh_service
+    register_dashboard(server, service)
+    assert server.node_ssh_service is shared
+    assert shared.routes == {"dell-linux": route}

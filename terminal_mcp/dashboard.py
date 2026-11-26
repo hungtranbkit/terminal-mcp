@@ -10,6 +10,7 @@ import re
 import secrets
 import socket
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -5057,7 +5058,12 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     #csModal .cs-submit { background:var(--accent); border:none; border-radius:8px; color:#fff; padding:10px; cursor:pointer; font:inherit; font-size:14px; font-weight:600 }
     #csModal .cs-submit:disabled { opacity:.5; cursor:not-allowed }
     #csModal button.close { background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:4px 9px; cursor:pointer; font:inherit }
-    #csModal .cs-error { color:#ff6b6b; font-size:12px; min-height:14px }
+    #csReconcile { min-height:44px; margin:8px 0; }
+    #csCreatedTerminal { display:inline-flex; align-items:center; min-height:44px; color:var(--text); overflow-wrap:anywhere }
+    body.cs-local #csModal input[type=text], body.cs-local #csModal select,
+    body.cs-local #csModal button { min-height:44px; border-color:#64748b }
+    body.cs-local #csModal .cs-submit { color:#0b1220 }
+    #csModal .cs-error { overflow-wrap:anywhere; color:#ff6b6b; font-size:12px; min-height:14px }
     #csModal .cs-hint { color:var(--muted); font-size:11px }
     /* ---- Node groups (see NODE_GROUP_JS) --------------------------------
        A header row per node, spanning the full table, with its own sessions
@@ -5181,7 +5187,8 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
         <label><input type="checkbox" id="csShowOnDesktop" checked> Hiện cửa sổ thật trên desktop Windows</label>
         <div class="cs-hint">Chỉ áp dụng cho node Windows có desktop tương tác đang đăng nhập -- không có tác dụng trên node Linux/tmux. Nếu không có desktop tương tác, session vẫn tạo bình thường ở chế độ headless (không giả là visible).</div>
       </div>
-      <div class="cs-error" id="csError"></div>
+      <div class="cs-hint">Đóng tab chỉ ngắt kết nối, shell vẫn chạy. Để dọn shell bạn vừa tạo, đóng modal rồi dùng Xoá trong danh sách Sessions; kiểm tra đúng tên/node và xác nhận. Không xoá phiên của người khác.</div>
+      <div class="cs-error" id="csError" role="status"></div>
       <button type="submit" class="cs-submit" id="csSubmitBtn">Tạo session</button>
     </form>
   </div>
@@ -5383,6 +5390,65 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     const WEBTERM_PAGE = '/dashboard/terminal';
 
     // -- Create-session modal ---------------------------------------------
+    const csPinnedLocal = new URLSearchParams(location.search).get('create_local');
+    let csCreated = false;
+    let csPreflight = false;
+    let csAttempt = null;
+    const csAttemptKey = 'local-terminal-create:' + csPinnedLocal;
+    try { csAttempt = JSON.parse(sessionStorage.getItem(csAttemptKey) || 'null'); } catch (_) {}
+    function persistLocalAttempt() {
+      sessionStorage.setItem(csAttemptKey, JSON.stringify(csAttempt));
+    }
+    function lockLocalAttempt() {
+      csModalCloseBtnEl.focus();
+      csSubmitBtnEl.disabled = true;
+      csNameEl.readOnly = true;
+      csCwdEl.readOnly = true;
+      csGrantEl.disabled = true;
+    }
+    function localUnknown() {
+      csErrorEl.textContent = `Chưa rõ kết quả tạo ${csAttempt.name} trên ${csPinnedLocal}. Không tạo lại. Bấm Kiểm tra kết quả; nếu controller mất receipt, nhờ owner đối chiếu đúng node/tên/instance trong Sessions. Đóng hộp thoại không hủy shell.`;
+      lockLocalAttempt();
+      if (!document.getElementById('csReconcile')) {
+        const button = document.createElement('button');
+        button.id = 'csReconcile'; button.type = 'button'; button.textContent = 'Kiểm tra kết quả';
+        button.onclick = async () => {
+          button.disabled = true;
+          try {
+            const response = await fetch('/dashboard/api/session/create?' + new URLSearchParams({
+              attempt_id: csAttempt.id, name: csAttempt.name, expected_local_node: csPinnedLocal}), {cache:'no-store'});
+            const result = await response.json();
+            if (!response.ok || result.error) { localUnknown(); return; }
+            showLocalReceipt(result, csAttempt.name);
+          } catch (_) { localUnknown(); }
+          finally { button.disabled = false; }
+        };
+        csErrorEl.after(button);
+      }
+    }
+    function showLocalReceipt(result, name) {
+      lockLocalAttempt();
+      document.getElementById('csCreatedTerminal')?.remove();
+      if (result.node_id !== csPinnedLocal || result.session !== name || result.agent_type !== 'shell'
+          || !result.session_id || !result.created_epoch
+          || result.terminal_instance !== `${result.session_id}@${result.created_epoch}`) {
+        localUnknown(); return;
+      }
+      csCreated = true;
+      csAttempt.state = 'created'; persistLocalAttempt();
+      document.getElementById('csReconcile')?.remove();
+      const access = result.terminal_access;
+      csErrorEl.textContent = access?.exists && !access.error
+        ? `Đã tạo ${name} trên ${csPinnedLocal}. ` + (access.input ? 'Có quyền gõ lệnh.' : 'Hiện chỉ có quyền xem.')
+        : `Đã tạo ${name} trên ${csPinnedLocal} nhưng chưa có quyền xem/gõ. Cấp quyền chủ động trong danh sách Sessions.`;
+      if (access?.exists && !access.error) {
+        const link = document.createElement('a');
+        link.id = 'csCreatedTerminal'; link.textContent = 'Mở terminal vừa tạo';
+        link.href = WEBTERM_PAGE + '?' + new URLSearchParams({session:name,
+          expected_node:csPinnedLocal, expected_instance:result.terminal_instance});
+        link.target = '_blank'; link.rel = 'noopener'; csErrorEl.after(link);
+      }
+    }
     let csSelectedAgent = 'shell';
     let csNodesCache = []; // last-fetched /dashboard/api/nodes rows, reused when the agent-type choice changes
 
@@ -5412,13 +5478,13 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     // rather than the setup script. The second keeps every node that
     // enrolled before session_transport existed working unchanged.
     function nodeHasTransport(node) {
-      if (!node || node.id === 'local') return true;   // in-process, no transport to dial
+      if (!node || node.id === 'local' || node.endpoint === 'local') return true;   // in-process, no transport to dial
       if ((node.capabilities || []).includes('session_transport')) return true;
       const version = String(node.agent_version || '');
       return version !== '' && !version.startsWith('windows-setup/');
     }
     function nodeSummaryLabel(node) {
-      const os = osLabel(node);
+      const os = ({linux: 'Linux', darwin: 'macOS', windows: 'Windows'})[node.platform] || node.platform || 'Linux';
       const health = node.status !== 'online' ? 'Offline'
         : node.capacity_status === 'overloaded' ? 'Overloaded'
         : node.capacity_status === 'busy' ? 'Busy'
@@ -5456,7 +5522,12 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       // A previously-picked node that's now missing/disabled falls back to
       // Auto rather than silently submitting against a stale selection.
       const stillValid = [...csNodeEl.options].some(o => o.value === previous && !o.disabled);
-      csNodeEl.value = stillValid ? previous : 'auto';
+      if (csPinnedLocal) {
+        csNodeEl.value = csPinnedLocal;
+        csNodeEl.disabled = true;
+      } else {
+        csNodeEl.value = stillValid ? previous : 'auto';
+      }
       csNodeHintEl.textContent = csNodeEl.value === 'auto'
         ? 'Scheduler tự chọn node phù hợp còn healthy nhất.'
         : '';
@@ -5474,21 +5545,57 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
 
     function closeCreateModal() {
       document.body.classList.remove('cs-modal-visible');
+      if (csPinnedLocal && (csAttempt || csPreflight)) { newSessionBtnEl.focus(); return; }
       csErrorEl.textContent = ''; csFormEl.reset();
+      document.getElementById('csCreatedTerminal')?.remove();
+      csCreated = false; csSubmitBtnEl.disabled = false;
+      csNameEl.readOnly = false;
       csSelectedAgent = 'shell';
       csAgentChoicesEl.querySelectorAll('button').forEach(b => b.classList.toggle('selected', b.dataset.agent === 'shell'));
+      if (csPinnedLocal) newSessionBtnEl.focus();
     }
     function openCreateModal() {
-      csErrorEl.textContent = '';
+      const retained = csPinnedLocal && (csAttempt || csPreflight);
+      if (!retained) csErrorEl.textContent = '';
+      if (csPinnedLocal) {
+        document.body.classList.add('cs-local');
+        csSelectedAgent = 'shell';
+        if (!retained) {
+          csNameEl.value = 'local-term-' + crypto.randomUUID();
+          csGrantEl.value = 'none';
+        } else if (csAttempt) {
+          csNameEl.value = csAttempt.name;
+          csGrantEl.value = csAttempt.grant || 'none';
+          csCwdEl.value = csAttempt.cwd || '';
+        }
+        csShowOnDesktopEl.checked = false;
+        csShowOnDesktopEl.closest('div').hidden = true;
+        csCwdEl.parentElement.querySelector('.cs-hint').textContent = 'Để trống dùng thư mục mặc định được policy cho phép trên HP.';
+        document.getElementById('csModalTitle').textContent = 'Terminal cục bộ — ' + csPinnedLocal;
+        csAgentChoicesEl.querySelectorAll('button').forEach(b => {
+          b.disabled = true; b.hidden = b.dataset.agent !== 'shell';
+          b.classList.toggle('selected', b.dataset.agent === 'shell');
+        });
+      }
       document.body.classList.add('cs-modal-visible');
-      csNameEl.focus();
-      loadNodesForCreateModal(); // fresh every open -- item 13: newly-registered nodes show up with no reload needed
+      if (csAttempt) {
+        if (!csCreated) localUnknown();
+        lockLocalAttempt();
+      } else csNameEl.focus();
+      loadNodesForCreateModal();
     }
     newSessionBtnEl.onclick = openCreateModal;
     csModalCloseBtnEl.onclick = closeCreateModal;
     csBackdropEl.onclick = closeCreateModal;
     document.addEventListener('keydown', event => {
       if (event.key === 'Escape' && document.body.classList.contains('cs-modal-visible')) closeCreateModal();
+      if (csPinnedLocal && event.key === 'Tab' && document.body.classList.contains('cs-modal-visible')) {
+        const controls = [...document.querySelectorAll('#csModal input:not(:disabled), #csModal select:not(:disabled), #csModal button:not(:disabled), #csModal a[href]')]
+          .filter(el => el.getClientRects().length);
+        const first = controls[0], last = controls[controls.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+      }
     });
     csAgentChoicesEl.querySelectorAll('button').forEach(btn => {
       btn.onclick = () => {
@@ -5506,8 +5613,12 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       event.preventDefault();
       const name = csNameEl.value.trim();
       const cwd = csCwdEl.value.trim();
-      const chosenNode = csNodeEl.value || 'auto';
+      const chosenNode = csPinnedLocal || csNodeEl.value || 'auto';
+      if (csCreated || csAttempt || csPreflight) return;
       csErrorEl.textContent = '';
+      if (!sessionLifecycleEnabled || (csPinnedLocal && !webTerminalEnabled)) {
+        csErrorEl.textContent = 'Tạo session hoặc web terminal đang tắt.'; return;
+      }
       if (!SAFE_SESSION_NAME_RE.test(name) || name.startsWith('-') || name.startsWith('.')) {
         csErrorEl.textContent = 'Tên session không hợp lệ (chỉ chữ/số/._- , không bắt đầu bằng "-" hoặc ".").';
         return;
@@ -5518,8 +5629,14 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       // server's own scheduler regardless, so only an EXPLICIT pick needs
       // this extra round-trip.
       if (chosenNode !== 'auto') {
+        csPreflight = true;
         await loadNodesForCreateModal();
+        csPreflight = false;
         const fresh = csNodesCache.find(n => n.id === chosenNode);
+        if (csPinnedLocal && (!fresh || fresh.endpoint !== 'local' || fresh.status !== 'online' || fresh.draining)) {
+          csErrorEl.textContent = 'HP không còn online/local hoặc đang draining. Không tạo trên node khác.';
+          return;
+        }
         if (!fresh || fresh.status !== 'online' || !nodeCapable(fresh, csSelectedAgent)) {
           csErrorEl.textContent = `Node "${chosenNode}" không còn khả dụng (offline hoặc thiếu capability) -- chọn Auto hoặc node khác.`;
           csNodeEl.value = 'auto';
@@ -5534,23 +5651,37 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
           }
         }
       }
+      if (csSubmitBtnEl.disabled) return;
       csSubmitBtnEl.disabled = true; csSubmitBtnEl.textContent = 'Đang tạo…';
       try {
+        if (csPinnedLocal) {
+          csAttempt = {id:crypto.randomUUID(), name, node:csPinnedLocal, state:'pending', grant:csGrantEl.value, cwd};
+          // Write before POST. If storage fails, do not send any create request.
+          persistLocalAttempt(); lockLocalAttempt();
+        }
         const response = await fetch('/dashboard/api/session/create', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({name, agent_type: csSelectedAgent, cwd: cwd || null, node: chosenNode, grant_mode: csGrantEl.value, show_on_desktop: csShowOnDesktopEl.checked}),
+          body: JSON.stringify({name, agent_type: csSelectedAgent, cwd: cwd || null, node: chosenNode, grant_mode: csGrantEl.value, show_on_desktop: csShowOnDesktopEl.checked,
+            ...(csPinnedLocal ? {expected_local_node: csPinnedLocal, attempt_id: csAttempt.id} : {})}),
         });
         const result = await response.json().catch(() => ({}));
-        if (result && result.error) {
-          csErrorEl.textContent = `Lỗi: ${clean(result.error)}${result.reason ? ' -- ' + clean(result.reason) : ''}`;
+        if (!response.ok || (result && result.error)) {
+          if (csPinnedLocal) { localUnknown(); return; }
+          csErrorEl.textContent = `Lỗi: ${clean(result.error || response.status)}${result.reason ? ' -- ' + clean(result.reason) : ''}`;
+          return;
+        }
+        if (csPinnedLocal) {
+          showLocalReceipt(result, name);
+          await load();
           return;
         }
         closeCreateModal();
         await load();
       } catch (error) {
-        csErrorEl.textContent = `Lỗi mạng: ${clean(error && error.message)}`;
+        if (csPinnedLocal && csAttempt) { csAttempt.state = 'unknown'; localUnknown(); }
+        else csErrorEl.textContent = `Lỗi mạng: ${clean(error && error.message)}`;
       } finally {
-        csSubmitBtnEl.disabled = false; csSubmitBtnEl.textContent = 'Tạo session';
+        csSubmitBtnEl.disabled = csCreated || !!csAttempt; csSubmitBtnEl.textContent = 'Tạo session';
       }
     };
 
@@ -6019,7 +6150,7 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
         }
       }
     }
-    refresh(); setInterval(refresh, 5000);
+    refresh().then(() => { if (csPinnedLocal) openCreateModal(); }); setInterval(refresh, 5000);
   </script>
 </body>
 </html>"""
@@ -6058,9 +6189,9 @@ NODES_ADMIN_HTML = """<!doctype html>
     button.icon-btn { background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:5px 11px; cursor:pointer; font:inherit; font-size:12px }
     button.icon-btn:hover { background:#233252 }
     main { flex:1; min-height:0; overflow:auto; padding:18px 24px 24px }
-    #cards { display:grid; grid-template-columns:repeat(auto-fill, minmax(300px, 1fr)); gap:14px }
+    #cards { display:grid; grid-template-columns:repeat(auto-fill, minmax(min(300px, 100%), 1fr)); gap:14px }
     .nc-ssh { border:1px solid var(--line); border-radius:10px; padding:10px; margin:10px 0; }
-    .node-card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px; cursor:pointer; transition:border-color .15s }
+    .node-card { min-width:0; overflow-wrap:anywhere; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px; cursor:pointer; transition:border-color .15s }
     .node-card:hover { border-color:var(--accent) }
     .node-card.selected { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) }
     .node-card .nc-head { display:flex; justify-content:space-between; align-items:center; gap:8px }
@@ -6081,8 +6212,13 @@ NODES_ADMIN_HTML = """<!doctype html>
     .meter > div { height:100%; background:var(--accent) }
     .meter.warn > div { background:var(--amber) } .meter.danger > div { background:var(--red) }
     .nc-foot { margin-top:10px; display:flex; justify-content:space-between; align-items:center; font-size:11px; color:var(--muted) }
-    .card-ssh { display:inline-block; margin-top:10px; padding:5px 11px; border:1px solid var(--accent); border-radius:6px; color:var(--text); text-decoration:none }
+    .card-ssh { display:inline-flex; align-items:center; justify-content:center; min-height:44px; min-width:44px; max-width:100%; margin-top:10px; padding:8px 12px; border:1px solid var(--accent); border-radius:6px; color:var(--text); text-decoration:none }
     .card-ssh:hover, .card-ssh:focus-visible { background:#233252 }
+    .card-local-terminal { display:inline-flex; align-items:center; min-height:44px; padding:0 12px; margin-top:10px; border:1px solid var(--accent); border-radius:6px; color:var(--text); text-decoration:none }
+    .card-local-terminal:focus-visible { outline:2px solid var(--text); outline-offset:2px }
+    .nodes-toolbar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; min-width:0; max-width:100% }
+    .nc-head > div:first-child { min-width:0 }
+    .nc-foot { flex-wrap:wrap; gap:4px 8px }
     .empty { text-align:center; color:var(--muted); padding:48px 8px }
     #detail { margin-top:20px; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px 18px }
     #detail[hidden] { display:none }
@@ -6208,14 +6344,19 @@ NODES_ADMIN_HTML = """<!doctype html>
       .tr-table th:nth-child(4), .tr-table td:nth-child(4) { display:none }
     }
     @media (max-width:760px) {
-      header { padding:12px 14px } main { padding:14px } #cards { grid-template-columns:1fr }
+      header { padding:12px 14px } main { padding:14px; min-width:0 } #cards { grid-template-columns:minmax(0, 1fr) }
+      .nodes-toolbar { width:100%; gap:6px }
+      .node-card .nc-head { flex-wrap:wrap }
+      .node-card .nc-head > div { min-width:0; max-width:100% }
+      .node-card .nc-head > div:last-child { flex-wrap:wrap }
+      .nc-metrics { grid-template-columns:repeat(2, minmax(0, 1fr)) }
     }
   </style>
 </head>
 <body>
   <header>
     <div><h1>Quản lý node</h1><div class="muted">Trạng thái, tài nguyên và session theo từng node</div></div>
-    <div style="display:flex;align-items:center;gap:10px">
+    <div class="nodes-toolbar">
       <button class="icon-btn an-primary" id="addNodeWizardBtn" type="button">+ Add Node</button>
       <button class="icon-btn" id="connectNodeBtn" type="button">+ Connect Node</button>
       <button class="icon-btn" id="addNodeBtn" type="button">+ Thêm node</button>
@@ -6612,6 +6753,8 @@ NODES_ADMIN_HTML = """<!doctype html>
             <span>${node.tmux_session_count ?? 0} session${(node.tmux_session_count ?? 0) === 1 ? '' : 's'}</span>
             <span>heartbeat: ${heartbeatAge(node.last_heartbeat_at)}</span>
           </div>
+          ${node.endpoint === 'local' && node.status === 'online' && !node.draining
+            ? `<a class="card-local-terminal" href="/dashboard/sessions?${new URLSearchParams({create_local: node.id})}">Terminal cục bộ</a>` : ''}
           ${node.endpoint === 'local' || node.id === 'local' ? '' :
             `<a class="card-ssh" href="${sshTerminalUrl(node.id)}" target="_blank" rel="noopener">SSH Web</a>`}
           ${(node.overload_reasons && node.overload_reasons.length) ? `<div class="d-sessions-error" style="margin-top:8px">${node.overload_reasons.join('; ')}</div>` : ''}
@@ -6624,7 +6767,7 @@ NODES_ADMIN_HTML = """<!doctype html>
       container.innerHTML = nodesCache.map(nodeCardHtml).join('');
       container.querySelectorAll('.node-card').forEach((card) => {
         card.addEventListener('click', (event) => {
-          if (event.target.closest('.card-ssh')) return;
+          if (event.target.closest('.card-ssh, .card-local-terminal')) return;
           selectedNodeId = card.dataset.nodeId; renderCards(); loadDetail(selectedNodeId);
         });
       });
@@ -12741,6 +12884,11 @@ WEBTERM_HTML = """<!doctype html>
     function wsUrl() {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const q = sshMode ? new URLSearchParams({ transport: 'ssh', node_id: sshNodeId }) : new URLSearchParams({ session: sessionName });
+      if (!sshMode) {
+        for (const key of ['expected_node', 'expected_instance']) {
+          if (params.has(key)) q.set(key, params.get(key));
+        }
+      }
       if (takeover) q.set('takeover', '1');
       return `${proto}//${location.host}${WS_PATH}?${q.toString()}`;
     }
@@ -13572,7 +13720,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     from .node_ssh import NodeSSHService
     node_ssh_service = getattr(server, "node_ssh_service", None)
     if node_ssh_service is None:
-        node_ssh_service = NodeSSHService(controller, connection_store.path.parent / "node-ssh", audit=terminal.audit)
+        node_ssh_service = NodeSSHService(
+            controller, connection_store.path.parent / "node-ssh", audit=terminal.audit,
+            routes=NodeSSHService.configured_routes(terminal.config))
         server.node_ssh_service = node_ssh_service
     if projects is None:
         projects = getattr(queue, "projects", None)
@@ -17415,6 +17565,56 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         _refresh_local_heartbeat()
         return call()
 
+    # Bounded controller-lifetime receipts. A restart cannot prove a
+    # create failed: clients must keep an unknown attempt locked, never retry.
+    local_create_attempts: dict[str, dict] = {}
+    local_create_attempts_lock = threading.Lock()
+
+    def _local_create_owner(identity):
+        return (identity.subject, identity.email) if identity else (None, None)
+
+    def _local_create_receipt(result, name, node):
+        result = dict(result)
+        if "error" in result:
+            return result
+        if (result.get("node_id") != node or result.get("session") != name
+                or result.get("agent_type") != "shell" or not result.get("session_id")
+                or not result.get("created_epoch")):
+            return {"error": "LOCAL_NODE_RECEIPT_MISMATCH", "session_created": True}
+        instance = f"{result['session_id']}@{result['created_epoch']}"
+        access = terminal.terminal_web_terminal_access(name, expected_instance=instance)
+        result["terminal_access"] = access
+        result.pop("terminal_instance", None)
+        if access.get("terminal_instance") == instance:
+            result["terminal_instance"] = instance
+        return result
+
+    @server.custom_route("/dashboard/api/session/create", methods=["GET"], include_in_schema=False)
+    async def session_create_status(request: Request) -> JSONResponse:
+        blocked, identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        if not _origin_allowed(request):
+            return JSONResponse({"error": "ORIGIN_NOT_ALLOWED"}, status_code=403)
+        token = request.query_params.get("attempt_id", "")
+        with local_create_attempts_lock:
+            attempt = local_create_attempts.get(token)
+            if (attempt is None or attempt["owner"] != _local_create_owner(identity)
+                    or attempt["name"] != request.query_params.get("name")
+                    or attempt["node"] != request.query_params.get("expected_local_node")):
+                return JSONResponse({"error": "CREATE_OUTCOME_UNKNOWN"}, status_code=409)
+            result = attempt.get("result")
+        if result is None:
+            return JSONResponse({"error": "CREATE_OUTCOME_PENDING"}, status_code=409)
+        local = controller.registry.get(controller.local_node_id)
+        resolution = await anyio.to_thread.run_sync(controller.resolve_session, attempt["name"])
+        if (attempt["node"] != controller.local_node_id or local is None
+                or local.endpoint != "local" or local.status != "online" or local.draining
+                or resolution.get("node_id") != attempt["node"] or "error" in resolution):
+            return JSONResponse({"error": "CREATE_RECONCILE_IDENTITY_MISMATCH"}, status_code=409)
+        receipt = await anyio.to_thread.run_sync(_local_create_receipt, result, attempt["name"], attempt["node"])
+        return JSONResponse(receipt, headers={"Cache-Control": "no-store"})
+
     @server.custom_route("/dashboard/api/session/create", methods=["POST"], include_in_schema=False)
     async def session_create(request: Request) -> JSONResponse:
         blocked, identity = _mutation_guard(request)
@@ -17462,7 +17662,21 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # session already used for grant_mode="read"/"read_send" (e.g. the
         # MCP tool's own initial_prompt flow) -- same refusal rules (a
         # sensitive-worded name, a denied input pattern) apply here too.
+        expected_local = body.get("expected_local_node") if isinstance(body, dict) else None
+        if expected_local is not None:
+            local = controller.registry.get(controller.local_node_id)
+            if (expected_local != controller.local_node_id or node != expected_local
+                    or agent_type != "shell" or local is None or local.endpoint != "local"):
+                return JSONResponse({"error": "LOCAL_NODE_IDENTITY_MISMATCH"}, status_code=409)
+            if local.status != "online" or local.draining:
+                return JSONResponse({"error": "LOCAL_NODE_UNAVAILABLE"}, status_code=409)
+            if not terminal.config.session_lifecycle.enabled or not terminal.config.dashboard.web_terminal_enabled:
+                return JSONResponse({"error": "LOCAL_TERMINAL_DISABLED"}, status_code=403)
+            existing = await anyio.to_thread.run_sync(controller.resolve_session, name)
+            if existing.get("error") != "SESSION_NOT_FOUND":
+                return JSONResponse({"error": existing.get("error", "SESSION_ALREADY_EXISTS")}, status_code=409)
         grant_mode = body.get("grant_mode", "none") if isinstance(body, dict) else "none"
+
         if grant_mode not in ("none", "read", "read_send"):
             return JSONResponse({"error": "INVALID_GRANT_MODE", "session": name}, status_code=400)
         # Windows visible-desktop-window request (task: "user nhìn tại
@@ -17475,11 +17689,34 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         granted_by = identity.email if identity else None
         _log.info("dashboard create_session name=%s agent_type=%s node=%s grant_mode=%s show_on_desktop=%s identity=%s",
                  name, agent_type, node, grant_mode, show_on_desktop, granted_by)
-        result = await anyio.to_thread.run_sync(
-            lambda: _routed(lambda: controller.terminal_create_session(
-                name, agent_type, cwd, node=node, grant_mode=grant_mode, requested_by=granted_by,
-                show_on_desktop=show_on_desktop))
-        )
+        attempt_id = body.get("attempt_id") if expected_local is not None else None
+        if attempt_id is not None:
+            if not isinstance(attempt_id, str) or not re.fullmatch(r"[a-f0-9-]{36}", attempt_id):
+                return JSONResponse({"error": "INVALID_CREATE_ATTEMPT"}, status_code=400)
+            with local_create_attempts_lock:
+                # No retry, even with the same token. Reconciliation is GET only.
+                if attempt_id in local_create_attempts:
+                    return JSONResponse({"error": "CREATE_RECONCILE_REQUIRED"}, status_code=409)
+                if any(a["name"] == name and a["node"] == node and a.get("result") is None
+                       for a in local_create_attempts.values()):
+                    return JSONResponse({"error": "CREATE_ALREADY_PENDING"}, status_code=409)
+                if len(local_create_attempts) >= 256:
+                    return JSONResponse({"error": "CREATE_RECEIPT_CAPACITY"}, status_code=409)
+                local_create_attempts[attempt_id] = {
+                    "name": name, "node": node, "owner": _local_create_owner(identity), "result": None}
+        # Shield the allocation/receipt from HTTP disconnect cancellation. If
+        # the process itself dies, the absence of a receipt stays UNKNOWN.
+        with anyio.CancelScope(shield=True):
+            result = await anyio.to_thread.run_sync(
+                lambda: _routed(lambda: controller.terminal_create_session(
+                    name, agent_type, cwd, node=node, grant_mode=grant_mode, requested_by=granted_by,
+                    show_on_desktop=show_on_desktop))
+            )
+            if attempt_id is not None:
+                with local_create_attempts_lock:
+                    local_create_attempts[attempt_id]["result"] = dict(result)
+            if expected_local is not None:
+                result = await anyio.to_thread.run_sync(_local_create_receipt, result, name, expected_local)
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 
@@ -18086,6 +18323,13 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             await websocket.close(code=4404 if resolution["error"] == "SESSION_NOT_FOUND" else 4409)
             return
         node_id = resolution["node_id"]
+        expected_node = websocket.query_params.get("expected_node")
+        expected_instance = websocket.query_params.get("expected_instance")
+        if ((expected_node is not None and expected_node != node_id)
+                or (expected_instance is not None and
+                    (not expected_node or node_id != controller.local_node_id))):
+            await websocket.close(code=4409)
+            return
         if node_id != controller.local_node_id:
             # Real bug this replaces: the old code only ever attempted a
             # remote lookup AFTER terminal.terminal_web_terminal_access
@@ -18098,11 +18342,25 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             # completely unreachable this way -- confirmed live.
             await _open_remote_terminal_ws(websocket, node_id, session, takeover_requested)
             return
-        access = await anyio.to_thread.run_sync(terminal.terminal_web_terminal_access, session)
+        if expected_instance is not None:
+            local = controller.registry.get(controller.local_node_id)
+            if local is None or local.endpoint != "local":
+                await websocket.close(code=4409)
+                return
+            access = await anyio.to_thread.run_sync(
+                lambda: terminal.terminal_web_terminal_access(session, expected_instance=expected_instance))
+        else:
+            access = await anyio.to_thread.run_sync(terminal.terminal_web_terminal_access, session)
         if "error" in access:
-            code = 4403
-            await websocket.close(code=code)
+            await websocket.close(code=4409 if access["error"] == "SESSION_IDENTITY_MISMATCH" else 4403)
             return
+        attach_target = session
+        if expected_instance is not None:
+            if access.get("terminal_instance") != expected_instance or not access.get("session_id"):
+                await websocket.close(code=4409)
+                return
+            # Access and target come from the SAME canonical identity snapshot.
+            attach_target = access["session_id"]
         input_enabled = bool(access["input"])
         # Takeover (tmux `-d`, detaching any other attached client) is a
         # disruptive, explicit choice (see WEBTERM_HTML's confirm()
@@ -18114,7 +18372,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         terminal.audit.record(action="web_terminal_open", session=session, result="OPENED",
                               reason=f"input={input_enabled} takeover={takeover}", source_transport="dashboard")
         proc = await anyio.to_thread.run_sync(
-            lambda: WebTerminalProcess(terminal.tmux.binary, session, readonly=not input_enabled, takeover=takeover)
+            lambda: WebTerminalProcess(terminal.tmux.binary, attach_target, readonly=not input_enabled, takeover=takeover)
         )
         try:
             await websocket.send_json({"type": "ready", "session": session, "readonly": not input_enabled,

@@ -354,7 +354,9 @@ def build_mcp(service: TerminalService | None = None,
     compact_tools = CompactTerminalTools(terminal, controller, run_journal=run_journal)
     from .node_ssh import NodeSSHService
     from .connection_store import default_connection_store_path
-    compact_tools.node_ssh = NodeSSHService(controller, default_connection_store_path().parent / "node-ssh", audit=terminal.audit)
+    compact_tools.node_ssh = NodeSSHService(
+        controller, default_connection_store_path().parent / "node-ssh", audit=terminal.audit,
+        routes=NodeSSHService.configured_routes(terminal.config))
     # Supervised direct tasks (direct_task.py). Every dispatch/observation
     # goes through compact_tools' own guarded, bounded send/status/tail.
     from .direct_task import DirectTaskStore, DirectTaskSupervisor
