@@ -44,7 +44,7 @@ from .session_resource import (ContextPolicy, build_resource_block,
 from .config import NodeHealthConfig
 from .connection_manager import ConnectionManager
 from .lease import ResourceLockStore
-from .scheduler import PlacementResult, choose_node
+from .scheduler import PlacementResult, agent_disk_block_reason, choose_node
 from .ephemeral_state import ephemeral_state_dir
 
 if TYPE_CHECKING:
@@ -1746,6 +1746,10 @@ class ControllerService:
         if client is None:
             return {"error": "NODE_UNREACHABLE", "node_id": node_id}
         node_row = self.registry.get(node_id)
+        disk_reason = agent_disk_block_reason(node_row, required_agent_type=agent_type)
+        if disk_reason:
+            return {"error": "NODE_DISK_CAPACITY_BLOCKED", "session": name,
+                    "node_id": node_id, "detail": disk_reason}
         capacity_snapshot = {
             "node_id": node_id,
             "status": node_row.status if node_row else "unknown",

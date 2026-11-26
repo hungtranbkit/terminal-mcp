@@ -200,3 +200,62 @@ def test_windows_node_with_no_agent_binaries_only_eligible_for_shell():
     result = choose_node([windows_node], required_agent_type="claude")
     assert result.node_id is None
     assert "agent_type" in result.excluded[0][1]
+
+
+def test_new_agent_disk_gate_matches_measured_fleet_and_explicit_dispatch():
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from terminal_mcp.controller import ControllerService
+    # Raw byte counters from 27 Nov 2026 06:28 ICT, all still marked
+    # healthy by the old live collector. Do not trust the old percentage.
+    readings = {
+        "hp-linux": (224141770752, 12887044096),
+        "m910": (108898664448, 9037901824),
+        "nec1": (44753195008, 13688012800),
+        "dell-linux": (371194286080, 120378961920),
+        "macbook": (82234564608, 382956191744),
+    }
+    nodes = [
+        replace(_node(n, agent_types=("shell", "codex"), ram_percent=10.0 if n in ("hp-linux","m910","nec1") else 30.0),
+                disk_used_bytes=used, disk_free_bytes=free)
+        for n,(used,free) in readings.items()
+    ]
+    by_id = {n.id: n for n in nodes}
+    blocked = {"hp-linux","m910","nec1"}
+    eligible = {"dell-linux","macbook"}
+    result = choose_node(nodes, required_agent_type="codex")
+    assert result.node_id in eligible
+    assert {n for n,_ in result.excluded} == blocked
+    assert choose_node([by_id[n] for n in blocked], required_agent_type="codex").node_id is None
+    # Exercise the actual controller dispatch function; a stub client is
+    # the side-effect boundary, no real process/session/db is created.
+    calls = []
+    client = SimpleNamespace(create_session=lambda *a, **kw: calls.append(a) or {"error":"TEST_CLIENT_REACHED"})
+    c = object.__new__(ControllerService)
+    c.resolve_session = lambda name: {"error":"SESSION_NOT_FOUND"}
+    c.list_nodes = lambda: nodes
+    c.node_status = by_id.get
+    c.local_node_id = "macbook"
+    c._clients = {n:client for n in by_id}
+    c.registry = SimpleNamespace(get=by_id.get)
+    c.local_client = SimpleNamespace()
+    for n in blocked:
+        outcome = c.terminal_create_session("fixture-"+n, "codex", node=n)
+        assert outcome["error"] == "NODE_DISK_CAPACITY_BLOCKED"
+    assert calls == []
+    for n in eligible:
+        assert c.terminal_create_session("fixture-"+n, "codex", node=n)["error"] == "TEST_CLIENT_REACHED"
+    assert len(calls) == 2
+    # A lightweight, explicit recovery shell remains available.
+    assert c.terminal_create_session("fixture-recovery", "shell", node="m910")["error"] == "TEST_CLIENT_REACHED"
+
+
+def test_new_agent_disk_gate_exact_boundary_and_missing_counters():
+    from dataclasses import replace
+    gib=1024**3
+    base = _node("node", agent_types=("codex",))
+    for used, free in [(180*gib,20*gib),(50*gib,20*gib-1),(None,30*gib),(50*gib,None)]:
+        row = replace(base, disk_used_bytes=used, disk_free_bytes=free)
+        assert choose_node([row],required_agent_type="codex").node_id is None
+    good=replace(base,disk_used_bytes=50*gib,disk_free_bytes=20*gib)
+    assert choose_node([good],required_agent_type="codex").node_id == "node"
