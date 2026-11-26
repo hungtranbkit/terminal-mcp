@@ -109,3 +109,76 @@ def test_local_terminal_explicit_create_and_pinned_receipt(outcome):
             assert sockets == []
         assert not errors
         browser.close()
+
+
+@pytest.mark.browser_smoke
+@pytest.mark.parametrize('lost', [False, True])
+@pytest.mark.parametrize('width', [320, 390, 1366])
+def test_pending_create_survives_close_reopen_and_lost_response(lost, width):
+    from playwright.sync_api import sync_playwright, expect
+    pending, bodies, reads = [], [], []
+    reconciliation = ['wrong-node']
+    def serve(route):
+        path = urlsplit(route.request.url).path
+        if path == '/dashboard/sessions':
+            route.fulfill(content_type='text/html', body=_nav_page(SESSIONS_ADMIN_HTML, 'sessions'))
+        elif path == '/dashboard/api/nodes':
+            route.fulfill(json={'nodes': [{'id':'hp-linux','endpoint':'local','status':'online'}]})
+        elif path == '/dashboard/api/sessions':
+            route.fulfill(json={'sessions': [], 'session_lifecycle_enabled': True, 'web_terminal_enabled': True})
+        elif path == '/dashboard/api/session/create' and route.request.method == 'POST':
+            bodies.append(route.request.post_data_json); pending.append(route)
+        elif path == '/dashboard/api/session/create' and route.request.method == 'GET':
+            reads.append(route.request.url)
+            route.fulfill(json=dict(session=bodies[0]['name'], node_id='worker' if reconciliation[0] == 'wrong-node' else 'hp-linux',
+                agent_type='shell', session_id='$42', created_epoch=123, terminal_instance='$42@123',
+                terminal_access={'exists':True,'input':False}))
+        else:
+            route.fulfill(json={})
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True, executable_path=os.environ.get('PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH'))
+        context = browser.new_context(); context.route('**/*', serve)
+        page = context.new_page(); page.set_default_timeout(3000)
+        page.set_viewport_size({'width':width, 'height':844})
+        page.goto('http://localhost/dashboard/sessions?create_local=hp-linux')
+        expect(page.locator('#csModal')).to_be_visible()
+        name = page.locator('#csName').input_value()
+        page.locator('#csSubmitBtn').click()
+        expect(page.locator('#csSubmitBtn')).to_be_disabled()
+        page.wait_for_function('document.querySelector("#csSubmitBtn").textContent.includes("Đang tạo")')
+        page.keyboard.press('Escape')
+        page.locator('#newSessionBtn').click()
+        expect(page.locator('#csName')).to_have_value(name)
+        expect(page.locator('#csSubmitBtn')).to_be_disabled()
+        page.locator('#csBackdrop').click(position={'x': page.locator('#csModal').bounding_box()['x'] - 10, 'y': 300})
+        page.locator('#newSessionBtn').click()
+        expect(page.locator('#csName')).to_have_value(name)
+        assert len(bodies) == 1
+        if lost:
+            # Server side effect happened; only its response is lost.
+            pending.pop().abort('failed')
+            expect(page.locator('#csError')).to_contain_text('Chưa rõ kết quả')
+            expect(page.locator('#csSubmitBtn')).to_be_disabled()
+            page.reload()
+            expect(page.locator('#csName')).to_have_value(name)
+            expect(page.locator('#csSubmitBtn')).to_be_disabled()
+            page.locator('#csReconcile').click()
+            expect(page.locator('#csCreatedTerminal')).to_have_count(0)
+            expect(page.locator('#csSubmitBtn')).to_be_disabled()
+            reconciliation[0] = 'correct'
+            page.locator('#csReconcile').click()
+            expect(page.locator('#csCreatedTerminal')).to_be_visible()
+            expect(page.locator('#csError')).to_contain_text('chỉ có quyền xem')
+            assert len(reads) == 2
+            assert parse_qs(urlsplit(reads[1]).query)['attempt_id'] == [bodies[0]['attempt_id']]
+            page.locator('#csCreatedTerminal').scroll_into_view_if_needed()
+            assert page.locator('#csCreatedTerminal').bounding_box()['height'] >= 44
+            assert page.locator('#csModal').evaluate('(e) => e.scrollWidth <= e.clientWidth + 1')
+            if os.environ.get('HP_LOCAL_EVIDENCE_DIR'):
+                page.screenshot(path=str(Path(os.environ['HP_LOCAL_EVIDENCE_DIR']) / f'reconciled-{width}.png'))
+        else:
+            pending.pop().fulfill(json=dict(session=name, node_id='hp-linux', agent_type='shell',
+                session_id='$42', created_epoch=123, terminal_instance='$42@123', terminal_access={'exists':True,'input':False}))
+            expect(page.locator('#csCreatedTerminal')).to_be_visible()
+        assert len(bodies) == 1
+        browser.close()

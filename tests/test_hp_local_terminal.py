@@ -35,7 +35,7 @@ def local_app(tmp_path, monkeypatch):
         return {'session': name, 'agent_type': agent_type, 'node_id': 'hp-linux',
                 'session_id': '$42', 'created_epoch': 123, 'state': 'READY'}
     monkeypatch.setattr(controller, 'terminal_create_session', create)
-    monkeypatch.setattr(service, 'terminal_web_terminal_access', lambda _: {'exists': True, 'input': True})
+    monkeypatch.setattr(service, 'terminal_web_terminal_access', lambda _, **kw: {'exists': True, 'input': True, 'session_id': '$42', 'terminal_instance': '$42@123'})
     monkeypatch.setattr('terminal_mcp.dashboard.WebTerminalProcess',
         lambda *a, **k: pytest.fail('must not spawn a real PTY'))
     server = build_mcp(service)
@@ -66,7 +66,7 @@ def test_pinned_create_receipt_keeps_default_grant_and_instance(local_app):
     r = client.post('/dashboard/api/session/create', json=payload())
     assert r.status_code == 200
     assert calls[0][2]['grant_mode'] == 'none'
-    assert r.json()['terminal_access'] == {'exists': True, 'input': True}
+    assert r.json()['terminal_access']['input'] is True
     assert r.json()['terminal_instance'] == '$42@123'
 
 
@@ -92,7 +92,7 @@ def test_pinned_create_does_not_borrow_existing_session(local_app, monkeypatch):
 @pytest.mark.parametrize('access', [{'error': 'ACCESS_DENIED'}, {'exists': True, 'input': False}])
 def test_create_reports_actual_access_without_upgrading(local_app, monkeypatch, access):
     client, _, service, _ = local_app
-    monkeypatch.setattr(service, 'terminal_web_terminal_access', lambda _: access)
+    monkeypatch.setattr(service, 'terminal_web_terminal_access', lambda _, **kw: access)
     assert client.post('/dashboard/api/session/create', json=payload()).json()['terminal_access'] == access
 
 
@@ -183,7 +183,7 @@ def test_ws_policy_guards_still_apply_to_pinned_identity(local_app, monkeypatch,
 def test_valid_pin_attaches_unique_id_and_preserves_readonly_takeover(local_app, monkeypatch, input_enabled):
     client, controller, service, _ = local_app
     monkeypatch.setattr(controller, 'resolve_session', lambda _: {'node_id': 'hp-linux'})
-    monkeypatch.setattr(service, 'terminal_web_terminal_access', lambda _: {'exists': True, 'input': input_enabled})
+    monkeypatch.setattr(service, 'terminal_web_terminal_access', lambda _, **kw: {'exists': True, 'input': input_enabled, 'session_id':'$42', 'terminal_instance':'$42@123'})
     calls, closed = [], []
     def proc(binary, target, **kw):
         calls.append((target, kw)); return SimpleNamespace(close=lambda: closed.append(True))
@@ -232,7 +232,139 @@ def test_actual_grants_preserve_readonly_disabled_and_stale_identity(local_app, 
 
 def test_local_create_receipt_refuses_session_replaced_during_create(local_app, monkeypatch):
     client, _, service, _ = local_app
-    monkeypatch.setattr(service, 'resolve_identity', lambda _: None)
+    monkeypatch.setattr(service, 'terminal_web_terminal_access', lambda _, **kw: {'error':'SESSION_IDENTITY_MISMATCH'})
     r = client.post('/dashboard/api/session/create', json=payload())
     assert r.json()['terminal_access']['error'] == 'SESSION_IDENTITY_MISMATCH'
     assert 'terminal_instance' not in r.json()
+
+
+def test_access_snapshot_does_not_authorize_a_replacement(local_app, monkeypatch):
+    _, _, service, _ = local_app
+    service.config = replace(service.config, session_access=SessionAccessConfig(default_read=False, default_input=False))
+    service.grant_session_read('local-term-test', True)
+    service.grant_session_input('local-term-test', True)
+    original = service.tmux.get_session('local-term-test')
+    replacement = SimpleNamespace(**{**vars(original), 'session_id': '$43', 'created_epoch': 124})
+    calls = []
+    def changing(_):
+        calls.append(True)
+        return original if len(calls) == 1 else replacement
+    monkeypatch.setattr(service.tmux, 'get_session', changing)
+    access = TerminalService.terminal_web_terminal_access(service, 'local-term-test', expected_instance='$42@123')
+    assert access['input'] is True
+    assert access['session_id'] == '$42'
+    assert len(calls) == 1  # authorization and attach receipt use precisely this snapshot
+    assert TerminalService.terminal_web_terminal_access(service, 'local-term-test', expected_instance='$42@123')['error'] == 'SESSION_IDENTITY_MISMATCH'
+
+
+def test_core_same_name_create_serialized_before_lifecycle(local_app, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    _, _, service, _ = local_app
+    entered, release, contender, overlapping = Event(), Event(), Event(), Event()
+    invocations = []
+    def allocate(*args, **kwargs):
+        invocations.append(True)
+        if len(invocations) > 1: overlapping.set()
+        entered.set()
+        assert release.wait(2)
+        return {'error': 'FIXTURE_NO_ALLOCATION'}
+    monkeypatch.setattr(service.lifecycle, 'create', allocate)
+    monkeypatch.setattr(service, '_session_capacity', lambda: (0, 10))
+    def second():
+        contender.set()
+        return service.terminal_create_session('local-term-race')
+    with ThreadPoolExecutor(2) as pool:
+        first = pool.submit(service.terminal_create_session, 'local-term-race')
+        try:
+            assert entered.wait(1)
+            other = pool.submit(second)
+            assert contender.wait(1)
+            assert not overlapping.wait(0.15)
+            assert len(invocations) == 1
+        finally:
+            release.set()
+        assert first.result()['error'] == 'FIXTURE_NO_ALLOCATION'
+        assert other.result()['error'] == 'FIXTURE_NO_ALLOCATION'
+
+
+@pytest.mark.parametrize('case', ['ok', 'wrong-node', 'wrong-name', 'unknown', 'stale', 'no-grant', 'readonly', 'origin', 'missing-access', 'other-owner', 'disabled-mutations'])
+def test_reconcile_is_read_only_and_bound_to_original_attempt(local_app, monkeypatch, case):
+    from terminal_mcp.cf_access import AccessIdentity
+    client, controller, service, calls = local_app
+    token = '12345678-1234-1234-1234-123456789abc'
+    body = payload(attempt_id=token)
+    identity = ['owner@example.test']
+    if case in ('missing-access', 'other-owner'):
+        service.config = replace(service.config, dashboard=replace(service.config.dashboard,
+            cloudflare_access_team_domain='fixture.cloudflareaccess.com', cloudflare_access_audience='fixture'))
+        monkeypatch.setattr('terminal_mcp.dashboard.verify_access_assertion', lambda *a, **k:
+            AccessIdentity(email=identity[0], subject=identity[0], raw_claims={}) if a[0] else None)
+        client.headers['Cf-Access-Jwt-Assertion'] = 'fixture-only'
+    assert client.post('/dashboard/api/session/create', json=body).status_code == 200
+    # Simulate losing that HTTP response: reconcile must never allocate/grant.
+    monkeypatch.setattr(controller, 'resolve_session', lambda _: {'node_id': 'hp-linux'})
+    params = {'attempt_id':token, 'name':body['name'], 'expected_local_node':'hp-linux'}
+    if case == 'wrong-node': params['expected_local_node'] = 'worker'
+    if case == 'wrong-name': params['name'] = 'some-other-session'
+    if case == 'unknown': params['attempt_id'] = 'not-a-known-receipt'
+    if case == 'origin': client.headers['Origin'] = 'https://evil.invalid'
+    if case == 'missing-access': del client.headers['Cf-Access-Jwt-Assertion']
+    if case == 'other-owner': identity[0] = 'different@example.test'
+    if case == 'disabled-mutations':
+        service.config = replace(service.config, dashboard=replace(service.config.dashboard, mutations_enabled=False))
+    if case in ('stale', 'no-grant'):
+        error = 'SESSION_IDENTITY_MISMATCH' if case == 'stale' else 'ACCESS_DENIED'
+        monkeypatch.setattr(service, 'terminal_web_terminal_access', lambda _, **kw: {'error':error})
+    if case == 'readonly':
+        monkeypatch.setattr(service, 'terminal_web_terminal_access', lambda _, **kw:
+            {'exists':True, 'input':False, 'session_id':'$42', 'terminal_instance':'$42@123'})
+    response = client.get('/dashboard/api/session/create', params=params)
+    if case in ('ok', 'readonly', 'disabled-mutations'):
+        assert response.status_code == 200
+        assert response.json()['terminal_instance'] == '$42@123'
+        if case == 'readonly': assert response.json()['terminal_access']['input'] is False
+    elif case in ('stale', 'no-grant'):
+        assert 'terminal_instance' not in response.json()
+        assert response.json()['terminal_access']['error'] == error
+    else:
+        assert response.status_code in (403,409)
+    assert len(calls) == 1
+
+
+def test_attempt_post_retry_never_allocates_again(local_app):
+    client, _, _, calls = local_app
+    body = payload(attempt_id='12345678-1234-1234-1234-123456789abc')
+    assert client.post('/dashboard/api/session/create', json=body).status_code == 200
+    assert client.post('/dashboard/api/session/create', json=body).status_code == 409
+    assert len(calls) == 1
+
+
+def test_pinned_concurrent_same_name_rejected_before_controller(local_app, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    client, controller, _, calls = local_app
+    entered, release = Event(), Event()
+    original = controller.terminal_create_session
+    def create(*args, **kwargs):
+        entered.set()
+        assert release.wait(3)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(controller, 'terminal_create_session', create)
+    with ThreadPoolExecutor(2) as pool:
+        future = pool.submit(client.post, '/dashboard/api/session/create', json=payload(
+            attempt_id='12345678-1234-1234-1234-123456789abc'))
+        try:
+            assert entered.wait(2)
+            pending = client.get('/dashboard/api/session/create', params={
+                'attempt_id':'12345678-1234-1234-1234-123456789abc',
+                'name':'local-term-test', 'expected_local_node':'hp-linux'})
+            assert pending.json()['error'] == 'CREATE_OUTCOME_PENDING'
+            result = client.post('/dashboard/api/session/create', json=payload(
+                attempt_id='22345678-1234-1234-1234-123456789abc'))
+            assert result.status_code == 409
+            assert result.json()['error'] == 'CREATE_ALREADY_PENDING'
+        finally:
+            release.set()
+        assert future.result().status_code == 200
+    assert len(calls) == 1

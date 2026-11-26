@@ -10,6 +10,7 @@ import re
 import secrets
 import socket
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -5057,6 +5058,7 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     #csModal .cs-submit { background:var(--accent); border:none; border-radius:8px; color:#fff; padding:10px; cursor:pointer; font:inherit; font-size:14px; font-weight:600 }
     #csModal .cs-submit:disabled { opacity:.5; cursor:not-allowed }
     #csModal button.close { background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:4px 9px; cursor:pointer; font:inherit }
+    #csReconcile { min-height:44px; margin:8px 0; }
     #csCreatedTerminal { display:inline-flex; align-items:center; min-height:44px; color:var(--text); overflow-wrap:anywhere }
     body.cs-local #csModal input[type=text], body.cs-local #csModal select,
     body.cs-local #csModal button { min-height:44px; border-color:#64748b }
@@ -5390,6 +5392,63 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     // -- Create-session modal ---------------------------------------------
     const csPinnedLocal = new URLSearchParams(location.search).get('create_local');
     let csCreated = false;
+    let csPreflight = false;
+    let csAttempt = null;
+    const csAttemptKey = 'local-terminal-create:' + csPinnedLocal;
+    try { csAttempt = JSON.parse(sessionStorage.getItem(csAttemptKey) || 'null'); } catch (_) {}
+    function persistLocalAttempt() {
+      sessionStorage.setItem(csAttemptKey, JSON.stringify(csAttempt));
+    }
+    function lockLocalAttempt() {
+      csModalCloseBtnEl.focus();
+      csSubmitBtnEl.disabled = true;
+      csNameEl.readOnly = true;
+      csCwdEl.readOnly = true;
+      csGrantEl.disabled = true;
+    }
+    function localUnknown() {
+      csErrorEl.textContent = `Chưa rõ kết quả tạo ${csAttempt.name} trên ${csPinnedLocal}. Không tạo lại. Bấm Kiểm tra kết quả; nếu controller mất receipt, nhờ owner đối chiếu đúng node/tên/instance trong Sessions. Đóng hộp thoại không hủy shell.`;
+      lockLocalAttempt();
+      if (!document.getElementById('csReconcile')) {
+        const button = document.createElement('button');
+        button.id = 'csReconcile'; button.type = 'button'; button.textContent = 'Kiểm tra kết quả';
+        button.onclick = async () => {
+          button.disabled = true;
+          try {
+            const response = await fetch('/dashboard/api/session/create?' + new URLSearchParams({
+              attempt_id: csAttempt.id, name: csAttempt.name, expected_local_node: csPinnedLocal}), {cache:'no-store'});
+            const result = await response.json();
+            if (!response.ok || result.error) { localUnknown(); return; }
+            showLocalReceipt(result, csAttempt.name);
+          } catch (_) { localUnknown(); }
+          finally { button.disabled = false; }
+        };
+        csErrorEl.after(button);
+      }
+    }
+    function showLocalReceipt(result, name) {
+      lockLocalAttempt();
+      document.getElementById('csCreatedTerminal')?.remove();
+      if (result.node_id !== csPinnedLocal || result.session !== name || result.agent_type !== 'shell'
+          || !result.session_id || !result.created_epoch
+          || result.terminal_instance !== `${result.session_id}@${result.created_epoch}`) {
+        localUnknown(); return;
+      }
+      csCreated = true;
+      csAttempt.state = 'created'; persistLocalAttempt();
+      document.getElementById('csReconcile')?.remove();
+      const access = result.terminal_access;
+      csErrorEl.textContent = access?.exists && !access.error
+        ? `Đã tạo ${name} trên ${csPinnedLocal}. ` + (access.input ? 'Có quyền gõ lệnh.' : 'Hiện chỉ có quyền xem.')
+        : `Đã tạo ${name} trên ${csPinnedLocal} nhưng chưa có quyền xem/gõ. Cấp quyền chủ động trong danh sách Sessions.`;
+      if (access?.exists && !access.error) {
+        const link = document.createElement('a');
+        link.id = 'csCreatedTerminal'; link.textContent = 'Mở terminal vừa tạo';
+        link.href = WEBTERM_PAGE + '?' + new URLSearchParams({session:name,
+          expected_node:csPinnedLocal, expected_instance:result.terminal_instance});
+        link.target = '_blank'; link.rel = 'noopener'; csErrorEl.after(link);
+      }
+    }
     let csSelectedAgent = 'shell';
     let csNodesCache = []; // last-fetched /dashboard/api/nodes rows, reused when the agent-type choice changes
 
@@ -5486,6 +5545,7 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
 
     function closeCreateModal() {
       document.body.classList.remove('cs-modal-visible');
+      if (csPinnedLocal && (csAttempt || csPreflight)) { newSessionBtnEl.focus(); return; }
       csErrorEl.textContent = ''; csFormEl.reset();
       document.getElementById('csCreatedTerminal')?.remove();
       csCreated = false; csSubmitBtnEl.disabled = false;
@@ -5495,12 +5555,19 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       if (csPinnedLocal) newSessionBtnEl.focus();
     }
     function openCreateModal() {
-      csErrorEl.textContent = '';
+      const retained = csPinnedLocal && (csAttempt || csPreflight);
+      if (!retained) csErrorEl.textContent = '';
       if (csPinnedLocal) {
         document.body.classList.add('cs-local');
         csSelectedAgent = 'shell';
-        csNameEl.value = 'local-term-' + crypto.randomUUID();
-        csGrantEl.value = 'none';
+        if (!retained) {
+          csNameEl.value = 'local-term-' + crypto.randomUUID();
+          csGrantEl.value = 'none';
+        } else if (csAttempt) {
+          csNameEl.value = csAttempt.name;
+          csGrantEl.value = csAttempt.grant || 'none';
+          csCwdEl.value = csAttempt.cwd || '';
+        }
         csShowOnDesktopEl.checked = false;
         csShowOnDesktopEl.closest('div').hidden = true;
         csCwdEl.parentElement.querySelector('.cs-hint').textContent = 'Để trống dùng thư mục mặc định được policy cho phép trên HP.';
@@ -5511,8 +5578,11 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
         });
       }
       document.body.classList.add('cs-modal-visible');
-      csNameEl.focus();
-      loadNodesForCreateModal(); // fresh every open -- item 13: newly-registered nodes show up with no reload needed
+      if (csAttempt) {
+        if (!csCreated) localUnknown();
+        lockLocalAttempt();
+      } else csNameEl.focus();
+      loadNodesForCreateModal();
     }
     newSessionBtnEl.onclick = openCreateModal;
     csModalCloseBtnEl.onclick = closeCreateModal;
@@ -5544,7 +5614,7 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       const name = csNameEl.value.trim();
       const cwd = csCwdEl.value.trim();
       const chosenNode = csPinnedLocal || csNodeEl.value || 'auto';
-      if (csCreated) return;
+      if (csCreated || csAttempt || csPreflight) return;
       csErrorEl.textContent = '';
       if (!sessionLifecycleEnabled || (csPinnedLocal && !webTerminalEnabled)) {
         csErrorEl.textContent = 'Tạo session hoặc web terminal đang tắt.'; return;
@@ -5559,7 +5629,9 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       // server's own scheduler regardless, so only an EXPLICIT pick needs
       // this extra round-trip.
       if (chosenNode !== 'auto') {
+        csPreflight = true;
         await loadNodesForCreateModal();
+        csPreflight = false;
         const fresh = csNodesCache.find(n => n.id === chosenNode);
         if (csPinnedLocal && (!fresh || fresh.endpoint !== 'local' || fresh.status !== 'online' || fresh.draining)) {
           csErrorEl.textContent = 'HP không còn online/local hoặc đang draining. Không tạo trên node khác.';
@@ -5582,48 +5654,34 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       if (csSubmitBtnEl.disabled) return;
       csSubmitBtnEl.disabled = true; csSubmitBtnEl.textContent = 'Đang tạo…';
       try {
+        if (csPinnedLocal) {
+          csAttempt = {id:crypto.randomUUID(), name, node:csPinnedLocal, state:'pending', grant:csGrantEl.value, cwd};
+          // Write before POST. If storage fails, do not send any create request.
+          persistLocalAttempt(); lockLocalAttempt();
+        }
         const response = await fetch('/dashboard/api/session/create', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({name, agent_type: csSelectedAgent, cwd: cwd || null, node: chosenNode, grant_mode: csGrantEl.value, show_on_desktop: csShowOnDesktopEl.checked,
-            ...(csPinnedLocal ? {expected_local_node: csPinnedLocal} : {})}),
+            ...(csPinnedLocal ? {expected_local_node: csPinnedLocal, attempt_id: csAttempt.id} : {})}),
         });
         const result = await response.json().catch(() => ({}));
         if (!response.ok || (result && result.error)) {
-          if (csPinnedLocal && result.session_created) csCreated = true;
+          if (csPinnedLocal) { localUnknown(); return; }
           csErrorEl.textContent = `Lỗi: ${clean(result.error || response.status)}${result.reason ? ' -- ' + clean(result.reason) : ''}`;
           return;
         }
         if (csPinnedLocal) {
-          // Never open a guessed/old session, even on a malformed success receipt.
-          csCreated = true;
-          csNameEl.readOnly = true;
-          if (result.node_id !== csPinnedLocal || result.session !== name || result.agent_type !== 'shell'
-              || !result.session_id || !result.created_epoch
-              || result.terminal_instance !== `${result.session_id}@${result.created_epoch}`) {
-            csErrorEl.textContent = 'Receipt không khớp HP/session/instance. Không mở terminal; kiểm tra danh sách session trước khi thử lại.';
-            return;
-          }
-          const access = result.terminal_access;
-          csErrorEl.textContent = access?.exists && !access.error
-            ? `Đã tạo ${name} trên ${csPinnedLocal}. ` + (access.input ? 'Có quyền gõ lệnh.' : 'Hiện chỉ có quyền xem.')
-            : `Đã tạo ${name} trên ${csPinnedLocal} nhưng chưa có quyền xem/gõ. Cấp quyền chủ động trong danh sách Sessions.`;
-          if (access?.exists && !access.error) {
-            const link = document.createElement('a');
-            link.id = 'csCreatedTerminal'; link.textContent = 'Mở terminal vừa tạo';
-            link.href = WEBTERM_PAGE + '?' + new URLSearchParams({session: name,
-              expected_node: csPinnedLocal, expected_instance: result.terminal_instance});
-            link.target = '_blank'; link.rel = 'noopener';
-            csErrorEl.after(link);
-          }
+          showLocalReceipt(result, name);
           await load();
           return;
         }
         closeCreateModal();
         await load();
       } catch (error) {
-        csErrorEl.textContent = `Lỗi mạng: ${clean(error && error.message)}`;
+        if (csPinnedLocal && csAttempt) { csAttempt.state = 'unknown'; localUnknown(); }
+        else csErrorEl.textContent = `Lỗi mạng: ${clean(error && error.message)}`;
       } finally {
-        csSubmitBtnEl.disabled = csCreated; csSubmitBtnEl.textContent = 'Tạo session';
+        csSubmitBtnEl.disabled = csCreated || !!csAttempt; csSubmitBtnEl.textContent = 'Tạo session';
       }
     };
 
@@ -17497,6 +17555,56 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         _refresh_local_heartbeat()
         return call()
 
+    # Bounded controller-lifetime receipts. A restart cannot prove a
+    # create failed: clients must keep an unknown attempt locked, never retry.
+    local_create_attempts: dict[str, dict] = {}
+    local_create_attempts_lock = threading.Lock()
+
+    def _local_create_owner(identity):
+        return (identity.subject, identity.email) if identity else (None, None)
+
+    def _local_create_receipt(result, name, node):
+        result = dict(result)
+        if "error" in result:
+            return result
+        if (result.get("node_id") != node or result.get("session") != name
+                or result.get("agent_type") != "shell" or not result.get("session_id")
+                or not result.get("created_epoch")):
+            return {"error": "LOCAL_NODE_RECEIPT_MISMATCH", "session_created": True}
+        instance = f"{result['session_id']}@{result['created_epoch']}"
+        access = terminal.terminal_web_terminal_access(name, expected_instance=instance)
+        result["terminal_access"] = access
+        result.pop("terminal_instance", None)
+        if access.get("terminal_instance") == instance:
+            result["terminal_instance"] = instance
+        return result
+
+    @server.custom_route("/dashboard/api/session/create", methods=["GET"], include_in_schema=False)
+    async def session_create_status(request: Request) -> JSONResponse:
+        blocked, identity = _read_guard(request)
+        if blocked is not None:
+            return blocked
+        if not _origin_allowed(request):
+            return JSONResponse({"error": "ORIGIN_NOT_ALLOWED"}, status_code=403)
+        token = request.query_params.get("attempt_id", "")
+        with local_create_attempts_lock:
+            attempt = local_create_attempts.get(token)
+            if (attempt is None or attempt["owner"] != _local_create_owner(identity)
+                    or attempt["name"] != request.query_params.get("name")
+                    or attempt["node"] != request.query_params.get("expected_local_node")):
+                return JSONResponse({"error": "CREATE_OUTCOME_UNKNOWN"}, status_code=409)
+            result = attempt.get("result")
+        if result is None:
+            return JSONResponse({"error": "CREATE_OUTCOME_PENDING"}, status_code=409)
+        local = controller.registry.get(controller.local_node_id)
+        resolution = await anyio.to_thread.run_sync(controller.resolve_session, attempt["name"])
+        if (attempt["node"] != controller.local_node_id or local is None
+                or local.endpoint != "local" or local.status != "online" or local.draining
+                or resolution.get("node_id") != attempt["node"] or "error" in resolution):
+            return JSONResponse({"error": "CREATE_RECONCILE_IDENTITY_MISMATCH"}, status_code=409)
+        receipt = await anyio.to_thread.run_sync(_local_create_receipt, result, attempt["name"], attempt["node"])
+        return JSONResponse(receipt, headers={"Cache-Control": "no-store"})
+
     @server.custom_route("/dashboard/api/session/create", methods=["POST"], include_in_schema=False)
     async def session_create(request: Request) -> JSONResponse:
         blocked, identity = _mutation_guard(request)
@@ -17571,21 +17679,34 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         granted_by = identity.email if identity else None
         _log.info("dashboard create_session name=%s agent_type=%s node=%s grant_mode=%s show_on_desktop=%s identity=%s",
                  name, agent_type, node, grant_mode, show_on_desktop, granted_by)
-        result = await anyio.to_thread.run_sync(
-            lambda: _routed(lambda: controller.terminal_create_session(
-                name, agent_type, cwd, node=node, grant_mode=grant_mode, requested_by=granted_by,
-                show_on_desktop=show_on_desktop))
-        )
-        if expected_local is not None and "error" not in result:
-            if result.get("node_id") != expected_local or result.get("session") != name:
-                return JSONResponse({"error": "LOCAL_NODE_RECEIPT_MISMATCH", "session_created": True}, status_code=409)
-            result["terminal_access"] = await anyio.to_thread.run_sync(terminal.terminal_web_terminal_access, name)
-            info = await anyio.to_thread.run_sync(terminal.resolve_identity, name)
-            if (info is not None and info.session_id == result.get("session_id")
-                    and info.created_epoch == result.get("created_epoch")):
-                result["terminal_instance"] = f"{info.session_id}@{info.created_epoch}"
-            else:
-                result["terminal_access"] = {"error": "SESSION_IDENTITY_MISMATCH"}
+        attempt_id = body.get("attempt_id") if expected_local is not None else None
+        if attempt_id is not None:
+            if not isinstance(attempt_id, str) or not re.fullmatch(r"[a-f0-9-]{36}", attempt_id):
+                return JSONResponse({"error": "INVALID_CREATE_ATTEMPT"}, status_code=400)
+            with local_create_attempts_lock:
+                # No retry, even with the same token. Reconciliation is GET only.
+                if attempt_id in local_create_attempts:
+                    return JSONResponse({"error": "CREATE_RECONCILE_REQUIRED"}, status_code=409)
+                if any(a["name"] == name and a["node"] == node and a.get("result") is None
+                       for a in local_create_attempts.values()):
+                    return JSONResponse({"error": "CREATE_ALREADY_PENDING"}, status_code=409)
+                if len(local_create_attempts) >= 256:
+                    return JSONResponse({"error": "CREATE_RECEIPT_CAPACITY"}, status_code=409)
+                local_create_attempts[attempt_id] = {
+                    "name": name, "node": node, "owner": _local_create_owner(identity), "result": None}
+        # Shield the allocation/receipt from HTTP disconnect cancellation. If
+        # the process itself dies, the absence of a receipt stays UNKNOWN.
+        with anyio.CancelScope(shield=True):
+            result = await anyio.to_thread.run_sync(
+                lambda: _routed(lambda: controller.terminal_create_session(
+                    name, agent_type, cwd, node=node, grant_mode=grant_mode, requested_by=granted_by,
+                    show_on_desktop=show_on_desktop))
+            )
+            if attempt_id is not None:
+                with local_create_attempts_lock:
+                    local_create_attempts[attempt_id]["result"] = dict(result)
+            if expected_local is not None:
+                result = await anyio.to_thread.run_sync(_local_create_receipt, result, name, expected_local)
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 
@@ -18211,21 +18332,25 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             # completely unreachable this way -- confirmed live.
             await _open_remote_terminal_ws(websocket, node_id, session, takeover_requested)
             return
-        access = await anyio.to_thread.run_sync(terminal.terminal_web_terminal_access, session)
+        if expected_instance is not None:
+            local = controller.registry.get(controller.local_node_id)
+            if local is None or local.endpoint != "local":
+                await websocket.close(code=4409)
+                return
+            access = await anyio.to_thread.run_sync(
+                lambda: terminal.terminal_web_terminal_access(session, expected_instance=expected_instance))
+        else:
+            access = await anyio.to_thread.run_sync(terminal.terminal_web_terminal_access, session)
         if "error" in access:
-            code = 4403
-            await websocket.close(code=code)
+            await websocket.close(code=4409 if access["error"] == "SESSION_IDENTITY_MISMATCH" else 4403)
             return
         attach_target = session
         if expected_instance is not None:
-            local = controller.registry.get(controller.local_node_id)
-            info = await anyio.to_thread.run_sync(terminal.resolve_identity, session)
-            if (local is None or local.endpoint != "local" or info is None
-                    or expected_instance != f"{info.session_id}@{info.created_epoch}"):
+            if access.get("terminal_instance") != expected_instance or not access.get("session_id"):
                 await websocket.close(code=4409)
                 return
-            # Attach tmux's unique ID, not a name that could be reused after this check.
-            attach_target = info.session_id
+            # Access and target come from the SAME canonical identity snapshot.
+            attach_target = access["session_id"]
         input_enabled = bool(access["input"])
         # Takeover (tmux `-d`, detaching any other attached client) is a
         # disruptive, explicit choice (see WEBTERM_HTML's confirm()
