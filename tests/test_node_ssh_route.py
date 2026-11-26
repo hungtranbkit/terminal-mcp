@@ -135,7 +135,9 @@ def test_route_proof_requires_nonce_user_hostname_and_strict_host_key(route_serv
         return subprocess.CompletedProcess(argv, 255 if failure in {"host_key", "auth"} else 0,
             stdout="\n".join(lines), stderr="Host key verification failed" if failure == "host_key" else "Permission denied")
     monkeypatch.setattr("terminal_mcp.node_ssh.subprocess.run", run)
-    assert not service.verify("dell-linux")["verified"]
+    result = service.verify("dell-linux")
+    assert not result["verified"]
+    assert service.status("dell-linux")["status"] == result["status"]
     with pytest.raises(ValueError): service.connect_argv("dell-linux")
 
 

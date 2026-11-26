@@ -276,7 +276,7 @@ class NodeSSHService:
         stored_status = profile.get("status")
         observed_status = stored_status or ("not_configured" if result.get("status") == "ready"
                                             else result.get("status", "unknown"))
-        if profile.get("verified_route") != self._route_binding(node_id) or (route_options and not profile.get("verified")):
+        if profile.get("verified_route") != self._route_binding(node_id):
             observed_status = "configured"
         current_fingerprint = None
         if result.get("host_public_key"):
@@ -517,7 +517,8 @@ class NodeSSHService:
         if result.returncode != 0:
             text = (result.stderr or "").lower()
             status = "host_key_mismatch" if "host key" in text or "remote host identification" in text else "auth_failed" if "permission denied" in text else "port_closed" if "refused" in text or "timed out" in text or "no route" in text else "error"
-            profile.update(status=status, verified=False, error=status)
+            profile.update(status=status, verified=False, error=status,
+                           verified_route=self._route_binding(node_id))
             if persist:
                 self._store_profile(profile_path, profile)
             return {"node_id": node_id, "status": status, "verified": False}
@@ -526,7 +527,8 @@ class NodeSSHService:
         ok = (len(output) >= 3 and output[0].strip() == nonce and output[1].strip() == user
               and bool(output[2].strip()) and (not expected_hostname or output[2].strip().casefold() == expected_hostname.casefold()))
         if not ok:
-            profile.update(status="identity_mismatch", verified=False, error="identity_mismatch")
+            profile.update(status="identity_mismatch", verified=False, error="identity_mismatch",
+                           verified_route=self._route_binding(node_id))
             if persist:
                 self._store_profile(profile_path, profile)
             return {"node_id": node_id, "status": "identity_mismatch", "verified": False}
