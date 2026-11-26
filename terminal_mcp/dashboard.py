@@ -5057,7 +5057,11 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     #csModal .cs-submit { background:var(--accent); border:none; border-radius:8px; color:#fff; padding:10px; cursor:pointer; font:inherit; font-size:14px; font-weight:600 }
     #csModal .cs-submit:disabled { opacity:.5; cursor:not-allowed }
     #csModal button.close { background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:4px 9px; cursor:pointer; font:inherit }
-    #csModal .cs-error { color:#ff6b6b; font-size:12px; min-height:14px }
+    #csCreatedTerminal { display:inline-flex; align-items:center; min-height:44px; color:var(--text); overflow-wrap:anywhere }
+    body.cs-local #csModal input[type=text], body.cs-local #csModal select,
+    body.cs-local #csModal button { min-height:44px; border-color:#64748b }
+    body.cs-local #csModal .cs-submit { color:#0b1220 }
+    #csModal .cs-error { overflow-wrap:anywhere; color:#ff6b6b; font-size:12px; min-height:14px }
     #csModal .cs-hint { color:var(--muted); font-size:11px }
     /* ---- Node groups (see NODE_GROUP_JS) --------------------------------
        A header row per node, spanning the full table, with its own sessions
@@ -5181,7 +5185,8 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
         <label><input type="checkbox" id="csShowOnDesktop" checked> Hiện cửa sổ thật trên desktop Windows</label>
         <div class="cs-hint">Chỉ áp dụng cho node Windows có desktop tương tác đang đăng nhập -- không có tác dụng trên node Linux/tmux. Nếu không có desktop tương tác, session vẫn tạo bình thường ở chế độ headless (không giả là visible).</div>
       </div>
-      <div class="cs-error" id="csError"></div>
+      <div class="cs-hint">Đóng tab chỉ ngắt kết nối, shell vẫn chạy. Để dọn shell bạn vừa tạo, đóng modal rồi dùng Xoá trong danh sách Sessions; kiểm tra đúng tên/node và xác nhận. Không xoá phiên của người khác.</div>
+      <div class="cs-error" id="csError" role="status"></div>
       <button type="submit" class="cs-submit" id="csSubmitBtn">Tạo session</button>
     </form>
   </div>
@@ -5383,6 +5388,8 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     const WEBTERM_PAGE = '/dashboard/terminal';
 
     // -- Create-session modal ---------------------------------------------
+    const csPinnedLocal = new URLSearchParams(location.search).get('create_local');
+    let csCreated = false;
     let csSelectedAgent = 'shell';
     let csNodesCache = []; // last-fetched /dashboard/api/nodes rows, reused when the agent-type choice changes
 
@@ -5412,13 +5419,13 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     // rather than the setup script. The second keeps every node that
     // enrolled before session_transport existed working unchanged.
     function nodeHasTransport(node) {
-      if (!node || node.id === 'local') return true;   // in-process, no transport to dial
+      if (!node || node.id === 'local' || node.endpoint === 'local') return true;   // in-process, no transport to dial
       if ((node.capabilities || []).includes('session_transport')) return true;
       const version = String(node.agent_version || '');
       return version !== '' && !version.startsWith('windows-setup/');
     }
     function nodeSummaryLabel(node) {
-      const os = osLabel(node);
+      const os = ({linux: 'Linux', darwin: 'macOS', windows: 'Windows'})[node.platform] || node.platform || 'Linux';
       const health = node.status !== 'online' ? 'Offline'
         : node.capacity_status === 'overloaded' ? 'Overloaded'
         : node.capacity_status === 'busy' ? 'Busy'
@@ -5456,7 +5463,12 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       // A previously-picked node that's now missing/disabled falls back to
       // Auto rather than silently submitting against a stale selection.
       const stillValid = [...csNodeEl.options].some(o => o.value === previous && !o.disabled);
-      csNodeEl.value = stillValid ? previous : 'auto';
+      if (csPinnedLocal) {
+        csNodeEl.value = csPinnedLocal;
+        csNodeEl.disabled = true;
+      } else {
+        csNodeEl.value = stillValid ? previous : 'auto';
+      }
       csNodeHintEl.textContent = csNodeEl.value === 'auto'
         ? 'Scheduler tự chọn node phù hợp còn healthy nhất.'
         : '';
@@ -5475,11 +5487,29 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     function closeCreateModal() {
       document.body.classList.remove('cs-modal-visible');
       csErrorEl.textContent = ''; csFormEl.reset();
+      document.getElementById('csCreatedTerminal')?.remove();
+      csCreated = false; csSubmitBtnEl.disabled = false;
+      csNameEl.readOnly = false;
       csSelectedAgent = 'shell';
       csAgentChoicesEl.querySelectorAll('button').forEach(b => b.classList.toggle('selected', b.dataset.agent === 'shell'));
+      if (csPinnedLocal) newSessionBtnEl.focus();
     }
     function openCreateModal() {
       csErrorEl.textContent = '';
+      if (csPinnedLocal) {
+        document.body.classList.add('cs-local');
+        csSelectedAgent = 'shell';
+        csNameEl.value = 'local-term-' + crypto.randomUUID();
+        csGrantEl.value = 'none';
+        csShowOnDesktopEl.checked = false;
+        csShowOnDesktopEl.closest('div').hidden = true;
+        csCwdEl.parentElement.querySelector('.cs-hint').textContent = 'Để trống dùng thư mục mặc định được policy cho phép trên HP.';
+        document.getElementById('csModalTitle').textContent = 'Terminal cục bộ — ' + csPinnedLocal;
+        csAgentChoicesEl.querySelectorAll('button').forEach(b => {
+          b.disabled = true; b.hidden = b.dataset.agent !== 'shell';
+          b.classList.toggle('selected', b.dataset.agent === 'shell');
+        });
+      }
       document.body.classList.add('cs-modal-visible');
       csNameEl.focus();
       loadNodesForCreateModal(); // fresh every open -- item 13: newly-registered nodes show up with no reload needed
@@ -5489,6 +5519,13 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
     csBackdropEl.onclick = closeCreateModal;
     document.addEventListener('keydown', event => {
       if (event.key === 'Escape' && document.body.classList.contains('cs-modal-visible')) closeCreateModal();
+      if (csPinnedLocal && event.key === 'Tab' && document.body.classList.contains('cs-modal-visible')) {
+        const controls = [...document.querySelectorAll('#csModal input:not(:disabled), #csModal select:not(:disabled), #csModal button:not(:disabled), #csModal a[href]')]
+          .filter(el => el.getClientRects().length);
+        const first = controls[0], last = controls[controls.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+      }
     });
     csAgentChoicesEl.querySelectorAll('button').forEach(btn => {
       btn.onclick = () => {
@@ -5506,8 +5543,12 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       event.preventDefault();
       const name = csNameEl.value.trim();
       const cwd = csCwdEl.value.trim();
-      const chosenNode = csNodeEl.value || 'auto';
+      const chosenNode = csPinnedLocal || csNodeEl.value || 'auto';
+      if (csCreated) return;
       csErrorEl.textContent = '';
+      if (!sessionLifecycleEnabled || (csPinnedLocal && !webTerminalEnabled)) {
+        csErrorEl.textContent = 'Tạo session hoặc web terminal đang tắt.'; return;
+      }
       if (!SAFE_SESSION_NAME_RE.test(name) || name.startsWith('-') || name.startsWith('.')) {
         csErrorEl.textContent = 'Tên session không hợp lệ (chỉ chữ/số/._- , không bắt đầu bằng "-" hoặc ".").';
         return;
@@ -5520,6 +5561,10 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       if (chosenNode !== 'auto') {
         await loadNodesForCreateModal();
         const fresh = csNodesCache.find(n => n.id === chosenNode);
+        if (csPinnedLocal && (!fresh || fresh.endpoint !== 'local' || fresh.status !== 'online' || fresh.draining)) {
+          csErrorEl.textContent = 'HP không còn online/local hoặc đang draining. Không tạo trên node khác.';
+          return;
+        }
         if (!fresh || fresh.status !== 'online' || !nodeCapable(fresh, csSelectedAgent)) {
           csErrorEl.textContent = `Node "${chosenNode}" không còn khả dụng (offline hoặc thiếu capability) -- chọn Auto hoặc node khác.`;
           csNodeEl.value = 'auto';
@@ -5534,15 +5579,43 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
           }
         }
       }
+      if (csSubmitBtnEl.disabled) return;
       csSubmitBtnEl.disabled = true; csSubmitBtnEl.textContent = 'Đang tạo…';
       try {
         const response = await fetch('/dashboard/api/session/create', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({name, agent_type: csSelectedAgent, cwd: cwd || null, node: chosenNode, grant_mode: csGrantEl.value, show_on_desktop: csShowOnDesktopEl.checked}),
+          body: JSON.stringify({name, agent_type: csSelectedAgent, cwd: cwd || null, node: chosenNode, grant_mode: csGrantEl.value, show_on_desktop: csShowOnDesktopEl.checked,
+            ...(csPinnedLocal ? {expected_local_node: csPinnedLocal} : {})}),
         });
         const result = await response.json().catch(() => ({}));
-        if (result && result.error) {
-          csErrorEl.textContent = `Lỗi: ${clean(result.error)}${result.reason ? ' -- ' + clean(result.reason) : ''}`;
+        if (!response.ok || (result && result.error)) {
+          if (csPinnedLocal && result.session_created) csCreated = true;
+          csErrorEl.textContent = `Lỗi: ${clean(result.error || response.status)}${result.reason ? ' -- ' + clean(result.reason) : ''}`;
+          return;
+        }
+        if (csPinnedLocal) {
+          // Never open a guessed/old session, even on a malformed success receipt.
+          csCreated = true;
+          csNameEl.readOnly = true;
+          if (result.node_id !== csPinnedLocal || result.session !== name || result.agent_type !== 'shell'
+              || !result.session_id || !result.created_epoch
+              || result.terminal_instance !== `${result.session_id}@${result.created_epoch}`) {
+            csErrorEl.textContent = 'Receipt không khớp HP/session/instance. Không mở terminal; kiểm tra danh sách session trước khi thử lại.';
+            return;
+          }
+          const access = result.terminal_access;
+          csErrorEl.textContent = access?.exists && !access.error
+            ? `Đã tạo ${name} trên ${csPinnedLocal}. ` + (access.input ? 'Có quyền gõ lệnh.' : 'Hiện chỉ có quyền xem.')
+            : `Đã tạo ${name} trên ${csPinnedLocal} nhưng chưa có quyền xem/gõ. Cấp quyền chủ động trong danh sách Sessions.`;
+          if (access?.exists && !access.error) {
+            const link = document.createElement('a');
+            link.id = 'csCreatedTerminal'; link.textContent = 'Mở terminal vừa tạo';
+            link.href = WEBTERM_PAGE + '?' + new URLSearchParams({session: name,
+              expected_node: csPinnedLocal, expected_instance: result.terminal_instance});
+            link.target = '_blank'; link.rel = 'noopener';
+            csErrorEl.after(link);
+          }
+          await load();
           return;
         }
         closeCreateModal();
@@ -5550,7 +5623,7 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
       } catch (error) {
         csErrorEl.textContent = `Lỗi mạng: ${clean(error && error.message)}`;
       } finally {
-        csSubmitBtnEl.disabled = false; csSubmitBtnEl.textContent = 'Tạo session';
+        csSubmitBtnEl.disabled = csCreated; csSubmitBtnEl.textContent = 'Tạo session';
       }
     };
 
@@ -6019,7 +6092,7 @@ SESSIONS_ADMIN_HTML = """<!doctype html>
         }
       }
     }
-    refresh(); setInterval(refresh, 5000);
+    refresh().then(() => { if (csPinnedLocal) openCreateModal(); }); setInterval(refresh, 5000);
   </script>
 </body>
 </html>"""
@@ -6083,6 +6156,8 @@ NODES_ADMIN_HTML = """<!doctype html>
     .nc-foot { margin-top:10px; display:flex; justify-content:space-between; align-items:center; font-size:11px; color:var(--muted) }
     .card-ssh { display:inline-block; margin-top:10px; padding:5px 11px; border:1px solid var(--accent); border-radius:6px; color:var(--text); text-decoration:none }
     .card-ssh:hover, .card-ssh:focus-visible { background:#233252 }
+    .card-local-terminal { display:inline-flex; align-items:center; min-height:44px; padding:0 12px; margin-top:10px; border:1px solid var(--accent); border-radius:6px; color:var(--text); text-decoration:none }
+    .card-local-terminal:focus-visible { outline:2px solid var(--text); outline-offset:2px }
     .empty { text-align:center; color:var(--muted); padding:48px 8px }
     #detail { margin-top:20px; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px 18px }
     #detail[hidden] { display:none }
@@ -6612,6 +6687,8 @@ NODES_ADMIN_HTML = """<!doctype html>
             <span>${node.tmux_session_count ?? 0} session${(node.tmux_session_count ?? 0) === 1 ? '' : 's'}</span>
             <span>heartbeat: ${heartbeatAge(node.last_heartbeat_at)}</span>
           </div>
+          ${node.endpoint === 'local' && node.status === 'online' && !node.draining
+            ? `<a class="card-local-terminal" href="/dashboard/sessions?${new URLSearchParams({create_local: node.id})}">Terminal cục bộ</a>` : ''}
           ${node.endpoint === 'local' || node.id === 'local' ? '' :
             `<a class="card-ssh" href="${sshTerminalUrl(node.id)}" target="_blank" rel="noopener">SSH Web</a>`}
           ${(node.overload_reasons && node.overload_reasons.length) ? `<div class="d-sessions-error" style="margin-top:8px">${node.overload_reasons.join('; ')}</div>` : ''}
@@ -6624,7 +6701,7 @@ NODES_ADMIN_HTML = """<!doctype html>
       container.innerHTML = nodesCache.map(nodeCardHtml).join('');
       container.querySelectorAll('.node-card').forEach((card) => {
         card.addEventListener('click', (event) => {
-          if (event.target.closest('.card-ssh')) return;
+          if (event.target.closest('.card-ssh, .card-local-terminal')) return;
           selectedNodeId = card.dataset.nodeId; renderCards(); loadDetail(selectedNodeId);
         });
       });
@@ -12741,6 +12818,11 @@ WEBTERM_HTML = """<!doctype html>
     function wsUrl() {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const q = sshMode ? new URLSearchParams({ transport: 'ssh', node_id: sshNodeId }) : new URLSearchParams({ session: sessionName });
+      if (!sshMode) {
+        for (const key of ['expected_node', 'expected_instance']) {
+          if (params.has(key)) q.set(key, params.get(key));
+        }
+      }
       if (takeover) q.set('takeover', '1');
       return `${proto}//${location.host}${WS_PATH}?${q.toString()}`;
     }
@@ -17462,7 +17544,21 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         # session already used for grant_mode="read"/"read_send" (e.g. the
         # MCP tool's own initial_prompt flow) -- same refusal rules (a
         # sensitive-worded name, a denied input pattern) apply here too.
+        expected_local = body.get("expected_local_node") if isinstance(body, dict) else None
+        if expected_local is not None:
+            local = controller.registry.get(controller.local_node_id)
+            if (expected_local != controller.local_node_id or node != expected_local
+                    or agent_type != "shell" or local is None or local.endpoint != "local"):
+                return JSONResponse({"error": "LOCAL_NODE_IDENTITY_MISMATCH"}, status_code=409)
+            if local.status != "online" or local.draining:
+                return JSONResponse({"error": "LOCAL_NODE_UNAVAILABLE"}, status_code=409)
+            if not terminal.config.session_lifecycle.enabled or not terminal.config.dashboard.web_terminal_enabled:
+                return JSONResponse({"error": "LOCAL_TERMINAL_DISABLED"}, status_code=403)
+            existing = await anyio.to_thread.run_sync(controller.resolve_session, name)
+            if existing.get("error") != "SESSION_NOT_FOUND":
+                return JSONResponse({"error": existing.get("error", "SESSION_ALREADY_EXISTS")}, status_code=409)
         grant_mode = body.get("grant_mode", "none") if isinstance(body, dict) else "none"
+
         if grant_mode not in ("none", "read", "read_send"):
             return JSONResponse({"error": "INVALID_GRANT_MODE", "session": name}, status_code=400)
         # Windows visible-desktop-window request (task: "user nhìn tại
@@ -17480,6 +17576,16 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
                 name, agent_type, cwd, node=node, grant_mode=grant_mode, requested_by=granted_by,
                 show_on_desktop=show_on_desktop))
         )
+        if expected_local is not None and "error" not in result:
+            if result.get("node_id") != expected_local or result.get("session") != name:
+                return JSONResponse({"error": "LOCAL_NODE_RECEIPT_MISMATCH", "session_created": True}, status_code=409)
+            result["terminal_access"] = await anyio.to_thread.run_sync(terminal.terminal_web_terminal_access, name)
+            info = await anyio.to_thread.run_sync(terminal.resolve_identity, name)
+            if (info is not None and info.session_id == result.get("session_id")
+                    and info.created_epoch == result.get("created_epoch")):
+                result["terminal_instance"] = f"{info.session_id}@{info.created_epoch}"
+            else:
+                result["terminal_access"] = {"error": "SESSION_IDENTITY_MISMATCH"}
         status_code = 200 if "error" not in result else INPUT_ERROR_STATUS.get(result["error"], 400)
         return JSONResponse(result, status_code=status_code, headers={"Cache-Control": "no-store"})
 
@@ -18086,6 +18192,13 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             await websocket.close(code=4404 if resolution["error"] == "SESSION_NOT_FOUND" else 4409)
             return
         node_id = resolution["node_id"]
+        expected_node = websocket.query_params.get("expected_node")
+        expected_instance = websocket.query_params.get("expected_instance")
+        if ((expected_node is not None and expected_node != node_id)
+                or (expected_instance is not None and
+                    (not expected_node or node_id != controller.local_node_id))):
+            await websocket.close(code=4409)
+            return
         if node_id != controller.local_node_id:
             # Real bug this replaces: the old code only ever attempted a
             # remote lookup AFTER terminal.terminal_web_terminal_access
@@ -18103,6 +18216,16 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
             code = 4403
             await websocket.close(code=code)
             return
+        attach_target = session
+        if expected_instance is not None:
+            local = controller.registry.get(controller.local_node_id)
+            info = await anyio.to_thread.run_sync(terminal.resolve_identity, session)
+            if (local is None or local.endpoint != "local" or info is None
+                    or expected_instance != f"{info.session_id}@{info.created_epoch}"):
+                await websocket.close(code=4409)
+                return
+            # Attach tmux's unique ID, not a name that could be reused after this check.
+            attach_target = info.session_id
         input_enabled = bool(access["input"])
         # Takeover (tmux `-d`, detaching any other attached client) is a
         # disruptive, explicit choice (see WEBTERM_HTML's confirm()
@@ -18114,7 +18237,7 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         terminal.audit.record(action="web_terminal_open", session=session, result="OPENED",
                               reason=f"input={input_enabled} takeover={takeover}", source_transport="dashboard")
         proc = await anyio.to_thread.run_sync(
-            lambda: WebTerminalProcess(terminal.tmux.binary, session, readonly=not input_enabled, takeover=takeover)
+            lambda: WebTerminalProcess(terminal.tmux.binary, attach_target, readonly=not input_enabled, takeover=takeover)
         )
         try:
             await websocket.send_json({"type": "ready", "session": session, "readonly": not input_enabled,
