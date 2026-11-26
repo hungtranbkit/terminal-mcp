@@ -410,8 +410,13 @@ class BrowserGateway:
         viewport = self._viewport(viewport_width, viewport_height)
         nav_ms, hard = self._budget(timeout_seconds)
         steps: list[dict[str, Any]] = []
-        if isinstance(wait_for, str) and wait_for.strip():
-            steps.append({"action": "wait_for", "target": wait_for.strip()[:300]})
+        if wait_for is not None:
+            if (not isinstance(wait_for, str) or not wait_for.strip()
+                    or len(wait_for.strip()) > 300
+                    or any(ord(c) < 32 or ord(c) == 127 for c in wait_for)):
+                return self._error("INVALID_BROWSER_WAIT", "invalid browser wait selector",
+                                   verification_scope="incomplete")
+            steps.append({"action": "wait_for", "target": wait_for.strip()})
         job = self._job(url=target, viewport=viewport, nav_ms=nav_ms,
                         selectors=browser_script.selectors_for(checks),
                         steps=steps, artifact=self._artifact_path(screenshot))
@@ -426,15 +431,30 @@ class BrowserGateway:
 
         observation = browser_script.Observation.from_payload(raw.get("observation"))
         results = browser_script.evaluate(checks, observation)
+        wait_result = None
+        if steps:
+            receipts = raw.get("steps")
+            receipt = receipts[0] if isinstance(receipts, list) and len(receipts) == 1 else None
+            if (not isinstance(receipt, dict) or receipt.get("action") != "wait_for"
+                    or receipt.get("target") != steps[0]["target"]):
+                wait_result = {"status": "ERROR", "reason": "WAIT_RECEIPT_MISSING"}
+            elif receipt.get("status") == "OK":
+                wait_result = {"status": "PASS"}
+            elif receipt.get("status") == "FAILED":
+                wait_result = {"status": "FAIL", "reason": "WAIT_FAILED"}
+            else:
+                wait_result = {"status": "ERROR", "reason": "WAIT_STEP_ERROR"}
         failed = [r for r in results if r["status"] == "FAIL"]
         errored = [r for r in results if r["status"] == "ERROR"]
         # No assertions is not a PASS by default: the caller asked "does this
         # page work" and we can only answer "it loaded". Say that, and let the
         # HTTP status and the error counts carry the weight.
-        if parse_errors:
+        if parse_errors or (wait_result and wait_result["status"] == "ERROR"):
             verdict = "ERROR"
         elif errored:
             verdict = "ERROR"
+        elif wait_result and wait_result["status"] == "FAIL":
+            verdict = "FAIL"
         elif failed:
             verdict = "FAIL"
         elif checks:
@@ -444,7 +464,8 @@ class BrowserGateway:
 
         result: dict[str, Any] = {
             "status": verdict,
-            "verification_scope": ("incomplete" if parse_errors or errored else
+            "verification_scope": ("incomplete" if parse_errors or errored
+                                    or (wait_result and wait_result["status"] != "PASS") else
                                    "assertions" if checks else "navigation_only"),
             "url": scrub(target, 300),
             "engine": ENGINE,
@@ -458,6 +479,10 @@ class BrowserGateway:
         }
         if parse_errors:
             result["assertion_errors"] = [scrub(e) for e in parse_errors]
+        if wait_result:
+            result["wait"] = wait_result
+            if wait_result["status"] != "PASS":
+                result["failures"].append(wait_result["reason"])
         if redaction_applied(observation.text, observation.final_url,
                              " ".join(observation.console_errors)):
             result["redacted"] = True

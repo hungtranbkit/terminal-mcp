@@ -30,7 +30,16 @@ def normalize_cached_browser_args(action: str, args: dict | None, *, steps: list
             if not isinstance(step, dict):
                 raise ValueError("invalid browser assertion step")
             kind = step.get("action")
-            if kind in {"assert_text", "assert_title"}:
+            if kind == "wait_for":
+                selector = step.get("selector")
+                if (set(step) != {"action", "selector"} or not isinstance(selector, str)
+                        or not selector.strip() or len(selector.strip()) > 300
+                        or any(ord(c) < 32 or ord(c) == 127 for c in selector)):
+                    raise ValueError("invalid browser wait selector")
+                if assertions or "wait_for" in out:
+                    raise ValueError("one browser wait must precede assertions")
+                put("wait_for", selector.strip())
+            elif kind in {"assert_text", "assert_title"}:
                 value = step.get("text")
                 if set(step) != {"action", "text"} or not isinstance(value, str) or not value.strip() or len(value) > 4000:
                     raise ValueError("invalid text assertion")
