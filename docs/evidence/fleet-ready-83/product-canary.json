@@ -1,0 +1,157 @@
+{
+  "schema_version": 2,
+  "canary": "actual TerminalService.terminal_create_session",
+  "pf_source_sha": "1cf9404434155fc743cee620846b0350c22d857e",
+  "workspace": "/home/kimex/workspace/.worktrees/pf83-v2-mcp-product",
+  "session": "pf83-v2-mcp-c503cb4466fa",
+  "tmux_socket": "pf83-v2-mcp-ab1157cdb336",
+  "runtime": "docker",
+  "scope": "local",
+  "delivery": "NOT_TESTED_HERE",
+  "started_at": 1795579504.2254446,
+  "before": {
+    "head": "1cf9404434155fc743cee620846b0350c22d857e",
+    "branch": "agent/codex/pf83-v2-mcp-product",
+    "dirty": ""
+  },
+  "apply": {
+    "code": "PASS",
+    "changed": true,
+    "profile": "trusted-project-unattended-v1"
+  },
+  "create": {
+    "session": "pf83-v2-mcp-c503cb4466fa",
+    "agent_type": "codex",
+    "cwd": "/home/kimex/workspace/.worktrees/pf83-v2-mcp-product",
+    "state": "SUBMITTED",
+    "execution_confirmed": false,
+    "tool_ready": false,
+    "request_key": "mcp-91b92feab44ae9d496ef53ba4cc184ae0ee4f0348aa0b5c9128289c103c8ea46",
+    "grant": {
+      "read": {
+        "session": "pf83-v2-mcp-c503cb4466fa",
+        "read_enabled": true,
+        "input_enabled": false
+      },
+      "input": {
+        "session": "pf83-v2-mcp-c503cb4466fa",
+        "read_enabled": true,
+        "input_enabled": true
+      }
+    },
+    "binding": {
+      "binding": "pf83-v2-mcp-c503cb4466fa",
+      "session": "pf83-v2-mcp-c503cb4466fa",
+      "session_exists": true,
+      "allowed": true,
+      "read_enabled": true,
+      "input_enabled": false,
+      "effective_input": false,
+      "created_at": "2026-11-25T04:05:06.879425+00:00",
+      "updated_at": "2026-11-25T04:05:06.879425+00:00",
+      "replaced": false
+    },
+    "fleet_readiness": {
+      "schema_version": 1,
+      "source_sha": "1cf9404434155fc743cee620846b0350c22d857e",
+      "request_key": "mcp-91b92feab44ae9d496ef53ba4cc184ae0ee4f0348aa0b5c9128289c103c8ea46",
+      "task_id": "pf83-v2-mcp-owner-canary-1",
+      "preflight": {
+        "code": "PASS",
+        "failures": {},
+        "execution": "NOT_DISPATCHED"
+      }
+    },
+    "initial_prompt_result": {
+      "status": "SUBMITTED",
+      "execution_confirmed": false,
+      "request_key": "mcp-91b92feab44ae9d496ef53ba4cc184ae0ee4f0348aa0b5c9128289c103c8ea46",
+      "transport": "shared_fleet_runner"
+    }
+  },
+  "durable_receipt": {
+    "fingerprint": "96969316eb2303b7302cb9fb23bb313020f6af723af7cc8f369ba64723cda512",
+    "request_key": "mcp-91b92feab44ae9d496ef53ba4cc184ae0ee4f0348aa0b5c9128289c103c8ea46",
+    "result": {
+      "code": "PASS",
+      "returncode": 0,
+      "elapsed_ms": 22514,
+      "execution": "EXITED",
+      "dispatched": true,
+      "task_outcome": "UNVERIFIED",
+      "runtime": "docker",
+      "capabilities": "FILE_WORK_ONLY_NO_GIT",
+      "log_path": "/tmp/pf83-v2-mcp-product-canary-3/profile/4ef973a48938e4e2cf49.mcp-91b92feab44ae9d496ef53ba4cc184ae0ee4f0348aa0b5c9128289c103c8ea46.log",
+      "request_key": "mcp-91b92feab44ae9d496ef53ba4cc184ae0ee4f0348aa0b5c9128289c103c8ea46",
+      "output_sha256": "53d9629040b3d50159adcf9c0c622e2449b5c3b8f7211a8a05fc195c50e1b9f9"
+    }
+  },
+  "retry": {
+    "error": "BINDING_EXISTS",
+    "session": "pf83-v2-mcp-c503cb4466fa",
+    "state": "BLOCKED"
+  },
+  "independent_build_test": [
+    {
+      "argv": [
+        "/bin/sh",
+        "-n",
+        "pf83_mcp_v2.sh"
+      ],
+      "exit": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "/bin/sh",
+        "pf83_mcp_v2.sh"
+      ],
+      "exit": 0,
+      "stdout": "PF83_MCP_V2_BUILD_TEST_PASS\n",
+      "stderr": ""
+    }
+  ],
+  "proof": "PF83_MCP_V2_BUILD_TEST_PASS\n",
+  "status": "LOCAL_CODE_BUILD_TEST_PASS",
+  "after": {
+    "head": "1cf9404434155fc743cee620846b0350c22d857e",
+    "branch": "agent/codex/pf83-v2-mcp-product",
+    "dirty": "?? pf83_mcp_v2.result.txt\n?? pf83_mcp_v2.sh"
+  },
+  "close": {
+    "session": "pf83-v2-mcp-c503cb4466fa",
+    "deleted": false,
+    "action": "already_gone",
+    "receipt": {
+      "node_id": "local",
+      "tmux_kill": "already_gone",
+      "instance": null,
+      "tmux_absent_verified": true,
+      "registry_tombstone": {
+        "status": "KILLED",
+        "generation": 1,
+        "tombstone_identity": null
+      },
+      "lifecycle": null
+    },
+    "references": {
+      "bindings": [
+        "pf83-v2-mcp-c503cb4466fa"
+      ],
+      "active_grant": true,
+      "attached": false,
+      "active_lease": false,
+      "recovery_state": null
+    }
+  },
+  "rollback": {
+    "code": "PASS",
+    "changed": true
+  },
+  "rollback_repeat": {
+    "code": "PASS",
+    "changed": false
+  },
+  "elapsed_ms": 28363
+}

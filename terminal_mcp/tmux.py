@@ -8,6 +8,7 @@ import uuid
 from datetime import datetime, timezone
 
 from .models import SessionInfo
+from .launcher_resolution import effective_path
 
 
 class TmuxError(RuntimeError):
@@ -242,7 +243,7 @@ class TmuxClient:
         never client-supplied text). Ignored (and must be empty) when
         `command` is None -- there is nothing to pass flags to when the
         session is just a plain shell."""
-        args = ["new-session", "-d", "-s", name, "-c", cwd]
+        args = ["new-session", "-d", "-s", name, "-c", cwd, "-e", "PATH=" + effective_path()]
         if command:
             args.append(command)
             args.extend(extra_args)

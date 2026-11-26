@@ -31,8 +31,11 @@ def effective_path() -> str:
     """Return the process PATH plus the current Windows user PATH."""
     process_path = os.environ.get("PATH", "")
     user_path = _windows_user_path()
-    if not user_path:
-        return process_path
+    local_bin = Path.home() / '.local' / 'bin'
+    if os.name != 'nt' and local_bin.is_dir():
+        stat = local_bin.stat()
+        if stat.st_uid == os.getuid() and not stat.st_mode & 0o022:
+            user_path = str(local_bin)
     parts = [part for part in (process_path, user_path) if part]
     return os.pathsep.join(parts)
 

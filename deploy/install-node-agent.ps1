@@ -55,9 +55,13 @@
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)] [string] $ControllerUrl,
-    [Parameter(Mandatory = $true)] [ValidatePattern('^[A-Za-z0-9_-]+$')] [string] $NodeId,
+    [string] $ControllerUrl,
+    [ValidatePattern('^[A-Za-z0-9_-]+$')] [string] $NodeId,
     [string] $Token,
+    [string] $FleetReadinessConfig,
+    [string] $FleetWorkspace,
+    [ValidateSet('audit', 'apply', 'check', 'rollback')] [string] $FleetAction = 'audit',
+    [switch] $AuthorizeTrust,
     [string] $RepoDir = (Split-Path -Parent $PSScriptRoot),
     [int] $Port = 8790,
     [string] $BindHost = "127.0.0.1",
@@ -78,6 +82,21 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# Readiness-only repair runs non-elevated through PF's Windows ACL checks and
+# exits before pairing, token generation, package install or scheduled tasks.
+if ($FleetReadinessConfig) {
+    if (-not $PythonExe) { $PythonExe = 'python' }
+    $FleetArgs = @((Join-Path $PSScriptRoot '../scripts/fleet-readiness.py'),
+        '--config', $FleetReadinessConfig, '--workspace', $FleetWorkspace, '--action', $FleetAction)
+    if ($AuthorizeTrust) { $FleetArgs += '--authorize-trust' }
+    & $PythonExe @FleetArgs
+    exit $LASTEXITCODE
+}
+if (-not $ControllerUrl -or -not $NodeId) {
+    throw 'ControllerUrl and NodeId are required for installation.'
+}
+
 
 Write-Host "== Terminal MCP Windows node agent installer ==" -ForegroundColor Cyan
 Write-Host "  node-id:    $NodeId"

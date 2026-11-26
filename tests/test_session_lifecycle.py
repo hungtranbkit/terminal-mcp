@@ -770,13 +770,27 @@ def test_dashboard_lifecycle_routes_require_cloudflare_access_when_configured():
     assert response.json()["error"] == "CLOUDFLARE_ACCESS_VERIFICATION_FAILED"
 
 
-def test_dashboard_create_detach_delete_round_trip_refreshes_list(tmp_path, lifecycle_session_factory):
+@pytest.fixture
+def healthy_lifecycle_metrics(monkeypatch):
+    # These two tests verify route/lifecycle behavior, not live host capacity.
+    # Real fleet pressure must still reject production creates; deterministic
+    # metrics keep an unrelated concurrent job from changing this test's setup.
+    from terminal_mcp.host_metrics import NodeMetrics
+    gib = 1024 ** 3
+    metrics = NodeMetrics(cpu_percent=10, load1=.1, load5=.1, load15=.1, cpu_count=4,
+        ram_total_bytes=8*gib, ram_used_bytes=2*gib, ram_percent=25,
+        swap_total_bytes=2*gib, swap_used_bytes=0, swap_percent=0,
+        disk_total_bytes=100*gib, disk_used_bytes=20*gib, disk_free_bytes=80*gib, disk_percent=20)
+    monkeypatch.setattr('terminal_mcp.controller.host_metrics.collect', lambda **kwargs: metrics)
+
+
+def test_dashboard_create_detach_delete_round_trip_refreshes_list(tmp_path, lifecycle_session_factory, healthy_lifecycle_metrics):
     config = _lifecycle_config(tmp_path)
     client, service = _dashboard_client(config)
     name = lifecycle_session_factory("roundtrip-1")
 
     created = client.post("/dashboard/api/session/create", json={"name": name, "agent_type": "shell"})
-    assert created.status_code == 200
+    assert created.status_code == 200, created.json()
     listed = client.get("/dashboard/api/sessions").json()
     assert any(row["name"] == name for row in listed["sessions"])
     assert listed["session_lifecycle_enabled"] is True
@@ -805,7 +819,7 @@ def test_dashboard_delete_route_refuses_protected_session(tmp_path, owned_name, 
     assert service.tmux.get_session(name) is not None
 
 
-def test_mcp_tool_and_dashboard_route_share_the_same_service(tmp_path, lifecycle_session_factory):
+def test_mcp_tool_and_dashboard_route_share_the_same_service(tmp_path, lifecycle_session_factory, healthy_lifecycle_metrics):
     # The dashboard route below and mcp_app.py's terminal_create_session
     # tool both do nothing but call TerminalService.terminal_create_session
     # -- proven here by creating through the dashboard HTTP route, then
@@ -815,7 +829,7 @@ def test_mcp_tool_and_dashboard_route_share_the_same_service(tmp_path, lifecycle
     client, service = _dashboard_client(config)
     name = lifecycle_session_factory("shared-svc")
     response = client.post("/dashboard/api/session/create", json={"name": name, "agent_type": "shell"})
-    assert response.status_code == 200
+    assert response.status_code == 200, response.json()
     direct = service.terminal_create_session(name, "shell")  # same session, via the "MCP" call shape
     assert direct["error"] == "SESSION_ALREADY_EXISTS"  # proves it's the same underlying tmux/service state
 

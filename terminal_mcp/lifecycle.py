@@ -205,7 +205,8 @@ class SessionLifecycleService:
         return None
 
     def create(self, name: str, agent_type: str, cwd: str | None, *,
-              show_on_desktop: bool = False, extra_args: tuple[str, ...] = ()) -> dict[str, Any]:
+              show_on_desktop: bool = False, extra_args: tuple[str, ...] = (),
+              prepared_fleet=None) -> dict[str, Any]:
         """Create one new detached session, then poll (bounded by
         config.session_lifecycle.create_ready_timeout_seconds) for
         evidence the launched process actually started. Returns a receipt
@@ -244,6 +245,23 @@ class SessionLifecycleService:
         resolved_cwd, error = resolve_cwd(cwd, self.config)
         if error is not None:
             return {**error, "state": "FAILED"}
+        if prepared_fleet is not None:
+            from .fleet_readiness import PreparedFleetLaunch
+            if not isinstance(prepared_fleet, PreparedFleetLaunch) or not prepared_fleet.argv:
+                return {'error': 'TRUST_REQUIRED', 'state': 'FAILED'}
+            try:
+                self.tmux.new_session(name, str(resolved_cwd), prepared_fleet.argv[0],
+                    show_on_desktop=show_on_desktop, extra_args=prepared_fleet.argv[1:])
+                info = self.tmux.get_session(name)
+            except TmuxError:
+                return {'error': 'EXECUTION_UNKNOWN', 'state': 'EXECUTION_UNKNOWN', 'session': name,
+                        'request_key': prepared_fleet.request_key}
+            # Python runner existence is not proof its agent executed. PF owns
+            # the durable launch receipt; independent output must confirm work.
+            return {'session': name, 'agent_type': agent_type, 'cwd': str(resolved_cwd),
+                    'state': 'SUBMITTED' if info and not info.pane_dead else 'EXECUTION_UNKNOWN',
+                    'execution_confirmed': False, 'tool_ready': False,
+                    'request_key': prepared_fleet.request_key}
         command = self.launch_command_for(agent_type)
         if agent_type != "shell" and not command:
             return {"error": "LAUNCHER_NOT_CONFIGURED", "agent_type": agent_type, "state": "FAILED"}
