@@ -3706,7 +3706,7 @@ class TerminalService:
         _resolved, error = resolve_cwd(info.pane_current_path, self.config)
         return error is None
 
-    def terminal_web_terminal_access(self, session: str) -> dict[str, Any]:
+    def terminal_web_terminal_access(self, session: str, *, expected_instance: str | None = None) -> dict[str, Any]:
         """Authorization + existence resolution for the web terminal
         (xterm.js over a WebSocket, attaching a browser directly to an
         existing tmux session's real pty -- webterm.py). This is the ONE
@@ -3750,11 +3750,18 @@ class TerminalService:
             return {"error": "TMUX_ERROR", "reason": str(exc)}
         if info is None:
             return {"error": "SESSION_NOT_FOUND"}
+        current = SessionIdentity.from_session_info(info)
+        instance = f"{current.session_id}@{current.created_epoch}"
+        if expected_instance is not None and expected_instance != instance:
+            return {"error": "SESSION_IDENTITY_MISMATCH"}
         input_enabled = bool(
             self.config.permissions.terminal_input
-            and self._input_authorized_with_grant(session, grant)[0]
+            and self._input_authorized_with_grant(session, grant, current_identity=current)[0]
         )
-        return {"exists": True, "input": input_enabled, "attached": info.attached}
+        result = {"exists": True, "input": input_enabled, "attached": info.attached}
+        if expected_instance is not None:
+            result.update(session_id=current.session_id, terminal_instance=instance)
+        return result
 
     # Grant rows written by the system itself, as bookkeeping rather than as
     # anyone's security decision. `system:session_deleted` is the teardown
@@ -4463,6 +4470,21 @@ class TerminalService:
 
     @serialized_admission
     def terminal_create_session(self, name: str, agent_type: str = "shell", cwd: str | None = None, *,
+                                initial_prompt: str | None = None, grant_mode: str = "none",
+                                binding: str | None = None, requested_by: str | None = None,
+                                show_on_desktop: bool = False,
+                                resume_session_id: str | None = None) -> dict[str, Any]:
+        """Create through canonical lifecycle/grant policy, serialized by name."""
+        # Every in-process caller shares this admission lock, before lifecycle
+        # allocation or grant writes. tmux new-session -s (without -A) remains
+        # the cross-process atomic duplicate-name guard.
+        with self._pane_locks.get("create:" + name):
+            return self._terminal_create_session_locked(
+                name, agent_type, cwd, initial_prompt=initial_prompt, grant_mode=grant_mode,
+                binding=binding, requested_by=requested_by, show_on_desktop=show_on_desktop,
+                resume_session_id=resume_session_id)
+
+    def _terminal_create_session_locked(self, name: str, agent_type: str = "shell", cwd: str | None = None, *,
                                 initial_prompt: str | None = None, grant_mode: str = "none",
                                 binding: str | None = None, requested_by: str | None = None,
                                 show_on_desktop: bool = False,
