@@ -6058,9 +6058,9 @@ NODES_ADMIN_HTML = """<!doctype html>
     button.icon-btn { background:#19243b; border:1px solid var(--line); border-radius:6px; color:var(--text); padding:5px 11px; cursor:pointer; font:inherit; font-size:12px }
     button.icon-btn:hover { background:#233252 }
     main { flex:1; min-height:0; overflow:auto; padding:18px 24px 24px }
-    #cards { display:grid; grid-template-columns:repeat(auto-fill, minmax(300px, 1fr)); gap:14px }
+    #cards { display:grid; grid-template-columns:repeat(auto-fill, minmax(min(300px, 100%), 1fr)); gap:14px }
     .nc-ssh { border:1px solid var(--line); border-radius:10px; padding:10px; margin:10px 0; }
-    .node-card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px; cursor:pointer; transition:border-color .15s }
+    .node-card { min-width:0; overflow-wrap:anywhere; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px; cursor:pointer; transition:border-color .15s }
     .node-card:hover { border-color:var(--accent) }
     .node-card.selected { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) }
     .node-card .nc-head { display:flex; justify-content:space-between; align-items:center; gap:8px }
@@ -6081,8 +6081,11 @@ NODES_ADMIN_HTML = """<!doctype html>
     .meter > div { height:100%; background:var(--accent) }
     .meter.warn > div { background:var(--amber) } .meter.danger > div { background:var(--red) }
     .nc-foot { margin-top:10px; display:flex; justify-content:space-between; align-items:center; font-size:11px; color:var(--muted) }
-    .card-ssh { display:inline-block; margin-top:10px; padding:5px 11px; border:1px solid var(--accent); border-radius:6px; color:var(--text); text-decoration:none }
+    .card-ssh { display:inline-flex; align-items:center; justify-content:center; min-height:44px; min-width:44px; max-width:100%; margin-top:10px; padding:8px 12px; border:1px solid var(--accent); border-radius:6px; color:var(--text); text-decoration:none }
     .card-ssh:hover, .card-ssh:focus-visible { background:#233252 }
+    .nodes-toolbar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; min-width:0; max-width:100% }
+    .nc-head > div:first-child { min-width:0 }
+    .nc-foot { flex-wrap:wrap; gap:4px 8px }
     .empty { text-align:center; color:var(--muted); padding:48px 8px }
     #detail { margin-top:20px; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px 18px }
     #detail[hidden] { display:none }
@@ -6208,14 +6211,19 @@ NODES_ADMIN_HTML = """<!doctype html>
       .tr-table th:nth-child(4), .tr-table td:nth-child(4) { display:none }
     }
     @media (max-width:760px) {
-      header { padding:12px 14px } main { padding:14px } #cards { grid-template-columns:1fr }
+      header { padding:12px 14px } main { padding:14px; min-width:0 } #cards { grid-template-columns:minmax(0, 1fr) }
+      .nodes-toolbar { width:100%; gap:6px }
+      .node-card .nc-head { flex-wrap:wrap }
+      .node-card .nc-head > div { min-width:0; max-width:100% }
+      .node-card .nc-head > div:last-child { flex-wrap:wrap }
+      .nc-metrics { grid-template-columns:repeat(2, minmax(0, 1fr)) }
     }
   </style>
 </head>
 <body>
   <header>
     <div><h1>Quản lý node</h1><div class="muted">Trạng thái, tài nguyên và session theo từng node</div></div>
-    <div style="display:flex;align-items:center;gap:10px">
+    <div class="nodes-toolbar">
       <button class="icon-btn an-primary" id="addNodeWizardBtn" type="button">+ Add Node</button>
       <button class="icon-btn" id="connectNodeBtn" type="button">+ Connect Node</button>
       <button class="icon-btn" id="addNodeBtn" type="button">+ Thêm node</button>
