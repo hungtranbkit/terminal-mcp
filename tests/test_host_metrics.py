@@ -107,3 +107,28 @@ def test_windows_cpu_percent_sampler_handles_unavailable_api():
         assert sampler.sample() is None
     finally:
         hm_module._read_windows_system_times = original
+
+
+def test_linux_disk_percent_matches_user_available_capacity(monkeypatch, tmp_path):
+    from terminal_mcp.node_registry import classify_capacity
+    from terminal_mcp.node_models import CAPACITY_OVERLOADED, OverloadThresholds
+    for total, used, available in [
+        (249792131072, 224129048576, 12899766272),
+        (124297854976, 108939894784, 8996671488),
+    ]:
+        assert 100 * used / total < 90
+        monkeypatch.setattr(hm, "disk_usage", lambda _: (total, used, available))
+        m = hm._collect_linux(workspace_path=str(tmp_path))
+        assert m.disk_total_bytes == total
+        assert m.disk_free_bytes == available
+        assert abs(m.disk_percent - 100 * used / (used + available)) < 1e-9
+        state, _ = classify_capacity({"disk_percent": m.disk_percent}, OverloadThresholds())
+        assert state == CAPACITY_OVERLOADED
+
+
+def test_disk_effective_percentage_handles_invalid_and_no_reserve():
+    assert hm._disk_used_percent(80, 20) == 80.0
+    assert hm._disk_used_percent(100, 0) == 100.0
+    assert hm._disk_used_percent(0, 100) == 0.0
+    for used, free in [(None, 20), (80, None), (0, 0), (-1, 20), (80, -1)]:
+        assert hm._disk_used_percent(used, free) is None
