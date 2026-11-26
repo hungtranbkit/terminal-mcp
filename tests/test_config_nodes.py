@@ -13,6 +13,29 @@ from terminal_mcp.config import NodeHealthConfig, RemoteNodeConfig, load_config
 from terminal_mcp.node_models import NodeHeartbeatThresholds, OverloadThresholds
 
 
+@pytest.mark.parametrize("invalid", [None, "address", "port", "username", "hostname", "pin", "endpoint", "unknown", "missing"])
+def test_managed_ssh_route_requires_explicit_bound_identity(tmp_path, invalid):
+    from terminal_mcp.node_ssh import NodeSSHService
+    route = dict(address="192.168.100.97", port=22, username="dell", hostname="node-dell",
+                 registered_endpoint="http://100.81.85.120:8790",
+                 host_key_fingerprint="SHA256:" + "a" * 43)
+    if invalid == "address": route["address"] = "example.com"
+    if invalid == "port": route["port"] = True
+    if invalid == "username": route["username"] = "-oProxyCommand=x"
+    if invalid == "hostname": route["hostname"] = "wrong\nname"
+    if invalid == "pin": route["host_key_fingerprint"] = "untrusted"
+    if invalid == "endpoint": route["registered_endpoint"] = "http://100.81.85.121:8790"
+    if invalid == "unknown": route["fallback"] = "auto"
+    if invalid == "missing": del route["hostname"]
+    path = _write(tmp_path, _base_raw(remote=[dict(node_id="dell-linux", token_env="TOKEN",
+        endpoint="http://100.81.85.120:8790", ssh_route=route)]))
+    if invalid:
+        with pytest.raises(ValueError, match="ssh_route"): load_config(path)
+    else:
+        config = load_config(path)
+        assert NodeSSHService.configured_routes(config)["dell-linux"].address == route["address"]
+
+
 def _write(tmp_path, raw: dict):
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(raw))

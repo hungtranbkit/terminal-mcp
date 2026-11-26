@@ -1169,6 +1169,38 @@ class MaintenanceConfig:
 
 
 @dataclass(frozen=True)
+class ManagedSSHRouteConfig:
+    """Operator-declared transport only; never a new SSH trust bootstrap."""
+    address: str
+    registered_endpoint: str
+    username: str
+    hostname: str
+    host_key_fingerprint: str
+    port: int = 22
+
+    def __post_init__(self) -> None:
+        # Literal private addresses avoid DNS changes/fallbacks. Tailnet addresses
+        # are allowed too, but must be individually declared by the operator.
+        try:
+            address = ipaddress.ip_address(self.address)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("ssh_route.address must be a private literal IP") from exc
+        private_networks = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7")
+        if not any(address in ipaddress.ip_network(network) for network in private_networks):
+            raise ValueError("ssh_route.address must be a private unicast IP")
+        if type(self.port) is not int or not 1 <= self.port <= 65535:
+            raise ValueError("ssh_route.port must be an integer in 1..65535")
+        for name, pattern in (("username", r"[A-Za-z_][A-Za-z0-9_.-]{0,63}"),
+                              ("hostname", r"[A-Za-z0-9][A-Za-z0-9_.-]{0,252}"),
+                              ("host_key_fingerprint", r"SHA256:[A-Za-z0-9+/]{43}")):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not re.fullmatch(pattern, value):
+                raise ValueError(f"ssh_route.{name} is invalid")
+        if not isinstance(self.registered_endpoint, str) or not self.registered_endpoint:
+            raise ValueError("ssh_route.registered_endpoint is required")
+
+
+@dataclass(frozen=True)
 class RemoteNodeConfig:
     """One operator-declared remote node (task item 15's "cấu hình đăng
     ký" -- the config-driven half of remote registration; the node's own
@@ -1189,6 +1221,7 @@ class RemoteNodeConfig:
     # owns the single replacement process.
     self_heal_enabled: bool = False
     self_heal_action: str = "none"
+    ssh_route: ManagedSSHRouteConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -1740,6 +1773,17 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             raise ValueError(f"nodes.remote[{index}].self_heal_action is unsupported")
         if self_heal_enabled and self_heal_action == "none":
             raise ValueError(f"nodes.remote[{index}] enables self-heal without an action")
+        ssh_route = None
+        if "ssh_route" in entry:
+            raw_route = entry["ssh_route"]
+            if not isinstance(raw_route, dict):
+                raise ValueError("ssh_route must be a mapping")
+            try:
+                ssh_route = ManagedSSHRouteConfig(**raw_route)
+            except TypeError as exc:
+                raise ValueError("ssh_route requires an exact identity binding and supported fields") from exc
+            if ssh_route.registered_endpoint != endpoint:
+                raise ValueError("ssh_route.registered_endpoint must match this node endpoint exactly")
         remote_nodes.append(RemoteNodeConfig(
             node_id=node_id,
             display_name=entry.get("display_name") or node_id,
@@ -1750,6 +1794,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             timeout_seconds=float(entry.get("timeout_seconds", 10.0)),
             self_heal_enabled=self_heal_enabled,
             self_heal_action=self_heal_action,
+            ssh_route=ssh_route,
         ))
     # Scheme/host gate, as a SECOND pass over the parsed entries.
     #

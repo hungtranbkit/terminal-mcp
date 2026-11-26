@@ -13572,7 +13572,9 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
     from .node_ssh import NodeSSHService
     node_ssh_service = getattr(server, "node_ssh_service", None)
     if node_ssh_service is None:
-        node_ssh_service = NodeSSHService(controller, connection_store.path.parent / "node-ssh", audit=terminal.audit)
+        node_ssh_service = NodeSSHService(
+            controller, connection_store.path.parent / "node-ssh", audit=terminal.audit,
+            routes=NodeSSHService.configured_routes(terminal.config))
         server.node_ssh_service = node_ssh_service
     if projects is None:
         projects = getattr(queue, "projects", None)
