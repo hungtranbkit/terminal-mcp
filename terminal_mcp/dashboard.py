@@ -6081,6 +6081,8 @@ NODES_ADMIN_HTML = """<!doctype html>
     .meter > div { height:100%; background:var(--accent) }
     .meter.warn > div { background:var(--amber) } .meter.danger > div { background:var(--red) }
     .nc-foot { margin-top:10px; display:flex; justify-content:space-between; align-items:center; font-size:11px; color:var(--muted) }
+    .card-ssh { display:inline-block; margin-top:10px; padding:5px 11px; border:1px solid var(--accent); border-radius:6px; color:var(--text); text-decoration:none }
+    .card-ssh:hover, .card-ssh:focus-visible { background:#233252 }
     .empty { text-align:center; color:var(--muted); padding:48px 8px }
     #detail { margin-top:20px; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px 18px }
     #detail[hidden] { display:none }
@@ -6571,6 +6573,10 @@ NODES_ADMIN_HTML = """<!doctype html>
       return parts.join(' · ');
     }
 
+    function sshTerminalUrl(nodeId) {
+      return '/dashboard/terminal?' + new URLSearchParams({ transport: 'ssh', node_id: nodeId });
+    }
+
     function nodeCardHtml(node) {
       const capBadge = node.capacity_status || 'unknown';
       const draining = node.draining ? '<span class="badge draining">draining</span>' : '';
@@ -6606,6 +6612,8 @@ NODES_ADMIN_HTML = """<!doctype html>
             <span>${node.tmux_session_count ?? 0} session${(node.tmux_session_count ?? 0) === 1 ? '' : 's'}</span>
             <span>heartbeat: ${heartbeatAge(node.last_heartbeat_at)}</span>
           </div>
+          ${node.endpoint === 'local' || node.id === 'local' ? '' :
+            `<a class="card-ssh" href="${sshTerminalUrl(node.id)}" target="_blank" rel="noopener">SSH Web</a>`}
           ${(node.overload_reasons && node.overload_reasons.length) ? `<div class="d-sessions-error" style="margin-top:8px">${node.overload_reasons.join('; ')}</div>` : ''}
         </div>`;
     }
@@ -6615,7 +6623,10 @@ NODES_ADMIN_HTML = """<!doctype html>
       if (!nodesCache.length) { container.innerHTML = '<div class="empty">Chưa có node nào đăng ký.</div>'; return; }
       container.innerHTML = nodesCache.map(nodeCardHtml).join('');
       container.querySelectorAll('.node-card').forEach((card) => {
-        card.addEventListener('click', () => { selectedNodeId = card.dataset.nodeId; renderCards(); loadDetail(selectedNodeId); });
+        card.addEventListener('click', (event) => {
+          if (event.target.closest('.card-ssh')) return;
+          selectedNodeId = card.dataset.nodeId; renderCards(); loadDetail(selectedNodeId);
+        });
       });
     }
 
@@ -6691,7 +6702,7 @@ NODES_ADMIN_HTML = """<!doctype html>
         await sshAction('revoke');
       });
       sshOpenEl.addEventListener('click', () => {
-        if (!sshOpenEl.disabled) window.open('/dashboard/terminal?transport=ssh&node_id=' + encodeURIComponent(nodeId), '_blank', 'noopener');
+        if (!sshOpenEl.disabled) window.open(sshTerminalUrl(nodeId), '_blank', 'noopener');
       });
       refreshNodeSsh();
       document.getElementById('refreshDetailBtn').addEventListener('click', () => loadDetail(nodeId));
@@ -12659,7 +12670,12 @@ WEBTERM_HTML = """<!doctype html>
     const attachPillEl = document.getElementById('attachPill');
     const bannerEl = document.getElementById('banner');
     const takeoverBtnEl = document.getElementById('takeoverBtn');
-    if (sshMode) takeoverBtnEl.hidden = true;
+    if (sshMode) {
+      takeoverBtnEl.hidden = true;
+      const backLink = document.querySelector('header a.back');
+      backLink.href = '/dashboard/nodes';
+      backLink.textContent = '← Danh sách node';
+    }
     const WS_PATH = '/dashboard/ws/terminal';
 
     const FONT_KEY = 'terminal-mcp:webterm-font-size';
@@ -12750,8 +12766,38 @@ WEBTERM_HTML = """<!doctype html>
       reconnectTimer = setTimeout(connect, delayMs);
     }
 
-    function connect() {
+    let checkingSsh = false;
+    async function connect() {
       clearTimeout(reconnectTimer);
+      if (sshMode) {
+        if (checkingSsh || closedByUser) return;
+        checkingSsh = true;
+        try {
+          const response = await fetch('/dashboard/api/nodes/' + encodeURIComponent(sshNodeId) + '/ssh', { cache: 'no-store' });
+          if (response.redirected || response.status === 401 || response.status === 403) {
+            throw new Error('Hãy đăng nhập lại dashboard và kiểm tra quyền truy cập.');
+          }
+          if (!response.ok) throw new Error('Không đọc được trạng thái SSH (HTTP ' + response.status + ').');
+          const ssh = await response.json();
+          if (!(ssh.verified || ssh.connect_available)) {
+            const reasons = {
+              not_configured: 'Mở chi tiết node và chọn Thiết lập SSH.',
+              needs_admin: 'Node cần quản trị viên hoàn tất thiết lập OpenSSH.',
+              route_collision: 'Đường kết nối đang trỏ tới dịch vụ SSH khác.',
+              host_key_mismatch: 'Khóa máy chủ SSH khác với khóa đã xác minh.',
+              offline: 'Node đang offline.',
+            };
+            throw new Error(reasons[ssh.status] || ('Kiểm tra SSH trong chi tiết node (' + (ssh.status || 'unknown') + ').'));
+          }
+        } catch (error) {
+          connPillEl.textContent = '● SSH chưa sẵn sàng'; connPillEl.className = 'pill err';
+          setBanner(error.message, 'error');
+          return;
+        } finally {
+          checkingSsh = false;
+        }
+        if (closedByUser) return;
+      }
       connPillEl.textContent = '● đang kết nối…'; connPillEl.className = 'pill';
       ws = new WebSocket(wsUrl());
       ws.binaryType = 'arraybuffer';

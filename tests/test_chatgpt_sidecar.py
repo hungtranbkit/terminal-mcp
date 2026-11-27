@@ -89,6 +89,19 @@ def test_catalog_is_exactly_one_tool():
     assert len(set(CATALOG)) == len(CATALOG), "no duplicates"
 
 
+def test_compact_instructions_expose_managed_node_ssh_arguments():
+    """The one-tool surface must make the existing SSH lifecycle discoverable.
+
+    Cached connector schemas can hide newly-added optional fields.  Naming the
+    exact top-level arguments in the server instructions gives a reconnected
+    client an auditable contract without adding a parallel SSH tool.
+    """
+    instructions = sidecar.compact_instructions()
+    assert "action=node_ssh" in instructions
+    assert "node_id" in instructions
+    assert "args.operation" in instructions
+
+
 #: What v1.x advertised. Kept as a named constant so the shrink is asserted
 #: against the real previous surface rather than a paraphrase of it.
 V1_CATALOG = (
@@ -802,12 +815,14 @@ def test_recursion_is_bounded_on_a_self_referential_cause():
     assert _looks_like_timeout(exc) is False
 
 
-def test_sidecar_catalog_preserves_actual_confirmation_and_cached_browser_fields():
+def test_sidecar_catalog_preserves_security_and_lifecycle_fields():
     from terminal_mcp.mcp_app import build_mcp
 
     upstream = asyncio.run(build_mcp().list_tools())
     served = _list_tools(build_sidecar(FakeBackend(upstream)))
     assert [tool.name for tool in served] == ["terminal_turn"]
     properties = served[0].input_schema["properties"]
-    assert {"confirm", "args", "steps", "viewport", "screenshot", "allow_mutations"} <= properties.keys()
+    assert {"confirm", "args", "node_id", "steps", "viewport", "screenshot",
+            "allow_mutations"} <= properties.keys()
+    assert "node_ssh" in properties["action"]["description"]
     assert {row.get("type") for row in properties["confirm"]["anyOf"]} == {"boolean", "null"}

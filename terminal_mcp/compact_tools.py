@@ -115,6 +115,13 @@ START_SERVER_PENDING_STATUSES = frozenset({"WAITING_SESSION", "DISPATCH_UNCERTAI
 #: already been asked for).
 START_SETTLED_STATUSES = (START_UNDERWAY_STATUSES | START_NEEDS_HUMAN_STATUSES
                           | START_SERVER_PENDING_STATUSES)
+
+NODE_SSH_FAILURE_STATUSES = frozenset({
+    "error", "offline", "auth_failed", "unsupported", "needs_admin",
+    "host_key_mismatch", "timeout", "port_closed", "not_configured",
+    "command_failed", "route_collision", "route_banner_mismatch",
+    "route_unreachable",
+})
 # action -> handler key in CompactTerminalTools.handlers
 # `compact=True` is terminal_turn's DEFAULT, but until 2026-09-21 only
 # batch_inspect honoured it -- list_nodes and list_sessions were dispatched as
@@ -965,7 +972,7 @@ class CompactTerminalTools:
                 return {"status": "FAILED", "error": "ACTION_UNAVAILABLE", "action": normalized}
             result = (self.node_ssh.exec(node_id.strip(), args.get("argv"), timeout=args.get("timeout", 15.0))
                       if operation == "exec" else getattr(self.node_ssh, operation)(node_id.strip()))
-            return {"status": "OK" if result.get("status") not in {"error", "offline", "auth_failed", "unsupported", "needs_admin", "host_key_mismatch", "timeout", "port_closed", "not_configured", "command_failed"} else "FAILED",
+            return {"status": "OK" if result.get("status") not in NODE_SSH_FAILURE_STATUSES else "FAILED",
                     "action": normalized, "result": result}
 
         if normalized not in TURN_ACTIONS:
