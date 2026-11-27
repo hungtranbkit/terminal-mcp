@@ -34,12 +34,19 @@ only, nothing to call yet. Never treat a PLANNED item as available.
 For an **idle local Codex**, call `terminal_turn(action="start", target=...,
 text=..., request_key="<stable unique request>")`. This source version returns
 `TASK_STARTED` only after confirmed submission and a fresh `RUNNING` check.
-It never queues that Codex start, even with legacy queue opt-in. Failures are
-explicit: inspect the returned evidence; do not resend under a new key.
-Same-key retries return the durable receipt. `EXISTING_QUEUE_TASK` points to
-existing work that must not be duplicated. Remote guarded start is currently
-unsupported and fails closed. This change requires a service rollout; a source
-checkout alone does not change the running HP process.
+If the guarded submission is confirmed but RUNNING cannot be verified within
+the request deadline, it returns `TASK_DISPATCHED` with
+`execution_state=UNVERIFIED`; this is not a completed/running claim. If the
+guarded-send call itself exceeds the deadline, it returns
+`TASK_SUBMIT_UNCERTAIN` with `dispatch_state=AMBIGUOUS`. In either case inspect
+the durable receipt and do not retry or retype with a new key. Same-key retries
+return the stored receipt. A slow preflight shares the same monotonic deadline
+as submission and verification; it is no longer capped at two seconds before
+the durable request reservation. Codex starts never enter the legacy queue,
+even with legacy queue opt-in. `EXISTING_QUEUE_TASK` points to existing work
+that must not be duplicated. Remote guarded start is currently unsupported
+and fails closed. These changes are source-only until a separate approved
+review and rollout; they do not change the running HP process.
 
 - The production control plane serves the MCP endpoint at
   `http://127.0.0.1:8766/mcp` and the dashboard at

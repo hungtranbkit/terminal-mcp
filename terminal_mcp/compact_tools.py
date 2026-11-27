@@ -468,6 +468,8 @@ class CompactTerminalTools:
         self.sleep = sleep
         self._read_lock = threading.Lock()
         self._reads: dict[tuple, Future] = {}
+        self._dispatch_lock = threading.Lock()
+        self._dispatches: dict[str, Future] = {}
 
     def _bounded_read(self, key: tuple, read: Callable, seconds: float) -> dict[str, Any]:
         """Bound read-only I/O without cancelling or duplicating an in-flight probe.
@@ -500,6 +502,39 @@ class CompactTerminalTools:
             return future.result(timeout=seconds)
         except FutureTimeout:
             return {"error": "STATUS_PROBE_TIMEOUT"}
+
+    def _bounded_dispatch(self, key: str, dispatch: Callable[[], dict[str, Any]],
+                          seconds: float) -> dict[str, Any]:
+        """Bound the caller's wait for a mutation without ever replaying it.
+
+        A timed-out send may still finish remotely. Its durable outer request
+        claim and inner send idempotency key therefore remain held; timeout is
+        reported as ambiguous and is never treated as a safe retry signal.
+        """
+        if seconds <= 0:
+            return {"_dispatch_state": "NOT_STARTED", "error": "DIRECT_START_DEADLINE_EXCEEDED"}
+        with self._dispatch_lock:
+            self._dispatches = {k: f for k, f in self._dispatches.items() if not f.done()}
+            if key in self._dispatches:
+                return {"_dispatch_state": "IN_PROGRESS", "error": "DIRECT_SUBMIT_IN_PROGRESS"}
+            if len(self._dispatches) >= 32:
+                return {"_dispatch_state": "NOT_STARTED", "error": "DIRECT_SUBMIT_CAPACITY"}
+            future: Future = Future()
+            self._dispatches[key] = future
+
+        def run() -> None:
+            try:
+                future.set_result(dispatch())
+            except BaseException as exc:  # noqa: BLE001
+                future.set_exception(exc)
+
+        threading.Thread(target=run, daemon=True, name="terminal-bounded-dispatch").start()
+        try:
+            return future.result(timeout=seconds)
+        except FutureTimeout:
+            return {"_dispatch_state": "AMBIGUOUS", "error": "DIRECT_SUBMIT_TIMEOUT"}
+        except Exception:  # noqa: BLE001
+            return {"_dispatch_state": "AMBIGUOUS", "error": "DIRECT_SUBMIT_UNCERTAIN"}
 
     def _resolve(self, target: str) -> tuple[str, str] | tuple[None, dict[str, Any]]:
         if (not isinstance(target, str) or not target.strip()
@@ -1318,45 +1353,91 @@ class CompactTerminalTools:
                 not request_key or len(request_key) > 200 or "\x00" in request_key):
             return {"status": "FAILED", "error": "INVALID_IDEMPOTENCY_KEY"}
         key = request_key or str(uuid.uuid4())
-        cache_key = "codex-direct-start:" + hashlib.sha256(key.encode()).hexdigest()
+        request_hash = hashlib.sha256(key.encode()).hexdigest()
+        cache_key = "codex-direct-start:" + request_hash
+        probe_key = "codex-direct-probe:" + request_hash
         digest = hashlib.sha256(json.dumps([target, text], ensure_ascii=False).encode()).hexdigest()
         audit = getattr(self.terminal, "audit", None)
-        if audit is not None:
-            saved = audit.get_idempotent_result(cache_key)
-            if saved is not None:
-                if saved.get("request_digest") != digest:
-                    return {"status": "FAILED", "error": "IDEMPOTENCY_CONFLICT"}
-                return saved["result"]
         if not hasattr(self.controller, "terminal_status"):
             return None
+        if audit is None:
+            # Compatibility tools that do not expose AuditStore still hand
+            # non-Codex targets to their existing send path. A Codex launch
+            # fails closed because its durable request reservation is absent.
+            deadline = self.monotonic() + float(timeout)
+            remaining = max(0.0, deadline - self.monotonic())
+            before = self._bounded_read(("direct-start", target),
+                lambda: self._status(target, timeout_seconds=remaining), remaining)
+            if before.get("error"):
+                return {"action": "start", "mode": "direct", "session": target,
+                        "status": "FAILED", "error": before["error"],
+                        "dispatched": False}
+            if before.get("agent_type") != "codex" and not before.get("error"):
+                return None
+            return {"action": "start", "mode": "direct", "session": target,
+                    "status": "FAILED", "error": "DIRECT_AUDIT_UNAVAILABLE",
+                    "dispatched": False}
+        base = {"action": "start", "mode": "direct", "session": target,
+                "request_key": key, "idempotency_key": cache_key,
+                "dispatched": False, "client_polling": False,
+                "delivery_state": "NOT_SUBMITTED", "task_state": "NOT_STARTED"}
+        saved = audit.get_idempotent_result(probe_key)
+        if saved is not None:
+            if saved.get("request_digest") != digest:
+                return {"status": "FAILED", "error": "IDEMPOTENCY_CONFLICT"}
+            result = saved["result"]
+            # The legacy path still owns non-Codex starts. The direct-start
+            # sentinel reserves the key across its probe, then hands off;
+            # the queue's own request-key idempotency owns any later replay.
+            if result.get("handoff_to_legacy") is True:
+                return None
+            return result
+        pending = {**base, "status": "FAILED", "error": "DIRECT_DISPATCH_IN_PROGRESS",
+                   "task_state": "PREFLIGHT_PENDING",
+                   "next_action": "Inspect this request; do not resend with a new key."}
+        if not audit.claim_idempotency_key(probe_key):
+            saved = audit.get_idempotent_result(probe_key)
+            if saved is not None and saved.get("request_digest") != digest:
+                return {**base, "status": "FAILED", "error": "IDEMPOTENCY_CONFLICT"}
+            return saved["result"] if saved else pending
+        direct_claimed = False
+        def finish(result: dict[str, Any]) -> dict[str, Any]:
+            record = {"request_digest": digest, "result": result}
+            audit.store_idempotent_result(probe_key, record)
+            if direct_claimed:
+                audit.store_idempotent_result(cache_key, record)
+            return result
+        finish(pending)
         deadline = self.monotonic() + float(timeout)
         def observe() -> dict[str, Any]:
             remaining = max(0.0, deadline - self.monotonic())
             return self._bounded_read(("direct-start", target),
-                lambda: self._status(target, timeout_seconds=remaining), min(remaining, 2.0))
+                lambda: self._status(target, timeout_seconds=remaining), remaining)
         try:
             before = observe()
         except Exception:
-            return {"status": "FAILED", "error": "DIRECT_STATUS_UNAVAILABLE", "dispatched": False}
+            return finish({**base, "status": "FAILED", "error": "DIRECT_STATUS_UNAVAILABLE"})
         if before.get("error"):
-            return {"status": "FAILED", "error": before["error"], "dispatched": False}
+            return finish({**base, "status": "FAILED", "error": before["error"],
+                           "task_state": "PREFLIGHT_FAILED"})
         if before.get("agent_type") != "codex":
+            finish({**base, "status": "HANDOFF", "handoff_to_legacy": True,
+                    "task_state": "LEGACY_PATH_OWNS_DISPATCH"})
             return None
-        base = {"action": "start", "mode": "direct", "session": target,
-                "request_key": key, "idempotency_key": cache_key,
-                "dispatched": False, "client_polling": False}
-        if audit is None:
-            return {**base, "status": "FAILED", "error": "DIRECT_AUDIT_UNAVAILABLE"}
-        pending = {**base, "status": "FAILED", "error": "DIRECT_DISPATCH_IN_PROGRESS",
-                   "next_action": "Inspect this request; do not resend with a new key."}
+        # Keep the normal send idempotency namespace untouched for shell and
+        # other non-Codex callers. Only a positively identified Codex start
+        # claims the direct submission key.
+        saved = audit.get_idempotent_result(cache_key)
+        if saved is not None:
+            if saved.get("request_digest") != digest:
+                return {"status": "FAILED", "error": "IDEMPOTENCY_CONFLICT"}
+            return finish(saved["result"])
         if not audit.claim_idempotency_key(cache_key):
             saved = audit.get_idempotent_result(cache_key)
             if saved is not None and saved.get("request_digest") != digest:
                 return {**base, "status": "FAILED", "error": "IDEMPOTENCY_CONFLICT"}
-            return saved["result"] if saved else pending
-        def finish(result: dict[str, Any]) -> dict[str, Any]:
-            audit.store_idempotent_result(cache_key, {"request_digest": digest, "result": result})
-            return result
+            return finish(saved["result"] if saved else pending)
+        direct_claimed = True
         finish(pending)
         try:
             legacy_lookup = self.handlers.get("legacy_task_by_request_key")
@@ -1368,13 +1449,38 @@ class CompactTerminalTools:
             if (before.get("state") != "IDLE" or before.get("input_required")
                     or before.get("exists") is False or before.get("allowed") is False):
                 return finish({**base, "status": "FAILED", "error": "DIRECT_TARGET_NOT_IDLE",
-                               "task_state": before.get("state", "UNKNOWN")})
-            sent = self.send_task(target, text, timeout=float(timeout), idempotency_key=cache_key + ":send",
-                                  require_idle=True)
-            base = {**base, "send": sent, "submission_id": sent.get("submission_id")}
+                               "task_state": before.get("state", "UNKNOWN"),
+                               "preflight": before})
+            remaining = max(0.0, deadline - self.monotonic())
+            if remaining <= 0:
+                return finish({**base, "status": "FAILED", "error": "DIRECT_START_DEADLINE_EXCEEDED",
+                               "task_state": "PREFLIGHT_EXPIRED", "preflight": before})
+            sent = self._bounded_dispatch(cache_key,
+                lambda: self.send_task(target, text, timeout=remaining,
+                    idempotency_key=cache_key + ":send", require_idle=True), remaining)
+            if sent.get("_dispatch_state") == "AMBIGUOUS":
+                return finish({**base, "status": "TASK_SUBMIT_UNCERTAIN",
+                               "error": sent.get("error", "DIRECT_SUBMIT_UNCERTAIN"),
+                               "dispatch_state": "AMBIGUOUS", "dispatched": None,
+                               "delivery_state": "SUBMIT_UNKNOWN", "task_state": "SUBMIT_UNVERIFIED",
+                               "next_action": "Inspect the durable guarded-send receipt; do not retry or retype."})
+            if sent.get("_dispatch_state") == "NOT_STARTED":
+                return finish({**base, "status": "FAILED", "error": sent.get("error"),
+                               "dispatch_state": "NOT_STARTED", "task_state": "NOT_STARTED"})
+            if sent.get("_dispatch_state") == "IN_PROGRESS":
+                return finish({**base, "status": "TASK_SUBMIT_UNCERTAIN",
+                               "error": sent.get("error"), "dispatch_state": "AMBIGUOUS",
+                               "dispatched": None, "delivery_state": "SUBMIT_UNKNOWN",
+                               "task_state": "SUBMIT_UNVERIFIED"})
+            delivery = (sent.get("evidence") or {}).get("delivery_state", sent.get("status"))
+            base = {**base, "send": sent, "submission_id": sent.get("submission_id"),
+                    "delivery_state": delivery}
             if sent.get("status") != "SUBMIT_CONFIRMED":
                 return finish({**base, "status": "FAILED", "error": "DIRECT_SUBMIT_NOT_ACCEPTED",
                                "next_action": "Inspect submission evidence; do not retype the prompt."})
+            base = {**base, "dispatched": True, "delivery_state": "SUBMIT_CONFIRMED",
+                    "dispatch_state": "CONFIRMED", "task_state": "START_UNVERIFIED",
+                    "execution_state": "UNVERIFIED"}
             state = "UNKNOWN"
             while self.monotonic() < deadline:
                 after = observe()
@@ -1383,10 +1489,12 @@ class CompactTerminalTools:
                     break
                 if state == "RUNNING" and after.get("exists") is not False and after.get("allowed") is not False:
                     return finish({**base, "status": "TASK_STARTED", "task_state": "RUNNING",
-                                   "dispatched": True, "next_action": "none"})
+                                   "execution_state": "RUNNING_VERIFIED", "next_action": "none"})
                 self.sleep(min(.25, max(0.0, deadline - self.monotonic())))
-            return finish({**base, "status": "FAILED", "error": "DIRECT_START_NOT_RUNNING",
-                           "task_state": state, "next_action": "Inspect the submission; acceptance is not proof of a running task. Do not resend."})
+            return finish({**base, "status": "TASK_DISPATCHED", "error": "EXECUTION_UNVERIFIED",
+                           "task_state": "START_UNVERIFIED",
+                           "verification_state": state,
+                           "next_action": "Inspect the confirmed submission; execution is unverified. Do not resend."})
         except Exception:
             return finish({**base, "status": "FAILED", "error": "DIRECT_DISPATCH_UNCERTAIN",
                            "next_action": "Inspect the durable submission; do not resend."})
