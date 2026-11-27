@@ -498,3 +498,14 @@ def test_first_dispatch_capacity_gate_preserves_continuations(tmp_path):
     _run(sup, clock, 8)
     assert len(calls) == 1
     assert len(pane.sent) >= 2
+
+def test_disk_recovery_shell_requires_structured_identity():
+    from types import SimpleNamespace
+    from terminal_mcp.compact_tools import CompactTerminalTools
+    tools = SimpleNamespace(controller=SimpleNamespace(registry=None))
+    admit = lambda status: CompactTerminalTools._first_dispatch_disk_reason(tools, "fixture", status)
+    assert admit({"reason": "shell prompt is back at the bottom of the pane"}) is not None
+    assert admit({"reason": "current command is 'python'"}) is not None
+    assert admit({"agent_type": "shell", "resource": {"agent": "codex"}}) is not None
+    assert admit({"agent_type": "shell", "reason": "shell prompt is back"}) is None
+    assert admit({"current_command": "bash", "reason": "shell prompt is back"}) is None
