@@ -148,6 +148,21 @@ AGENT_RUNNING_PATTERNS = (
     # not conversational mentions of "thinking" or the finished "for ...".
     re.compile(r"^\s*[✢✳✶✻✽·*]\s+[^\n…]+…\s+\(\d+(?:h|m|s)\b[^\n]*\)\s*$"),
 )
+# Codex renders its ready-looking composer during a live turn, too. These
+# exact UI shapes were captured during the 2026-11-27 Dell/HP audit, including
+# "Working (15m 10s • esc to interrupt)" with a background terminal and
+# "─ Worked for 2m 33s ─" after a completed turn.
+_CODEX_TIMED_BUSY = re.compile(
+    r"^\s*[•·]\s+Working\s+\((?:\d+[hms]\s*)+[•·]\s*esc to interrupt\)",
+    re.IGNORECASE,
+)
+_CODEX_FINISHED = re.compile(
+    r"^\s*─+\s*Worked for\s+(?:\d+[hms]\s*)+─+\s*$", re.IGNORECASE
+)
+_CODEX_PENDING_UI = re.compile(
+    r"^\s*[•·]\s+Queued follow-up inputs\s*$|\b\d+ background terminals? running\b",
+    re.IGNORECASE,
+)
 AGENT_IDLE_PATTERNS = (
     re.compile(r"·\s*done\s+\d{1,2}:\d{2}\s*[ap]\.?m\.?\b", re.IGNORECASE),
     re.compile(r"^\s*new task\?", re.IGNORECASE),
@@ -165,24 +180,28 @@ def detect_agent_ui_state(
 ) -> tuple[str | None, str]:
     """RUNNING/IDLE read from an agent CLI's own footer, or (None, why-not).
 
-    Prefer a live busy footer over a previous turn's done marker. For
-    Codex only, a recognized ready composer below the newest busy marker
-    supersedes that historical marker. Claude can paint an empty composer
-    during live work, so its existing busy-footer precedence is unchanged.
+    Prefer a live busy footer over a previous turn's done marker. Codex
+    and Claude can paint empty composers during live work. For Codex, only
+    a newer completion marker plus composer can establish IDLE in the
+    presence of an old busy hint; an ambiguous hint is UNKNOWN. A timed
+    busy footer indicates CLI activity, not verified code progress.
     """
     recent = [line for line in output.splitlines() if line.strip()][-AGENT_UI_MARKER_LINES:]
     for offset, line in enumerate(reversed(recent)):
         for pattern in AGENT_RUNNING_PATTERNS:
             if pattern.search(line):
-                # Audit 2026-11-27 (#126): a Codex pane retained the old
-                # interrupt hint above its current "Ask Codex to do anything"
-                # composer. Reuse the adapter's exact composer recognition
-                # on the newer lines only; never override a newer busy
-                # marker, a permission modal, or Claude's live spinner.
                 if command == "codex" and offset:
                     newer = recent[-offset:]
                     if select_adapter(command).identify_target_state(newer) == adapters.TARGET_COMPOSER:
-                        return "IDLE", "codex ready composer supersedes an older busy marker"
+                        # Queued work and background terminal indicators are
+                        # not evidence of code progress, but they prohibit an
+                        # idle verdict or age-based session cleanup.
+                        if any(_CODEX_PENDING_UI.search(row) for row in [line, *newer]):
+                            return "RUNNING", "codex busy hint with queued/background activity"
+                        if any(_CODEX_FINISHED.fullmatch(row) for row in newer):
+                            return "IDLE", "codex finished-turn marker and ready composer supersede older busy hint"
+                        if not _CODEX_TIMED_BUSY.search(line):
+                            return "UNKNOWN", "codex composer and ambiguous busy hint coexist; no completion evidence"
                 return "RUNNING", (f"agent CLI busy footer matched {pattern.pattern!r} "
                                    f"at bottom offset {offset}")
     for offset, line in enumerate(reversed(recent)):
