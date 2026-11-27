@@ -179,6 +179,36 @@ def _disk_used_percent(used: int | None, available: int | None) -> float | None:
     return 100.0 * used / effective if effective else None
 
 
+
+def local_agent_disk_block_reason(path: str) -> str | None:
+    """Fresh target-side check, immediately before a new agent is spawned.
+
+    On POSIX check user-available inode capacity too. Windows does not
+    expose POSIX inode counters; the byte guard still applies there.
+    """
+    _, used, available = disk_usage(path)
+    percent = _disk_used_percent(used, available)
+    if percent is None:
+        return "target disk capacity unknown or invalid"
+    if percent >= 90:
+        return "target effective disk usage >= 90%"
+    if available < 20 * 1024 ** 3:
+        return "target disk free < 20 GiB"
+    if hasattr(os, "statvfs"):
+        try:
+            v = os.statvfs(path)
+            inode_used = v.f_files - v.f_ffree
+            inode_available = v.f_favail
+            inode_percent = _disk_used_percent(inode_used, inode_available)
+        except (OSError, AttributeError, ValueError):
+            return "target inode capacity unknown"
+        if inode_percent is None:
+            return "target inode capacity unknown or invalid"
+        if inode_percent >= 90:
+            return "target effective inode usage >= 90%"
+    return None
+
+
 def _collect_linux(*, workspace_path: str) -> NodeMetrics:
     load1, load5, load15 = read_loadavg()
     mem = read_meminfo()

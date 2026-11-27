@@ -27,6 +27,7 @@ from typing import Any, Callable
 from .config import AppConfig
 from .adapters import codex_folder_trust_prompt, tool_permission_prompt
 from .launcher_resolution import resolve_launcher
+from .host_metrics import local_agent_disk_block_reason
 from .permissions import SENSITIVE_SESSION_WORDS, valid_new_session_name, session_input_denied_by_pattern
 from .session_backend import SessionBackend
 from .tmux import TmuxError
@@ -244,6 +245,11 @@ class SessionLifecycleService:
         resolved_cwd, error = resolve_cwd(cwd, self.config)
         if error is not None:
             return {**error, "state": "FAILED"}
+        if agent_type != "shell":
+            reason = local_agent_disk_block_reason(str(resolved_cwd))
+            if reason:
+                return {"error": "NODE_DISK_CAPACITY_BLOCKED", "session": name,
+                        "detail": reason, "state": "FAILED"}
         command = self.launch_command_for(agent_type)
         if agent_type != "shell" and not command:
             return {"error": "LAUNCHER_NOT_CONFIGURED", "agent_type": agent_type, "state": "FAILED"}
