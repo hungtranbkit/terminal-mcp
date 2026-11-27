@@ -917,7 +917,7 @@ class CompactTerminalTools:
         - inspect: status+tail for one target or many targets (`targets`), each
           row carrying the `resource` context/quota health block.
         - send: guarded/idempotent direct submission. With queue disabled,
-          legacy start aliases and long_task=True use this same guarded path.
+          start aliases and long_task=True use the durable guarded supervisor.
           Queue-enabled operators retain the legacy durable receipt path.
         - send_wait: submit, then create one durable bounded wait in the same call.
         - wait: create one durable bounded wait.
@@ -986,6 +986,22 @@ class CompactTerminalTools:
             return {"status": "FAILED", "error": "INVALID_ACTION",
                     "allowed": allowed, "aliases": aliases}
 
+        # Issue #118: with the legacy queue retired (production), `start`
+        # persists a supervised direct task FIRST and returns its durable
+        # task_id; the send is the atomic node-side idle guard only. Before
+        # this, start returned TASK_STARTED/SUBMIT_CONFIRMED with task_id=null.
+        if (normalized == "start" or (normalized in {"send", "send_wait"} and long_task)) and not queue_submission_enabled():
+            if not target or not text:
+                return {"status": "FAILED", "error": "TARGET_REQUIRED" if not target else "TEXT_REQUIRED", "dispatched": False}
+            if self.direct_tasks is None:
+                return {"status": "FAILED", "error": "DURABLE_SUPERVISOR_UNAVAILABLE",
+                        "action": "start", "dispatched": False,
+                        "next_action": "Restore the durable supervisor before starting work; nothing was sent."}
+            return self._supervised_start(
+                target, text, timeout=timeout,
+                request_key=idempotency_key if idempotency_key is not None else request_key,
+                title=title, metadata=metadata)
+
         # Codex start is an immediate guarded dispatch, regardless of the
         # historical queue opt-in. Never enqueue an idle Codex as a fallback.
         if normalized == "start" and target and text:
@@ -996,17 +1012,6 @@ class CompactTerminalTools:
                     return self._with_label(direct, self._label_send(
                         target, text, direct.get("send", {}), title, metadata))
                 return direct
-
-        # Cached clients may still say start or long_task. With queue off,
-        # translate those into the SAME guarded direct send, never a new
-        # session, queue row, dispatch tick or implicit supervision loop.
-        if not queue_submission_enabled():
-            if normalized == "start" or (normalized in {"send", "send_wait"} and long_task):
-                if normalized == "start":
-                    normalized = "send"
-                if idempotency_key is None:
-                    idempotency_key = request_key
-                long_task = False
 
         # Queue submission is retired for normal public use.  The legacy
         # engine remains for historical/running tasks, but no new queue row is
@@ -1303,6 +1308,123 @@ class CompactTerminalTools:
         return {**result, "action": action}
 
 
+    def _supervised_start(self, target: str, text: str, *, timeout: float,
+                          request_key: str | None, title: str | None = None,
+                          metadata: dict | None = None) -> dict[str, Any]:
+        """`action=start` as a durable, deduplicated, idle-guarded task.
+
+        Order matters: (1) replay of a known key returns the SAME task and
+        never sends; (2) the authorization/idle preflight refuses without
+        persisting anything (start is not a queue); (3) the supervisor
+        persists the dt_ row, then types through `send_guarded` only.
+        """
+        if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                or not math.isfinite(timeout) or not 0 < timeout <= MAX_SEND_WAIT_SECONDS):
+            return {"status": "FAILED", "error": "INVALID_TIMEOUT"}
+        if request_key is not None and (not isinstance(request_key, str) or
+                not request_key or len(request_key) > 200 or "\x00" in request_key):
+            return {"status": "FAILED", "error": "INVALID_IDEMPOTENCY_KEY"}
+        key = request_key or str(uuid.uuid4())
+        base = {"action": "start", "mode": "supervised", "session": target,
+                "request_key": key, "client_polling": False}
+        supervisor = self.direct_tasks
+        task_key = "turn-start:" + key
+        existing = supervisor.store.by_idempotency_key(task_key)
+        if existing is not None:
+            if not self._same_start(existing, target, text):
+                return {**base, "status": "FAILED", "error": "IDEMPOTENCY_CONFLICT",
+                        "task_id": existing["task_id"]}
+            return self._supervised_receipt(base, supervisor.get(existing["task_id"], refresh=False),
+                                            deduplicated=True)
+        # A key already answered by the pre-#118 direct path is never re-sent.
+        audit = getattr(self.terminal, "audit", None)
+        if audit is not None:
+            legacy_direct = audit.get_idempotent_result(
+                "codex-direct-start:" + hashlib.sha256(key.encode()).hexdigest())
+            if legacy_direct is not None:
+                return {**base, "status": "FAILED", "error": "EXISTING_DIRECT_START",
+                        "previous": legacy_direct.get("result"),
+                        "next_action": "Inspect the earlier direct start; no automatic resend."}
+        legacy_lookup = self.handlers.get("legacy_task_by_request_key")
+        legacy = legacy_lookup(key) if legacy_lookup is not None else None
+        if legacy:
+            return {**base, "status": "FAILED", "error": "EXISTING_QUEUE_TASK",
+                    "task_id": legacy["id"], "task_state": legacy["status"],
+                    "next_action": "Inspect the existing queue task; no automatic migration or resend."}
+        try:
+            before = self._bounded_read(("supervised-start", target),
+                lambda: self._status(target, timeout_seconds=float(timeout)), min(float(timeout), 2.0))
+        except Exception:
+            return {**base, "status": "FAILED", "error": "DIRECT_STATUS_UNAVAILABLE", "dispatched": False}
+        if before.get("error"):
+            return {**base, "status": "FAILED", "error": before["error"], "dispatched": False}
+        if before.get("allowed") is False or before.get("exists") is False:
+            return {**base, "status": "FAILED", "error": "TARGET_NOT_AUTHORIZED", "dispatched": False}
+        if before.get("state") != "IDLE" or before.get("input_required"):
+            return {**base, "status": "FAILED", "error": "DIRECT_TARGET_NOT_IDLE", "dispatched": False,
+                    "task_state": before.get("state", "UNKNOWN")}
+        result = supervisor.start(target, text=text, idempotency_key=task_key, require_idle=True)
+        if result.get("deduplicated"):
+            # Lost a race with a concurrent start under the same key: the
+            # store dedups on the key alone, so re-check the content here or
+            # this caller would be told its never-persisted prompt is running.
+            winner = supervisor.store.by_idempotency_key(task_key)
+            if winner is not None and not self._same_start(winner, target, text):
+                return {**base, "status": "FAILED", "error": "IDEMPOTENCY_CONFLICT",
+                        "task_id": winner["task_id"], "dispatched": False}
+        if result.get("status") == "FAILED" and "task" not in result:
+            return {**base, **result, "dispatched": False}
+        if result.get("error") == "TARGET_HAS_ACTIVE_SUPERVISED_TASK":
+            return {**base, **result, "dispatched": False}
+        receipt = self._supervised_receipt(base, result, deduplicated=bool(result.get("deduplicated")))
+        # Label the actual accepted target, including logical bindings. Replays
+        # and refused/uncertain input never replace existing task labels.
+        if (self.task_labels is not None and receipt.get("task_id")
+                and not receipt.get("deduplicated") and not result.get("error")
+                and receipt.get("receipt") in {"SUBMIT_CONFIRMED", "EXECUTION_ACCEPTED"}):
+            try:
+                node_id, name = self.task_labels.split_target(target)
+                label = self.task_labels.on_task(
+                    node_id=before.get("node_id") or node_id,
+                    session=before.get("session") or name, text=text,
+                    title=title, metadata=metadata, task_id=receipt["task_id"],
+                    request_key=key, source="supervised")
+                self._with_label(receipt, label)
+            except Exception:
+                pass
+        return receipt
+
+    @staticmethod
+    def _same_start(task: dict[str, Any], target: str, text: str) -> bool:
+        from .direct_task import TASK_ID_PLACEHOLDER
+        # The supervisor stores executable steps with its generated ID
+        # substituted. Compare the replay in that same representation.
+        replay_text = text.replace(TASK_ID_PLACEHOLDER, task["task_id"])
+        return task["target"] == target and (task["steps"] or [None])[0] == replay_text
+
+    @staticmethod
+    def _supervised_receipt(base: dict[str, Any], result: dict[str, Any], *,
+                            deduplicated: bool) -> dict[str, Any]:
+        task = result.get("task") or {}
+        state = task.get("state")
+        if state in ("BLOCKED", "DISPATCH_UNCERTAIN") or result.get("status") == "BLOCKED":
+            status = "BLOCKED"
+        elif state in ("FAILED", "CANCELLED"):
+            status = "FAILED"
+        elif state == "DONE":
+            status = "DONE"
+        elif task.get("running_confirmed"):
+            status = "TASK_STARTED"
+        else:
+            status = "TASK_ACCEPTED"
+        return {**base, "status": status, "task_id": task.get("task_id"), "task_state": state,
+                "receipt": task.get("receipt"), "running_confirmed": bool(task.get("running_confirmed")),
+                "dispatched": (task.get("dispatches") or 0) > 0 and task.get("receipt") != "NOT_SENT",
+                "deduplicated": deduplicated, "submission_id": task.get("submission_id"),
+                "reason": task.get("reason"),
+                "next_action": task.get("next_action") or "supervise_status(task_id) when asked",
+                "task": task}
+
     def _codex_direct_start(self, target: str, text: str, *, timeout: float,
                             request_key: str | None) -> dict[str, Any] | None:
         """Immediate Codex startup; None preserves non-Codex legacy behavior.
@@ -1372,6 +1494,13 @@ class CompactTerminalTools:
             sent = self.send_task(target, text, timeout=float(timeout), idempotency_key=cache_key + ":send",
                                   require_idle=True)
             base = {**base, "send": sent, "submission_id": sent.get("submission_id")}
+            if sent.get("reason") == "IDLE_GUARD_UNSUPPORTED":
+                # Nothing reached the pane. Name the capability gap and the
+                # durable alternative instead of a generic failure (issue #118).
+                return finish({**base, "status": "FAILED", "error": "IDLE_GUARD_UNSUPPORTED",
+                               "next_action": ("Do not retry start on this node: the node agent "
+                                               "lacks the idle-guarded route. Upgrade the node agent, "
+                                               "or use action=supervise for a durable task_id.")})
             if sent.get("status") != "SUBMIT_CONFIRMED":
                 return finish({**base, "status": "FAILED", "error": "DIRECT_SUBMIT_NOT_ACCEPTED",
                                "next_action": "Inspect submission evidence; do not retype the prompt."})
@@ -1638,6 +1767,13 @@ class CompactTerminalTools:
         is the same function the standalone tool calls -- so routing a verb
         through `turn` can never be a weaker path than calling it directly.
         """
+        if (action == "task_status" and isinstance(task_id, str)
+                and task_id.strip().startswith("dt_") and self.direct_tasks is not None):
+            # Issue #118: `start` returns supervised dt_ ids. The monitor
+            # bridge (ProjectFlow) reads receipts back through task_status, so
+            # answer them from the durable supervisor, not the legacy queue.
+            result = self.direct_tasks.get(task_id.strip(), refresh=False)
+            return {"status": result.get("status", "FAILED"), "action": action, "result": result}
         handler = self.handlers.get(TURN_HANDLER_ACTIONS[action])
         if handler is None:
             # An honest refusal, not a silent no-op: this deployment did not
@@ -1823,3 +1959,39 @@ class CompactTerminalTools:
                 label = None
             self._with_label(response, label)
         return response
+
+
+def make_direct_task_supervisor(tools: "CompactTerminalTools", store: Any, *,
+                                accept_wait_seconds: float = 6.0, clock: Any = None,
+                                sleep: Any = None) -> Any:
+    """Production wiring for DirectTaskSupervisor (one place, also used by tests).
+
+    Every dispatch and observation goes through `tools`' own guarded, bounded
+    send/status/tail, so authorization is re-checked on every call.
+    `send_guarded` is the atomic node-side idle guard (issue #118).
+    """
+    from .direct_task import DirectTaskSupervisor
+
+    extra: dict[str, Any] = {}
+    if clock is not None:
+        extra["clock"] = clock
+    if sleep is not None:
+        extra["sleep"] = sleep
+    return DirectTaskSupervisor(
+        store,
+        send=lambda target, text, key: tools.send_task(target, text, idempotency_key=key),
+        send_guarded=lambda target, text, key: tools.send_task(
+            target, text, idempotency_key=key, require_idle=True),
+        status=lambda target: tools._bounded_read(
+            ("direct-task-status", target),
+            lambda: tools._status(target, timeout_seconds=8), 10),
+        tail=lambda target, lines: tools._bounded_read(
+            ("direct-task-tail", target, lines),
+            lambda: tools._tail(target, lines), 10),
+        # Stuck-composer recovery: the guarded activate-only send (empty
+        # text + Enter) submits the composer's OWN content and refuses on
+        # an empty composer -- it can never retype or duplicate a prompt.
+        activate=lambda target, key: tools.send_task(target, "", idempotency_key=key),
+        accept_wait_seconds=accept_wait_seconds,
+        **extra,
+    )

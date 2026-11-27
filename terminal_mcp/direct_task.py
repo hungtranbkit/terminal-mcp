@@ -324,6 +324,9 @@ class DirectTaskStore:
         ("agent", "TEXT"), ("submission_id", "TEXT"), ("last_error", "TEXT"),
         ("last_error_hop", "TEXT"), ("unreachable_since", "REAL"), ("next_observe_at", "REAL"),
         ("late_completion", "INTEGER NOT NULL DEFAULT 0"),
+        # Issue #118: a task started by `action=start` may only ever be typed
+        # through the atomic node-side idle guard; a refusal is terminal.
+        ("require_idle", "INTEGER NOT NULL DEFAULT 0"),
     )
 
     def __init__(self, path: str | Path | None = None) -> None:
@@ -530,6 +533,7 @@ class DirectTaskSupervisor:
     def __init__(self, store: DirectTaskStore, *, send: Callable[[str, str, str], dict],
                  status: Callable[[str], dict], tail: Callable[[str, int], dict],
                  activate: Callable[[str, str], dict] | None = None,
+                 send_guarded: Callable[[str, str, str], dict] | None = None,
                  clock: Callable[[], float] = _now,
                  settle_seconds: float = DEFAULT_SETTLE_SECONDS,
                  accept_wait_seconds: float = 0.0,
@@ -539,6 +543,7 @@ class DirectTaskSupervisor:
         self._status = status
         self._tail = tail
         self._activate = activate
+        self._send_guarded = send_guarded
         self.clock = clock
         self.settle_seconds = float(settle_seconds)
         self.accept_wait_seconds = float(accept_wait_seconds)
@@ -549,7 +554,8 @@ class DirectTaskSupervisor:
 
     def start(self, target: str, *, text: str | None = None, steps: list[str] | None = None,
               max_continuations: int | None = None, continue_text: str | None = None,
-              mode: str = "auto", idempotency_key: str | None = None) -> dict[str, Any]:
+              mode: str = "auto", idempotency_key: str | None = None,
+              require_idle: bool = False) -> dict[str, Any]:
         items = [item for item in ([text] if text else []) + list(steps or [])]
         if not items:
             return {"status": "FAILED", "error": "TEXT_OR_STEPS_REQUIRED"}
@@ -596,6 +602,7 @@ class DirectTaskSupervisor:
             "task_id": task_id, "target": target, "mode": mode, "state": "DISPATCHING",
             "receipt": RECEIPT_PERSISTED, "steps": items, "continue_text": continue_text,
             "max_continuations": max_continuations, "idempotency_key": idempotency_key,
+            "require_idle": 1 if require_idle else 0,
             "created_at": now, "updated_at": now,
         }, exclusive_target=True)
         if task.get("conflict"):
@@ -809,6 +816,13 @@ class DirectTaskSupervisor:
         if terminal is not None:
             return self.store.update(task["task_id"], **terminal)
         key = f"direct-task:{task['task_id']}:{task['dispatches'] + 1}:{task['send_failures']}"
+        guarded = bool(task.get("require_idle"))
+        if guarded and self._send_guarded is None:
+            # Fail closed: an idle-guarded task is never typed through the
+            # unguarded send. Nothing was sent.
+            return self.store.update(
+                task["task_id"], state="BLOCKED", completed_at=now, receipt=RECEIPT_NOT_SENT,
+                reason="IDLE_GUARD_UNAVAILABLE: no idle-guarded sender is wired; nothing was sent")
         needle = self._needle(task, text, advance)
         # Persist the intent BEFORE the send: after a crash between here and
         # the result, the task is verified by observation, never re-typed.
@@ -823,7 +837,7 @@ class DirectTaskSupervisor:
             # Another process claimed this dispatch first: never send twice.
             return self.store.get(task_id)
         try:
-            sent = self._send(task["target"], text, key)
+            sent = (self._send_guarded if guarded else self._send)(task["target"], text, key)
         except Exception as exc:  # noqa: BLE001 -- outcome unknown, verified below
             sent = {"status": "FAILED", "reason": type(exc).__name__, "evidence": {"delivery_state": "UNKNOWN"}}
         return self._record_send(task, sent, now)
@@ -843,6 +857,16 @@ class DirectTaskSupervisor:
                 task["task_id"], **common, dispatches=task["dispatches"] + 1, send_failures=0,
                 last_dispatch_at=now, receipt=RECEIPT_SUBMIT_CONFIRMED, submit_confirmed_at=now,
                 state="EXECUTION_ACCEPTED", last_turn_state="DISPATCHED", reason=None)
+        if task.get("require_idle") and (
+                status == "BLOCKED" or delivery == "BLOCKED"
+                or "IDLE_GUARD_UNSUPPORTED" in str(sent.get("reason") or sent.get("error") or "")):
+            # The node's atomic idle guard refused before typing anything.
+            # Terminal: a later automatic send would bypass the caller's
+            # "only if idle now" intent (issue #118). Never resent.
+            return self.store.update(
+                task["task_id"], state="BLOCKED", completed_at=now, receipt=RECEIPT_NOT_SENT,
+                pending_advance=None, idle_since=None,
+                reason=_clip(f"IDLE_GUARD_REFUSED: nothing was typed: {reason}"))
         if ((status == "BLOCKED" and sent.get("error"))
                 or delivery in _DEFINITELY_NOT_TYPED and sent.get("error")):
             # Refused before anything was typed: safe to retry, bounded.
@@ -913,11 +937,24 @@ class DirectTaskSupervisor:
             tail = self._tail(task["target"], MARKER_TAIL_LINES)
             output = str(tail.get("output") or "") if "error" not in tail else None
             marker = find_marker(output or "", task["task_id"])
-            if (marker is not None and task.get("accepted_at")
+            # A confirmed shell step can finish between observations. Only
+            # accept a fresh standalone task-bound marker that was not literal
+            # in the submitted command, never a merely echoed command.
+            fast_shell = False
+            if (marker is not None and task["mode"] == "shell"
+                    and task.get("receipt") == RECEIPT_SUBMIT_CONFIRMED
+                    and task.get("dispatches", 0) > 0 and turn_state == "IDLE"
+                    and not observed.get("input_required")):
+                prefix = "TMCP-" + marker[0] + ":" + task["task_id"]
+                texts = list(task.get("steps") or []) + [task.get("continue_text") or ""]
+                standalone = re.compile(r"^[ \t]*" + re.escape(prefix) + (r"[ \t]*$" if marker[0] == "DONE" else r"(?:[ \t]+[^\r\n]+)?[ \t]*$"), re.MULTILINE)
+                fast_shell = bool(standalone.search(output or "")) and not any(prefix in x for x in texts)
+            if (marker is not None and (task.get("accepted_at") or fast_shell)
                     and turn_state == "IDLE"):
                 outcome, detail = marker
+                proof = {"receipt": RECEIPT_EXECUTION_ACCEPTED, "accepted_at": now} if fast_shell and not task.get("accepted_at") else {}
                 return self.store.update(
-                    task["task_id"], **base, state=outcome, completed_at=now, wait_reason=None,
+                    task["task_id"], **base, **proof, state=outcome, completed_at=now, wait_reason=None,
                     reason=_clip(detail or f"target printed TMCP-{outcome}"))
 
         receipt = task.get("receipt")
@@ -1008,7 +1045,7 @@ class DirectTaskSupervisor:
             return self.store.update(
                 task["task_id"], **base, state="DISPATCH_UNCERTAIN",
                 wait_reason="NO_EXECUTION_EVIDENCE",
-                reason=_clip(f"submit not confirmed; {task.get('reason') or 'execution evidence absent'}; no execution evidence "
+                reason=_clip(f"submit not confirmed; no execution evidence "
                              f"{now - sent_at:.0f}s after dispatch "
                              f"(turn {turn_state}, submitted prompt not identifiable in composer); not resending"))
         return self.store.update(task["task_id"], **base,

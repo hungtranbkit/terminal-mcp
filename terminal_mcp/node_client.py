@@ -548,11 +548,21 @@ class RemoteNodeClient:
         # silently ignore require_idle and turn this into an unguarded send.
         # Its 404 is surfaced as unsupported before any pane input occurs.
         endpoint = "send-guarded" if require_idle else "send"
-        return self._request("POST", f"/v1/sessions/{urllib.parse.quote(session)}/{endpoint}", body={
-            "text": text, "press_enter": press_enter, "dry_run": dry_run,
-            "prompt_response": prompt_response, "idempotency_key": idempotency_key,
-            "origin": origin, "trace_id": trace_id, "parent_turn_id": parent_turn_id, "depth": depth,
-        })
+        try:
+            return self._request("POST", f"/v1/sessions/{urllib.parse.quote(session)}/{endpoint}", body={
+                "text": text, "press_enter": press_enter, "dry_run": dry_run,
+                "prompt_response": prompt_response, "idempotency_key": idempotency_key,
+                "origin": origin, "trace_id": trace_id, "parent_turn_id": parent_turn_id, "depth": depth,
+            })
+        except NodeClientError as exc:
+            # Issue #118: the node agent answered (it is reachable) but predates
+            # /send-guarded. That is a capability gap, not NODE_UNREACHABLE, and
+            # must never fall back to the unguarded /send.
+            if require_idle and exc.http_status == 404:
+                return {"error": "IDLE_GUARD_UNSUPPORTED", "sent": False, "enter_sent": False,
+                        "upgrade_required": "node_agent",
+                        "detail": "node agent has no /send-guarded route"}
+            raise
 
     def send_keys(self, session: str, keys: list[str], confirm_sensitive: bool = False) -> dict[str, Any]:
         return self._request("POST", f"/v1/sessions/{urllib.parse.quote(session)}/send-keys",

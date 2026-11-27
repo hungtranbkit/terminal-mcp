@@ -1,5 +1,79 @@
 # PROJECT_CONTEXT.md
 
+## 2026-11-18 — Issue #118 PR #120 follow-up: race fix + real-tmux end-to-end (code only, NOT deployed)
+
+- **Owner commit `e715a5a`.**
+  - With the queue off and no supervisor, `start` now fails closed with `DURABLE_SUPERVISOR_UNAVAILABLE` and sends nothing.
+  - Replay compares the prompt with the `{TMCP_TASK_ID}` placeholder substituted.
+- **Race fix (this commit).** Two concurrent `start` calls with the same key and different text could both pass the replay check before either row existed. `DirectTaskStore.insert` dedups on the key alone, so the loser was told `deduplicated` for a prompt that was never persisted or sent. `_supervised_start` now re-checks content after a deduplicated insert (`_same_start`) and returns `IDEMPOTENCY_CONFLICT` with nothing sent. RED→GREEN: `test_concurrent_same_key_with_different_text_is_a_conflict`.
+- **Real tmux end-to-end.** `test_real_tmux_codex_durable_start_done_and_replay` uses the inert fixture `tests/fixtures/codex_marker_agent.py`, which runs nothing from the prompt and prints `TMCP-DONE:<dt_ id>`. The test checks:
+  1. `start` returns a `dt_` id, EXECUTION_ACCEPTED/RUNNING;
+  2. `running_confirmed` → DONE through the marker;
+  3. a replay from a fresh process over the same store is `deduplicated` with status DONE;
+  4. the pane has exactly one `SUBMITTED[1]`.
+
+  The fixture must clear scrollback on redraw (`ESC[3J`), because a stale "esc to interrupt" line keeps the status classifier on RUNNING.
+- **`task_status` answers `dt_` ids.** `turn(action="task"|"task_status", task_id="dt_…")` reads `DirectTaskSupervisor.get`, so the reply carries `target`, `agent`, `mode`, `state`, `running_confirmed`, `turn_state` and `watcher`. Before this, it went to the legacy queue handler and answered `ACTION_UNAVAILABLE`/unknown. This is how ProjectFlow `harness_monitor_bridge` verifies receipts (ProjectFlow PR #54, execution-first `dispatch`). Test: `test_task_status_reads_back_a_durable_start_by_dt_id`, RED → GREEN.
+- **Runtime.** Not deployed, no live canary. HP tailnet `:8766` answers 403 for non-heartbeat routes. The public MCP is served by `tunnel-client --profile terminal-mcp`, whose credential sits in `tunnel.env` and was not read. Loopback `/mcp` over `ssh hp-net` accepts unauthenticated JSON-RPC, but it was not used without an explicit owner grant.
+
+## 2026-11-17 ~22:30 ICT — Issue #118: `action=start` now returns a durable task_id (code only, NOT deployed)
+
+- **Symptom (live, after the 56ccb14 deploy).** `start` returned `TASK_STARTED` (Codex) or `SUBMIT_CONFIRMED` (other panes) with `task_id=null` and no persisted row.
+- **Root cause.** Production runs with the legacy queue off (`TERMINAL_MCP_ENABLE_QUEUE=0`). In that mode `turn(action="start")` either took `_codex_direct_start`, a bare direct send that never had a task id, or was translated into `send`. The durable `DirectTaskSupervisor` (`dt_` ids, persist-before-send, `TMCP-DONE` marker, `DirectTaskLoop` running in `server_http`) was only reachable through `action=supervise`.
+- **Fix.**
+  - In `compact_tools.turn`, when the queue is off and `direct_tasks` exists, `start` routes to `_supervised_start`.
+  - `_supervised_start` checks in this order:
+    1. A replay of the same request key returns the same task and sends nothing. The key is stored as `turn-start:<key>`. A different target or text under the same key is `IDEMPOTENCY_CONFLICT`. A key already used by the old direct start or the legacy queue is never re-sent.
+    2. The status preflight refuses without persisting or sending when the target is missing, unauthorized (`allowed`/`exists` false) or not IDLE.
+    3. `DirectTaskSupervisor.start(require_idle=True)` persists the row first, then types through `send_guarded` only.
+  - `send_guarded` is `send_task(require_idle=True)`, the atomic node-side idle guard.
+  - In `direct_task.py`: new column `require_idle`. A guarded task without a guarded sender becomes BLOCKED with nothing sent. A node guard refusal (`BLOCKED` or `IDLE_GUARD_UNSUPPORTED`) is terminal BLOCKED and never resent by the loop.
+  - The production wiring is now one factory, `compact_tools.make_direct_task_supervisor`, used by `mcp_app` and by the tests.
+  - With the queue opted in, the legacy paths are unchanged.
+- **Tests.**
+  - `tests/test_issue118_durable_start.py` has 12 tests: task_id persisted before send, guarded send only, the RUNNING→DONE marker lifecycle, replay dedup, conflict, dedup across a restart (new store and tools on the same files), permission and missing-target refusal, busy refusal, and guard refusal being terminal. It was RED before the fix.
+  - 5 mutants were all killed.
+  - `tests/test_queue_persist_mcp_tools.py::test_queue_disabled_compatibility…` pinned the old untracked `SUBMIT_CONFIRMED` for `start`. It now asserts the `dt_` receipt and replay dedup, and still checks that the queue DB is byte-identical.
+  - Related set: 518 passed.
+- **Runtime.** Not deployed, no live canary. The HP controller rejects tailnet MCP calls with 403 ("node heartbeat and enrollment routes only… must arrive over loopback (the authenticated tunnel)"). This session has no authenticated tunnel client, and loopback-over-SSH would skip that authentication, so I did not use it.
+- **Next.** Owner reviews PR #120, deploys it with the same Dell-then-HP rollback plan, then runs the canary (start → `dt_` → EXECUTION_ACCEPTED → RUNNING → `TMCP-DONE` → replay dedup → cleanup).
+
+## 2026-11-17 18:28–18:34 ICT — Issue #118 deployed: Dell node then HP controller at main `56ccb14` (canary pending)
+
+- **Dell node agent.** `rollout-dell-node-56ccb14.sh` added drop-in `zzzzzz-dispatch-guard-56ccb14ded9b.conf` → `release-56ccb14ded9b`, a clean detached worktree of `~/workspace/terminal-mcp`. Result: PID 872171, health ok, `/send-guarded` answers 401 (was 404), `/send` 401, 10/10 tmux panes kept, NRestarts 0. The HP controller is calling the node and getting 200s.
+  - Snapshot and rollback: `~/.cache/terminal-mcp/rollbacks/dispatch-guard-56ccb14ded9b/rollback.sh` (removes the drop-in → back to 5bd6745).
+- **HP controller.** `rollout-hp-56ccb14ded9b.sh` added drop-in `zzzzzzzzzzzzzzzzzzzzzzzzz-dispatch-guard-56ccb14ded9b.conf`; the 5d4ee0a drop-in is kept. Result: `/version` = `56ccb14ded9be3dd337a7dcf6ac64f94f6873b12`, `/health/ready` ready, PID 1156806, NRestarts 0.
+  - HP has no tmux server (0 panes before and after).
+  - Config loaded with the new code; `agent_cleanup.enabled=False`, so no reaper was enabled.
+  - Warnings after restart (fleet projection legacy ids, LAN bind) were already present on 5d4ee0a.
+  - First attempt aborted in preflight (no tmux server → pipefail) with no change.
+  - Rollback: `~/.cache/terminal-mcp/rollbacks/dispatch-guard-56ccb14ded9b/rollback.sh` on HP.
+- **PR #120 is NOT deployed** (main 56ccb14 only). It is still needed: m910, mac-macbookpro14-3 and rag-pc node agents still answer 404 on `/send-guarded`, which 56ccb14 mislabels as NODE_UNREACHABLE.
+- **NOT DONE:** the live durable dispatch canary. This agent has no authorized Terminal MCP client and does not read tokens. Until a canary shows a `dt_` task_id → EXECUTION_ACCEPTED → RUNNING → DONE and a guarded `start` → TASK_STARTED on Dell, do not reopen monitor dispatch.
+
+## 2026-11-17 — Issue #118: IDLE_GUARD_UNSUPPORTED root cause (branch `agent/claude/dispatch-guard-118`, draft PR)
+
+- **Root cause (read-only evidence).** The HP canonical controller `/version` reports `5d4ee0a` (PID 1197300, started 2026-11-10). It runs `release-5d4ee0a29f2b`, with `TERMINAL_MCP_ENABLE_QUEUE=0`. In 5d4ee0a, `RemoteNodeClient.send_text(require_idle=True)` returns `IDLE_GUARD_UNSUPPORTED` before sending any request. `action=start` on an idle Codex calls `_codex_direct_start` → `send_task(require_idle=True)`. So every guarded start to a session on a remote node (the Zalo Hub and Screen Remote Dell Codex sessions) fails with `dispatched=false` and no task_id. Both monitors share this path. Whether the automation connector really hits the HP controller was not read from the ChatGPT side.
+- **56ccb14 is necessary but not sufficient.** It calls `/v1/sessions/{name}/send-guarded`. The Dell node agent runs `release-5bd67451e974`, which has no such route. Without this branch, the old node's 404 surfaces as `NODE_UNREACHABLE`, a mislabel. Both the controller AND the node agent must be upgraded. Upgrade the node first: the route is additive, and the old controller never calls it.
+- **Fix in this branch.** `RemoteNodeClient.send_text` maps a 404 on a guarded send to `IDLE_GUARD_UNSUPPORTED` + `upgrade_required=node_agent`. It never falls back to `/send`, and other HTTP errors still raise. `_codex_direct_start` returns error `IDLE_GUARD_UNSUPPORTED`, `dispatched=false`, no task_id, and a `next_action` (upgrade the node agent, or use `supervise`). Idempotent replay sends nothing again. Test: `tests/test_issue118_remote_idle_guard.py`. Its real HTTP stub failed 2/5 before the fix (RED).
+- **Durable path that exists on live 5d4ee0a:** `terminal_turn(action="supervise")` (`DirectTaskSupervisor`). It persists a `dt_…` id first, then DISPATCHING → EXECUTION_ACCEPTED → RUNNING, but only after a RUNNING signal is observed. It sends via `send_task` WITHOUT `require_idle`, so it is not blocked by this bug.
+  - Its own guards: settled IDLE observed through status, one active task per target, idempotency key, and DISPATCH_UNCERTAIN is never resent.
+  - It is NOT the atomic node-side idle guard. There is a status→send window, so it is an owner decision, not equivalent.
+  - Not live-canaried by this agent: no authorized MCP client in this session, and tokens were not read.
+- **Verification** (local only; commit message carries `[skip ci]`):
+  - new file + direct/supervised/node_agent suites: 119 passed;
+  - local mirror of the submit-invariant/compact-turn PR gates + the new test: 302 passed;
+  - unified-memory gate tests: 25 passed;
+  - 62 related test files: 1798 passed / 9 failed. The 9 failures (dashboard SSH connect, transports, windows installer) are IDENTICAL on unmodified 56ccb14 (pre-existing);
+  - mutation 3/3 killed; `git diff --check` ok.
+- **No change** to production, services, schedule, queue flag, node janitor or branch protection.
+- **Owner actions:**
+  1. Approve deploying `release-56ccb14` (+ this PR) to the Dell node agent first, then the HP controller, via the rollback-guarded plan in #118.
+  2. Then run the canary: a disposable dell-linux shell session, `supervise` with steps `sleep 20` + `printf 'TMCP-%s:%s\n' DONE {TMCP_TASK_ID}`. Expect a `dt_` task_id → EXECUTION_ACCEPTED → RUNNING → DONE, read via `supervise_status` from a second client; then `delete_session confirm=true`.
+  3. Plus a guarded `start` on a disposable idle Codex session, which should give TASK_STARTED.
+  4. Separately, decide whether monitors may use `supervise` before the upgrade.
+- **Next after dispatch works:** monitor → agent → test → acceptance via Harness, where submit or ACK is never "done".
+
 ## 2026-11-12 — P0 fleet session lifecycle (PR #117, not deployed)
 
 - Work is isolated from the starting checkout (`fix/codex-session-readiness-20261016`) at `/home/dell/workspace/.terminal-mcp-worktrees/p0-session-lifecycle-20261112`, branch `fix/p0-session-lifecycle-20261112`, based on `origin/main` `5d4ee0a`. Implementation commit `837a413` is pushed and PR #117 is open: https://github.com/hungtranbkit/terminal-mcp/pull/117. Remote guarded direct-start now uses the node agent's dedicated `/v1/sessions/{name}/send-guarded` route; legacy workers fail closed before input rather than silently dropping `require_idle`.

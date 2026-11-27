@@ -73,8 +73,8 @@ class FakeTerminal:
             return {"error": "BINDING_NOT_FOUND", "binding": binding}
         return {"binding": binding, **self.controller.terminal_tail(self.bindings[binding], lines)}
 
-    def terminal_send_bound(self, binding, text, press_enter, dry_run, idempotency_key):
-        self.send_calls.append((binding, text, press_enter, dry_run, idempotency_key))
+    def terminal_send_bound(self, binding, text, press_enter, dry_run, idempotency_key, **kwargs):
+        self.send_calls.append((binding, text, press_enter, dry_run, idempotency_key, kwargs))
         return {"binding": binding, "session": self.bindings.get(binding), **self.send_result}
 
 
@@ -592,19 +592,35 @@ def test_stalled_reads_are_single_flight_and_capacity_bounded():
         release.set()
 
 
+def _wire_durable_compat(compact, tmp_path):
+    from terminal_mcp.compact_tools import make_direct_task_supervisor
+    from terminal_mcp.direct_task import DirectTaskStore
+    clock = FakeClock()
+    clock.now = 1000.0
+    compact.direct_tasks = make_direct_task_supervisor(
+        compact, DirectTaskStore(tmp_path / "direct.db"), accept_wait_seconds=0,
+        clock=clock.monotonic, sleep=clock.sleep)
+    return clock
+
+
+def _compat_idle(session):
+    return {"session": session, "state": "IDLE", "agent_type": "shell",
+            "exists": True, "reason": "shell prompt is back at the bottom of the pane"}
+
+
 @pytest.mark.parametrize("queue_flag", [None, "0"])
 @pytest.mark.parametrize("action,long_task", [
     ("start", False), ("run", False), ("dispatch", False),
     ("start_task", False), ("send", True), ("send_wait", True),
 ])
-def test_direct_compatibility_uses_guarded_send_without_queue(monkeypatch, queue_flag, action, long_task):
+def test_direct_compatibility_uses_guarded_send_without_queue(monkeypatch, tmp_path, queue_flag, action, long_task):
     if queue_flag is None:
         monkeypatch.delenv("TERMINAL_MCP_ENABLE_QUEUE", raising=False)
     else:
         monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", queue_flag)
     compact, _terminal, controller = service()
     controller.send_result = {"delivery_state": "SUBMIT_CONFIRMED", "enter_sent": True}
-    controller.statuses["node/worker"] = {"state": "IDLE"}
+    controller.statuses["node/worker"] = _compat_idle("node/worker")
     controller.tails["node/worker"] = "done"
 
     def forbidden(*args, **kwargs):
@@ -614,26 +630,47 @@ def test_direct_compatibility_uses_guarded_send_without_queue(monkeypatch, queue
         ("enqueue_task", "dispatch_tick", "follow_task", "create_session", "task_status"), forbidden)
     result = compact.turn(action=action, target="node/worker", text="do work",
                           long_task=long_task, request_key="retry-1")
-    assert result["status"] in {"SUBMIT_CONFIRMED", "MATCHED"}
-    assert result["action"] == ("send_wait" if action == "send_wait" else "send")
-    assert controller.send_calls == [
-        ("node/worker", "do work", True, False, {"idempotency_key": "retry-1"})]
-    assert "task_id" not in result and "receipt" not in result
+    assert result["error"] == "DURABLE_SUPERVISOR_UNAVAILABLE"
+    assert result["dispatched"] is False and controller.send_calls == []
+
+    _wire_durable_compat(compact, tmp_path)
+    result = compact.turn(action=action, target="node/worker", text="do work",
+                          long_task=long_task, request_key="retry-1")
+    assert result["status"] == "TASK_ACCEPTED"
+    assert result["task_id"].startswith("dt_")
+    assert result["receipt"] == "SUBMIT_CONFIRMED"
+    assert result["running_confirmed"] is False
+    assert len(controller.send_calls) == 1
+    assert controller.send_calls[0][:4] == ("node/worker", "do work", True, False)
+    assert controller.send_calls[0][4]["require_idle"] is True
+    replay = compact.turn(action="start", target="node/worker", text="do work", request_key="retry-1")
+    assert replay["task_id"] == result["task_id"] and replay["deduplicated"] is True
+    assert len(controller.send_calls) == 1
 
 
-@pytest.mark.parametrize("action,long_task", [("start", False), ("send", True), ("send_wait", True)])
+@pytest.mark.parametrize("action,long_task", [("start", False), ("send", True), ("send_wait", True),
+                                             ("send", False), ("send_wait", False)])
 @pytest.mark.parametrize("error", ["TARGET_AWAITING_APPROVAL", "INPUT_RESTRICTED", "PROTECTED_SESSION", "IDENTITY_MISMATCH"])
-def test_direct_compatibility_preserves_guard_refusals(monkeypatch, action, long_task, error):
+def test_direct_compatibility_preserves_guard_refusals(monkeypatch, tmp_path, action, long_task, error):
     monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "0")
     compact, _terminal, controller = service()
-    controller.statuses["worker"] = {"state": "IDLE", "agent_type": "shell"}
+    clock = _wire_durable_compat(compact, tmp_path)
+    controller.statuses["worker"] = _compat_idle("worker")
     controller.send_result = {"delivery_state": "BLOCKED", "error": error, "enter_sent": False}
     result = compact.turn(action=action, target="worker", text="do work", long_task=long_task)
     assert result["status"] == "BLOCKED"
-    assert (result.get("result") or result.get("send"))["reason"] == error
     assert len(controller.send_calls) == 1
-    assert controller.status_calls == (1 if action == "start" else 0)
     assert result.get("wait") is None
+    if action == "start" or long_task:
+        assert result["receipt"] == "NOT_SENT"
+        assert result["dispatched"] is False
+        assert error in result["reason"]
+        assert controller.send_calls[0][4]["require_idle"] is True
+        clock.now += 1000
+        compact.direct_tasks.tick()
+        assert len(controller.send_calls) == 1
+    else:
+        assert (result.get("result") or result.get("send"))["reason"] == error
 
 
 @pytest.mark.parametrize("target,text,error", [(None, "work", "TARGET_REQUIRED"), ("worker", None, "TEXT_REQUIRED")])
@@ -646,47 +683,72 @@ def test_direct_start_requires_existing_target_and_text(monkeypatch, target, tex
     assert controller.send_calls == []
 
 
-def test_direct_start_keeps_explicit_idempotency_key(monkeypatch):
+def test_direct_send_keeps_explicit_idempotency_key(monkeypatch):
     monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "0")
     compact, _terminal, controller = service()
     controller.statuses["worker"] = {"state": "IDLE", "agent_type": "shell"}
-    compact.turn(action="start", target="worker", text="work",
+    compact.turn(action="send", target="worker", text="work",
                  request_key="legacy", idempotency_key="explicit")
     assert controller.send_calls[0][-1] == {"idempotency_key": "explicit"}
 
 
-@pytest.mark.parametrize("action,long_task", [("start", False), ("send", True)])
-def test_direct_compatibility_keeps_binding_guard_and_task_label(monkeypatch, action, long_task):
+@pytest.mark.parametrize("action,long_task", [("start", False), ("send", True), ("send_wait", True),
+                                             ("send", False)])
+def test_direct_compatibility_keeps_binding_guard_and_task_label(monkeypatch, tmp_path, action, long_task):
     from unittest.mock import Mock
 
     monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "0")
     compact, terminal, controller = service()
-    controller.statuses["worker"] = {"state": "IDLE", "agent_type": "shell"}
+    _wire_durable_compat(compact, tmp_path)
+    controller.statuses["worker"] = _compat_idle("worker")
     terminal.bindings["primary"] = "worker"
     terminal.send_result = {"delivery_state": "SUBMIT_CONFIRMED", "enter_sent": True}
     compact.task_labels = Mock()
     compact.task_labels.split_target.return_value = (None, "worker")
-    compact.task_labels.on_send.return_value = {"title": "Feature"}
-    compact.turn(action=action, target="binding:primary", text="implement feature",
+    compact.task_labels.on_send.return_value = {"summary": "Feature"}
+    compact.task_labels.on_task.return_value = {"summary": "Feature", "task_id": "test-label"}
+    result = compact.turn(action=action, target="binding:primary", text="implement feature",
                  long_task=long_task, title="Feature", metadata={"task_summary": "Feature"})
     assert len(terminal.send_calls) == 1
     assert terminal.send_calls[0][:4] == ("primary", "implement feature", True, False)
     assert controller.send_calls == []
-    assert compact.task_labels.on_send.call_args.kwargs["title"] == "Feature"
-    assert compact.task_labels.on_send.call_args.kwargs["metadata"] == {"task_summary": "Feature"}
+    if action == "start" or long_task:
+        assert terminal.send_calls[0][-1] == {"require_idle": True}
+        args = compact.task_labels.on_task.call_args.kwargs
+        assert args["session"] == "worker"
+        assert args["task_id"] == result["task_id"]
+        assert args["title"] == "Feature"
+        assert args["metadata"] == {"task_summary": "Feature"}
+        compact.task_labels.on_send.assert_not_called()
+    else:
+        assert compact.task_labels.on_send.call_args.kwargs["title"] == "Feature"
+        assert compact.task_labels.on_send.call_args.kwargs["metadata"] == {"task_summary": "Feature"}
 
 
-@pytest.mark.parametrize("action,long_task", [("start", False), ("send", True), ("send_wait", True)])
-def test_direct_compatibility_does_not_confirm_or_retry_unknown_delivery(monkeypatch, action, long_task):
+@pytest.mark.parametrize("action,long_task", [("start", False), ("send", True), ("send_wait", True),
+                                             ("send", False), ("send_wait", False)])
+def test_direct_compatibility_does_not_confirm_or_retry_unknown_delivery(monkeypatch, tmp_path, action, long_task):
     from unittest.mock import Mock
 
     monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "0")
     compact, _terminal, controller = service()
-    controller.statuses["worker"] = {"state": "IDLE", "agent_type": "shell"}
+    clock = _wire_durable_compat(compact, tmp_path)
+    controller.statuses["worker"] = _compat_idle("worker")
     controller.send_result = {"delivery_state": "DELIVERY_UNKNOWN", "enter_sent": True}
     compact.task_labels = Mock()
-    result = compact.turn(action=action, target="worker", text="work", long_task=long_task)
-    assert result["status"] == "FAILED"
+    result = compact.turn(action=action, target="worker", text="work", long_task=long_task,
+                          request_key="unknown")
     assert len(controller.send_calls) == 1
-    assert controller.status_calls == (1 if action == "start" else 0)
+    if action == "start" or long_task:
+        assert result["status"] == "BLOCKED"
+        assert result["receipt"] == "DISPATCH_UNCERTAIN"
+        assert result["running_confirmed"] is False
+        replay = compact.turn(action="start", target="worker", text="work", request_key="unknown")
+        assert replay["task_id"] == result["task_id"] and replay["deduplicated"]
+        clock.now += 100
+        compact.direct_tasks.tick()
+        assert len(controller.send_calls) == 1
+    else:
+        assert result["status"] == "FAILED"
     compact.task_labels.on_send.assert_not_called()
+    compact.task_labels.on_task.assert_not_called()
