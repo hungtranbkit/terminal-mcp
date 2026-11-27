@@ -361,7 +361,8 @@ class QueueEngine:
                 verify_queue: Any = None, delivery_policy: Any = None,
                 governor: RequestGovernor | None = None,
                 runbooks: RunbookRegistry | None = None,
-                skill_loader: Callable[[QueueTask], str | None] | None = None) -> None:
+                skill_loader: Callable[[QueueTask], str | None] | None = None,
+                admit_dispatch: Callable[[str, dict[str, Any]], str | None] | None = None) -> None:
         self.store = store
         self.ops = ops
         # TMCP-PROJECT-BOOTSTRAP-001: returns the bound-skill briefing for one
@@ -369,6 +370,7 @@ class QueueEngine:
         # knowing nothing about agents or skills -- it asks a callable and
         # prepends whatever it gets back.
         self.skill_loader = skill_loader
+        self.admit_dispatch = admit_dispatch
         # PROMPT DELIVERY / ACCEPTANCE GATE (delivery_gate.py). None ->
         # PromptDeliveryConfig()'s own default, which is advisory: the
         # verdict is computed and recorded, and every transition below
@@ -645,6 +647,12 @@ class QueueEngine:
 
         active = lane["current_task"]
         if active is None:
+            # Check before the atomic claim (including governor-backed
+            # admission). An unavailable node leaves pending work queued.
+            if self.admit_dispatch is not None and self.store.next_dispatchable_task(session) is not None:
+                reason = self._capacity_reason(session)
+                if reason:
+                    return TickResult(session, "QUEUED", detail=reason)
             if self.governor is not None:
                 claimed, queued_reason = self.governor.try_admit_and_claim(
                     session, claimed_by=self.claimed_by, lease_seconds=self.lease_seconds)
@@ -670,6 +678,18 @@ class QueueEngine:
         if status == WAITING_SESSION:
             return self._recheck_waiting_session(session, task_id)
         return TickResult(session, "NO_OP", task_id=task_id, detail=f"status={status}")
+
+    def _capacity_reason(self, session: str, observed: dict[str, Any] | None = None) -> str | None:
+        if self.admit_dispatch is None:
+            return None
+        try:
+            current = self._status_bounded(session) if observed is None else observed
+            if not isinstance(current, dict) or current.get("error") or current.get("exists") is False:
+                return "disk capacity unavailable: target status unknown"
+            reason = self.admit_dispatch(session, current)
+            return f"disk capacity admission: {reason}" if reason else None
+        except Exception:  # noqa: BLE001 -- no new claim/send on unknown capacity
+            return "disk capacity unavailable: admission probe failed"
 
     # -- coordinator review ------------------------------------------------
 
@@ -954,6 +974,12 @@ class QueueEngine:
         except Exception as exc:  # noqa: BLE001 -- fail closed before any bytes are sent
             self.store.mark_waiting_session(task_id, reason=f"pre-dispatch status unavailable: {exc}")
             return TickResult(session, "WAITING_SESSION", task_id=task_id, detail=str(exc))
+        # Recheck after claim/review, before nonce, recovery snapshot,
+        # relaunch, dispatch transition or sending any bytes. Running/
+        # verifying and uncertain receipt reconciliation are not gated.
+        reason = self._capacity_reason(session, observed)
+        if reason:
+            return TickResult(session, "WAITING_CAPACITY", task_id=task_id, detail=reason)
         nonce = self.store.ensure_verification_nonce(task_id)
         # STICKY idempotency key (item 8/9, and the real Phase 2 fix
         # this closes -- see queue_store.py's own dispatch_idempotency_

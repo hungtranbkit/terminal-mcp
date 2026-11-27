@@ -1259,3 +1259,51 @@ def test_recheck_uncertain_ignores_output_change_when_no_key_was_sent(store, ops
     result = engine._recheck_uncertain("lane-a", task_id)
     assert result.action == "DISPATCH_UNCERTAIN"
     assert store.get_task(task_id).status == "DISPATCH_UNCERTAIN"
+
+
+@pytest.mark.parametrize("node_id,used,available", [
+    ("hp-linux",225780416512,11248398336),
+    ("m910",99304972288,18631593984),
+    ("nec1",44782256128,13658951680),
+    ("unknown",None,None),
+])
+def test_queue_capacity_blocks_before_claim(store, ops, node_id, used, available):
+    from types import SimpleNamespace
+    from terminal_mcp.compact_tools import CompactTerminalTools
+    node=SimpleNamespace(status="online",disk_used_bytes=used,disk_free_bytes=available)
+    owner=SimpleNamespace(controller=SimpleNamespace(registry=SimpleNamespace(get=lambda _: node)))
+    task_id=_make_task(store)
+    ops.set_status("lane-a", {"state":"IDLE","cwd":"/repo/a","current_command":"codex","node_id":node_id})
+    admit=lambda target, observed: CompactTerminalTools._first_dispatch_disk_reason(owner,target,observed)
+    engine=QueueEngine(store,ops,coordinator=_always_ready_gate(),admit_dispatch=admit)
+    result=engine.tick("lane-a")
+    assert result.action=="QUEUED" and "capacity" in result.detail.lower()
+    task=store.get_task(task_id)
+    assert task.status==QUEUED and task.claim_token is None and task.attempt_count==0
+    assert not ops.sent
+
+
+def test_queue_rechecks_capacity_after_claim_and_keeps_running_task(store,ops):
+    from types import SimpleNamespace
+    from terminal_mcp.compact_tools import CompactTerminalTools
+    node=SimpleNamespace(status="online",disk_used_bytes=82770722816,disk_free_bytes=382420033536)
+    owner=SimpleNamespace(controller=SimpleNamespace(registry=SimpleNamespace(get=lambda _: node)))
+    task_id=_make_task(store)
+    ops.set_status("lane-a", {"state":"IDLE","cwd":"/repo/a","current_command":"codex","node_id":"macbook"})
+    admit=lambda target, observed: CompactTerminalTools._first_dispatch_disk_reason(owner,target,observed)
+    engine=QueueEngine(store,ops,coordinator=_always_ready_gate(),admit_dispatch=admit)
+    assert engine.tick("lane-a").action=="CLAIMED"
+    engine.tick("lane-a")
+    assert store.get_task(task_id).status=="READY"
+    node.disk_free_bytes=11248398336
+    assert "capacity" in engine.tick("lane-a").detail.lower()
+    task=store.get_task(task_id)
+    assert task.status=="READY" and task.attempt_count==0 and not ops.sent
+    assert not task.verification_nonce
+    node.disk_free_bytes=382420033536
+    engine.tick("lane-a")
+    assert len(ops.sent)==1 and store.get_task(task_id).status==RUNNING
+    node.disk_free_bytes=11248398336
+    ops.set_status("lane-a", {"state":"RUNNING","current_command":"codex","node_id":"macbook"})
+    engine.tick("lane-a")
+    assert len(ops.sent)==1 and store.get_task(task_id).status==RUNNING

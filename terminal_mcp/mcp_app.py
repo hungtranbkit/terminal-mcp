@@ -519,6 +519,7 @@ def build_mcp(service: TerminalService | None = None,
     queue_engine = QueueEngine(queue.store, controller, coordinator=_gate,
                               on_completed=_on_task_completed, verify_queue=queue.verify_queue,
                               governor=request_governor,
+                              admit_dispatch=compact_tools._first_dispatch_disk_reason,
                               runbooks=registry_from_config(terminal.config.runbooks))
     # TMCP-CALLED-TOOL-SPAM-002: carries a task that `terminal_turn
     # action="start"` explicitly started, so normal orchestration costs ONE
