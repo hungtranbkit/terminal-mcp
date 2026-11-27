@@ -369,11 +369,10 @@ def test_codex_idle_composer_is_idle_even_when_process_is_recent():
 
 
 def test_codex_newer_ready_composer_supersedes_stale_busy_footer():
-    # Reproduces the ordering from the Dell ZGH audit on 2026-11-27.
-    # The stale hint is five non-empty lines above the bottom.
+    # Require actual completion chrome, not just the ready-looking composer.
     pane = "\n".join((
-        "  Working (esc to interrupt)",
-        "  completed previous turn",
+        "  • Working (15m 10s • esc to interrupt)",
+        "  ─ Worked for 2m 33s ─────────────────────────",
         "  Tip: Press ^t to open the full transcript.",
         "› Ask Codex to do anything",
         "  GPT-6-Luna medium · ~/workspace · Main [default]",
@@ -385,6 +384,58 @@ def test_codex_newer_ready_composer_supersedes_stale_busy_footer():
     assert state == "IDLE"
     assert input_required is False
     assert "composer" in reason.casefold()
+
+
+def test_codex_composer_with_ambiguous_interrupt_hint_is_unknown():
+    pane = "\n".join((
+        "  Working (esc to interrupt)",
+        "  Tip: Press ^t to open the full transcript.",
+        "› Ask Codex to do anything",
+        "  GPT-6-Luna medium · ~/workspace · Main [default]",
+    ))
+    state, input_required, reason = classify_status(
+        info("codex", activity=1), pane, now=191758
+    )
+    assert state == "UNKNOWN"
+    assert input_required is False
+    assert "ambiguous" in reason
+
+
+def test_codex_timed_busy_with_visible_composer_is_still_running():
+    pane = "\n".join((
+        "• Working (2m 36s • esc to interrupt)",
+        "› Ask Codex to do anything",
+        "  GPT-6-Luna medium · ~/workspace · Main [default]",
+    ))
+    assert classify_status(info("codex", activity=1), pane, now=191758)[:2] == (
+        "RUNNING", False
+    )
+
+
+def test_codex_busy_with_background_terminal_and_composer_is_not_idle():
+    pane = "\n".join((
+        "• Working (15m 10s • esc to interrupt) · 1 background terminal running · /ps to view",
+        "  Tip: Use /fork to branch",
+        "› Ask Codex to do anything",
+        "  GPT-6-Luna medium · ~/workspace · Main [default]",
+    ))
+    assert classify_status(info("codex", activity=1), pane, now=191758)[:2] == (
+        "RUNNING", False
+    )
+
+
+def test_codex_queued_followup_with_composer_is_not_idle():
+    pane = "\n".join((
+        "• Working (2m 36s • esc to interrupt)",
+        "• Queued follow-up inputs",
+        "  ? 1 question",
+        "    shift + ← to answer",
+        "› Ask Codex to do anything",
+        "  GPT-6-Luna medium · ~/workspace · Main [default]",
+    ))
+    assert classify_status(info("codex", activity=1), pane, now=191758)[:2] == (
+        "RUNNING", False
+    )
 
 
 def test_codex_newer_busy_footer_still_wins_over_older_composer():
