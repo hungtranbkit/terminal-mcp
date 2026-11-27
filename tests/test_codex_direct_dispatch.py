@@ -1,6 +1,7 @@
 """Idle Codex starts directly even when legacy queue submission is enabled."""
 
 import pytest
+from types import SimpleNamespace
 
 from terminal_mcp.audit import AuditStore
 from tests.test_compact_tools import service
@@ -11,6 +12,13 @@ def rig(tmp_path, monkeypatch):
     monkeypatch.setenv("TERMINAL_MCP_ENABLE_QUEUE", "1")
     tools, terminal, controller = service(tmp_path / 'journal.db')
     terminal.audit = AuditStore(tmp_path / 'audit.db')
+    # The production controller reports the actual target node and registry.
+    original_status = controller.terminal_status
+    monkeypatch.setattr(controller, 'terminal_status', lambda target: {
+        'node_id': 'macbook', **original_status(target)})
+    controller.registry = SimpleNamespace(get=lambda node_id: SimpleNamespace(
+        status='online', disk_used_bytes=82_662_125_568, disk_free_bytes=382_528_630_784
+    ) if node_id == 'macbook' else None)
     clock = [0.0]
     tools.monotonic = lambda: clock[0]
     tools.sleep = lambda seconds: clock.__setitem__(0, clock[0] + seconds)
@@ -165,7 +173,7 @@ def test_stalled_status_probe_has_a_bound_and_never_sends(rig, monkeypatch):
         release.set()
 
 
-def test_real_disposable_tmux_direct_start_and_replay(tmp_path, tmux_session_factory):
+def test_real_disposable_tmux_direct_start_and_replay(tmp_path, tmux_session_factory, monkeypatch):
     import hashlib
     import shlex
     import time
@@ -183,6 +191,13 @@ def test_real_disposable_tmux_direct_start_and_replay(tmp_path, tmux_session_fac
     while 'codex fixture' not in '\n'.join(terminal.tmux.capture_lines(session, 30)):
         assert time.monotonic() < limit
         time.sleep(.02)
+    import shutil
+    usage = shutil.disk_usage(tmp_path)
+    node = SimpleNamespace(status='online', disk_used_bytes=usage.used, disk_free_bytes=usage.free)
+    monkeypatch.setattr(terminal, 'registry', SimpleNamespace(get=lambda _: node), raising=False)
+    original_status = terminal.terminal_status
+    monkeypatch.setattr(terminal, 'terminal_status', lambda target: {
+        **original_status(target), 'node_id': 'disposable-local'})
     tools = CompactTerminalTools(terminal, terminal)
     tools.handlers['enqueue_task'] = lambda *a, **kw: pytest.fail('must not enqueue')
     result = tools.turn(action='start', target=session, text=PROMPT, request_key='live-once', timeout=2)
@@ -224,3 +239,29 @@ def test_explicit_idempotency_key_takes_precedence_over_legacy_request_key(rig):
                         request_key='changed-legacy', idempotency_key='explicit')
     assert replay == first
     assert len(controller.send_calls) == 1
+
+
+@pytest.mark.parametrize("used,available", [
+    (225617035264, 11411779584),  # HP, current df
+    (99353378816, 18583187456),   # M910 root, after migration
+    (44770668544, 13670539264),   # NEC
+    (None, None),
+])
+def test_direct_start_blocks_insufficient_or_unknown_capacity(rig, used, available):
+    tools, _, controller = rig
+    controller.registry = SimpleNamespace(get=lambda _: SimpleNamespace(
+        status='online', disk_used_bytes=used, disk_free_bytes=available))
+    result = start(tools)
+    assert result['error'] == 'DISK_CAPACITY_BLOCKED'
+    assert result['dispatched'] is False
+    assert controller.send_calls == []
+    # A blocked request stays a no-send receipt even if retried.
+    assert start(tools) == result
+    assert controller.send_calls == []
+
+
+def test_direct_start_blocks_missing_target_identity(rig):
+    tools, _, controller = rig
+    controller.statuses['codex'] = {'state': 'IDLE', 'agent_type': 'codex', 'node_id': None}
+    assert start(tools)['error'] == 'DISK_CAPACITY_BLOCKED'
+    assert controller.send_calls == []

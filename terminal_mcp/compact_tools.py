@@ -1386,6 +1386,10 @@ class CompactTerminalTools:
                     or before.get("exists") is False or before.get("allowed") is False):
                 return finish({**base, "status": "FAILED", "error": "DIRECT_TARGET_NOT_IDLE",
                                "task_state": before.get("state", "UNKNOWN")})
+            disk_reason = self._first_dispatch_disk_reason(target, before)
+            if disk_reason is not None:
+                return finish({**base, "status": "FAILED", "error": "DISK_CAPACITY_BLOCKED",
+                               "reason": disk_reason})
             sent = self.send_task(target, text, timeout=float(timeout), idempotency_key=cache_key + ":send",
                                   require_idle=True)
             base = {**base, "send": sent, "submission_id": sent.get("submission_id")}
