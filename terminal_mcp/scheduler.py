@@ -27,6 +27,33 @@ class PlacementResult:
     diagnosis: dict[str, Any] = field(default_factory=dict)
 
 
+AGENT_MIN_DISK_FREE_BYTES = 20 * 1024 ** 3
+
+
+def agent_disk_block_reason(node: Node | None, *, required_agent_type: str,
+                            min_disk_free_bytes: int = AGENT_MIN_DISK_FREE_BYTES) -> str | None:
+    """Conservative admission for new agent sessions, not recovery shells.
+
+    The controller registry is an early placement guard; this is not a
+    substitute for a fresh path-specific node-local admission receipt.
+    Compute from raw counters so an older collector cannot understate
+    pressure through its total-block denominator.
+    """
+    if required_agent_type == "shell":
+        return None
+    if node is None or node.disk_used_bytes is None or node.disk_free_bytes is None:
+        return "disk capacity unknown"
+    used, available = node.disk_used_bytes, node.disk_free_bytes
+    if used < 0 or available < 0 or used + available <= 0:
+        return "disk capacity invalid"
+    if used * 100 >= 90 * (used + available):
+        return "effective disk usage >= 90%"
+    floor = max(AGENT_MIN_DISK_FREE_BYTES, min_disk_free_bytes)
+    if available < floor:
+        return f"disk_free_bytes {available} < required {floor}"
+    return None
+
+
 def _eligible(node: Node, *, required_agent_type: str, min_disk_free_bytes: int,
               required_platform: str | None = None) -> tuple[bool, str | None]:
     """One node's eligibility gate -- ALL must pass before it's even
@@ -51,6 +78,10 @@ def _eligible(node: Node, *, required_agent_type: str, min_disk_free_bytes: int,
         return False, f"agent_type={required_agent_type!r} not in node's capabilities {node.agent_types!r}"
     if node.max_sessions is not None and (node.tmux_session_count or 0) >= node.max_sessions:
         return False, f"at max_sessions ({node.tmux_session_count}/{node.max_sessions})"
+    disk_reason = agent_disk_block_reason(node, required_agent_type=required_agent_type,
+                                          min_disk_free_bytes=min_disk_free_bytes)
+    if disk_reason:
+        return False, disk_reason
     if node.disk_free_bytes is not None and node.disk_free_bytes < min_disk_free_bytes:
         return False, f"disk_free_bytes {node.disk_free_bytes} < required {min_disk_free_bytes}"
     return True, None
@@ -78,7 +109,7 @@ def _node_requirements(*, required_agent_type: str, labels_required: tuple[str, 
     return tuple(required)
 
 
-def _capacity_blocked(node: Node, *, min_disk_free_bytes: int) -> bool:
+def _capacity_blocked(node: Node, *, min_disk_free_bytes: int, required_agent_type: str) -> bool:
     """Capacity, as opposed to capability: this node could do the work but
     has no room for it right now. Kept separate so an overloaded node that
     ALSO lacks the capability is reported as a capability gap -- the
@@ -86,6 +117,9 @@ def _capacity_blocked(node: Node, *, min_disk_free_bytes: int) -> bool:
     if node.draining or node.capacity_status == CAPACITY_OVERLOADED:
         return True
     if node.max_sessions is not None and (node.tmux_session_count or 0) >= node.max_sessions:
+        return True
+    if agent_disk_block_reason(node, required_agent_type=required_agent_type,
+                               min_disk_free_bytes=min_disk_free_bytes):
         return True
     if node.disk_free_bytes is not None and node.disk_free_bytes < min_disk_free_bytes:
         return True
@@ -139,7 +173,7 @@ def choose_node(nodes: list[Node], *, required_agent_type: str = "shell",
         # stays authoritative for placement).
         views.append(CandidateView(
             key=node.id, online=node.status == NODE_ONLINE,
-            busy=_capacity_blocked(node, min_disk_free_bytes=min_disk_free_bytes),
+            busy=_capacity_blocked(node, min_disk_free_bytes=min_disk_free_bytes, required_agent_type=required_agent_type),
             has_profile=True,
             capability=match_capabilities(required, detected=_node_capability_pool(node)),
             ineligible_reason=None if ok else (reason or "ineligible")))

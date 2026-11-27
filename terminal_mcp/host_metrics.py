@@ -165,6 +165,50 @@ def disk_usage(path: str) -> tuple[int | None, int | None, int | None]:
         return None, None, None
 
 
+
+def _disk_used_percent(used: int | None, available: int | None) -> float | None:
+    """Use the writable pool (used + user-available), not physical total.
+
+    POSIX shutil.disk_usage.free uses f_bavail; reserved blocks belong to
+    neither used nor user-available. Preserve raw byte counters separately.
+    This matches df's effective ratio before display rounding.
+    """
+    if used is None or available is None or used < 0 or available < 0:
+        return None
+    effective = used + available
+    return 100.0 * used / effective if effective else None
+
+
+
+def local_agent_disk_block_reason(path: str) -> str | None:
+    """Fresh target-side check, immediately before a new agent is spawned.
+
+    On POSIX check user-available inode capacity too. Windows does not
+    expose POSIX inode counters; the byte guard still applies there.
+    """
+    _, used, available = disk_usage(path)
+    percent = _disk_used_percent(used, available)
+    if percent is None:
+        return "target disk capacity unknown or invalid"
+    if percent >= 90:
+        return "target effective disk usage >= 90%"
+    if available < 20 * 1024 ** 3:
+        return "target disk free < 20 GiB"
+    if hasattr(os, "statvfs"):
+        try:
+            v = os.statvfs(path)
+            inode_used = v.f_files - v.f_ffree
+            inode_available = v.f_favail
+            inode_percent = _disk_used_percent(inode_used, inode_available)
+        except (OSError, AttributeError, ValueError):
+            return "target inode capacity unknown"
+        if inode_percent is None:
+            return "target inode capacity unknown or invalid"
+        if inode_percent >= 90:
+            return "target effective inode usage >= 90%"
+    return None
+
+
 def _collect_linux(*, workspace_path: str) -> NodeMetrics:
     load1, load5, load15 = read_loadavg()
     mem = read_meminfo()
@@ -181,7 +225,7 @@ def _collect_linux(*, workspace_path: str) -> NodeMetrics:
     swap_used = (swap_total - swap_free) if (swap_total is not None and swap_free is not None) else None
     swap_percent = (100.0 * swap_used / swap_total) if (swap_used is not None and swap_total) else None
     disk_total, disk_used, disk_free = disk_usage(workspace_path)
-    disk_percent = (100.0 * disk_used / disk_total) if (disk_used is not None and disk_total) else None
+    disk_percent = _disk_used_percent(disk_used, disk_free)
     return NodeMetrics(
         cpu_percent=sample_cpu_percent(),
         load1=load1, load5=load5, load15=load15,
@@ -303,7 +347,7 @@ def _read_windows_memory() -> tuple[int | None, int | None, float | None, int | 
 def _collect_windows(*, workspace_path: str) -> NodeMetrics:
     ram_total, ram_used, ram_percent, swap_total, swap_used, swap_percent = _read_windows_memory()
     disk_total, disk_used, disk_free = disk_usage(workspace_path)  # shutil.disk_usage -- already cross-platform
-    disk_percent = (100.0 * disk_used / disk_total) if (disk_used is not None and disk_total) else None
+    disk_percent = _disk_used_percent(disk_used, disk_free)
     return NodeMetrics(
         cpu_percent=_WINDOWS_CPU_SAMPLER.sample(),
         load1=None, load5=None, load15=None,  # no load-average concept on Windows
@@ -324,7 +368,7 @@ def collect(*, workspace_path: str) -> NodeMetrics:
     # a wrong/misleading number; disk usage is genuinely cross-platform
     # via shutil, so that one field is still populated.
     disk_total, disk_used, disk_free = disk_usage(workspace_path)
-    disk_percent = (100.0 * disk_used / disk_total) if (disk_used is not None and disk_total) else None
+    disk_percent = _disk_used_percent(disk_used, disk_free)
     return NodeMetrics(
         cpu_percent=None, load1=None, load5=None, load15=None, cpu_count=os.cpu_count(),
         ram_total_bytes=None, ram_used_bytes=None, ram_percent=None,
