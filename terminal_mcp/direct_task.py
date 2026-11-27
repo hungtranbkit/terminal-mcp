@@ -937,11 +937,24 @@ class DirectTaskSupervisor:
             tail = self._tail(task["target"], MARKER_TAIL_LINES)
             output = str(tail.get("output") or "") if "error" not in tail else None
             marker = find_marker(output or "", task["task_id"])
-            if (marker is not None and task.get("accepted_at")
+            # A confirmed shell step can finish between observations. Only
+            # accept a fresh standalone task-bound marker that was not literal
+            # in the submitted command, never a merely echoed command.
+            fast_shell = False
+            if (marker is not None and task["mode"] == "shell"
+                    and task.get("receipt") == RECEIPT_SUBMIT_CONFIRMED
+                    and task.get("dispatches", 0) > 0 and turn_state == "IDLE"
+                    and not observed.get("input_required")):
+                prefix = "TMCP-" + marker[0] + ":" + task["task_id"]
+                texts = list(task.get("steps") or []) + [task.get("continue_text") or ""]
+                standalone = re.compile(r"^[ \t]*" + re.escape(prefix) + (r"[ \t]*$" if marker[0] == "DONE" else r"(?:[ \t]+[^\r\n]+)?[ \t]*$"), re.MULTILINE)
+                fast_shell = bool(standalone.search(output or "")) and not any(prefix in x for x in texts)
+            if (marker is not None and (task.get("accepted_at") or fast_shell)
                     and turn_state == "IDLE"):
                 outcome, detail = marker
+                proof = {"receipt": RECEIPT_EXECUTION_ACCEPTED, "accepted_at": now} if fast_shell and not task.get("accepted_at") else {}
                 return self.store.update(
-                    task["task_id"], **base, state=outcome, completed_at=now, wait_reason=None,
+                    task["task_id"], **base, **proof, state=outcome, completed_at=now, wait_reason=None,
                     reason=_clip(detail or f"target printed TMCP-{outcome}"))
 
         receipt = task.get("receipt")
@@ -1032,7 +1045,7 @@ class DirectTaskSupervisor:
             return self.store.update(
                 task["task_id"], **base, state="DISPATCH_UNCERTAIN",
                 wait_reason="NO_EXECUTION_EVIDENCE",
-                reason=_clip(f"submit not confirmed; {task.get('reason') or 'execution evidence absent'}; no execution evidence "
+                reason=_clip(f"submit not confirmed; no execution evidence "
                              f"{now - sent_at:.0f}s after dispatch "
                              f"(turn {turn_state}, submitted prompt not identifiable in composer); not resending"))
         return self.store.update(task["task_id"], **base,

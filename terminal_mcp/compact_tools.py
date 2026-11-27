@@ -990,7 +990,9 @@ class CompactTerminalTools:
         # persists a supervised direct task FIRST and returns its durable
         # task_id; the send is the atomic node-side idle guard only. Before
         # this, start returned TASK_STARTED/SUBMIT_CONFIRMED with task_id=null.
-        if normalized == "start" and target and text and not queue_submission_enabled():
+        if (normalized == "start" or (normalized in {"send", "send_wait"} and long_task)) and not queue_submission_enabled():
+            if not target or not text:
+                return {"status": "FAILED", "error": "TARGET_REQUIRED" if not target else "TEXT_REQUIRED", "dispatched": False}
             if self.direct_tasks is None:
                 return {"status": "FAILED", "error": "DURABLE_SUPERVISOR_UNAVAILABLE",
                         "action": "start", "dispatched": False,
@@ -1341,7 +1343,7 @@ class CompactTerminalTools:
             if not self._same_start(existing, target, text):
                 return {**base, "status": "FAILED", "error": "IDEMPOTENCY_CONFLICT",
                         "task_id": existing["task_id"]}
-            return self._supervised_receipt(base, supervisor.get(existing["task_id"]),
+            return self._supervised_receipt(base, supervisor.get(existing["task_id"], refresh=False),
                                             deduplicated=True)
         # A key already answered by the pre-#118 direct path is never re-sent.
         audit = getattr(self.terminal, "audit", None)
