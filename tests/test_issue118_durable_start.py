@@ -333,3 +333,27 @@ def test_task_status_reads_back_a_durable_start_by_dt_id(rig):
     unknown = tools.turn(action="task", task_id="dt_ffffffffffffffff")
     assert unknown["status"] == "FAILED" and unknown["result"]["error"] == "UNKNOWN_TASK_ID"
     assert len(controller.send_calls) == 1
+
+
+@pytest.mark.parametrize("state", ["DISPATCHING", "EXECUTION_ACCEPTED",
+                                  "DISPATCH_UNCERTAIN", "STUCK_COMPOSER", "RUNNING"])
+def test_direct_task_status_is_read_only(rig, monkeypatch, state):
+    tools, controller, _ = rig
+    tid = start(tools)["task_id"]
+    supervisor = tools.direct_tasks
+    supervisor.store.update(tid, state=state)
+    before = supervisor.store.get(tid)
+    sends = list(controller.send_calls)
+    def forbidden(*args, **kwargs):
+        pytest.fail("task_status must never observe, tick, or dispatch")
+    for method in ("_tick_task", "_late_completion", "_status", "_tail", "_send", "_send_guarded"):
+        monkeypatch.setattr(supervisor, method, forbidden)
+    for action in ("task", "task_status"):
+        result = tools.turn(action=action, task_id=tid)
+        assert result["status"] == "OK"
+        assert result["result"]["task"]["state"] == state
+        assert result["result"]["task"]["task_id"] == tid
+    result = tools.turn(action="task", task_id="dt_ffffffffffffffff")
+    assert result["result"]["error"] == "UNKNOWN_TASK_ID"
+    assert supervisor.store.get(tid) == before
+    assert controller.send_calls == sends

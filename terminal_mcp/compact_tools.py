@@ -1772,7 +1772,7 @@ class CompactTerminalTools:
             # Issue #118: `start` returns supervised dt_ ids. The monitor
             # bridge (ProjectFlow) reads receipts back through task_status, so
             # answer them from the durable supervisor, not the legacy queue.
-            result = self.direct_tasks.get(task_id.strip())
+            result = self.direct_tasks.get(task_id.strip(), refresh=False)
             return {"status": result.get("status", "FAILED"), "action": action, "result": result}
         handler = self.handlers.get(TURN_HANDLER_ACTIONS[action])
         if handler is None:
