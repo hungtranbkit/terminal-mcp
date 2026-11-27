@@ -362,6 +362,7 @@ def build_mcp(service: TerminalService | None = None,
         direct_tasks = DirectTaskSupervisor(
             DirectTaskStore(),
             send=lambda target, text, key: compact_tools.send_task(target, text, idempotency_key=key),
+            admit_first_dispatch=compact_tools._first_dispatch_disk_reason,
             status=lambda target: compact_tools._bounded_read(
                 ("direct-task-status", target),
                 lambda: compact_tools._status(target, timeout_seconds=8), 10),

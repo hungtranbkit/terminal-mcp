@@ -451,3 +451,50 @@ def test_shell_task_self_completes_via_task_id_placeholder(tmp_path):
     assert pane.sent[-1][0] == f"printf 'TMCP-%s:%s\\n' DONE {task_id}"
     task = sup.get(task_id, refresh=False)["task"]
     assert task["state"] == "DONE" and len(pane.sent) == 4
+
+
+def test_first_dispatch_capacity_gate_blocks_before_send_and_allows_recovery(tmp_path):
+    from types import SimpleNamespace
+    from terminal_mcp.compact_tools import CompactTerminalTools
+    counters = {
+        "hp": (225449357312, 11579457536),
+        "m910": (108951822336, 8984743936),
+        "nec": (44769669120, 13671538688),
+        "mac": (82522497024, 382668259328),
+    }
+    nodes = {k: SimpleNamespace(status="online", disk_used_bytes=u, disk_free_bytes=f)
+             for k, (u, f) in counters.items()}
+    tools = SimpleNamespace(controller=SimpleNamespace(registry=nodes))
+    admit = lambda target, observed: CompactTerminalTools._first_dispatch_disk_reason(tools, target, observed)
+    for i, (node, agent, allowed) in enumerate([
+        ("hp", "codex", False), ("m910", "codex", False),
+        ("nec", "codex", False), ("unknown", "codex", False),
+        ("mac", "codex", True), ("hp", "shell", True),
+    ]):
+        pane = FakePane(agent=agent)
+        original = pane.status
+        pane.status = lambda target: {**original(target), "node_id": node, "agent_type": agent}
+        d = tmp_path / str(i)
+        d.mkdir()
+        sup = _supervisor(d, pane, Clock(), admit_first_dispatch=admit)
+        result = sup.start(node, text="bounded fixture only")
+        task = result["task"]
+        assert pane.send_attempts == int(allowed)
+        assert (task["state"] == "BLOCKED") is (not allowed)
+        if not allowed:
+            assert task["dispatches"] == 0
+            assert task["wait_reason"] == "DISK_CAPACITY_BLOCKED"
+
+
+def test_first_dispatch_capacity_gate_preserves_continuations(tmp_path):
+    clock = Clock()
+    pane = FakePane()
+    calls = []
+    def admit(target, observed):
+        calls.append(target)
+        return None if len(calls) == 1 else "disk full"
+    sup = _supervisor(tmp_path, pane, clock, admit_first_dispatch=admit)
+    sup.start("mac", text="bounded fixture only")
+    _run(sup, clock, 8)
+    assert len(calls) == 1
+    assert len(pane.sent) >= 2

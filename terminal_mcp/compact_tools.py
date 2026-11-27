@@ -533,6 +533,23 @@ class CompactTerminalTools:
             result = self.controller.terminal_status(value)
         return {"target": target, "target_type": kind, **result}
 
+    def _first_dispatch_disk_reason(self, target: str, observed: dict) -> str | None:
+        """Early controller admission using the observed target's registry row.
+        Not a substitute for fresh path-specific target-side admission.
+        """
+        from .direct_task import agent_of
+        from .scheduler import agent_disk_block_reason
+        if agent_of(observed) == "shell":
+            return None
+        node_id = observed.get("node_id")
+        registry = getattr(self.controller, "registry", None)
+        if not isinstance(node_id, str) or not node_id or registry is None:
+            return "target node capacity unknown"
+        node = registry.get(node_id)
+        if node is None or node.status != "online":
+            return "target node capacity unavailable or stale"
+        return agent_disk_block_reason(node, required_agent_type="agent")
+
     def _tail(self, target: str, lines: int) -> dict[str, Any]:
         kind, value = self._resolve(target)
         if kind is None:
