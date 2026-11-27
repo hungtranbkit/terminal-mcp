@@ -1359,6 +1359,20 @@ class CompactTerminalTools:
         digest = hashlib.sha256(json.dumps([target, text], ensure_ascii=False).encode()).hexdigest()
         deadline = self.monotonic() + float(timeout)
         audit = getattr(self.terminal, "audit", None)
+        # Prior releases persisted the authoritative direct-send receipt under
+        # this key before the probe namespace existed. Resolve it first: a
+        # fresh probe (or a non-Codex handoff) must never hide a confirmed or
+        # ambiguous submission after upgrade. The request digest binds target
+        # and prompt, so changed input conflicts without probing or replaying.
+        if audit is not None:
+            saved = audit.get_idempotent_result(cache_key)
+            if saved is not None:
+                if saved.get("request_digest") != digest:
+                    return {"status": "FAILED", "error": "IDEMPOTENCY_CONFLICT"}
+                result = saved.get("result")
+                if isinstance(result, dict):
+                    return result
+                return {"status": "FAILED", "error": "DIRECT_RECEIPT_INVALID"}
         if not hasattr(self.controller, "terminal_status"):
             return None
         if audit is None:
@@ -1495,6 +1509,12 @@ class CompactTerminalTools:
                            "verification_state": state,
                            "next_action": "Inspect the confirmed submission; execution is unverified. Do not resend."})
         except Exception:
+            if base.get("dispatched") is True:
+                return finish({**base, "status": "TASK_DISPATCHED",
+                               "error": "EXECUTION_UNVERIFIED",
+                               "task_state": "START_UNVERIFIED",
+                               "execution_state": "UNVERIFIED",
+                               "next_action": "Inspect the confirmed submission; execution is unverified. Do not resend."})
             return finish({**base, "status": "FAILED", "error": "DIRECT_DISPATCH_UNCERTAIN",
                            "next_action": "Inspect the durable submission; do not resend."})
 

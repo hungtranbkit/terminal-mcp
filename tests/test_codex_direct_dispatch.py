@@ -331,6 +331,101 @@ def test_replay_across_restart_returns_original_receipt_without_retyping(rig):
     assert len(controller.send_calls) == 1
 
 
+@pytest.mark.parametrize("prior", [
+    {"status": "TASK_STARTED", "dispatched": True,
+     "delivery_state": "SUBMIT_CONFIRMED", "task_state": "RUNNING"},
+    {"status": "TASK_DISPATCHED", "dispatched": True,
+     "delivery_state": "SUBMIT_CONFIRMED", "task_state": "START_UNVERIFIED"},
+    {"status": "TASK_SUBMIT_UNCERTAIN", "dispatched": None,
+     "delivery_state": "SUBMIT_UNKNOWN", "task_state": "SUBMIT_UNVERIFIED"},
+    {"status": "FAILED", "dispatched": False,
+     "delivery_state": "NOT_SUBMITTED", "task_state": "PREFLIGHT_PENDING"},
+])
+def test_prior_version_direct_receipt_is_read_before_any_new_probe(rig, monkeypatch, prior):
+    import hashlib
+    import json
+
+    tools, terminal, controller = rig
+    request_key = "legacy-direct-receipt"
+    cache_key = "codex-direct-start:" + hashlib.sha256(request_key.encode()).hexdigest()
+    digest = hashlib.sha256(json.dumps(["codex", "inert task"], ensure_ascii=False).encode()).hexdigest()
+    assert terminal.audit.claim_idempotency_key(cache_key)
+    terminal.audit.store_idempotent_result(cache_key, {
+        "request_digest": digest,
+        "result": {"action": "start", "mode": "direct", "session": "codex",
+                   "request_key": request_key, "idempotency_key": cache_key, **prior},
+    })
+    probes = []
+    monkeypatch.setattr(tools, "_bounded_read", lambda *_: probes.append(1) or
+                        {"error": "STATUS_PROBE_TIMEOUT"})
+
+    result = tools.turn(action="start", target="codex", text="inert task", timeout=1,
+                        request_key=request_key)
+
+    assert result["status"] == prior["status"]
+    assert result["task_state"] == prior["task_state"]
+    assert result["dispatched"] == prior["dispatched"]
+    assert probes == []
+    assert controller.send_calls == []
+    assert terminal.audit.get_idempotent_result("codex-direct-probe:" +
+        hashlib.sha256(request_key.encode()).hexdigest()) is None
+
+
+@pytest.mark.parametrize(("target", "text"), [
+    ("codex-renamed", "inert task"),
+    ("shell", "inert task"),
+    ("codex", "changed prompt"),
+])
+def test_prior_version_direct_receipt_changed_digest_conflicts_before_probe(rig, monkeypatch, target, text):
+    import hashlib
+    import json
+
+    tools, terminal, controller = rig
+    request_key = "legacy-target-conflict"
+    cache_key = "codex-direct-start:" + hashlib.sha256(request_key.encode()).hexdigest()
+    digest = hashlib.sha256(json.dumps(["codex", "inert task"], ensure_ascii=False).encode()).hexdigest()
+    assert terminal.audit.claim_idempotency_key(cache_key)
+    terminal.audit.store_idempotent_result(cache_key, {
+        "request_digest": digest,
+        "result": {"status": "TASK_DISPATCHED", "dispatched": True,
+                   "delivery_state": "SUBMIT_CONFIRMED", "task_state": "START_UNVERIFIED"},
+    })
+    probes = []
+    monkeypatch.setattr(tools, "_bounded_read", lambda *_: probes.append(1) or
+                        {"error": "STATUS_PROBE_TIMEOUT"})
+
+    result = tools.turn(action="start", target=target, text=text, timeout=1,
+                        request_key=request_key)
+
+    assert result["error"] == "IDEMPOTENCY_CONFLICT"
+    assert probes == []
+    assert controller.send_calls == []
+    assert terminal.audit.get_idempotent_result("codex-direct-probe:" +
+        hashlib.sha256(request_key.encode()).hexdigest()) is None
+
+
+def test_post_submit_verification_exception_keeps_confirmed_start_unverified(rig, monkeypatch):
+    tools, _, controller = rig
+    calls = []
+
+    def read(_key, operation, _seconds):
+        calls.append(1)
+        if len(calls) == 1:
+            return operation()
+        raise RuntimeError("verification transport failed after confirmed send")
+
+    monkeypatch.setattr(tools, "_bounded_read", read)
+    result = start(tools)
+
+    assert result["status"] == "TASK_DISPATCHED"
+    assert result["dispatched"] is True
+    assert result["delivery_state"] == "SUBMIT_CONFIRMED"
+    assert result["task_state"] == "START_UNVERIFIED"
+    assert result["execution_state"] == "UNVERIFIED"
+    assert result["error"] == "EXECUTION_UNVERIFIED"
+    assert len(controller.send_calls) == 1
+
+
 def test_same_key_different_prompt_fails_without_input(rig):
     tools, _, controller = rig
     start(tools)
