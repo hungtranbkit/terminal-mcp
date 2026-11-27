@@ -160,19 +160,29 @@ AGENT_IDLE_PATTERNS = (
 AGENT_UI_MARKER_LINES = 8
 
 
-def detect_agent_ui_state(output: str) -> tuple[str | None, str]:
+def detect_agent_ui_state(
+    output: str, *, command: str | None = None
+) -> tuple[str | None, str]:
     """RUNNING/IDLE read from an agent CLI's own footer, or (None, why-not).
 
-    Two separate passes, RUNNING first: a busy footer is the LIVE state and
-    must win outright over a "done 10:05 AM" line still visible from the
-    PREVIOUS turn. One pass over both pattern sets would instead let
-    whichever marker happened to sit lower in the pane decide, which is
-    exactly backwards.
+    Prefer a live busy footer over a previous turn's done marker. For
+    Codex only, a recognized ready composer below the newest busy marker
+    supersedes that historical marker. Claude can paint an empty composer
+    during live work, so its existing busy-footer precedence is unchanged.
     """
     recent = [line for line in output.splitlines() if line.strip()][-AGENT_UI_MARKER_LINES:]
     for offset, line in enumerate(reversed(recent)):
         for pattern in AGENT_RUNNING_PATTERNS:
             if pattern.search(line):
+                # Audit 2026-11-27 (#126): a Codex pane retained the old
+                # interrupt hint above its current "Ask Codex to do anything"
+                # composer. Reuse the adapter's exact composer recognition
+                # on the newer lines only; never override a newer busy
+                # marker, a permission modal, or Claude's live spinner.
+                if command == "codex" and offset:
+                    newer = recent[-offset:]
+                    if select_adapter(command).identify_target_state(newer) == adapters.TARGET_COMPOSER:
+                        return "IDLE", "codex ready composer supersedes an older busy marker"
                 return "RUNNING", (f"agent CLI busy footer matched {pattern.pattern!r} "
                                    f"at bottom offset {offset}")
     for offset, line in enumerate(reversed(recent)):
@@ -305,7 +315,7 @@ def classify_status(session: SessionInfo, output: str, now: int | None = None) -
     # redraw, and a working one whose spinner has not moved reporting UNKNOWN.
     # The command is restated in the reason string because that is where
     # terminal_wall.command_from() reads it from.
-    ui_state, ui_reason = detect_agent_ui_state(output)
+    ui_state, ui_reason = detect_agent_ui_state(output, command=command)
     if ui_state is not None:
         return ui_state, False, f"{ui_reason}; current command is {command or 'unknown'!r}"
     # Shell equivalent of the agent-UI check above, and placed AFTER it so an
