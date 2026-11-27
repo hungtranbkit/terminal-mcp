@@ -1357,6 +1357,7 @@ class CompactTerminalTools:
         cache_key = "codex-direct-start:" + request_hash
         probe_key = "codex-direct-probe:" + request_hash
         digest = hashlib.sha256(json.dumps([target, text], ensure_ascii=False).encode()).hexdigest()
+        deadline = self.monotonic() + float(timeout)
         audit = getattr(self.terminal, "audit", None)
         if not hasattr(self.controller, "terminal_status"):
             return None
@@ -1364,7 +1365,6 @@ class CompactTerminalTools:
             # Compatibility tools that do not expose AuditStore still hand
             # non-Codex targets to their existing send path. A Codex launch
             # fails closed because its durable request reservation is absent.
-            deadline = self.monotonic() + float(timeout)
             remaining = max(0.0, deadline - self.monotonic())
             before = self._bounded_read(("direct-start", target),
                 lambda: self._status(target, timeout_seconds=remaining), remaining)
@@ -1408,7 +1408,6 @@ class CompactTerminalTools:
                 audit.store_idempotent_result(cache_key, record)
             return result
         finish(pending)
-        deadline = self.monotonic() + float(timeout)
         def observe() -> dict[str, Any]:
             remaining = max(0.0, deadline - self.monotonic())
             return self._bounded_read(("direct-start", target),
