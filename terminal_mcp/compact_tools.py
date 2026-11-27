@@ -533,6 +533,33 @@ class CompactTerminalTools:
             result = self.controller.terminal_status(value)
         return {"target": target, "target_type": kind, **result}
 
+    def _first_dispatch_disk_reason(self, target: str, observed: dict) -> str | None:
+        """Early controller admission using the observed target's registry row.
+        Not a substitute for fresh path-specific target-side admission.
+        """
+        from .direct_task import agent_of
+        from .scheduler import agent_disk_block_reason
+        # A textual status reason is not evidence of a recovery shell:
+        # agent_of also classifies arbitrary foreground commands as shell.
+        resource = observed.get("resource")
+        identities = [observed.get("agent"), observed.get("agent_type")]
+        if isinstance(resource, dict):
+            identities.append(resource.get("agent"))
+        commands = [observed.get("pane_current_command"), observed.get("current_command")]
+        identities = {str(value or "").strip().lower() for value in identities}
+        commands = {str(value or "").strip().lower().rsplit("/", 1)[-1] for value in commands}
+        explicit_shell = "shell" in identities or bool(commands & {"bash", "sh", "dash", "zsh", "fish", "ksh", "pwsh", "powershell", "cmd", "cmd.exe"})
+        if explicit_shell and not ((identities | commands) & {"codex", "claude"}) and agent_of(observed) not in {"codex", "claude"}:
+            return None
+        node_id = observed.get("node_id")
+        registry = getattr(self.controller, "registry", None)
+        if not isinstance(node_id, str) or not node_id or registry is None:
+            return "target node capacity unknown"
+        node = registry.get(node_id)
+        if node is None or node.status != "online":
+            return "target node capacity unavailable or stale"
+        return agent_disk_block_reason(node, required_agent_type="agent")
+
     def _tail(self, target: str, lines: int) -> dict[str, Any]:
         kind, value = self._resolve(target)
         if kind is None:
@@ -1369,6 +1396,10 @@ class CompactTerminalTools:
                     or before.get("exists") is False or before.get("allowed") is False):
                 return finish({**base, "status": "FAILED", "error": "DIRECT_TARGET_NOT_IDLE",
                                "task_state": before.get("state", "UNKNOWN")})
+            disk_reason = self._first_dispatch_disk_reason(target, before)
+            if disk_reason is not None:
+                return finish({**base, "status": "FAILED", "error": "DISK_CAPACITY_BLOCKED",
+                               "reason": disk_reason})
             sent = self.send_task(target, text, timeout=float(timeout), idempotency_key=cache_key + ":send",
                                   require_idle=True)
             base = {**base, "send": sent, "submission_id": sent.get("submission_id")}

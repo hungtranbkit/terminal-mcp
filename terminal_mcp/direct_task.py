@@ -530,6 +530,7 @@ class DirectTaskSupervisor:
     def __init__(self, store: DirectTaskStore, *, send: Callable[[str, str, str], dict],
                  status: Callable[[str], dict], tail: Callable[[str, int], dict],
                  activate: Callable[[str, str], dict] | None = None,
+                 admit_first_dispatch: Callable[[str, dict], str | None] | None = None,
                  clock: Callable[[], float] = _now,
                  settle_seconds: float = DEFAULT_SETTLE_SECONDS,
                  accept_wait_seconds: float = 0.0,
@@ -539,6 +540,7 @@ class DirectTaskSupervisor:
         self._status = status
         self._tail = tail
         self._activate = activate
+        self._admit_first_dispatch = admit_first_dispatch
         self.clock = clock
         self.settle_seconds = float(settle_seconds)
         self.accept_wait_seconds = float(accept_wait_seconds)
@@ -952,6 +954,17 @@ class DirectTaskSupervisor:
             # text into a working agent.
             return self.store.update(task["task_id"], **base, state="DISPATCHING",
                                      wait_reason="TARGET_BUSY", idle_since=None)
+        # Only a new task, before the first claim or send. Accepted work
+        # and continuation/recovery paths do not enter this method.
+        if self._admit_first_dispatch is not None:
+            try:
+                disk_reason = self._admit_first_dispatch(task["target"], observed)
+            except Exception:
+                disk_reason = "capacity admission unavailable"
+            if disk_reason is not None:
+                return self.store.update(task["task_id"], **base, state="BLOCKED",
+                                         completed_at=now, wait_reason="DISK_CAPACITY_BLOCKED",
+                                         reason=_clip(disk_reason), idle_since=None)
         task = self.store.update(task["task_id"], **base, wait_reason=None)
         return self._dispatch(task, now)
 
