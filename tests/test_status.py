@@ -368,6 +368,56 @@ def test_codex_idle_composer_is_idle_even_when_process_is_recent():
     assert "composer" in reason.casefold()
 
 
+def test_codex_newer_ready_composer_supersedes_stale_busy_footer():
+    # Reproduces the ordering from the Dell ZGH audit on 2026-11-27.
+    # The stale hint is five non-empty lines above the bottom.
+    pane = "\n".join((
+        "  Working (esc to interrupt)",
+        "  completed previous turn",
+        "  Tip: Press ^t to open the full transcript.",
+        "› Ask Codex to do anything",
+        "  GPT-6-Luna medium · ~/workspace · Main [default]",
+        "  ← for agents · ? for shortcuts",
+    ))
+    state, input_required, reason = classify_status(
+        info("codex", activity=1), pane, now=191758
+    )
+    assert state == "IDLE"
+    assert input_required is False
+    assert "composer" in reason.casefold()
+
+
+def test_codex_newer_busy_footer_still_wins_over_older_composer():
+    pane = "\n".join((
+        "› Ask Codex to do anything",
+        "  reading files",
+        "  Working (esc to interrupt)",
+    ))
+    state, input_required, reason = classify_status(
+        info("codex", activity=1), pane, now=191758
+    )
+    assert state == "RUNNING"
+    assert input_required is False
+    assert "esc to interrupt" in reason
+
+
+def test_codex_ready_composer_never_overrides_live_permission_dialog():
+    pane = "\n".join((
+        "  Working (esc to interrupt)",
+        "› Ask Codex to do anything",
+        "  Allow terminal.start_process?",
+        "› 1. Allow once",
+        "  2. Always allow",
+        "  3. Cancel",
+        "  Enter to select · Esc to cancel",
+    ))
+    state, input_required, _ = classify_status(
+        info("codex", activity=1), pane, now=191758
+    )
+    assert state == "WAITING_INPUT"
+    assert input_required is True
+
+
 def test_codex_process_and_recent_activity_alone_are_not_running_evidence():
     state, input_required, _reason = classify_status(
         info("codex", activity=99), "task contract text without Codex UI chrome", now=100)
