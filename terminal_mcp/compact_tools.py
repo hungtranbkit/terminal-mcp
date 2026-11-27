@@ -917,7 +917,7 @@ class CompactTerminalTools:
         - inspect: status+tail for one target or many targets (`targets`), each
           row carrying the `resource` context/quota health block.
         - send: guarded/idempotent direct submission. With queue disabled,
-          legacy start aliases and long_task=True use this same guarded path.
+          start aliases and long_task=True use the durable guarded supervisor.
           Queue-enabled operators retain the legacy durable receipt path.
         - send_wait: submit, then create one durable bounded wait in the same call.
         - wait: create one durable bounded wait.
@@ -999,7 +999,8 @@ class CompactTerminalTools:
                         "next_action": "Restore the durable supervisor before starting work; nothing was sent."}
             return self._supervised_start(
                 target, text, timeout=timeout,
-                request_key=idempotency_key if idempotency_key is not None else request_key)
+                request_key=idempotency_key if idempotency_key is not None else request_key,
+                title=title, metadata=metadata)
 
         # Codex start is an immediate guarded dispatch, regardless of the
         # historical queue opt-in. Never enqueue an idle Codex as a fallback.
@@ -1011,17 +1012,6 @@ class CompactTerminalTools:
                     return self._with_label(direct, self._label_send(
                         target, text, direct.get("send", {}), title, metadata))
                 return direct
-
-        # Cached clients may still say start or long_task. With queue off,
-        # translate those into the SAME guarded direct send, never a new
-        # session, queue row, dispatch tick or implicit supervision loop.
-        if not queue_submission_enabled():
-            if normalized == "start" or (normalized in {"send", "send_wait"} and long_task):
-                if normalized == "start":
-                    normalized = "send"
-                if idempotency_key is None:
-                    idempotency_key = request_key
-                long_task = False
 
         # Queue submission is retired for normal public use.  The legacy
         # engine remains for historical/running tasks, but no new queue row is
@@ -1319,7 +1309,8 @@ class CompactTerminalTools:
 
 
     def _supervised_start(self, target: str, text: str, *, timeout: float,
-                          request_key: str | None) -> dict[str, Any]:
+                          request_key: str | None, title: str | None = None,
+                          metadata: dict | None = None) -> dict[str, Any]:
         """`action=start` as a durable, deduplicated, idle-guarded task.
 
         Order matters: (1) replay of a known key returns the SAME task and
@@ -1385,7 +1376,23 @@ class CompactTerminalTools:
             return {**base, **result, "dispatched": False}
         if result.get("error") == "TARGET_HAS_ACTIVE_SUPERVISED_TASK":
             return {**base, **result, "dispatched": False}
-        return self._supervised_receipt(base, result, deduplicated=bool(result.get("deduplicated")))
+        receipt = self._supervised_receipt(base, result, deduplicated=bool(result.get("deduplicated")))
+        # Label the actual accepted target, including logical bindings. Replays
+        # and refused/uncertain input never replace existing task labels.
+        if (self.task_labels is not None and receipt.get("task_id")
+                and not receipt.get("deduplicated") and not result.get("error")
+                and receipt.get("receipt") in {"SUBMIT_CONFIRMED", "EXECUTION_ACCEPTED"}):
+            try:
+                node_id, name = self.task_labels.split_target(target)
+                label = self.task_labels.on_task(
+                    node_id=before.get("node_id") or node_id,
+                    session=before.get("session") or name, text=text,
+                    title=title, metadata=metadata, task_id=receipt["task_id"],
+                    request_key=key, source="supervised")
+                self._with_label(receipt, label)
+            except Exception:
+                pass
+        return receipt
 
     @staticmethod
     def _same_start(task: dict[str, Any], target: str, text: str) -> bool:

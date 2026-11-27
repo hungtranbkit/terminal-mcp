@@ -48,8 +48,13 @@ def test_terminal_turn_schema_teaches_direct_compatibility(monkeypatch):
     server = build_mcp()
     tool = next(t for t in server._tool_manager.list_tools() if t.name == "terminal_turn")
     assert "direct session control" in tool.description
-    assert "existing target" in tool.description
-    assert "not a queued task_id" in tool.description
+    assert "durable DirectTaskSupervisor" in tool.description
+    assert "stable task_id" in tool.description
+    assert "no new session or queue row" in tool.description
+    assert "Replays never resend" in tool.description
+    assert "SUBMIT_CONFIRMED is not observed execution" in tool.description
     flag = tool.parameters["properties"]["long_task"]
     assert flag["deprecated"] is True
-    assert "creates no queue task" in flag["description"]
+    assert "durable guarded" in flag["description"]
+    assert "returns task_id" in flag["description"]
+    assert "short sends remain direct" in flag["description"]

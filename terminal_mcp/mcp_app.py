@@ -90,7 +90,7 @@ _RETIRED_PUBLIC_QUEUE_TOOLS = (
 _DIRECT_ACTION_SCHEMA_HELP = (
     "For new local headless work: headless_start (agent_type=codex|claude, text, working_directory, "
     "idempotency_key), headless_status/list/checkpoint/cancel/cleanup. "
-    "Direct Terminal MCP action. Normal public actions: start (idle local Codex, confirmed RUNNING or error), inspect, send, send_wait, wait, resume, "
+    "Direct Terminal MCP action. Normal public actions: start (durable guarded task; task_id; observed RUNNING only), inspect, send, send_wait, wait, resume, "
     "supervise (long task continued server-side until explicit DONE), supervise_status, "
     "supervise_complete, supervise_cancel, "
     "list_sessions, list_nodes, node_ssh(node_id + args.operation=status|setup|verify|connect|revoke|exec), "
@@ -104,8 +104,8 @@ _DIRECT_ACTION_SCHEMA_HELP = (
     "continuations (y, continue, approvals, follow-ups)."
 )
 _LONG_TASK_SCHEMA_HELP = (
-    "Deprecated compatibility flag. With queue disabled, send/send_wait stay guarded direct "
-    "sends; this flag creates no queue task and enables no automatic continuation. "
+    "Compatibility flag: with queue disabled, long_task=True routes to the durable guarded "
+    "supervisor and returns task_id; short sends remain direct. "
     "Only queue-enabled operators retain legacy queued send behavior."
 )
 from .queue_service import QueueService
@@ -853,12 +853,12 @@ INTERACTIVE FLOW (existing tmux sessions / remote nodes):
    session/worktree/branch.
 
 The durable task queue is RETIRED and disabled by default. With queue disabled,
-legacy `start` (including `run`/`dispatch`/`start_task`) is a guarded `send` to
-an existing target; it never creates a session. `long_task=true` on send or
-send_wait is accepted for compatibility and does not enable queueing or automatic
-continuation. These calls return direct delivery evidence, not a queued task_id;
-request_key is used as idempotency_key when no explicit idempotency_key is given.
-Idle Codex start additionally requires fresh RUNNING evidence. For tracked work, prefer create_session then supervise in new clients.
+`start` (including `run`/`dispatch`/`start_task`) and `long_task=true` on
+send/send_wait use the existing durable DirectTaskSupervisor, guarded idle
+send and stable task_id; no new session or queue row. Replays never resend.
+SUBMIT_CONFIRMED is not observed execution. Without the supervisor, fail
+closed before input. request_key is the fallback for idempotency_key.
+Use task_status with task_id when checking; plain short sends remain direct.
 Queue-producing actions (`enqueue_task`, `route_start`, `agent_start`,
 `project_start`) and queue dispatch return `QUEUE_DISABLED_USE_DIRECT_SESSION`.
 Read-only task/task-batch/history/metrics and cleanup/cancel operations remain
