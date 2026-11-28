@@ -1,5 +1,34 @@
 # PROJECT_CONTEXT.md
 
+## 2026-11-28 — Shared AUTONOMY_FIRST v1 policy (#104)
+
+- Isolated from the dirty local Terminal MCP checkout at exact public main
+  `d6a84ff9f6f7feab5bb4435c7c828165773d5dde`; feature branch
+  `agent/codex/autonomy-first-policy-v1-20261128`. The local checkout's
+  `config.yaml` WIP is untouched.
+- `terminal_mcp/orchestration_policy.py` is the canonical shared policy
+  source (`AUTONOMY_FIRST_VERSION=1`, orchestration policy `1.6.0`), included
+  in MCP server instructions. The generated `docs/CHATGPT_ORCHESTRATION_POLICY.md`
+  quotes that same wire text. `work_policy.py` reuses the canonical constant,
+  increments Work Policy to `1.1.0`, and ensures AUTONOMY_FIRST is included in
+  every `-work` task policy load, even when only selected sections are requested.
+- Recovery instructions distinguish a terminal CANCELLED/PERSISTED/zero-dispatch
+  receipt from execution; retries are bounded/idempotent; ambiguous submits are
+  reconciled; stale session names/grants are not recreated; alternate executors
+  require verified identity, scope, toolchain, capacity and existing permission.
+  Independent review/CI and explicit production release authority remain intact.
+- No dispatch, queue/config, provider, permission, service, schema or runtime
+  behavior changed. Running Work tasks keep their existing version-bound policy.
+- Focused verification: `tests/test_orchestration_policy.py`,
+  `tests/test_work_policy.py`, `tests/test_work_policy_integration.py`,
+  `tests/test_transports.py`, `tests/test_work_spec.py` — **116 passed** in
+  9.88s, exit 0. Log `/tmp/tmcp-autonomy-first-policy-focused-20261128.log`,
+  SHA-256 `695a6b033a14ac337e41fc4f4c9529d3b00d85a3742c197b144344b87a9083de`.
+  Compileall and `git diff --check` both exit 0. This does not substitute for
+  required PR CI or independent review. No deployment performed.
+- Next: inspect the final diff, run lint/compile checks, publish a scoped PR, and
+  request independent review. Do not merge or deploy in this task.
+
 ## 2026-11-12 — P0 fleet session lifecycle (PR #117, not deployed)
 
 - Work is isolated from the starting checkout (`fix/codex-session-readiness-20261016`) at `/home/dell/workspace/.terminal-mcp-worktrees/p0-session-lifecycle-20261112`, branch `fix/p0-session-lifecycle-20261112`, based on `origin/main` `5d4ee0a`. Implementation commit `837a413` is pushed and PR #117 is open: https://github.com/hungtranbkit/terminal-mcp/pull/117. Remote guarded direct-start now uses the node agent's dedicated `/v1/sessions/{name}/send-guarded` route; legacy workers fail closed before input rather than silently dropping `require_idle`.

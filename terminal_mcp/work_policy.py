@@ -36,9 +36,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+from .orchestration_policy import AUTONOMY_FIRST_POLICY
 from .project_knowledge import canonical_root, scrub_knowledge
 
-WORK_POLICY_VERSION = "1.0.0"
+WORK_POLICY_VERSION = "1.1.0"
 POLICIES_DIRNAME = ".projectflow/policies"
 POLICY_FILENAME = "WORK_POLICY.md"
 PROJECT_POLICY_FILENAME = "PROJECT_POLICY.md"
@@ -65,6 +66,7 @@ SAFETY_CAVEAT = (
 # Canonical section keys, in file order. Workers ask for these by name.
 SECTIONS: tuple[tuple[str, str], ...] = (
     ("precedence", "Policy Precedence"),
+    ("autonomy_first", "AUTONOMY_FIRST v1"),
     ("planner_contract", "Bug Planner to Executor Contract"),
     ("difficulty", "Difficulty Triage"),
     ("spec_levels", "Bug Spec Levels"),
@@ -110,6 +112,10 @@ Highest first:
 5. Historical memory or past chat.
 
 {SAFETY_CAVEAT}
+
+## AUTONOMY_FIRST v1
+
+{AUTONOMY_FIRST_POLICY}
 
 ## Bug Planner to Executor Contract
 
@@ -556,6 +562,8 @@ def policy_for_task(cwd: str, *, session: str | None = None,
                 "note": "ordinary terminal session; Work policy does not apply"}
     policy = load_policy(cwd)
     keys = list(sections) or list(SECTION_KEYS)
+    if "autonomy_first" not in keys:
+        keys.append("autonomy_first")
     return {
         "applies": True,
         "binding": policy.binding(sections_loaded=keys).as_dict(),

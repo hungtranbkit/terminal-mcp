@@ -80,10 +80,10 @@ def test_new_task_binds_the_new_version_after_a_bump(project):
     first = wp.load_policy(project).binding()
     path = wp.policy_dir(project) / wp.POLICY_FILENAME
     path.write_text(path.read_text().replace(
-        f"WORK_POLICY_VERSION: {wp.WORK_POLICY_VERSION}", "WORK_POLICY_VERSION: 1.1.0", 1))
+        f"WORK_POLICY_VERSION: {wp.WORK_POLICY_VERSION}", "WORK_POLICY_VERSION: 1.2.0", 1))
     second = wp.load_policy(project).binding()
     assert first.policy_version == wp.WORK_POLICY_VERSION
-    assert second.policy_version == "1.1.0"
+    assert second.policy_version == "1.2.0"
     assert first.policy_hash != second.policy_hash
 
 
@@ -93,13 +93,13 @@ def test_a_running_task_is_not_silently_reruled_midflight(project):
     assert wp.binding_is_stale(binding, wp.load_policy(project)) == {
         "stale": False, "action": "continue"}
     path = wp.policy_dir(project) / wp.POLICY_FILENAME
-    path.write_text(path.read_text().replace("WORK_POLICY_VERSION: 1.0.0",
+    path.write_text(path.read_text().replace(f"WORK_POLICY_VERSION: {wp.WORK_POLICY_VERSION}",
                                              "WORK_POLICY_VERSION: 2.0.0", 1))
     verdict = wp.binding_is_stale(binding, wp.load_policy(project))
     assert verdict["stale"] is True
     # Reported, not applied: the worker planned against the bound version.
     assert verdict["action"] == "continue_under_bound_version"
-    assert verdict["bound_version"] == "1.0.0"
+    assert verdict["bound_version"] == wp.WORK_POLICY_VERSION
     assert verdict["current_version"] == "2.0.0"
 
 
@@ -142,8 +142,9 @@ def test_work_sessions_auto_load_without_being_told_the_rules(project):
     assert result["applies"] is True
     # A brand-new session learns these from the file, not from chat history.
     assert "FAST_FIX" in result["text"] and "NEEDS_REDEFINE" in result["text"]
+    assert "AUTONOMY_FIRST v1" in result["text"]
     assert result["binding"]["policy_version"] == wp.WORK_POLICY_VERSION
-    assert result["binding"]["sections_loaded"] == ["modes", "needs_redefine"]
+    assert result["binding"]["sections_loaded"] == ["modes", "needs_redefine", "autonomy_first"]
 
 
 def test_a_project_without_a_policy_file_still_gets_rules(tmp_path):
