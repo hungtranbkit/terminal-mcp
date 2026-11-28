@@ -36,9 +36,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+from .orchestration_policy import AUTONOMY_FIRST_POLICY
 from .project_knowledge import canonical_root, scrub_knowledge
 
-WORK_POLICY_VERSION = "1.0.0"
+WORK_POLICY_VERSION = "1.1.0"
 POLICIES_DIRNAME = ".projectflow/policies"
 POLICY_FILENAME = "WORK_POLICY.md"
 PROJECT_POLICY_FILENAME = "PROJECT_POLICY.md"
@@ -65,6 +66,7 @@ SAFETY_CAVEAT = (
 # Canonical section keys, in file order. Workers ask for these by name.
 SECTIONS: tuple[tuple[str, str], ...] = (
     ("precedence", "Policy Precedence"),
+    ("autonomy_first", "AUTONOMY_FIRST v1"),
     ("planner_contract", "Bug Planner to Executor Contract"),
     ("difficulty", "Difficulty Triage"),
     ("spec_levels", "Bug Spec Levels"),
@@ -110,6 +112,10 @@ Highest first:
 5. Historical memory or past chat.
 
 {SAFETY_CAVEAT}
+
+## AUTONOMY_FIRST v1
+
+{AUTONOMY_FIRST_POLICY}
 
 ## Bug Planner to Executor Contract
 
@@ -333,6 +339,54 @@ def split_sections(text: str) -> dict[str, str]:
     return out
 
 
+_CANONICAL_AUTONOMY_SECTION = split_sections(CANONICAL_POLICY)["autonomy_first"]
+_CANONICAL_AUTONOMY_BODY = _CANONICAL_AUTONOMY_SECTION.split("\n", 1)[1].strip()
+
+
+def _compose_autonomy_section(
+    installed_section: str | None,
+    override_section: str | None = None,
+) -> str:
+    """Keep both project autonomy sections plus mandatory canonical rules.
+
+    PROJECT_POLICY normally replaces same-named installed sections. The
+    autonomy contract is additive instead: retain both installed and override
+    bodies, then append the non-waivable canonical baseline. Loading never
+    rewrites either project file.
+    """
+    project_bodies: list[tuple[str, str]] = []
+    for label, section in (
+        ("Installed project constraints", installed_section),
+        ("PROJECT_POLICY additions", override_section),
+    ):
+        if not section:
+            continue
+        _, _, body = section.partition("\n")
+        body = body.strip()
+        # Current policy files may already carry the canonical baseline.
+        # Remove one exact copy so it is included only once after both sets
+        # of project-authored constraints.
+        if _CANONICAL_AUTONOMY_BODY in body:
+            body = body.replace(_CANONICAL_AUTONOMY_BODY, "", 1).strip()
+        if body and all(body != existing for _, existing in project_bodies):
+            project_bodies.append((label, body))
+
+    if not project_bodies:
+        return _CANONICAL_AUTONOMY_SECTION
+
+    preserved = "\n\n".join(f"### {label} (preserved)\n\n{body}"
+                            for label, body in project_bodies)
+    return (
+        "## AUTONOMY_FIRST v1\n\n"
+        "Project-specific constraints below are preserved additively. They "
+        "may add stricter requirements, but cannot waive the mandatory "
+        "canonical rules that follow:\n\n"
+        f"{preserved}\n\n"
+        "### Mandatory canonical AUTONOMY_FIRST v1\n\n"
+        f"{_CANONICAL_AUTONOMY_BODY}"
+    )
+
+
 @dataclass(frozen=True)
 class PolicyBinding:
     """What a task actually loaded -- recorded on its execution metadata."""
@@ -473,7 +527,8 @@ def load_policy(cwd: str) -> EffectivePolicy:
                          f"assuming built-in {WORK_POLICY_VERSION}")
         elif file_version != WORK_POLICY_VERSION:
             drift.append(f"project policy is v{file_version}, built-in is "
-                         f"v{WORK_POLICY_VERSION}; the project file wins")
+                         f"v{WORK_POLICY_VERSION}; project sections remain authoritative "
+                         "except the mandatory AUTONOMY_FIRST v1 composition")
     else:
         text = CANONICAL_POLICY
         source = "built-in"
@@ -490,6 +545,7 @@ def load_policy(cwd: str) -> EffectivePolicy:
                              drift=tuple(drift))
 
     override_path = (directory / PROJECT_POLICY_FILENAME) if directory is not None else None
+    override_sections: dict[str, str] = {}
     if override_path is not None and override_path.exists():
         override_text = override_path.read_text(encoding="utf-8")
         override_sections = split_sections(override_text)
@@ -513,6 +569,17 @@ def load_policy(cwd: str) -> EffectivePolicy:
                 policy.drift = policy.drift + (
                     "override duplicates canonical text for: "
                     + ", ".join(sorted(duplicated)) + " -- keep only the delta",)
+
+    original_autonomy = sections.get("autonomy_first")
+    override_autonomy = override_sections.get("autonomy_first")
+    composed_autonomy = _compose_autonomy_section(original_autonomy, override_autonomy)
+    if composed_autonomy != policy.sections.get("autonomy_first"):
+        policy.sections["autonomy_first"] = composed_autonomy
+        # The binding hashes what a task can actually load, not only the
+        # unchanged file on disk. Keep the project source/version intact.
+        policy.text += "\n\n<!-- mandatory AUTONOMY_FIRST v1 composition -->\n\n" + composed_autonomy
+        policy.drift = policy.drift + (
+            "mandatory AUTONOMY_FIRST v1 composed in memory; project policy file was not rewritten",)
     return policy
 
 
@@ -556,6 +623,8 @@ def policy_for_task(cwd: str, *, session: str | None = None,
                 "note": "ordinary terminal session; Work policy does not apply"}
     policy = load_policy(cwd)
     keys = list(sections) or list(SECTION_KEYS)
+    if "autonomy_first" not in keys:
+        keys.append("autonomy_first")
     return {
         "applies": True,
         "binding": policy.binding(sections_loaded=keys).as_dict(),

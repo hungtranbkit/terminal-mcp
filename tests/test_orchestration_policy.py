@@ -26,6 +26,28 @@ def test_server_metadata_carries_the_orchestration_policy():
     assert mcp.instructions == op.SERVER_INSTRUCTIONS + "\n\n" + ANALYSIS_GATE_BOOTSTRAP
 
 
+def test_autonomy_first_v1_is_versioned_and_reaches_the_server():
+    assert op.AUTONOMY_FIRST_VERSION == "1"
+    policy = op.AUTONOMY_FIRST_POLICY
+    assert "AUTONOMY_FIRST v1" in policy
+    for required in (
+        "inspect evidence",
+        "continue independent work",
+        "CANCELLED task",
+        "zero dispatches",
+        "stable idempotency key",
+        "alternate executor",
+        "explicit consent",
+        "independent review",
+        "production deployment",
+    ):
+        assert required.lower() in policy.lower(), required
+    assert policy in (mcp.instructions or "")
+    assert "supervise_status/task_status" in op.FAILURE_RECOVERY
+    assert "list_nodes" in op.FAILURE_RECOVERY
+    assert "AUTONOMY_FIRST v1" in op.policy_document()
+
+
 @pytest.mark.parametrize("phrase", op.CRITICAL_INVARIANTS)
 def test_every_critical_invariant_survives(phrase: str):
     """One test per invariant so a failure names the rule that was dropped.
@@ -50,6 +72,9 @@ def test_invariants_cover_each_required_area():
                      "execution started", "6 attempts", "UI-UX-Pro-Max", "UI V3",
                      "/codex:review", "/codex:rescue", "review gate stays DISABLED",
                      "one primary Claude executor", "EXPLICIT USER APPROVAL",
+                     "AUTONOMY_FIRST v1", "CANCELLED task", "zero dispatches",
+                     "independent review", "production release authority",
+                     "MCP restart recover durable receipts",
                      "Before EVERY terminal_turn action=create_session",
                      "UNKNOWN status is NEVER proof of completion"):
         assert required in joined, f"CRITICAL_INVARIANTS no longer covers {required!r}"

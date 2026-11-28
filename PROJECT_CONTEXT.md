@@ -1,5 +1,83 @@
 # PROJECT_CONTEXT.md
 
+## 2026-11-28 — PR #144 review corrections (source fix verified)
+
+- Reconciled independent review comment 7240692528 against the current
+  work_policy.py merge path. Old installed WORK_POLICY.md versions and
+  selected-section loads did not guarantee AUTONOMY_FIRST; a same-key project
+  override could replace the canonical rules.
+- terminal_mcp/work_policy.py now composes the mandatory canonical
+  AUTONOMY_FIRST section in memory after project overrides, preserving
+  project-authored additions and never rewriting the installed policy. The
+  loaded section and effective hash include the composed rules; the bound
+  policy version remains the installed version so prior task bindings are
+  detectable as stale without being silently rebound.
+- Added regression coverage for a v1.0 installed file, selected-section
+  loading, preserved stricter project text, unsafe conflicting text followed
+  by mandatory canonical safeguards, unchanged on-disk content, and stale
+  prior-version binding behavior.
+- Follow-up review comment 7241047127 identified that same-named override
+  sections were discarding stricter installed autonomy text before composition.
+  The loader now composes installed constraints + PROJECT_POLICY additions +
+  canonical rules in that order. The overlap regression preserves both
+  separate sign-off constraints, keeps v1.0 binding version and stale-hash
+  behavior, and verifies both source files remain unchanged.
+- Final verification after these source changes:
+  PYTHONPATH=. /home/dell/workspace/terminal-mcp/.venv/bin/python -m pytest
+  -q tests/test_work_policy.py tests/test_work_policy_integration.py —
+  26 passed, exit 0; compileall and git diff --check exit 0. The overlap test
+  was observed RED before the source change and GREEN afterward.
+- First review-fix commit 11a3bdd655f9f2471e1c01706948672443fb0fed and overlap
+  follow-up commit 5f31af3e756abd5274103234a4bce6057e51c2e8 are on the existing
+  PR #144 branch and pushed. Current main 591b411fd7befd8b423bb1c96fe5a95f8aeeaaba
+  was merged normally; integrated candidate before the final handoff note was
+  f70db186036bf3912bfc8c0382ad2e04da36cd7e.
+  The two main commits changed controller fanout and its test only. The merged
+  candidate focused run `tests/test_work_policy.py
+  tests/test_work_policy_integration.py tests/test_session_read_fanout.py`
+  passed **28 tests**, exit 0; compileall and git diff --check passed. No
+  deployment occurred. The overlap-fix head `5f31af3e756abd5274103234a4bce6057e51c2e8`
+  has both PR workflows successful (46157274510, 46157274501). Formal
+  independent review has not been submitted; request re-review before merge.
+  Do not merge/deploy until review and release gates pass.
+
+## 2026-11-28 — Shared AUTONOMY_FIRST v1 policy (#104)
+
+- Isolated from the dirty local Terminal MCP checkout at exact public main
+  `d6a84ff9f6f7feab5bb4435c7c828165773d5dde`; feature branch
+  `agent/codex/autonomy-first-policy-v1-20261128`. The local checkout's
+  `config.yaml` WIP is untouched.
+- Published as PR #144, based on current main; policy commits are
+  `c738cc052103627bf479638c8ce0d0594d72a0d5` and
+  `2b6b977d568e02f8c72aece9835d02d06a3755b4`. Its source policy is consumed by
+  ProjectFlow follow-up PR #106, stacked on PR #105 head
+  `3a363bc7ceb6af95fd6a843719df0ebf8b47039a`.
+- `terminal_mcp/orchestration_policy.py` is the canonical shared policy
+  source (`AUTONOMY_FIRST_VERSION=1`, orchestration policy `1.6.0`), included
+  in MCP server instructions. The generated `docs/CHATGPT_ORCHESTRATION_POLICY.md`
+  quotes that same wire text. `work_policy.py` reuses the canonical constant,
+  increments Work Policy to `1.1.0`, and ensures AUTONOMY_FIRST is included in
+  every `-work` task policy load, even when only selected sections are requested.
+- Recovery instructions distinguish a terminal CANCELLED/PERSISTED/zero-dispatch
+  receipt from execution; retries are bounded/idempotent; ambiguous submits are
+  reconciled; stale session names/grants are not recreated; alternate executors
+  require verified identity, scope, toolchain, capacity and existing permission.
+  Independent review/CI and explicit production release authority remain intact.
+- No dispatch, queue/config, provider, permission, service, schema or runtime
+  behavior changed. Running Work tasks keep their existing version-bound policy.
+- Supervised task `dt_80d21c9312414e22` is the replacement implementation task;
+  prior receipt `dt_6bf695d228eb4c6b` remains CANCELLED/PERSISTED with zero
+  dispatches and SESSION_DELETED. Neither was re-dispatched by this change.
+- Focused verification: `tests/test_orchestration_policy.py`,
+  `tests/test_work_policy.py`, `tests/test_work_policy_integration.py`,
+  `tests/test_transports.py`, `tests/test_work_spec.py` — **116 passed** in
+  10.32s, exit 0. Log `/tmp/tmcp-autonomy-first-policy-focused-20261128.log`,
+  SHA-256 `57f8be258caac6c39ade09526a37865d8758d922a6669356d27ef9f20e79f8d3`.
+  Compileall and `git diff --check` both exit 0. This does not substitute for
+  required PR CI or independent review. No deployment performed.
+- Next: inspect the final diff, run lint/compile checks, publish a scoped PR, and
+  request independent review. Do not merge or deploy in this task.
+
 ## 2026-11-12 — P0 fleet session lifecycle (PR #117, not deployed)
 
 - Work is isolated from the starting checkout (`fix/codex-session-readiness-20261016`) at `/home/dell/workspace/.terminal-mcp-worktrees/p0-session-lifecycle-20261112`, branch `fix/p0-session-lifecycle-20261112`, based on `origin/main` `5d4ee0a`. Implementation commit `837a413` is pushed and PR #117 is open: https://github.com/hungtranbkit/terminal-mcp/pull/117. Remote guarded direct-start now uses the node agent's dedicated `/v1/sessions/{name}/send-guarded` route; legacy workers fail closed before input rather than silently dropping `require_idle`.

@@ -37,7 +37,8 @@ Design commitments:
 
 from __future__ import annotations
 
-ORCHESTRATION_POLICY_VERSION = "1.5.1"
+ORCHESTRATION_POLICY_VERSION = "1.6.0"
+AUTONOMY_FIRST_VERSION = "1"
 
 #: Where the expanded, human-readable form lives, relative to the repo root.
 POLICY_DOC_PATH = "docs/CHATGPT_ORCHESTRATION_POLICY.md"
@@ -95,6 +96,16 @@ EXECUTION_FLOW = (
     "10) A task is not complete merely because a prompt was sent: confirm actual execution and verified results. 11) PRODUCTION DEPLOYMENT AND RELEASE REMAIN A SEPARATE, EXPLICIT USER APPROVAL STEP."
 )
 
+AUTONOMY_FIRST_POLICY = (
+    "AUTONOMY_FIRST v1. Within assigned objective, current authorization, project rules and safety limits, inspect evidence, choose an approach, execute, verify and report. "
+    "Routine implementation, test, review-coordination and release-preparation decisions are executor work; try distinct authorized remedies and continue independent work. "
+    "Before retry, reconcile durable task/session receipts: reuse the stable idempotency key only for known-unaccepted sends; reconcile ambiguous/accepted submits first. "
+    "A CANCELLED task with PERSISTED receipt and zero dispatches stays terminal: never resurrect, queue/replay, or reuse deleted session names/stale grants. "
+    "Fresh attempts need current authorization, a new identity and verified target/project-cwd/toolchain/capacity/permissions; alternate executors cannot expand scope. "
+    "Escalate new credentials/login/access, explicit consent, destructive/high-risk/out-of-scope authority or unclear business decisions with one owner action and safe option. "
+    "Never fake dispatch/RUNNING/PASS/DONE or auto-approve. Preserve independent review/CI; production deployment/release requires explicit production release authority."
+)
+
 PARALLELISM = (
     "PARALLELISM. Default to one primary Claude executor. Allow limited parallel work only for "
     "tasks that are demonstrably independent and low-coupling. Do not spawn many workers for "
@@ -103,9 +114,10 @@ PARALLELISM = (
 )
 
 FAILURE_RECOVERY = (
-    "FAILURE RECOVERY. Do not leave queued, idle or stale work behind. If a direct send fails, inspect the same session only when useful, repair the routine blocker, and retry the direct send without spawning duplicate sessions. "
-    "If a session is irrecoverably stale, preserve any unmerged work, close it and create one clean replacement session. If Terminal MCP itself restarts, recover from Git/worktree state and live session state; do not create durable queue work as a fallback. "
-    "Surface BLOCKED/NEEDS_HUMAN only for genuine credentials, authorization, destructive-action approval, or ambiguous unsafe states."
+    "FAILURE RECOVERY. Use existing bounded, idempotent paths. On MCP restart recover durable receipts and Git/worktree state; never queue as fallback. "
+    "Reconcile with supervise_status/task_status; inspect list_nodes before choosing an alternate; use the existing authorized session/supervise path. "
+    "For stale sessions preserve worktree before safe close; a fresh session needs current authorization and a new identity. Hold only an owner-dependent action; continue safe independent work. "
+    "Never repeat an identical failed remedy or bypass gates."
 )
 
 EFFICIENCY = (
@@ -124,7 +136,7 @@ _REFERENCE = (
 #: The exact string handed to `MCPServer(instructions=...)`, and therefore the
 #: exact string a ChatGPT client receives in its `initialize` response.
 SERVER_INSTRUCTIONS = "\n\n".join(
-    (TOOL_EFFICIENCY, ROLES, SESSION_PRECREATE_AUDIT, EXECUTION_FLOW, PARALLELISM, FAILURE_RECOVERY, EFFICIENCY, _REFERENCE)
+    (TOOL_EFFICIENCY, ROLES, SESSION_PRECREATE_AUDIT, EXECUTION_FLOW, AUTONOMY_FIRST_POLICY, PARALLELISM, FAILURE_RECOVERY, EFFICIENCY, _REFERENCE)
 )
 
 
@@ -158,6 +170,11 @@ CRITICAL_INVARIANTS: tuple[str, ...] = (
     "delete_session with confirm=true",
     "After direct send, avoid polling unless the user asks for a check",
     "PRODUCTION DEPLOYMENT AND RELEASE REMAIN A SEPARATE, EXPLICIT USER APPROVAL STEP",
+    "AUTONOMY_FIRST v1",
+    "CANCELLED task with PERSISTED receipt and zero dispatches stays terminal",
+    "Preserve independent review/CI",
+    "production release authority",
+    "On MCP restart recover durable receipts and Git/worktree state",
     # Session task label: new chats only keep the live monitor accurate if
     # they are told to title task assignments.
     "pass BOTH title=\"<short summary>\" and metadata.task_summary=\"<same summary>\" on send/send_wait",
