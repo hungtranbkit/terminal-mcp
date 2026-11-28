@@ -18834,12 +18834,22 @@ def register_dashboard(server: MCPServer, terminal: TerminalService,
         except ValueError:
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
 
+        from .node_registry import valid_nonnegative_integer
+        raw_count = body.get("tmux_session_count")
+        if not valid_nonnegative_integer(raw_count):
+            return JSONResponse({"error": "INVALID_CAPACITY_EVIDENCE",
+                                 "field": "tmux_session_count"}, status_code=422)
+        metrics_raw = body.get("metrics") or {}
+        for field in ("disk_total_bytes", "disk_used_bytes", "disk_free_bytes"):
+            value = metrics_raw.get(field)
+            if value is not None and not valid_nonnegative_integer(value):
+                return JSONResponse({"error": "INVALID_CAPACITY_EVIDENCE", "field": field}, status_code=422)
+
         def _compute() -> dict:
             from .host_metrics import NodeMetrics
-            metrics_raw = body.get("metrics") or {}
             metrics = NodeMetrics(**{k: metrics_raw.get(k) for k in NodeMetrics.__dataclass_fields__})
             node = controller.receive_remote_heartbeat(
-                node_id, metrics=metrics, tmux_session_count=int(body.get("tmux_session_count") or 0),
+                node_id, metrics=metrics, tmux_session_count=raw_count,
                 agent_counts=dict(body.get("agent_counts") or {}),
                 agent_types=tuple(body.get("agent_types") or ()),
                 agent_version=body.get("agent_version"), labels=tuple(body.get("labels") or ()),

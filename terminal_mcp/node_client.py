@@ -301,17 +301,29 @@ class LocalNodeClient:
         try:
             evidence = git_repo_evidence(cwd)
         except RepoEvidenceError as exc:
+            capacity = {}
+            if readable:
+                stat = os.stat(cwd)
+                statvfs = os.statvfs(cwd)
+                capacity = {"device": stat.st_dev,
+                            "statvfs_free_bytes": statvfs.f_bavail * statvfs.f_frsize,
+                            "statvfs_free_inodes": statvfs.f_favail}
             return {"cwd": cwd, "error": "REPO_EVIDENCE_FAILED", "detail": str(exc),
                     "exists": exists, "readable": readable,
                     # Only a path that IS there and readable can be judged
                     # "not a repository". Otherwise the repo question was
                     # never reached, and answering it would be a guess.
-                    "repo_valid": False if readable else None}
+                    "repo_valid": False if readable else None, **capacity}
+        stat = os.stat(cwd)
+        statvfs = os.statvfs(cwd)
         return {"cwd": cwd, "branch": evidence.branch, "head": evidence.head,
                 "clean": evidence.clean, "status_lines": list(evidence.status_lines),
                 "has_upstream": evidence.has_upstream,
                 "ahead": evidence.ahead, "behind": evidence.behind,
-                "exists": exists, "readable": readable, "repo_valid": True}
+                "exists": exists, "readable": readable, "repo_valid": True,
+                "device": stat.st_dev,
+                "statvfs_free_bytes": statvfs.f_bavail * statvfs.f_frsize,
+                "statvfs_free_inodes": statvfs.f_favail}
 
     def repo_op(self, op: str, path: str, params: dict[str, Any]) -> dict[str, Any]:
         """Read-only repo introspection on THIS host (controller == node).

@@ -1770,6 +1770,51 @@ class ControllerService:
         if client is None:
             return {"error": "NODE_UNREACHABLE", "node_id": node_id}
         node_row = next((row for row in snapshot if row.id == node_id), None)
+        # Capacity in a heartbeat is only useful for the filesystem that the
+        # session will actually use.  Ask the authenticated node agent to
+        # resolve/allow the requested cwd and return fresh statvfs evidence
+        # before any create request.  Auto placement may try another already
+        # eligible node; an explicit target remains pinned and fails closed.
+        target_volume = None
+        volume_excluded: list[str] = []
+        while cwd is not None:
+            try:
+                target_volume = client.repo_evidence(cwd)
+            except Exception as exc:  # transport/unsupported probe
+                target_volume = {"error": "TARGET_VOLUME_PROBE_FAILED", "detail": type(exc).__name__}
+            valid_probe = (
+                isinstance(target_volume, dict)
+                and target_volume.get("exists") is True
+                and target_volume.get("readable") is True
+                and isinstance(target_volume.get("device"), int)
+                and not isinstance(target_volume.get("device"), bool)
+                and isinstance(target_volume.get("statvfs_free_bytes"), int)
+                and not isinstance(target_volume.get("statvfs_free_bytes"), bool)
+                and target_volume.get("statvfs_free_bytes") >= 1024 * 1024 * 1024
+                and isinstance(target_volume.get("statvfs_free_inodes"), int)
+                and not isinstance(target_volume.get("statvfs_free_inodes"), bool)
+                and target_volume.get("statvfs_free_inodes") > 0
+            )
+            if valid_probe:
+                break
+            reason = (target_volume or {}).get("error", "missing or invalid statvfs evidence")
+            if node != "auto":
+                return {"error": "TARGET_VOLUME_UNVERIFIED", "node_id": node_id,
+                        "cwd": cwd, "detail": reason}
+            volume_excluded.append(node_id)
+            placement = choose_node(snapshot, required_agent_type=agent_type,
+                                    required_platform=platform,
+                                    required_capabilities=required_tools,
+                                    excluded_node_ids=tuple(volume_excluded))
+            if placement.node_id is None:
+                return {"error": "NO_ELIGIBLE_NODE", "session": name,
+                        "reason": placement.reason, "excluded": list(placement.excluded)}
+            node_id = placement.node_id
+            client = self._clients.get(node_id)
+            if client is None:
+                volume_excluded.append(node_id)
+                continue
+            node_row = next((row for row in snapshot if row.id == node_id), None)
         capacity_snapshot = {
             "node_id": node_id,
             "status": node_row.status if node_row else "unknown",
@@ -1778,6 +1823,13 @@ class ControllerService:
             "max_sessions": node_row.max_sessions if node_row else None,
             "overload_reasons": list(node_row.overload_reasons) if node_row else [],
         }
+        if target_volume is not None:
+            capacity_snapshot["target_volume"] = {
+                "cwd": target_volume.get("cwd", cwd),
+                "device": target_volume.get("device"),
+                "statvfs_free_bytes": target_volume.get("statvfs_free_bytes"),
+                "statvfs_free_inodes": target_volume.get("statvfs_free_inodes"),
+            }
         audit_terminal = getattr(self.local_client, "terminal", None)
         audit = getattr(audit_terminal, "audit", None)
         if audit is not None:

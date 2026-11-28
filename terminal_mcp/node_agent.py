@@ -452,6 +452,11 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
                 "detail": (f"{resolved} exists but this agent cannot read it"
                            if exists else f"{resolved} does not exist on this node"),
             }, status_code=200)
+        stat = path.stat()
+        statvfs = os.statvfs(str(path))
+        base.update({"device": stat.st_dev,
+                     "statvfs_free_bytes": statvfs.f_bavail * statvfs.f_frsize,
+                     "statvfs_free_inodes": statvfs.f_favail})
         try:
             evidence = git_repo_evidence(str(resolved))
         except RepoEvidenceError as exc:

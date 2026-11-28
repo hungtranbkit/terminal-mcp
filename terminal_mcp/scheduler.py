@@ -8,10 +8,12 @@ after the fact (`reason` on the result) and reproduced in a test.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from .capability_profile import CandidateView, diagnose, match_capabilities
 from .node_models import CAPACITY_OVERLOADED, NODE_ONLINE, Node
+from .node_registry import valid_nonnegative_integer
 
 
 @dataclass(frozen=True)
@@ -36,6 +38,25 @@ def _eligible(node: Node, *, required_agent_type: str, min_disk_free_bytes: int,
         return False, f"status={node.status}"
     if not node.last_heartbeat_at:
         return False, "incomplete heartbeat evidence"
+    try:
+        heartbeat = datetime.fromisoformat(node.last_heartbeat_at)
+        if heartbeat.tzinfo is None:
+            return False, "naive heartbeat evidence"
+        age = (datetime.now(timezone.utc) - heartbeat).total_seconds()
+    except (TypeError, ValueError):
+        return False, "invalid heartbeat evidence"
+    if age < 0:
+        return False, "future heartbeat evidence"
+    if node.tmux_session_count is None:
+        return False, "incomplete capacity evidence: tmux_session_count unknown"
+    if not valid_nonnegative_integer(node.tmux_session_count):
+        return False, "invalid capacity evidence: tmux_session_count"
+    if node.disk_free_bytes is None:
+        return False, "incomplete capacity evidence: disk_free_bytes unknown"
+    if not valid_nonnegative_integer(node.disk_free_bytes):
+        return False, "invalid capacity evidence: disk_free_bytes"
+    if node.max_sessions is not None and not valid_nonnegative_integer(node.max_sessions):
+        return False, "invalid capacity evidence: max_sessions"
     if node.draining:
         return False, "draining"
     if node.capacity_status == CAPACITY_OVERLOADED:
@@ -63,9 +84,9 @@ def _eligible(node: Node, *, required_agent_type: str, min_disk_free_bytes: int,
     missing = tuple(cap for cap in required_capabilities if cap not in node.capabilities)
     if missing:
         return False, f"missing required tools {missing!r} (has {node.capabilities!r})"
-    if node.max_sessions is not None and (node.tmux_session_count or 0) >= node.max_sessions:
+    if node.max_sessions is not None and node.tmux_session_count >= node.max_sessions:
         return False, f"at max_sessions ({node.tmux_session_count}/{node.max_sessions})"
-    if node.disk_free_bytes is not None and node.disk_free_bytes < min_disk_free_bytes:
+    if node.disk_free_bytes < min_disk_free_bytes:
         return False, f"disk_free_bytes {node.disk_free_bytes} < required {min_disk_free_bytes}"
     return True, None
 
@@ -102,9 +123,9 @@ def _capacity_blocked(node: Node, *, min_disk_free_bytes: int) -> bool:
     blocker an operator actually has to fix."""
     if node.draining or node.capacity_status == CAPACITY_OVERLOADED:
         return True
-    if node.max_sessions is not None and (node.tmux_session_count or 0) >= node.max_sessions:
+    if node.max_sessions is not None and valid_nonnegative_integer(node.tmux_session_count) and node.tmux_session_count >= node.max_sessions:
         return True
-    if node.disk_free_bytes is not None and node.disk_free_bytes < min_disk_free_bytes:
+    if valid_nonnegative_integer(node.disk_free_bytes) and node.disk_free_bytes < min_disk_free_bytes:
         return True
     return False
 
@@ -127,7 +148,8 @@ def choose_node(nodes: list[Node], *, required_agent_type: str = "shell",
                 min_disk_free_bytes: int = 1024 * 1024 * 1024,  # 1 GiB -- a real floor, not zero
                 labels_required: tuple[str, ...] = (),
                 required_platform: str | None = None,
-                required_capabilities: tuple[str, ...] = ()) -> PlacementResult:
+                required_capabilities: tuple[str, ...] = (),
+                excluded_node_ids: tuple[str, ...] = ()) -> PlacementResult:
     """The Auto scheduler (task item 6, extended by multi-node Windows
     support's own "Scheduler Auto phải xét platform requirement"). `nodes`
     should already be the CURRENT NodeRegistry.list() snapshot -- this
@@ -145,6 +167,9 @@ def choose_node(nodes: list[Node], *, required_agent_type: str = "shell",
                                   required_platform=required_platform,
                                   required_capabilities=required_capabilities)
     for node in nodes:
+        if node.id in excluded_node_ids:
+            excluded.append((node.id, "excluded after target-volume probe"))
+            continue
         ok, reason = _eligible(node, required_agent_type=required_agent_type, min_disk_free_bytes=min_disk_free_bytes,
                                required_platform=required_platform,
                                required_capabilities=required_capabilities)
