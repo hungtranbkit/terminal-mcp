@@ -1829,56 +1829,35 @@ class ControllerService:
                         "reason": explicit_placement.reason,
                         "excluded": [list(item) for item in explicit_placement.excluded]}
 
-        client = self._clients.get(node_id)
-        if client is None:
-            return {"error": "NODE_UNREACHABLE", "node_id": node_id}
-        node_row = next((row for row in snapshot if row.id == node_id), None)
         # Capacity in a heartbeat is only useful for the filesystem that the
         # session will actually use.  Ask the authenticated node agent to
         # resolve/allow the requested cwd and return fresh statvfs evidence
         # before any create request.  Auto placement may try another already
         # eligible node; an explicit target remains pinned and fails closed.
-        target_volume = None
         volume_excluded: list[str] = []
-        effective_cwd = cwd
         while True:
-            if effective_cwd is None:
-                # Test doubles and third-party adapters predating the
-                # authenticated resolve endpoint retain the historical shell
-                # path; all shipped Local/RemoteNodeClient implementations
-                # expose resolve_cwd and therefore take the fail-closed path.
-                if not callable(getattr(client, "resolve_cwd", None)):
-                    break
+            client = self._clients.get(node_id)
+            effective_cwd = cwd
+            target_volume = None
+            reason = "missing or invalid statvfs evidence"
+            if client is None:
+                reason = "node client unavailable"
+            else:
                 try:
-                    resolved = client.resolve_cwd()
+                    if effective_cwd is None:
+                        resolved = client.resolve_cwd()
+                        if isinstance(resolved, dict) and resolved.get("resolved") is True:
+                            path = resolved.get("cwd")
+                            if isinstance(path, str) and path:
+                                effective_cwd = path
+                        reason = "missing or invalid node cwd resolution"
+                    if effective_cwd is not None:
+                        target_volume = client.repo_evidence(effective_cwd)
                 except Exception as exc:
-                    resolved = {"error": "TARGET_CWD_RESOLUTION_FAILED", "detail": type(exc).__name__}
-                if not isinstance(resolved, dict) or resolved.get("resolved") is not True:
-                    reason = (resolved or {}).get("error", "missing node cwd resolution")
-                    if node != "auto":
-                        return {"error": "TARGET_VOLUME_UNVERIFIED", "node_id": node_id, "detail": reason}
-                    volume_excluded.append(node_id)
-                    placement = choose_node(snapshot, required_agent_type=agent_type,
-                                             required_platform=platform,
-                                             required_capabilities=required_tools,
-                                             excluded_node_ids=tuple(volume_excluded))
-                    if placement.node_id is None:
-                        return {"error": "NO_ELIGIBLE_NODE", "session": name,
-                                "reason": placement.reason, "excluded": list(placement.excluded)}
-                    node_id = placement.node_id
-                    client = self._clients.get(node_id)
-                    node_row = next((row for row in snapshot if row.id == node_id), None)
-                    continue
-                effective_cwd = resolved.get("cwd")
-                if not isinstance(effective_cwd, str) or not effective_cwd:
-                    return {"error": "TARGET_VOLUME_UNVERIFIED", "node_id": node_id,
-                            "detail": "node returned invalid resolved cwd"}
-            try:
-                target_volume = client.repo_evidence(effective_cwd)
-            except Exception as exc:  # transport/unsupported probe
-                target_volume = {"error": "TARGET_VOLUME_PROBE_FAILED", "detail": type(exc).__name__}
+                    reason = type(exc).__name__
             valid_probe = (
-                isinstance(target_volume, dict)
+                effective_cwd is not None
+                and isinstance(target_volume, dict)
                 and target_volume.get("exists") is True
                 and target_volume.get("readable") is True
                 and target_volume.get("cwd") == effective_cwd
@@ -1892,9 +1871,13 @@ class ControllerService:
                 and target_volume.get("statvfs_free_inodes") > 0
             )
             if valid_probe:
+                node_row = next((row for row in snapshot if row.id == node_id), None)
                 break
-            reason = (target_volume or {}).get("error", "missing or invalid statvfs evidence")
             if node != "auto":
+                if client is None:
+                    return {"error": "NODE_UNREACHABLE", "node_id": node_id}
+                if isinstance(target_volume, dict):
+                    reason = target_volume.get("error", reason)
                 return {"error": "TARGET_VOLUME_UNVERIFIED", "node_id": node_id,
                         "cwd": effective_cwd, "detail": reason}
             volume_excluded.append(node_id)
@@ -1903,15 +1886,9 @@ class ControllerService:
                                     required_capabilities=required_tools,
                                     excluded_node_ids=tuple(volume_excluded))
             if placement.node_id is None:
-                return {"error": "NO_ELIGIBLE_NODE", "session": name,
-                        "reason": placement.reason, "excluded": list(placement.excluded)}
+                return {"error": "NO_ELIGIBLE_NODE", "session": name, "reason": placement.reason,
+                        "excluded": list(placement.excluded)}
             node_id = placement.node_id
-            client = self._clients.get(node_id)
-            if client is None:
-                volume_excluded.append(node_id)
-                continue
-            node_row = next((row for row in snapshot if row.id == node_id), None)
-            effective_cwd = cwd
         capacity_snapshot = {
             "node_id": node_id,
             "status": node_row.status if node_row else "unknown",
