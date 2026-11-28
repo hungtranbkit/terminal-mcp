@@ -1,6 +1,6 @@
 # PROJECT_CONTEXT.md
 
-## 2026-11-28 — PR #144 review corrections (latest follow-up pending)
+## 2026-11-28 — PR #144 review corrections (source fix verified)
 
 - Reconciled independent review comment 7240692528 against the current
   work_policy.py merge path. Old installed WORK_POLICY.md versions and
@@ -22,12 +22,13 @@
   canonical rules in that order. The overlap regression preserves both
   separate sign-off constraints, keeps v1.0 binding version and stale-hash
   behavior, and verifies both source files remain unchanged.
-- Verification after these source changes:
+- Final verification after these source changes:
   PYTHONPATH=. /home/dell/workspace/terminal-mcp/.venv/bin/python -m pytest
   -q tests/test_work_policy.py tests/test_work_policy_integration.py —
   26 passed, exit 0; compileall and git diff --check exit 0. The overlap test
   was observed RED before the source change and GREEN afterward.
-- Fix commit 11a3bdd655f9f2471e1c01706948672443fb0fed was made on the existing
+- First review-fix commit 11a3bdd655f9f2471e1c01706948672443fb0fed and overlap
+  follow-up commit 5f31af3e756abd5274103234a4bce6057e51c2e8 are on the existing
   PR #144 branch and pushed. Current main 591b411fd7befd8b423bb1c96fe5a95f8aeeaaba
   was merged normally; integrated candidate before the final handoff note was
   f70db186036bf3912bfc8c0382ad2e04da36cd7e.
@@ -35,10 +36,8 @@
   candidate focused run `tests/test_work_policy.py
   tests/test_work_policy_integration.py tests/test_session_read_fanout.py`
   passed **28 tests**, exit 0; compileall and git diff --check passed. No
-  deployment occurred. Source-tested candidate
-  `2ac22e69bf4eda2179508a32f6d94da2cd68cc38` has both PR workflows successful
-  (46156531588, 46156531450). Later published changes are PROJECT_CONTEXT-only;
-  workflow path filters exclude that file, so no fresh run was created. Formal
+  deployment occurred. The overlap-fix head `5f31af3e756abd5274103234a4bce6057e51c2e8`
+  has both PR workflows successful (46157274510, 46157274501). Formal
   independent review has not been submitted; request re-review before merge.
   Do not merge/deploy until review and release gates pass.
 
