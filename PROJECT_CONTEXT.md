@@ -28,9 +28,11 @@
   candidate focused run `tests/test_work_policy.py
   tests/test_work_policy_integration.py tests/test_session_read_fanout.py`
   passed **28 tests**, exit 0; compileall and git diff --check passed. No
-  deployment occurred. Exact PR head `2ac22e69bf4eda2179508a32f6d94da2cd68cc38`
-  has both PR workflows successful (46156531588, 46156531450). Independent
-  formal review has not been submitted; request re-review of this updated head.
+  deployment occurred. Source-tested candidate
+  `2ac22e69bf4eda2179508a32f6d94da2cd68cc38` has both PR workflows successful
+  (46156531588, 46156531450). Later published changes are PROJECT_CONTEXT-only;
+  workflow path filters exclude that file, so no fresh run was created. Formal
+  independent review has not been submitted; request re-review before merge.
   Do not merge/deploy until review and release gates pass.
 
 ## 2026-11-28 — Shared AUTONOMY_FIRST v1 policy (#104)
