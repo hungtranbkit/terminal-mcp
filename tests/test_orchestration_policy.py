@@ -43,6 +43,8 @@ def test_autonomy_first_v1_is_versioned_and_reaches_the_server():
     ):
         assert required.lower() in policy.lower(), required
     assert policy in (mcp.instructions or "")
+    assert "supervise_status/task_status" in op.FAILURE_RECOVERY
+    assert "list_nodes" in op.FAILURE_RECOVERY
     assert "AUTONOMY_FIRST v1" in op.policy_document()
 
 

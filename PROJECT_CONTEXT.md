@@ -22,8 +22,8 @@
 - Focused verification: `tests/test_orchestration_policy.py`,
   `tests/test_work_policy.py`, `tests/test_work_policy_integration.py`,
   `tests/test_transports.py`, `tests/test_work_spec.py` — **116 passed** in
-  9.88s, exit 0. Log `/tmp/tmcp-autonomy-first-policy-focused-20261128.log`,
-  SHA-256 `695a6b033a14ac337e41fc4f4c9529d3b00d85a3742c197b144344b87a9083de`.
+  10.32s, exit 0. Log `/tmp/tmcp-autonomy-first-policy-focused-20261128.log`,
+  SHA-256 `57f8be258caac6c39ade09526a37865d8758d922a6669356d27ef9f20e79f8d3`.
   Compileall and `git diff --check` both exit 0. This does not substitute for
   required PR CI or independent review. No deployment performed.
 - Next: inspect the final diff, run lint/compile checks, publish a scoped PR, and

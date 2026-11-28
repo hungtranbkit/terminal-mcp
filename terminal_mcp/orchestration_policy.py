@@ -115,6 +115,7 @@ PARALLELISM = (
 
 FAILURE_RECOVERY = (
     "FAILURE RECOVERY. Use existing bounded, idempotent paths. On MCP restart recover durable receipts and Git/worktree state; never queue as fallback. "
+    "Reconcile with supervise_status/task_status; inspect list_nodes before choosing an alternate; use the existing authorized session/supervise path. "
     "For stale sessions preserve worktree before safe close; a fresh session needs current authorization and a new identity. Hold only an owner-dependent action; continue safe independent work. "
     "Never repeat an identical failed remedy or bypass gates."
 )
