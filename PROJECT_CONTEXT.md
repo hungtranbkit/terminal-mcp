@@ -1,5 +1,54 @@
 # PROJECT_CONTEXT.md
 
+## 2026-11-28 — AUTONOMY_FIRST Phase 2 target-gone recovery (source-only)
+
+- New isolated branch/worktree from current `origin/main` 591b411f:
+  `agent/codex/autonomy-first-recovery-phase2-20261128` at
+  `/home/dell/workspace/.terminal-mcp-worktrees/autonomy-first-recovery-phase2-20261128`.
+  The dirty canonical checkout (`fix/codex-session-readiness-20261016`, config.yaml)
+  and existing PR #144/#137/#139/#142 worktrees were not edited.
+- `DirectTaskSupervisor._observe_failed()` now turns only repeated authoritative
+  session absence (`SESSION_NOT_FOUND`, `SESSION_DELETED`, or
+  `SESSION_RUNTIME_MISSING`) into existing terminal `FAILED` with
+  `wait_reason=TARGET_GONE_BEFORE_DISPATCH` when the durable receipt is still
+  `PERSISTED`, dispatch count is zero, and no input/submit/acceptance timestamp
+  exists. Existing bounded observe/backoff behavior is reused; status probe,
+  unknown location, node/transport, timeout, and authority errors do not qualify.
+- `_view()` exposes the bounded observation count, evidence-derived
+  `alternate_executor_eligible`, and an explicit next action. Eligibility is
+  only a signal that no dispatch occurred; operator authorization and separate
+  identity/scope/permission/toolchain/capacity checks remain required. No
+  automatic session creation, task requeue, prompt replay, schema migration or
+  new scheduler was added. Previously dispatched/ambiguous receipts and
+  CANCELLED tasks are never made eligible or revived.
+- RED: `PYTHONPATH=. /home/dell/workspace/terminal-mcp/.venv/bin/python -m pytest -q
+  tests/test_direct_task_lifecycle.py -k 'target_gone or unknown_transport or
+  uncertain_dispatched_task or running_execution_and_cancelled'` exited 1 with
+  6 failed/20 deselected: four `exists=False` transport/authority errors were
+  misclassified as session loss, and ambiguous/active views lacked the safe
+  eligibility field. (The primary target-gone name did not match this `-k`
+  expression; it is included and passes in the final full-file suite.)
+- GREEN: final command `PYTHONPATH=. /home/dell/workspace/terminal-mcp/.venv/bin/python -m
+  pytest -q tests/test_direct_task_lifecycle.py
+  tests/test_issue52_supervised_dispatch.py tests/test_live_sessions.py` —
+  **88 passed**, exit 0. Log `/tmp/tmcp-autonomy-phase2-target-gone-focused-20261128.log`,
+  SHA-256 `2d04aa04e9c693cbdd3efd7e2bd20de1e15db36ce15f220567b8041c20563b08`.
+  Compileall and `git diff --check` passed. No full suite or live dispatch.
+- The new persisted-target regression, observed after bounded status failures
+  across store reopen, also verifies failed terminal state, unchanged target and
+  key, zero sends/dispatches, and explicit operator-only next action. The test
+  matrix covers SESSION_NOT_FOUND/SESSION_DELETED/SESSION_RUNTIME_MISSING,
+  unknown node/location/transport/authority, INPUT_SENT/SUBMIT_CONFIRMED/
+  DISPATCH_UNCERTAIN, active execution, cancellation and independent tasks.
+- Published as draft PR #145: https://github.com/hungtranbkit/terminal-mcp/pull/145,
+  head `9fc457e87170077e408006b536b7cd671ddc8bba`; phase2 evidence posted
+  to issue #104 (comment 7241452123). Exact-head Unified Memory gate run
+  46159737973 was superseded by exact-head run 46159812326 on
+  `39e7900a0a97d4258ee68e6c146e4faac6259892`, which completed SUCCESS. No
+  independent review has been submitted. This deterministic target-gone result
+  is not automatic alternate execution; that remains an explicitly authorized
+  operator action after separate executor verification.
+
 ## 2026-11-12 — P0 fleet session lifecycle (PR #117, not deployed)
 
 - Work is isolated from the starting checkout (`fix/codex-session-readiness-20261016`) at `/home/dell/workspace/.terminal-mcp-worktrees/p0-session-lifecycle-20261112`, branch `fix/p0-session-lifecycle-20261112`, based on `origin/main` `5d4ee0a`. Implementation commit `837a413` is pushed and PR #117 is open: https://github.com/hungtranbkit/terminal-mcp/pull/117. Remote guarded direct-start now uses the node agent's dedicated `/v1/sessions/{name}/send-guarded` route; legacy workers fail closed before input rather than silently dropping `require_idle`.

@@ -14,7 +14,10 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from terminal_mcp.compact_tools import CompactTerminalTools
-from terminal_mcp.direct_task import (DirectTaskStore, DirectTaskSupervisor,
+from terminal_mcp.direct_task import (MAX_OBSERVE_FAILURES, RECEIPT_INPUT_SENT,
+                                      RECEIPT_PERSISTED, RECEIPT_SUBMIT_CONFIRMED,
+                                      RECEIPT_UNCERTAIN,
+                                      DirectTaskStore, DirectTaskSupervisor,
                                       completion_instruction, continuation_prompt,
                                       find_marker)
 from terminal_mcp.run_journal import RunJournalStore
@@ -170,6 +173,186 @@ def test_permission_prompt_clear_does_not_automatically_retry_task(tmp_path):
     assert task["state"] == "WAITING_INPUT"
     assert task["wait_reason"] == "EXPLICIT_RESUME_REQUIRED"
     assert pane.send_attempts == attempts_before_wait
+
+
+@pytest.mark.parametrize("missing_error", [
+    "SESSION_NOT_FOUND", "SESSION_DELETED", "SESSION_RUNTIME_MISSING",
+])
+def test_persisted_missing_target_is_terminal_and_operator_actionable_after_store_reopen(
+        tmp_path, missing_error):
+    clock = Clock()
+    path = tmp_path / "direct.db"
+    status_calls = []
+    sends = []
+
+    def missing_status(target):
+        status_calls.append(target)
+        return {"error": missing_error, "session": target}
+
+    def make_supervisor():
+        return DirectTaskSupervisor(
+            DirectTaskStore(path), send=lambda *args: sends.append(args) or {"status": "SUBMIT_CONFIRMED"},
+            status=missing_status, tail=lambda *_: {"output": ""}, clock=clock,
+            settle_seconds=5)
+
+    sup = make_supervisor()
+    started = sup.start("dell-linux/deleted-session", text="run the assigned task",
+                        idempotency_key="phase2-target-gone")
+    task_id = started["task"]["task_id"]
+    assert started["task"]["receipt"] == RECEIPT_PERSISTED
+    assert started["task"]["dispatches"] == 0
+    assert sends == []
+
+    # Reopen the durable store between bounded status observations to model a
+    # controller restart while the target stays authoritatively absent.
+    for _ in range(1, MAX_OBSERVE_FAILURES // 4):
+        persisted = DirectTaskStore(path).get(task_id)
+        clock.now = persisted["next_observe_at"]
+        make_supervisor().tick()
+
+    reopened = make_supervisor()
+    task = reopened.get(task_id, refresh=False)["task"]
+    assert len(status_calls) == MAX_OBSERVE_FAILURES // 4
+    assert task["state"] == "FAILED"
+    assert task["wait_reason"] == "TARGET_GONE_BEFORE_DISPATCH"
+    assert task["reason"].startswith("TARGET_GONE_BEFORE_DISPATCH:")
+    assert task["last_error_hop"] == "session"
+    assert task["observe_failures"] == MAX_OBSERVE_FAILURES // 4
+    assert task["target"] == "dell-linux/deleted-session"
+    assert task["receipt"] == RECEIPT_PERSISTED and task["dispatches"] == 0
+    assert task["alternate_executor_eligible"] is True
+    assert task["requires_operator_authorization"] is True
+    assert "separate task" in task["next_action"].lower()
+    assert "replay this task" in task["next_action"].lower()
+    assert sends == []
+
+    replay = reopened.start("dell-linux/deleted-session", text="run the assigned task",
+                            idempotency_key="phase2-target-gone")
+    assert replay["deduplicated"] is True
+    assert replay["task"]["task_id"] == task_id
+    assert len(status_calls) == MAX_OBSERVE_FAILURES // 4
+    assert sends == []
+
+
+@pytest.mark.parametrize("observation,expected_hop", [
+    ({"error": "NODE_UNREACHABLE", "exists": False, "node_id": "dell-linux"}, "node"),
+    ({"error": "SESSION_LOCATION_UNKNOWN", "exists": False}, "controller"),
+    ({"error": "STATUS_PROBE_TIMEOUT", "exists": False}, "controller->node"),
+    ({"error": "AUTHORIZATION_REQUIRED", "exists": False}, "controller"),
+])
+def test_unknown_transport_or_denied_authority_is_not_confirmed_target_gone(
+        tmp_path, observation, expected_hop):
+    clock = Clock()
+    sends = []
+    sup = DirectTaskSupervisor(
+        DirectTaskStore(tmp_path / "direct.db"),
+        send=lambda *args: sends.append(args) or {"status": "SUBMIT_CONFIRMED"},
+        status=lambda _target: dict(observation), tail=lambda *_: {"output": ""},
+        clock=clock, settle_seconds=5)
+
+    task = sup.start("dell-linux/possibly-live", text="assigned work",
+                     idempotency_key="unknown-not-gone")["task"]
+    assert task["dispatches"] == 0 and task["receipt"] == RECEIPT_PERSISTED
+    assert task["state"] not in {"FAILED", "CANCELLED"}
+    assert task["last_error_hop"] == expected_hop
+    assert task["alternate_executor_eligible"] is False
+    assert "SESSION_NOT_FOUND" not in task["reason"]
+    assert sends == []
+
+
+@pytest.mark.parametrize("receipt,dispatches", [
+    (RECEIPT_INPUT_SENT, 0),
+    (RECEIPT_SUBMIT_CONFIRMED, 1),
+    (RECEIPT_UNCERTAIN, 1),
+])
+def test_dispatched_or_ambiguous_task_never_becomes_alternate_executor_eligible(
+        tmp_path, receipt, dispatches):
+    clock = Clock()
+    path = tmp_path / "direct.db"
+    sends = []
+    status_calls = []
+
+    def missing_status(target):
+        status_calls.append(target)
+        return {"error": "SESSION_NOT_FOUND", "session": target}
+
+    store = DirectTaskStore(path)
+    task_id = "dt_0123456789abcdef"
+    store.insert({
+        "task_id": task_id, "target": "dell-linux/uncertain", "mode": "agent",
+        "state": "DISPATCH_UNCERTAIN", "receipt": receipt,
+        "steps": ["assigned work"], "max_continuations": 0, "dispatches": dispatches,
+        "input_sent_at": clock.now,
+        "submit_confirmed_at": clock.now if receipt == RECEIPT_SUBMIT_CONFIRMED else None,
+        "idempotency_key": "uncertain-target-gone", "created_at": clock.now,
+        "updated_at": clock.now,
+    })
+    sup = DirectTaskSupervisor(store, send=lambda *args: sends.append(args),
+                               status=missing_status, tail=lambda *_: {"output": ""},
+                               clock=clock, settle_seconds=5)
+
+    for _ in range(MAX_OBSERVE_FAILURES // 4):
+        current = store.get(task_id)
+        if current.get("next_observe_at"):
+            clock.now = current["next_observe_at"]
+        sup.tick()
+
+    task = DirectTaskStore(path).get(task_id)
+    viewed = sup._view(task)
+    assert task["state"] == "FAILED" and task["completed_at"] is not None
+    assert task["receipt"] == receipt and task["dispatches"] == dispatches
+    assert viewed["alternate_executor_eligible"] is False
+    assert "TARGET_GONE_BEFORE_DISPATCH" not in (task.get("wait_reason") or "")
+    assert "do not replay" in viewed["next_action"].lower()
+    assert len(status_calls) == MAX_OBSERVE_FAILURES // 4
+    assert sends == []
+
+
+def test_running_execution_and_cancelled_task_are_not_revived_by_missing_target(tmp_path):
+    clock = Clock()
+    pane = FakePane(busy_ticks=3)
+    path = tmp_path / "direct.db"
+    sup = _supervisor(tmp_path, pane, clock)
+    started = sup.start("active", text="long task", idempotency_key="active-key")
+    active_id = started["task"]["task_id"]
+    sent_count = pane.send_attempts
+
+    # Make the existing active task's status explicit and make a separate
+    # persisted task's target absent; one failure must not disrupt the other.
+    missing_id = "dt_abcdef0123456789"
+    sup.store.insert({
+        "task_id": missing_id, "target": "gone/session", "mode": "agent",
+        "state": "DISPATCHING", "receipt": RECEIPT_PERSISTED,
+        "steps": ["another task"], "max_continuations": 0, "dispatches": 0,
+        "idempotency_key": "independent-gone", "created_at": clock.now,
+        "updated_at": clock.now,
+    })
+    sup._status = lambda target: ({"error": "SESSION_NOT_FOUND", "session": target}
+                                  if target == "gone/session" else
+                                  {"state": "RUNNING", "agent_type": "claude"})
+    sup.tick()
+
+    active_task = sup.get(active_id, refresh=False)["task"]
+    gone_task = sup.get(missing_id, refresh=False)["task"]
+    assert active_task["state"] == "RUNNING"
+    assert pane.send_attempts == sent_count
+    assert gone_task["state"] == "DISPATCHING"
+    assert gone_task["alternate_executor_eligible"] is False
+    assert gone_task["dispatches"] == 0 and gone_task["receipt"] == RECEIPT_PERSISTED
+
+    cancelled_id = "dt_abcdef0123456780"
+    sup.store.insert({
+        "task_id": cancelled_id, "target": "gone/cancelled", "mode": "agent",
+        "state": "CANCELLED", "receipt": RECEIPT_PERSISTED,
+        "steps": ["cancelled"], "max_continuations": 0, "dispatches": 0,
+        "idempotency_key": "cancelled-gone", "created_at": clock.now,
+        "updated_at": clock.now, "completed_at": clock.now,
+    })
+    sup.tick()
+    cancelled = sup.get(cancelled_id, refresh=False)["task"]
+    assert cancelled["state"] == "CANCELLED"
+    assert cancelled["alternate_executor_eligible"] is False
+    assert pane.send_attempts == sent_count
 
 
 def test_generic_finished_text_is_not_a_completion_receipt(tmp_path):
