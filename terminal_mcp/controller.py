@@ -1679,13 +1679,22 @@ class ControllerService:
     def terminal_create_session(self, name: str, agent_type: str = "shell", cwd: str | None = None, *,
                                 node: str = "auto", platform: str | None = None, initial_prompt: str | None = None,
                                 grant_mode: str = "none", binding: str | None = None,
-                                requested_by: str | None = None, show_on_desktop: bool = False) -> dict[str, Any]:
+                                requested_by: str | None = None, show_on_desktop: bool = False,
+                                required_tools: tuple[str, ...] = ()) -> dict[str, Any]:
         existing = self.resolve_session(name)
         if "error" not in existing:
             return {"error": "SESSION_ALREADY_EXISTS", "session": name, "node_id": existing["node_id"]}
 
+        # One authenticated registry read is the admission snapshot for the
+        # whole request.  Do not choose from one read and dispatch against a
+        # second, potentially different row (or silently fall back from an
+        # explicit target).
+        snapshot = self.list_nodes()
+        required_tools = tuple(dict.fromkeys(str(tool).strip() for tool in required_tools if str(tool).strip()))
         if node == "auto":
-            placement = choose_node(self.list_nodes(), required_agent_type=agent_type, required_platform=platform)
+            placement = choose_node(snapshot, required_agent_type=agent_type,
+                                    required_platform=platform,
+                                    required_capabilities=required_tools)
             if placement.node_id is None:
                 return {"error": "NO_ELIGIBLE_NODE", "session": name, "reason": placement.reason,
                         "excluded": list(placement.excluded)}
@@ -1697,7 +1706,7 @@ class ControllerService:
             # before the exact NodeRegistry lookup too.
             node_id = (self.local_node_id if node == LOCAL_NODE_ID
                        and self.local_node_id != LOCAL_NODE_ID else node)
-            explicit_node = self.node_status(node_id)
+            explicit_node = next((row for row in snapshot if row.id == node_id), None)
             if explicit_node is None:
                 # Name the answering controller and what it does know. Two
                 # controllers serving one ChatGPT tunnel made list_nodes
@@ -1741,11 +1750,26 @@ class ControllerService:
                 return {"error": "AGENT_TYPE_NOT_AVAILABLE_ON_TARGET", "node_id": node_id,
                         "detail": f"agent_type={agent_type!r} not available on {node_id!r} "
                                   f"(has {explicit_node.agent_types!r})"}
+            if not explicit_node.last_heartbeat_at:
+                return {"error": "NODE_EVIDENCE_INCOMPLETE", "node_id": node_id,
+                        "detail": "fresh snapshot has no heartbeat evidence"}
+            missing_tools = tuple(tool for tool in required_tools if tool not in explicit_node.capabilities)
+            if missing_tools:
+                return {"error": "REQUIRED_TOOL_UNAVAILABLE", "node_id": node_id,
+                        "missing": list(missing_tools),
+                        "available": list(explicit_node.capabilities)}
+            explicit_placement = choose_node([explicit_node], required_agent_type=agent_type,
+                                             required_platform=platform,
+                                             required_capabilities=required_tools)
+            if explicit_placement.node_id is None:
+                return {"error": "NODE_NOT_ELIGIBLE", "node_id": node_id,
+                        "reason": explicit_placement.reason,
+                        "excluded": [list(item) for item in explicit_placement.excluded]}
 
         client = self._clients.get(node_id)
         if client is None:
             return {"error": "NODE_UNREACHABLE", "node_id": node_id}
-        node_row = self.registry.get(node_id)
+        node_row = next((row for row in snapshot if row.id == node_id), None)
         capacity_snapshot = {
             "node_id": node_id,
             "status": node_row.status if node_row else "unknown",

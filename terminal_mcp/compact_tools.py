@@ -902,6 +902,7 @@ class CompactTerminalTools:
              overwrite: bool = False, mode: str | None = None,
              idempotency_key: str | None = None,
              agent_type: str = "shell", working_directory: str | None = None,
+             required_tools: tuple[str, ...] = (),
              initial_prompt: str | None = None, grant_mode: str = "none",
              binding: str | None = None, node: str = "auto",
              title: str | None = None, priority: int = 0,
@@ -1041,6 +1042,7 @@ class CompactTerminalTools:
         if normalized in TURN_HANDLER_ACTIONS:
             return self._handler_turn(
                 normalized, target=target, text=text, agent_type=agent_type,
+                required_tools=required_tools,
                 working_directory=working_directory, initial_prompt=initial_prompt,
                 grant_mode=grant_mode, binding=binding, node=node, title=title,
                 priority=priority, metadata=metadata, request_key=request_key,
@@ -1104,6 +1106,7 @@ class CompactTerminalTools:
                 queued = self._handler_turn(
                     "enqueue_task", target=target, text=text,
                     agent_type=agent_type, working_directory=working_directory,
+                    required_tools=required_tools,
                     initial_prompt=initial_prompt, grant_mode=grant_mode,
                     binding=binding, node=node, title=title, priority=priority,
                     metadata={**(metadata or {}), "long_task": True},
@@ -1615,7 +1618,7 @@ class CompactTerminalTools:
         return result if isinstance(result, dict) else {"following": bool(result)}
 
     def _handler_turn(self, action: str, *, target: str | None, text: str | None,
-                      agent_type: str, working_directory: str | None,
+                      agent_type: str, required_tools: tuple[str, ...], working_directory: str | None,
                       initial_prompt: str | None, grant_mode: str,
                       binding: str | None, node: str, title: str | None,
                       priority: int, metadata: dict[str, Any] | None,
@@ -1795,7 +1798,7 @@ class CompactTerminalTools:
             "create_session": lambda: handler(
                 target.strip(), agent_type=agent_type, working_directory=working_directory,
                 initial_prompt=initial_prompt, grant_mode=grant_mode, binding=binding,
-                node=node),
+                node=node, **({"required_tools": required_tools} if required_tools else {})),
             "delete_session": lambda: (handler(target.strip(), confirm=args["confirm"])
                                         if args and "confirm" in args else handler(target.strip())),
             "enqueue_task": lambda: handler(
