@@ -40,6 +40,14 @@ def _eligible(node: Node, *, required_agent_type: str, min_disk_free_bytes: int,
         return False, "draining"
     if node.capacity_status == CAPACITY_OVERLOADED:
         return False, f"overloaded ({', '.join(node.overload_reasons) or 'no reason recorded'})"
+    # New work must have a verified task-volume and session-capacity sample.
+    # Unknown values are safe for status/maintenance reads, but treating them
+    # as zero here would admit a workload precisely when admission evidence is
+    # missing.
+    if node.disk_free_bytes is None:
+        return False, "incomplete capacity evidence: disk_free_bytes unknown"
+    if node.tmux_session_count is None:
+        return False, "incomplete capacity evidence: tmux_session_count unknown"
     if required_platform is not None and node.platform != required_platform:
         # Multi-node Windows support -- a caller that explicitly needs a
         # specific platform (e.g. a session that only makes sense on

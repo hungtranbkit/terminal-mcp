@@ -556,6 +556,11 @@ class NodeRegistry:
         except ValueError:
             return NODE_OFFLINE
         age = (now - heartbeat).total_seconds()
+        # A future-dated heartbeat is malformed evidence, not a fresh node.
+        # Keep it out of new-work placement while preserving the existing
+        # degraded/offline distinction for status and recovery tooling.
+        if age < 0:
+            return NODE_DEGRADED
         if age <= self.heartbeat_thresholds.degraded_after_seconds:
             return NODE_ONLINE
         if age <= self.heartbeat_thresholds.offline_after_seconds:

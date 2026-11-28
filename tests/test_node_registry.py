@@ -354,3 +354,14 @@ def test_acknowledge_status_event(tmp_path):
 def test_acknowledge_status_event_unknown_id_returns_false(tmp_path):
     registry = NodeRegistry(tmp_path / "nodes.db")
     assert registry.acknowledge_status_event(99999) is False
+from datetime import datetime, timedelta, timezone
+
+from terminal_mcp.node_models import NODE_DEGRADED, NODE_OFFLINE
+from terminal_mcp.node_registry import NodeRegistry
+
+
+def test_future_or_malformed_heartbeat_never_looks_online(tmp_path):
+    registry = NodeRegistry(tmp_path / "nodes.db")
+    now = datetime.now(timezone.utc)
+    assert registry._derive_status((now + timedelta(seconds=30)).isoformat(), now) == NODE_DEGRADED
+    assert registry._derive_status("not-a-timestamp", now) == NODE_OFFLINE

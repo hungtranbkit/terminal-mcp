@@ -62,6 +62,17 @@ def test_missing_heartbeat_is_incomplete_even_when_other_fields_look_healthy():
     assert denied.excluded == (("dell", "incomplete heartbeat evidence"),)
 
 
+def test_unknown_capacity_is_never_admitted_for_new_work():
+    disk_unknown = _node("disk-unknown")
+    disk_unknown = disk_unknown.__class__(**{**disk_unknown.__dict__, "disk_free_bytes": None})
+    sessions_unknown = _node("sessions-unknown")
+    sessions_unknown = sessions_unknown.__class__(**{**sessions_unknown.__dict__, "tmux_session_count": None})
+    result = choose_node([disk_unknown, sessions_unknown])
+    assert result.node_id is None
+    assert "disk_free_bytes unknown" in dict(result.excluded)["disk-unknown"]
+    assert "tmux_session_count unknown" in dict(result.excluded)["sessions-unknown"]
+
+
 def test_prefers_more_ram_headroom():
     busy = _node("busy", ram_percent=85.0)
     idle = _node("idle", ram_percent=20.0)
