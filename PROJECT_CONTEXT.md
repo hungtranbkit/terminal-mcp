@@ -20,12 +20,15 @@
   PYTHONPATH=. /home/dell/workspace/terminal-mcp/.venv/bin/python -m pytest
   -q tests/test_work_policy.py tests/test_work_policy_integration.py —
   25 passed, exit 0; compileall and git diff --check exit 0.
-- Changes remain uncommitted in the existing PR #144 worktree at original
-  head b3df3de82874197b62369734be5bee36adcf7c48; current PR base main is
-  591b411fd7befd8b423bb1c96fe5a95f8aeeaaba. No branch head was moved and no
-  deployment occurred. Next: inspect/update against current main without
-  rewriting history, rerun focused tests on the integrated candidate, then
-  publish for independent review and CI.
+- Fix commit 11a3bdd655f9f2471e1c01706948672443fb0fed was made on the existing
+  PR #144 branch. Current main 591b411fd7befd8b423bb1c96fe5a95f8aeeaaba was
+  merged normally; integrated candidate is f70db186036bf3912bfc8c0382ad2e04da36cd7e.
+  The two main commits changed controller fanout and its test only. The merged
+  candidate focused run `tests/test_work_policy.py
+  tests/test_work_policy_integration.py tests/test_session_read_fanout.py`
+  passed **28 tests**, exit 0; compileall and git diff --check passed. No
+  deployment occurred. Next: publish the candidate for CI and independent
+  review; do not merge/deploy until those gates pass.
 
 ## 2026-11-28 — Shared AUTONOMY_FIRST v1 policy (#104)
 
