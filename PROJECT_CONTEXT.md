@@ -40,10 +40,13 @@
   matrix covers SESSION_NOT_FOUND/SESSION_DELETED/SESSION_RUNTIME_MISSING,
   unknown node/location/transport/authority, INPUT_SENT/SUBMIT_CONFIRMED/
   DISPATCH_UNCERTAIN, active execution, cancellation and independent tasks.
-- Next: publish this branch as a separate PR linked to issue #104, request
-  independent review and exact-head CI. This deterministic target-gone result
-  is not automatic alternate execution; that remains an explicitly authorized
-  operator action after separate executor verification.
+- Published as draft PR #145: https://github.com/hungtranbkit/terminal-mcp/pull/145,
+  head `9fc457e87170077e408006b536b7cd671ddc8bba`; phase2 evidence posted
+  to issue #104 (comment 7241452123). Exact-head Unified Memory gate run
+  46159737973 was IN_PROGRESS when checked; no CI pass or independent review
+  is claimed. This deterministic target-gone result is not automatic alternate
+  execution; that remains an explicitly authorized operator action after
+  separate executor verification.
 
 ## 2026-11-12 — P0 fleet session lifecycle (PR #117, not deployed)
 
