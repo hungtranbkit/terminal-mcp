@@ -133,11 +133,14 @@ Use host-level network restrictions when a strict egress boundary is required.
 
 Contexts block service workers and WebSockets and disable accepted downloads.
 The worker disables QUIC and non-proxied WebRTC UDP. Operator browser arguments
-are restricted to `--disable-dev-shm-usage`, `--disable-gpu`, and `--no-sandbox`;
-remote debugging flags, extensions and arbitrary profile arguments are not
-passed through. `--no-sandbox` weakens Chromium isolation and should only be used
-where the deployment requires it. TLS verification is enabled unless the
-operator sets `ignore_https_errors`.
+are restricted to `--disable-dev-shm-usage` and `--disable-gpu`; remote debugging
+flags, extensions and arbitrary profile arguments are not passed through.
+Chromium is always launched with `chromium_sandbox=True`. Requests containing
+sandbox-disabling flags are rejected with `BROWSER_SANDBOX_REQUIRED` before
+proxy or browser startup. A host that cannot provide the sandbox returns
+`BROWSER_LAUNCH_FAILED`; there is no unsandboxed retry. Qualify the runner's
+actual renderer isolation separately from normal navigation tests. TLS
+verification is enabled unless the operator sets `ignore_https_errors`.
 
 Text results use the project's redaction rules, strip URL credentials, redact
 query values and enforce length/count limits. These rules do not make arbitrary
