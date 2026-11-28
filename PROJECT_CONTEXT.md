@@ -21,14 +21,17 @@
   -q tests/test_work_policy.py tests/test_work_policy_integration.py —
   25 passed, exit 0; compileall and git diff --check exit 0.
 - Fix commit 11a3bdd655f9f2471e1c01706948672443fb0fed was made on the existing
-  PR #144 branch. Current main 591b411fd7befd8b423bb1c96fe5a95f8aeeaaba was
-  merged normally; integrated candidate is f70db186036bf3912bfc8c0382ad2e04da36cd7e.
+  PR #144 branch and pushed. Current main 591b411fd7befd8b423bb1c96fe5a95f8aeeaaba
+  was merged normally; integrated candidate before the final handoff note was
+  f70db186036bf3912bfc8c0382ad2e04da36cd7e.
   The two main commits changed controller fanout and its test only. The merged
   candidate focused run `tests/test_work_policy.py
   tests/test_work_policy_integration.py tests/test_session_read_fanout.py`
   passed **28 tests**, exit 0; compileall and git diff --check passed. No
-  deployment occurred. Next: publish the candidate for CI and independent
-  review; do not merge/deploy until those gates pass.
+  deployment occurred. Exact PR head `2ac22e69bf4eda2179508a32f6d94da2cd68cc38`
+  has both PR workflows successful (46156531588, 46156531450). Independent
+  formal review has not been submitted; request re-review of this updated head.
+  Do not merge/deploy until review and release gates pass.
 
 ## 2026-11-28 — Shared AUTONOMY_FIRST v1 policy (#104)
 
