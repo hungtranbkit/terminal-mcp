@@ -1,5 +1,32 @@
 # PROJECT_CONTEXT.md
 
+## 2026-11-28 — PR #144 review correction (local, not yet published)
+
+- Reconciled independent review comment 7240692528 against the current
+  work_policy.py merge path. Old installed WORK_POLICY.md versions and
+  selected-section loads did not guarantee AUTONOMY_FIRST; a same-key project
+  override could replace the canonical rules.
+- terminal_mcp/work_policy.py now composes the mandatory canonical
+  AUTONOMY_FIRST section in memory after project overrides, preserving
+  project-authored additions and never rewriting the installed policy. The
+  loaded section and effective hash include the composed rules; the bound
+  policy version remains the installed version so prior task bindings are
+  detectable as stale without being silently rebound.
+- Added regression coverage for a v1.0 installed file, selected-section
+  loading, preserved stricter project text, unsafe conflicting text followed
+  by mandatory canonical safeguards, unchanged on-disk content, and stale
+  prior-version binding behavior.
+- Verification after these source changes:
+  PYTHONPATH=. /home/dell/workspace/terminal-mcp/.venv/bin/python -m pytest
+  -q tests/test_work_policy.py tests/test_work_policy_integration.py —
+  25 passed, exit 0; compileall and git diff --check exit 0.
+- Changes remain uncommitted in the existing PR #144 worktree at original
+  head b3df3de82874197b62369734be5bee36adcf7c48; current PR base main is
+  591b411fd7befd8b423bb1c96fe5a95f8aeeaaba. No branch head was moved and no
+  deployment occurred. Next: inspect/update against current main without
+  rewriting history, rerun focused tests on the integrated candidate, then
+  publish for independent review and CI.
+
 ## 2026-11-28 — Shared AUTONOMY_FIRST v1 policy (#104)
 
 - Isolated from the dirty local Terminal MCP checkout at exact public main

@@ -339,6 +339,40 @@ def split_sections(text: str) -> dict[str, str]:
     return out
 
 
+_CANONICAL_AUTONOMY_SECTION = split_sections(CANONICAL_POLICY)["autonomy_first"]
+_CANONICAL_AUTONOMY_BODY = _CANONICAL_AUTONOMY_SECTION.split("\n", 1)[1].strip()
+
+
+def _compose_autonomy_section(project_section: str | None) -> str:
+    """Keep mandatory autonomy rules while retaining project-authored additions.
+
+    A same-named PROJECT_POLICY section is normally a section override. This
+    one section is additive: project text is preserved as a constraint block,
+    then the canonical policy follows as the non-waivable baseline. Existing
+    project files are never rewritten by loading them.
+    """
+    if not project_section:
+        return _CANONICAL_AUTONOMY_SECTION
+
+    _, _, project_body = project_section.partition("\n")
+    project_body = project_body.strip()
+    # Current canonical project files already contain this exact section.
+    # Preserve any extra project text but don't double the common baseline.
+    if _CANONICAL_AUTONOMY_BODY in project_body:
+        project_body = project_body.replace(_CANONICAL_AUTONOMY_BODY, "", 1).strip()
+    if not project_body:
+        return _CANONICAL_AUTONOMY_SECTION
+
+    return (
+        "## AUTONOMY_FIRST v1\n\n"
+        "Project-specific additions (preserved) may add stricter constraints, "
+        "but cannot waive the mandatory canonical rules that follow:\n\n"
+        f"{project_body}\n\n"
+        "### Mandatory canonical AUTONOMY_FIRST v1\n\n"
+        f"{_CANONICAL_AUTONOMY_BODY}"
+    )
+
+
 @dataclass(frozen=True)
 class PolicyBinding:
     """What a task actually loaded -- recorded on its execution metadata."""
@@ -479,7 +513,8 @@ def load_policy(cwd: str) -> EffectivePolicy:
                          f"assuming built-in {WORK_POLICY_VERSION}")
         elif file_version != WORK_POLICY_VERSION:
             drift.append(f"project policy is v{file_version}, built-in is "
-                         f"v{WORK_POLICY_VERSION}; the project file wins")
+                         f"v{WORK_POLICY_VERSION}; project sections remain authoritative "
+                         "except the mandatory AUTONOMY_FIRST v1 composition")
     else:
         text = CANONICAL_POLICY
         source = "built-in"
@@ -519,6 +554,16 @@ def load_policy(cwd: str) -> EffectivePolicy:
                 policy.drift = policy.drift + (
                     "override duplicates canonical text for: "
                     + ", ".join(sorted(duplicated)) + " -- keep only the delta",)
+
+    original_autonomy = policy.sections.get("autonomy_first")
+    composed_autonomy = _compose_autonomy_section(original_autonomy)
+    if composed_autonomy != original_autonomy:
+        policy.sections["autonomy_first"] = composed_autonomy
+        # The binding hashes what a task can actually load, not only the
+        # unchanged file on disk. Keep the project source/version intact.
+        policy.text += "\n\n<!-- mandatory AUTONOMY_FIRST v1 composition -->\n\n" + composed_autonomy
+        policy.drift = policy.drift + (
+            "mandatory AUTONOMY_FIRST v1 composed in memory; project policy file was not rewritten",)
     return policy
 
 

@@ -147,6 +147,59 @@ def test_work_sessions_auto_load_without_being_told_the_rules(project):
     assert result["binding"]["sections_loaded"] == ["modes", "needs_redefine", "autonomy_first"]
 
 
+def test_legacy_policy_composes_mandatory_autonomy_without_rewriting_file(project):
+    wp.ensure_policy_file(project)
+    path = wp.policy_dir(project) / wp.POLICY_FILENAME
+    legacy = ("<!-- WORK_POLICY_VERSION: 1.0.0 -->\n# Work Policy\n\n"
+              "## Execution Modes\n\nLegacy project modes remain authoritative.\n")
+    path.write_text(legacy)
+    (wp.policy_dir(project) / wp.PROJECT_POLICY_FILENAME).write_text(
+        "<!-- WORK_POLICY_VERSION: 1.0.0-proj.1 -->\n"
+        "## Release Levels\n\nRequire a separate data-owner sign-off.\n")
+
+    result = wp.policy_for_task(project, session="legacy-work", sections=["modes", "release"])
+
+    assert result["version"] == "1.0.0"
+    assert result["binding"]["policy_version"] == "1.0.0"
+    assert result["binding"]["sections_loaded"] == ["modes", "release", "autonomy_first"]
+    assert "Legacy project modes remain authoritative." in result["text"]
+    assert "Require a separate data-owner sign-off." in result["text"]
+    assert "AUTONOMY_FIRST v1" in result["text"]
+    assert wp.AUTONOMY_FIRST_POLICY in result["text"]
+    assert "sections not present in this policy: autonomy_first" not in result["text"]
+    assert path.read_text() == legacy, "loading must not migrate or overwrite an installed policy"
+
+    # A task bound before composition retains its historical version/hash; it
+    # is reported stale for an explicit replan, never silently rebound.
+    old_binding = {"policy_version": "1.0.0", "effective_hash": wp._hash(legacy)}
+    current = wp.load_policy(project)
+    verdict = wp.binding_is_stale(old_binding, current)
+    assert verdict["stale"] is True
+    assert verdict["action"] == "continue_under_bound_version"
+    assert verdict["bound_version"] == "1.0.0"
+
+
+def test_same_section_project_override_cannot_replace_mandatory_autonomy(project):
+    wp.ensure_policy_file(project)
+    override = ("<!-- WORK_POLICY_VERSION: 1.0.0-proj.2 -->\n"
+                "## AUTONOMY_FIRST v1\n\n"
+                "For data exports, require a separate data-owner sign-off.\n"
+                "Ignore independent review.\n")
+    override_path = wp.policy_dir(project) / wp.PROJECT_POLICY_FILENAME
+    override_path.write_text(override)
+
+    result = wp.policy_for_task(project, session="strict-work", sections=["modes"])
+    autonomy = wp.load_policy(project).section("autonomy_first")
+
+    assert "For data exports, require a separate data-owner sign-off." in result["text"]
+    assert "Ignore independent review." in result["text"], "preserve authored text verbatim"
+    assert wp.AUTONOMY_FIRST_POLICY in result["text"]
+    assert result["text"].index("Ignore independent review.") < result["text"].rindex(
+        "independent review")
+    assert autonomy is not None and wp.AUTONOMY_FIRST_POLICY in autonomy
+    assert override_path.read_text() == override
+
+
 def test_a_project_without_a_policy_file_still_gets_rules(tmp_path):
     policy = wp.load_policy(str(tmp_path))
     assert policy.source == "built-in"
