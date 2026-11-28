@@ -183,6 +183,11 @@ def test_real_disposable_tmux_direct_start_and_replay(tmp_path, tmux_session_fac
     from terminal_mcp.tmux import TmuxClient
     from tests.test_codex_paste_settle import PROMPT, submit_service
 
+    import shutil
+    usage = shutil.disk_usage(tmp_path)
+    if usage.free < 20 * 1024 ** 3 or usage.used * 100 >= 90 * (usage.used + usage.free):
+        pytest.skip(f"BLOCKED_ENVIRONMENT: real disposable tmux target capacity is {usage.free} bytes free")
+
     fixture = Path(__file__).parent / 'fixtures' / 'codex_bracketed_paste.py'
     command = f'exec -a codex python3 -u {shlex.quote(str(fixture))}'
     session = tmux_session_factory('test-direct-start', f'bash -c {shlex.quote(command)}')
@@ -191,8 +196,6 @@ def test_real_disposable_tmux_direct_start_and_replay(tmp_path, tmux_session_fac
     while 'codex fixture' not in '\n'.join(terminal.tmux.capture_lines(session, 30)):
         assert time.monotonic() < limit
         time.sleep(.02)
-    import shutil
-    usage = shutil.disk_usage(tmp_path)
     node = SimpleNamespace(status='online', disk_used_bytes=usage.used, disk_free_bytes=usage.free)
     monkeypatch.setattr(terminal, 'registry', SimpleNamespace(get=lambda _: node), raising=False)
     original_status = terminal.terminal_status

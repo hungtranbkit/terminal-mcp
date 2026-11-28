@@ -368,7 +368,26 @@ def test_persisted_cap_is_shared_by_watcher_passes_and_restart(tmp_path: Path):
 
 
 @pytest.mark.parametrize("required_enters", [1, 2, 3, 6])
-def test_execution_starts_after_each_bounded_enter_count(tmp_path: Path, required_enters: int):
+def test_execution_starts_after_each_bounded_enter_count(tmp_path: Path, required_enters: int,
+                                                        monkeypatch: pytest.MonkeyPatch):
+    # This verifies the bounded Enter policy, not real scheduler latency. Use
+    # deterministic logical polling so SQLite/filesystem/CI load cannot consume
+    # the 0.2s deadline between the last Enter and its next evidence read.
+    class PollClock:
+        def __init__(self):
+            self.now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def time(self):
+            return 1_700_000_000.0 + self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    poll_clock = PollClock()
+    monkeypatch.setattr("terminal_mcp.submit_watchdog.time", poll_clock)
     store = SubmissionStore(tmp_path / f"required-{required_enters}.db")
     record, _ = store.create(idempotency_key=f"required-{required_enters}", session="codex",
                              agent_type="codex", prompt="long prompt")

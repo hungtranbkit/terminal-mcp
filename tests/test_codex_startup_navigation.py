@@ -40,6 +40,8 @@ def configured(tmp_path):
     return AppConfig(permissions=PermissionsConfig(True, True), allowed_session_patterns=("codex-nav-*",), input_policy=InputPolicyConfig(allowed_session_patterns=("codex-nav-*",)), session_lifecycle=SessionLifecycleConfig(enabled=True, allowed_cwd_roots=(str(tmp_path),), launch_commands=(("codex", "codex"),), create_ready_timeout_seconds=2.0))
 
 def launch(tmp_path, monkeypatch, backend, config=None):
+    from tests.capacity_fixtures import supply_positive_local_capacity
+    supply_positive_local_capacity(monkeypatch, tmp_path)
     svc = SessionLifecycleService(config or configured(tmp_path), backend)
     monkeypatch.setattr(svc, "launch_command_for", lambda agent: "codex")
     return svc.create("codex-nav-check", "codex", str(tmp_path))
@@ -134,6 +136,8 @@ def test_startup_open_default_does_not_require_retired_whitelist(tmp_path, monke
 
 
 def test_scoped_safe_daemon_choice_does_not_require_general_input_grant(tmp_path, monkeypatch):
+    from tests.capacity_fixtures import supply_positive_local_capacity
+    supply_positive_local_capacity(monkeypatch, tmp_path)
     backend = MenuBackend("daemon", 0)
     decisions = iter([True, False])
     svc = SessionLifecycleService(configured(tmp_path), backend,
@@ -237,6 +241,8 @@ def test_codex_no_daemon_flag_is_detected_from_cli_help(monkeypatch, version, su
 def test_supported_codex_gets_scoped_no_daemon_before_resume_args(tmp_path, monkeypatch):
     from terminal_mcp.lifecycle import _codex_supports_no_daemon
     _codex_supports_no_daemon.cache_clear()
+    from tests.capacity_fixtures import supply_positive_local_capacity
+    supply_positive_local_capacity(monkeypatch, tmp_path)
     monkeypatch.setattr("terminal_mcp.lifecycle.subprocess.run", lambda *a, **kw: SimpleNamespace(
         stdout="--no-daemon Run without shared background server", stderr="", returncode=0))
     backend = MenuBackend("daemon", 0)

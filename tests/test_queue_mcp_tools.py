@@ -33,7 +33,9 @@ async def _call(server, name, **kwargs):
 @pytest.fixture
 def server(tmp_path):
     queue = QueueService(QueueStore(tmp_path / "queue.db"))
-    return build_mcp(queue=queue)
+    instance = build_mcp(queue=queue)
+    instance._test_queue = queue
+    return instance
 
 
 @pytest.mark.anyio
@@ -154,11 +156,33 @@ async def test_queue_loop_status_reports_not_running_when_never_started(server):
 
 
 @pytest.mark.anyio
-async def test_queue_loop_run_once_ticks_only_auto_dispatch_enabled_lanes(server):
+async def test_queue_loop_run_once_ticks_only_auto_dispatch_enabled_lanes(server, monkeypatch, tmp_path):
     await _call(server, "terminal_queue_set", session="lane-a", tasks=[{"prompt": "a real task"}])
     await _call(server, "terminal_queue_set", session="lane-b", tasks=[{"prompt": "a real task"}])
     await _call(server, "terminal_queue_set_auto_dispatch", session="lane-a", enabled=True)
     # lane-b left OFF (the default) -- must be completely untouched.
+
+    # This test exercises queue-loop lane selection and claiming, not host
+    # admission. Supply an explicit synthetic positive capacity sample and a
+    # resolved target identity; negative/unknown admission cases stay intact.
+    queue = server._test_queue
+    controller = queue.engine.ops
+    node_id = controller.local_node_id
+    from types import SimpleNamespace
+    node = SimpleNamespace(status="online", disk_used_bytes=60 * 1024 ** 3,
+                           disk_free_bytes=40 * 1024 ** 3)
+    monkeypatch.setattr(controller.registry, "get", lambda requested, *args, **kwargs: node if requested == node_id else None)
+
+    def resolved_target(target):
+        return {
+            "session": target, "exists": True, "state": "IDLE", "node_id": node_id,
+            "agent": "codex", "agent_type": "codex", "cwd": str(tmp_path),
+            "allowed": True,
+        }
+
+    monkeypatch.setattr(controller, "terminal_status", resolved_target)
+    monkeypatch.setattr(controller, "terminal_status_bounded", lambda target, _timeout: resolved_target(target))
+    monkeypatch.setattr(queue.loop, "heartbeat_refresher", lambda: None)
 
     result = await _call(server, "terminal_queue_loop_run_once")
     sessions_touched = {r["session"] for r in result["results"]}
@@ -166,7 +190,7 @@ async def test_queue_loop_run_once_ticks_only_auto_dispatch_enabled_lanes(server
 
     status_a = await _call(server, "terminal_queue_status", session="lane-a")
     status_b = await _call(server, "terminal_queue_status", session="lane-b")
-    assert status_a["tasks"][0]["status"] != "QUEUED"  # lane-a's task was claimed (PRECHECK at least)
+    assert status_a["tasks"][0]["status"] != "QUEUED", result  # lane-a's task was claimed (PRECHECK at least)
     assert status_b["tasks"][0]["status"] == "QUEUED"  # lane-b completely untouched
 
     # And terminal_queue_loop_status now shows a real last_cycle_at,
@@ -174,6 +198,20 @@ async def test_queue_loop_run_once_ticks_only_auto_dispatch_enabled_lanes(server
     loop_status = await _call(server, "terminal_queue_loop_status")
     assert loop_status["last_cycle_at"] is not None
     assert loop_status["running"] is False
+
+
+@pytest.mark.anyio
+async def test_queue_loop_keeps_task_queued_when_target_capacity_is_unknown(server):
+    await _call(server, "terminal_queue_set", session="lane-a", tasks=[{"prompt": "a real task"}])
+    await _call(server, "terminal_queue_set_auto_dispatch", session="lane-a", enabled=True)
+
+    result = await _call(server, "terminal_queue_loop_run_once")
+    assert result["results"] == [{
+        "session": "lane-a", "action": "QUEUED", "task_id": None,
+        "detail": "disk capacity unavailable: target status unknown",
+    }]
+    status = await _call(server, "terminal_queue_status", session="lane-a")
+    assert status["tasks"][0]["status"] == "QUEUED"
 
 
 # ---------------------------------------------------------------------------
