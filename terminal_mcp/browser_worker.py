@@ -73,7 +73,17 @@ def _clip(text: Any, limit: int) -> str:
 
 def _safe_args(args: Any) -> list[str]:
     # Operator arguments cannot override the network boundary or load profiles.
-    allowed = {"--disable-dev-shm-usage", "--disable-gpu", "--no-sandbox"}
+    # Check the entire request before truncation; do not silently accept an
+    # operator's request to disable Chromium's own process isolation.
+    sandbox_disabling = {
+        "--no-sandbox", "--disable-setuid-sandbox",
+        "--disable-seccomp-filter-sandbox", "--disable-namespace-sandbox",
+        "--single-process", "--no-zygote",
+    }
+    if any(isinstance(arg, str) and arg.split("=", 1)[0] in sandbox_disabling
+           for arg in args or []):
+        raise ValueError("Chromium sandbox is required; disabling flags are forbidden")
+    allowed = {"--disable-dev-shm-usage", "--disable-gpu"}
     return [arg for arg in list(args or [])[:20] if arg in allowed]
 
 
@@ -162,9 +172,14 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
     page_errors: list[str] = []
     network_errors: list[dict[str, Any]] = []
 
+    try:
+        browser_args = _safe_args(job.get("browser_args"))
+    except ValueError as exc:
+        return _fail("BROWSER_SANDBOX_REQUIRED", str(exc))
     launch_kwargs: dict[str, Any] = {
         "headless": headless,
-        "args": _safe_args(job.get("browser_args")) or ["--disable-dev-shm-usage"],
+        "chromium_sandbox": True,
+        "args": browser_args or ["--disable-dev-shm-usage"],
     }
     if executable_path:
         launch_kwargs["executable_path"] = executable_path
