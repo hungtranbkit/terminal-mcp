@@ -1,6 +1,6 @@
 # PROJECT_CONTEXT.md
 
-## 2026-11-28 — PR #144 review correction (local, not yet published)
+## 2026-11-28 — PR #144 review corrections (latest follow-up pending)
 
 - Reconciled independent review comment 7240692528 against the current
   work_policy.py merge path. Old installed WORK_POLICY.md versions and
@@ -16,10 +16,17 @@
   loading, preserved stricter project text, unsafe conflicting text followed
   by mandatory canonical safeguards, unchanged on-disk content, and stale
   prior-version binding behavior.
+- Follow-up review comment 7241047127 identified that same-named override
+  sections were discarding stricter installed autonomy text before composition.
+  The loader now composes installed constraints + PROJECT_POLICY additions +
+  canonical rules in that order. The overlap regression preserves both
+  separate sign-off constraints, keeps v1.0 binding version and stale-hash
+  behavior, and verifies both source files remain unchanged.
 - Verification after these source changes:
   PYTHONPATH=. /home/dell/workspace/terminal-mcp/.venv/bin/python -m pytest
   -q tests/test_work_policy.py tests/test_work_policy_integration.py —
-  25 passed, exit 0; compileall and git diff --check exit 0.
+  26 passed, exit 0; compileall and git diff --check exit 0. The overlap test
+  was observed RED before the source change and GREEN afterward.
 - Fix commit 11a3bdd655f9f2471e1c01706948672443fb0fed was made on the existing
   PR #144 branch and pushed. Current main 591b411fd7befd8b423bb1c96fe5a95f8aeeaaba
   was merged normally; integrated candidate before the final handoff note was

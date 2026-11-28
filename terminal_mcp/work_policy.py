@@ -343,31 +343,45 @@ _CANONICAL_AUTONOMY_SECTION = split_sections(CANONICAL_POLICY)["autonomy_first"]
 _CANONICAL_AUTONOMY_BODY = _CANONICAL_AUTONOMY_SECTION.split("\n", 1)[1].strip()
 
 
-def _compose_autonomy_section(project_section: str | None) -> str:
-    """Keep mandatory autonomy rules while retaining project-authored additions.
+def _compose_autonomy_section(
+    installed_section: str | None,
+    override_section: str | None = None,
+) -> str:
+    """Keep both project autonomy sections plus mandatory canonical rules.
 
-    A same-named PROJECT_POLICY section is normally a section override. This
-    one section is additive: project text is preserved as a constraint block,
-    then the canonical policy follows as the non-waivable baseline. Existing
-    project files are never rewritten by loading them.
+    PROJECT_POLICY normally replaces same-named installed sections. The
+    autonomy contract is additive instead: retain both installed and override
+    bodies, then append the non-waivable canonical baseline. Loading never
+    rewrites either project file.
     """
-    if not project_section:
+    project_bodies: list[tuple[str, str]] = []
+    for label, section in (
+        ("Installed project constraints", installed_section),
+        ("PROJECT_POLICY additions", override_section),
+    ):
+        if not section:
+            continue
+        _, _, body = section.partition("\n")
+        body = body.strip()
+        # Current policy files may already carry the canonical baseline.
+        # Remove one exact copy so it is included only once after both sets
+        # of project-authored constraints.
+        if _CANONICAL_AUTONOMY_BODY in body:
+            body = body.replace(_CANONICAL_AUTONOMY_BODY, "", 1).strip()
+        if body and all(body != existing for _, existing in project_bodies):
+            project_bodies.append((label, body))
+
+    if not project_bodies:
         return _CANONICAL_AUTONOMY_SECTION
 
-    _, _, project_body = project_section.partition("\n")
-    project_body = project_body.strip()
-    # Current canonical project files already contain this exact section.
-    # Preserve any extra project text but don't double the common baseline.
-    if _CANONICAL_AUTONOMY_BODY in project_body:
-        project_body = project_body.replace(_CANONICAL_AUTONOMY_BODY, "", 1).strip()
-    if not project_body:
-        return _CANONICAL_AUTONOMY_SECTION
-
+    preserved = "\n\n".join(f"### {label} (preserved)\n\n{body}"
+                            for label, body in project_bodies)
     return (
         "## AUTONOMY_FIRST v1\n\n"
-        "Project-specific additions (preserved) may add stricter constraints, "
-        "but cannot waive the mandatory canonical rules that follow:\n\n"
-        f"{project_body}\n\n"
+        "Project-specific constraints below are preserved additively. They "
+        "may add stricter requirements, but cannot waive the mandatory "
+        "canonical rules that follow:\n\n"
+        f"{preserved}\n\n"
         "### Mandatory canonical AUTONOMY_FIRST v1\n\n"
         f"{_CANONICAL_AUTONOMY_BODY}"
     )
@@ -531,6 +545,7 @@ def load_policy(cwd: str) -> EffectivePolicy:
                              drift=tuple(drift))
 
     override_path = (directory / PROJECT_POLICY_FILENAME) if directory is not None else None
+    override_sections: dict[str, str] = {}
     if override_path is not None and override_path.exists():
         override_text = override_path.read_text(encoding="utf-8")
         override_sections = split_sections(override_text)
@@ -555,9 +570,10 @@ def load_policy(cwd: str) -> EffectivePolicy:
                     "override duplicates canonical text for: "
                     + ", ".join(sorted(duplicated)) + " -- keep only the delta",)
 
-    original_autonomy = policy.sections.get("autonomy_first")
-    composed_autonomy = _compose_autonomy_section(original_autonomy)
-    if composed_autonomy != original_autonomy:
+    original_autonomy = sections.get("autonomy_first")
+    override_autonomy = override_sections.get("autonomy_first")
+    composed_autonomy = _compose_autonomy_section(original_autonomy, override_autonomy)
+    if composed_autonomy != policy.sections.get("autonomy_first"):
         policy.sections["autonomy_first"] = composed_autonomy
         # The binding hashes what a task can actually load, not only the
         # unchanged file on disk. Keep the project source/version intact.

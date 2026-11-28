@@ -200,6 +200,34 @@ def test_same_section_project_override_cannot_replace_mandatory_autonomy(project
     assert override_path.read_text() == override
 
 
+def test_legacy_and_override_autonomy_constraints_are_both_preserved(project):
+    wp.ensure_policy_file(project)
+    legacy = ("<!-- WORK_POLICY_VERSION: 1.0.0 -->\n# Work Policy\n\n"
+              "## Execution Modes\n\nLegacy execution mode rules.\n\n"
+              "## AUTONOMY_FIRST v1\n\n"
+              "Require security signoff before release.\n")
+    override = ("<!-- WORK_POLICY_VERSION: 1.0.0-proj.3 -->\n"
+                "## AUTONOMY_FIRST v1\n\n"
+                "Require data owner signoff before release.\n")
+    policy_path = wp.policy_dir(project) / wp.POLICY_FILENAME
+    override_path = wp.policy_dir(project) / wp.PROJECT_POLICY_FILENAME
+    policy_path.write_text(legacy)
+    override_path.write_text(override)
+
+    result = wp.policy_for_task(project, session="overlap-work", sections=["modes"])
+    effective = wp.load_policy(project)
+    old_binding = {"policy_version": "1.0.0", "effective_hash": wp._hash(legacy)}
+
+    assert "Require security signoff before release." in result["text"]
+    assert "Require data owner signoff before release." in result["text"]
+    assert wp.AUTONOMY_FIRST_POLICY in result["text"]
+    assert result["binding"]["policy_version"] == "1.0.0"
+    assert result["binding"]["sections_loaded"] == ["modes", "autonomy_first"]
+    assert wp.binding_is_stale(old_binding, effective)["stale"] is True
+    assert policy_path.read_text() == legacy
+    assert override_path.read_text() == override
+
+
 def test_a_project_without_a_policy_file_still_gets_rules(tmp_path):
     policy = wp.load_policy(str(tmp_path))
     assert policy.source == "built-in"
