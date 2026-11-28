@@ -1777,15 +1777,48 @@ class ControllerService:
         # eligible node; an explicit target remains pinned and fails closed.
         target_volume = None
         volume_excluded: list[str] = []
-        while cwd is not None:
+        effective_cwd = cwd
+        while True:
+            if effective_cwd is None:
+                # Test doubles and third-party adapters predating the
+                # authenticated resolve endpoint retain the historical shell
+                # path; all shipped Local/RemoteNodeClient implementations
+                # expose resolve_cwd and therefore take the fail-closed path.
+                if not callable(getattr(client, "resolve_cwd", None)):
+                    break
+                try:
+                    resolved = client.resolve_cwd()
+                except Exception as exc:
+                    resolved = {"error": "TARGET_CWD_RESOLUTION_FAILED", "detail": type(exc).__name__}
+                if not isinstance(resolved, dict) or resolved.get("resolved") is not True:
+                    reason = (resolved or {}).get("error", "missing node cwd resolution")
+                    if node != "auto":
+                        return {"error": "TARGET_VOLUME_UNVERIFIED", "node_id": node_id, "detail": reason}
+                    volume_excluded.append(node_id)
+                    placement = choose_node(snapshot, required_agent_type=agent_type,
+                                             required_platform=platform,
+                                             required_capabilities=required_tools,
+                                             excluded_node_ids=tuple(volume_excluded))
+                    if placement.node_id is None:
+                        return {"error": "NO_ELIGIBLE_NODE", "session": name,
+                                "reason": placement.reason, "excluded": list(placement.excluded)}
+                    node_id = placement.node_id
+                    client = self._clients.get(node_id)
+                    node_row = next((row for row in snapshot if row.id == node_id), None)
+                    continue
+                effective_cwd = resolved.get("cwd")
+                if not isinstance(effective_cwd, str) or not effective_cwd:
+                    return {"error": "TARGET_VOLUME_UNVERIFIED", "node_id": node_id,
+                            "detail": "node returned invalid resolved cwd"}
             try:
-                target_volume = client.repo_evidence(cwd)
+                target_volume = client.repo_evidence(effective_cwd)
             except Exception as exc:  # transport/unsupported probe
                 target_volume = {"error": "TARGET_VOLUME_PROBE_FAILED", "detail": type(exc).__name__}
             valid_probe = (
                 isinstance(target_volume, dict)
                 and target_volume.get("exists") is True
                 and target_volume.get("readable") is True
+                and target_volume.get("cwd") == effective_cwd
                 and isinstance(target_volume.get("device"), int)
                 and not isinstance(target_volume.get("device"), bool)
                 and isinstance(target_volume.get("statvfs_free_bytes"), int)
@@ -1800,7 +1833,7 @@ class ControllerService:
             reason = (target_volume or {}).get("error", "missing or invalid statvfs evidence")
             if node != "auto":
                 return {"error": "TARGET_VOLUME_UNVERIFIED", "node_id": node_id,
-                        "cwd": cwd, "detail": reason}
+                        "cwd": effective_cwd, "detail": reason}
             volume_excluded.append(node_id)
             placement = choose_node(snapshot, required_agent_type=agent_type,
                                     required_platform=platform,
@@ -1815,6 +1848,7 @@ class ControllerService:
                 volume_excluded.append(node_id)
                 continue
             node_row = next((row for row in snapshot if row.id == node_id), None)
+            effective_cwd = cwd
         capacity_snapshot = {
             "node_id": node_id,
             "status": node_row.status if node_row else "unknown",
@@ -1825,7 +1859,7 @@ class ControllerService:
         }
         if target_volume is not None:
             capacity_snapshot["target_volume"] = {
-                "cwd": target_volume.get("cwd", cwd),
+                "cwd": target_volume.get("cwd", effective_cwd),
                 "device": target_volume.get("device"),
                 "statvfs_free_bytes": target_volume.get("statvfs_free_bytes"),
                 "statvfs_free_inodes": target_volume.get("statvfs_free_inodes"),
@@ -1843,7 +1877,7 @@ class ControllerService:
                 return {"error": "CAPACITY_AUDIT_FAILED", "session": name, "node_id": node_id,
                         "detail": type(exc).__name__}
         try:
-            result = client.create_session(name, agent_type, cwd, initial_prompt=initial_prompt,
+            result = client.create_session(name, agent_type, effective_cwd, initial_prompt=initial_prompt,
                                            grant_mode=grant_mode, binding=binding, requested_by=requested_by,
                                            show_on_desktop=show_on_desktop)
         except NodeClientError as exc:

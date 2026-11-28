@@ -89,6 +89,7 @@ class NodeClient(Protocol):
     def metrics(self) -> dict[str, Any]: ...
     def environment(self, roles: tuple[str, ...] = ("node",)) -> dict[str, Any]: ...
     def repo_evidence(self, cwd: str) -> dict[str, Any]: ...
+    def resolve_cwd(self, cwd: str | None = None) -> dict[str, Any]: ...
     def repo_op(self, op: str, path: str, params: dict[str, Any]) -> dict[str, Any]: ...
     def worktree_candidates(self, repo_path: str) -> dict[str, Any]: ...
     def worktree_cleanup(self, worktree_path: str, *, repo_path: str | None = None,
@@ -275,6 +276,11 @@ class LocalNodeClient:
     def environment(self, roles: tuple[str, ...] = ("node",)) -> dict[str, Any]:
         from . import node_profile
         return node_profile.inventory(tuple(roles))
+
+    def resolve_cwd(self, cwd: str | None = None) -> dict[str, Any]:
+        from .lifecycle import resolve_cwd
+        resolved, error = resolve_cwd(cwd, self._terminal.config)
+        return error or {"cwd": str(resolved), "resolved": True}
 
     def repo_evidence(self, cwd: str) -> dict[str, Any]:
         """Git metadata for a path on THIS host (controller == node here).
@@ -686,6 +692,11 @@ class RemoteNodeClient:
 
     def environment(self, roles: tuple[str, ...] = ("node",)) -> dict[str, Any]:
         return self._request("GET", "/v1/environment?roles=" + ",".join(roles))
+
+    def resolve_cwd(self, cwd: str | None = None) -> dict[str, Any]:
+        import urllib.parse as _urlparse
+        query = "" if cwd is None else "?cwd=" + _urlparse.quote(str(cwd), safe="")
+        return self._request("GET", "/v1/resolve-cwd" + query)
 
     def repo_evidence(self, cwd: str) -> dict[str, Any]:
         """Ask THIS node for git metadata about one of its own paths.

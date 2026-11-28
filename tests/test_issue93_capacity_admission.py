@@ -25,6 +25,13 @@ class Client:
         return {"session": args[0], "state": "READY", "session_id": "$1",
                 "created_epoch": "2026-11-28T00:00:00+00:00"}
 
+    def resolve_cwd(self, cwd=None):
+        return {"cwd": cwd or "/workspace/task", "resolved": True}
+
+    def repo_evidence(self, cwd):
+        return {"cwd": cwd, "exists": True, "readable": True, "device": 1,
+                "statvfs_free_bytes": 10 * 1024**3, "statvfs_free_inodes": 1000}
+
 
 def _controller(nodes, clients):
     ctl = ControllerService.__new__(ControllerService)

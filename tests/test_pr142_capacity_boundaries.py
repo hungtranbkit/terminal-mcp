@@ -32,6 +32,9 @@ class Client:
         return {"cwd": cwd, "exists": True, "readable": True, "device": 1,
                 "statvfs_free_bytes": 10 * 1024**3, "statvfs_free_inodes": 1000}
 
+    def resolve_cwd(self, cwd=None):
+        return {"cwd": cwd or "/workspace/task", "resolved": True}
+
     def create_session(self, *args, **kwargs):
         self.calls += 1
         return {"session": args[0], "state": "READY", "session_id": "$1",
@@ -71,6 +74,23 @@ def test_explicit_target_fails_closed_when_volume_probe_is_not_allowed():
     client = Client(volume=False)
     ctl = _controller([_node()], {"candidate": client})
     result = ctl.terminal_create_session("volume-denied", node="candidate", cwd="/workspace/task")
+    assert result["error"] == "TARGET_VOLUME_UNVERIFIED"
+    assert client.calls == 0
+
+
+def test_omitted_cwd_resolves_and_probes_default_before_create():
+    client = Client()
+    ctl = _controller([_node()], {"candidate": client})
+    result = ctl.terminal_create_session("volume-default", node="candidate")
+    assert result["node_id"] == "candidate"
+    assert result["capacity_snapshot"]["target_volume"]["cwd"] == "/workspace/task"
+    assert client.calls == 1
+
+
+def test_omitted_cwd_unknown_default_fails_closed():
+    client = Client(volume=False)
+    ctl = _controller([_node()], {"candidate": client})
+    result = ctl.terminal_create_session("volume-default-denied", node="candidate")
     assert result["error"] == "TARGET_VOLUME_UNVERIFIED"
     assert client.calls == 0
 
