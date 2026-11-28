@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -61,6 +62,24 @@ def default_registry_path() -> Path:
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def valid_nonnegative_integer(value: Any) -> bool:
+    """Return True only for finite, non-negative integer evidence.
+
+    JSON/Python booleans are ints at runtime, and SQLite coercion can turn
+    fractional values into integers.  Admission must never treat either as
+    a real capacity sample.
+    """
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and value >= 0)
+
+
+def valid_nonnegative_number(value: Any) -> bool:
+    """Strict quantitative evidence validator used at authenticated ingress."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value) and value >= 0
 
 
 def _iso(dt: datetime) -> str:
@@ -377,6 +396,15 @@ class NodeRegistry:
         historical `linux` rows were really macOS, which is unknowable
         without guessing from the hostname."""
         now = now or _now()
+        if not valid_nonnegative_integer(tmux_session_count):
+            raise ValueError("tmux_session_count must be a finite non-negative integer")
+        # Disk metrics are quantitative admission evidence.  Reject malformed
+        # values before persistence instead of allowing SQLite/Python coercion
+        # to turn them into a plausible zero.
+        for field in ("disk_total_bytes", "disk_used_bytes", "disk_free_bytes"):
+            value = getattr(metrics, field)
+            if value is not None and not valid_nonnegative_integer(value):
+                raise ValueError(f"{field} must be a finite non-negative integer")
         now_iso = _iso(now)
         platform = canonical_platform(platform)
         thresholds = self.overload_thresholds
@@ -553,9 +581,18 @@ class NodeRegistry:
             return NODE_OFFLINE
         try:
             heartbeat = datetime.fromisoformat(last_heartbeat_at)
-        except ValueError:
+            if heartbeat.tzinfo is None:
+                return NODE_OFFLINE
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
             return NODE_OFFLINE
         age = (now - heartbeat).total_seconds()
+        # A future-dated heartbeat is malformed evidence, not a fresh node.
+        # Keep it out of new-work placement while preserving the existing
+        # degraded/offline distinction for status and recovery tooling.
+        if age < 0:
+            return NODE_DEGRADED
         if age <= self.heartbeat_thresholds.degraded_after_seconds:
             return NODE_ONLINE
         if age <= self.heartbeat_thresholds.offline_after_seconds:

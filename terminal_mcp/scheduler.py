@@ -8,10 +8,12 @@ after the fact (`reason` on the result) and reproduced in a test.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from .capability_profile import CandidateView, diagnose, match_capabilities
 from .node_models import CAPACITY_OVERLOADED, NODE_ONLINE, Node
+from .node_registry import valid_nonnegative_integer
 
 
 @dataclass(frozen=True)
@@ -28,15 +30,45 @@ class PlacementResult:
 
 
 def _eligible(node: Node, *, required_agent_type: str, min_disk_free_bytes: int,
-              required_platform: str | None = None) -> tuple[bool, str | None]:
+              required_platform: str | None = None,
+              required_capabilities: tuple[str, ...] = ()) -> tuple[bool, str | None]:
     """One node's eligibility gate -- ALL must pass before it's even
     scored. Returns (eligible, exclusion_reason)."""
     if node.status != NODE_ONLINE:
         return False, f"status={node.status}"
+    if not node.last_heartbeat_at:
+        return False, "incomplete heartbeat evidence"
+    try:
+        heartbeat = datetime.fromisoformat(node.last_heartbeat_at)
+        if heartbeat.tzinfo is None:
+            return False, "naive heartbeat evidence"
+        age = (datetime.now(timezone.utc) - heartbeat).total_seconds()
+    except (TypeError, ValueError):
+        return False, "invalid heartbeat evidence"
+    if age < 0:
+        return False, "future heartbeat evidence"
+    if node.tmux_session_count is None:
+        return False, "incomplete capacity evidence: tmux_session_count unknown"
+    if not valid_nonnegative_integer(node.tmux_session_count):
+        return False, "invalid capacity evidence: tmux_session_count"
+    if node.disk_free_bytes is None:
+        return False, "incomplete capacity evidence: disk_free_bytes unknown"
+    if not valid_nonnegative_integer(node.disk_free_bytes):
+        return False, "invalid capacity evidence: disk_free_bytes"
+    if node.max_sessions is not None and not valid_nonnegative_integer(node.max_sessions):
+        return False, "invalid capacity evidence: max_sessions"
     if node.draining:
         return False, "draining"
     if node.capacity_status == CAPACITY_OVERLOADED:
         return False, f"overloaded ({', '.join(node.overload_reasons) or 'no reason recorded'})"
+    # New work must have a verified task-volume and session-capacity sample.
+    # Unknown values are safe for status/maintenance reads, but treating them
+    # as zero here would admit a workload precisely when admission evidence is
+    # missing.
+    if node.disk_free_bytes is None:
+        return False, "incomplete capacity evidence: disk_free_bytes unknown"
+    if node.tmux_session_count is None:
+        return False, "incomplete capacity evidence: tmux_session_count unknown"
     if required_platform is not None and node.platform != required_platform:
         # Multi-node Windows support -- a caller that explicitly needs a
         # specific platform (e.g. a session that only makes sense on
@@ -49,9 +81,12 @@ def _eligible(node: Node, *, required_agent_type: str, min_disk_free_bytes: int,
         # at all can host a plain shell session; claude/codex require the
         # node to have actually reported that capability at heartbeat time.
         return False, f"agent_type={required_agent_type!r} not in node's capabilities {node.agent_types!r}"
-    if node.max_sessions is not None and (node.tmux_session_count or 0) >= node.max_sessions:
+    missing = tuple(cap for cap in required_capabilities if cap not in node.capabilities)
+    if missing:
+        return False, f"missing required tools {missing!r} (has {node.capabilities!r})"
+    if node.max_sessions is not None and node.tmux_session_count >= node.max_sessions:
         return False, f"at max_sessions ({node.tmux_session_count}/{node.max_sessions})"
-    if node.disk_free_bytes is not None and node.disk_free_bytes < min_disk_free_bytes:
+    if node.disk_free_bytes < min_disk_free_bytes:
         return False, f"disk_free_bytes {node.disk_free_bytes} < required {min_disk_free_bytes}"
     return True, None
 
@@ -61,11 +96,13 @@ def _node_capability_pool(node: Node) -> tuple[str, ...]:
     literally called "linux" must never satisfy a platform requirement."""
     return (f"platform:{node.platform}",
             *(f"agent:{agent}" for agent in node.agent_types),
+            *(f"tool:{tool}" for tool in node.capabilities),
             *(str(label) for label in node.labels))
 
 
 def _node_requirements(*, required_agent_type: str, labels_required: tuple[str, ...],
-                       required_platform: str | None) -> tuple[str, ...]:
+                       required_platform: str | None,
+                       required_capabilities: tuple[str, ...] = ()) -> tuple[str, ...]:
     """The same three checks `_eligible` makes, expressed as capability
     keys so the shared diagnosis walk can classify them. "shell" is
     omitted deliberately -- every node that can run tmux can host a plain
@@ -75,6 +112,7 @@ def _node_requirements(*, required_agent_type: str, labels_required: tuple[str, 
         required.append(f"agent:{required_agent_type}")
     if required_platform is not None:
         required.append(f"platform:{required_platform}")
+    required.extend(f"tool:{cap}" for cap in required_capabilities)
     return tuple(required)
 
 
@@ -85,9 +123,9 @@ def _capacity_blocked(node: Node, *, min_disk_free_bytes: int) -> bool:
     blocker an operator actually has to fix."""
     if node.draining or node.capacity_status == CAPACITY_OVERLOADED:
         return True
-    if node.max_sessions is not None and (node.tmux_session_count or 0) >= node.max_sessions:
+    if node.max_sessions is not None and valid_nonnegative_integer(node.tmux_session_count) and node.tmux_session_count >= node.max_sessions:
         return True
-    if node.disk_free_bytes is not None and node.disk_free_bytes < min_disk_free_bytes:
+    if valid_nonnegative_integer(node.disk_free_bytes) and node.disk_free_bytes < min_disk_free_bytes:
         return True
     return False
 
@@ -109,7 +147,9 @@ def _score(node: Node) -> tuple[float, float, float, str]:
 def choose_node(nodes: list[Node], *, required_agent_type: str = "shell",
                 min_disk_free_bytes: int = 1024 * 1024 * 1024,  # 1 GiB -- a real floor, not zero
                 labels_required: tuple[str, ...] = (),
-                required_platform: str | None = None) -> PlacementResult:
+                required_platform: str | None = None,
+                required_capabilities: tuple[str, ...] = (),
+                excluded_node_ids: tuple[str, ...] = ()) -> PlacementResult:
     """The Auto scheduler (task item 6, extended by multi-node Windows
     support's own "Scheduler Auto phải xét platform requirement"). `nodes`
     should already be the CURRENT NodeRegistry.list() snapshot -- this
@@ -124,10 +164,15 @@ def choose_node(nodes: list[Node], *, required_agent_type: str = "shell",
     views: list[CandidateView] = []
     required = _node_requirements(required_agent_type=required_agent_type,
                                   labels_required=labels_required,
-                                  required_platform=required_platform)
+                                  required_platform=required_platform,
+                                  required_capabilities=required_capabilities)
     for node in nodes:
+        if node.id in excluded_node_ids:
+            excluded.append((node.id, "excluded after target-volume probe"))
+            continue
         ok, reason = _eligible(node, required_agent_type=required_agent_type, min_disk_free_bytes=min_disk_free_bytes,
-                               required_platform=required_platform)
+                               required_platform=required_platform,
+                               required_capabilities=required_capabilities)
         if ok and labels_required and not set(labels_required).issubset(node.labels):
             ok, reason = False, f"missing required labels {labels_required!r} (has {node.labels!r})"
         if not ok:

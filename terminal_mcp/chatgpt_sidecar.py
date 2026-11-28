@@ -165,7 +165,7 @@ _LEGACY_TRANSLATIONS: dict[str, dict[str, Any]] = {
     "terminal_create_session": {
         "action": "create_session", "rename": {"name": "target"},
         "keep": ("agent_type", "working_directory", "initial_prompt", "grant_mode",
-                 "binding", "node"),
+                 "binding", "node", "required_tools"),
         "required": ("target",),
     },
     "terminal_delete_session": {

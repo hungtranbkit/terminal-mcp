@@ -390,6 +390,15 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
         result = await anyio.to_thread.run_sync(lambda: client.metrics())
         return JSONResponse(result)
 
+    async def resolve_cwd_endpoint(request: Request) -> JSONResponse:
+        if (blocked := require_auth(request)) is not None:
+            return blocked
+        requested = (request.query_params.get("cwd") or "").strip() or None
+        resolved, error = resolve_cwd(requested, terminal.config)
+        if error is not None:
+            return JSONResponse(error)
+        return JSONResponse({"cwd": str(resolved), "resolved": True})
+
     async def repo_evidence(request: Request) -> JSONResponse:
         """Git branch/HEAD/dirty state for a path ON THIS NODE.
 
@@ -452,6 +461,11 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
                 "detail": (f"{resolved} exists but this agent cannot read it"
                            if exists else f"{resolved} does not exist on this node"),
             }, status_code=200)
+        stat = path.stat()
+        statvfs = os.statvfs(str(path))
+        base.update({"device": stat.st_dev,
+                     "statvfs_free_bytes": statvfs.f_bavail * statvfs.f_frsize,
+                     "statvfs_free_inodes": statvfs.f_favail})
         try:
             evidence = git_repo_evidence(str(resolved))
         except RepoEvidenceError as exc:
@@ -1216,6 +1230,7 @@ def build_node_agent(*, node_id: str, terminal: TerminalService, token: "str | A
         Route("/v1/ssh/manage", ssh_manage, methods=["POST"]),
         Route("/v1/environment", environment, methods=["GET"]),
         Route("/v1/repo-evidence", repo_evidence, methods=["GET"]),
+        Route("/v1/resolve-cwd", resolve_cwd_endpoint, methods=["GET"]),
         Route("/v1/repo/{op}", repo_op, methods=["GET"]),
         Route("/v1/worktree/candidates", worktree_candidates, methods=["GET"]),
         Route("/v1/worktree/cleanup", worktree_cleanup, methods=["POST"]),

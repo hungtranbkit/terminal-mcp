@@ -1236,7 +1236,8 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
     def terminal_create_session(name: str, agent_type: str = "shell", working_directory: str | None = None,
                                 initial_prompt: str | None = None, grant_mode: str = "none",
                                 binding: str | None = None, node: str = "auto",
-                                show_on_desktop: bool = False) -> dict:
+                                show_on_desktop: bool = False,
+                                required_tools: tuple[str, ...] = ()) -> dict:
         """Create a new, detached tmux session -- agent_type is "shell"
         (plain default shell), "claude", or "codex" (launched via a fixed,
         server-side-only command from config, never anything this caller
@@ -1288,6 +1289,7 @@ For direct work, prefer one useful session per task and avoid stale duplicates.
         result = controller.terminal_create_session(
             name, agent_type, working_directory, node=node, initial_prompt=initial_prompt,
             grant_mode=grant_mode, binding=binding, requested_by="mcp", show_on_desktop=show_on_desktop,
+            required_tools=required_tools,
         )
         if isinstance(result, dict) and "error" not in result:
             # A fresh session's label: its initial_prompt, else none (this

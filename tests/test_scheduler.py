@@ -45,6 +45,34 @@ def test_no_nodes_registered_at_all():
     assert "no nodes registered" in result.reason
 
 
+def test_required_tools_are_checked_against_probed_capabilities():
+    node = _node("dell")
+    node = node.__class__(**{**node.__dict__, "capabilities": ("git", "node")})
+    assert choose_node([node], required_capabilities=("git",)).node_id == "dell"
+    denied = choose_node([node], required_capabilities=("docker",))
+    assert denied.node_id is None
+    assert ("dell", "missing required tools ('docker',) (has ('git', 'node'))") in denied.excluded
+
+
+def test_missing_heartbeat_is_incomplete_even_when_other_fields_look_healthy():
+    node = _node("dell")
+    node = node.__class__(**{**node.__dict__, "last_heartbeat_at": None})
+    denied = choose_node([node])
+    assert denied.node_id is None
+    assert denied.excluded == (("dell", "incomplete heartbeat evidence"),)
+
+
+def test_unknown_capacity_is_never_admitted_for_new_work():
+    disk_unknown = _node("disk-unknown")
+    disk_unknown = disk_unknown.__class__(**{**disk_unknown.__dict__, "disk_free_bytes": None})
+    sessions_unknown = _node("sessions-unknown")
+    sessions_unknown = sessions_unknown.__class__(**{**sessions_unknown.__dict__, "tmux_session_count": None})
+    result = choose_node([disk_unknown, sessions_unknown])
+    assert result.node_id is None
+    assert "disk_free_bytes unknown" in dict(result.excluded)["disk-unknown"]
+    assert "tmux_session_count unknown" in dict(result.excluded)["sessions-unknown"]
+
+
 def test_prefers_more_ram_headroom():
     busy = _node("busy", ram_percent=85.0)
     idle = _node("idle", ram_percent=20.0)

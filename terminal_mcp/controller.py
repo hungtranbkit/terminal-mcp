@@ -1742,13 +1742,22 @@ class ControllerService:
     def terminal_create_session(self, name: str, agent_type: str = "shell", cwd: str | None = None, *,
                                 node: str = "auto", platform: str | None = None, initial_prompt: str | None = None,
                                 grant_mode: str = "none", binding: str | None = None,
-                                requested_by: str | None = None, show_on_desktop: bool = False) -> dict[str, Any]:
+                                requested_by: str | None = None, show_on_desktop: bool = False,
+                                required_tools: tuple[str, ...] = ()) -> dict[str, Any]:
         existing = self.resolve_session(name)
         if "error" not in existing:
             return {"error": "SESSION_ALREADY_EXISTS", "session": name, "node_id": existing["node_id"]}
 
+        # One authenticated registry read is the admission snapshot for the
+        # whole request.  Do not choose from one read and dispatch against a
+        # second, potentially different row (or silently fall back from an
+        # explicit target).
+        snapshot = self.list_nodes()
+        required_tools = tuple(dict.fromkeys(str(tool).strip() for tool in required_tools if str(tool).strip()))
         if node == "auto":
-            placement = choose_node(self.list_nodes(), required_agent_type=agent_type, required_platform=platform)
+            placement = choose_node(snapshot, required_agent_type=agent_type,
+                                    required_platform=platform,
+                                    required_capabilities=required_tools)
             if placement.node_id is None:
                 return {"error": "NO_ELIGIBLE_NODE", "session": name, "reason": placement.reason,
                         "excluded": list(placement.excluded)}
@@ -1760,7 +1769,7 @@ class ControllerService:
             # before the exact NodeRegistry lookup too.
             node_id = (self.local_node_id if node == LOCAL_NODE_ID
                        and self.local_node_id != LOCAL_NODE_ID else node)
-            explicit_node = self.node_status(node_id)
+            explicit_node = next((row for row in snapshot if row.id == node_id), None)
             if explicit_node is None:
                 # Name the answering controller and what it does know. Two
                 # controllers serving one ChatGPT tunnel made list_nodes
@@ -1804,11 +1813,82 @@ class ControllerService:
                 return {"error": "AGENT_TYPE_NOT_AVAILABLE_ON_TARGET", "node_id": node_id,
                         "detail": f"agent_type={agent_type!r} not available on {node_id!r} "
                                   f"(has {explicit_node.agent_types!r})"}
+            if not explicit_node.last_heartbeat_at:
+                return {"error": "NODE_EVIDENCE_INCOMPLETE", "node_id": node_id,
+                        "detail": "fresh snapshot has no heartbeat evidence"}
+            missing_tools = tuple(tool for tool in required_tools if tool not in explicit_node.capabilities)
+            if missing_tools:
+                return {"error": "REQUIRED_TOOL_UNAVAILABLE", "node_id": node_id,
+                        "missing": list(missing_tools),
+                        "available": list(explicit_node.capabilities)}
+            explicit_placement = choose_node([explicit_node], required_agent_type=agent_type,
+                                             required_platform=platform,
+                                             required_capabilities=required_tools)
+            if explicit_placement.node_id is None:
+                return {"error": "NODE_NOT_ELIGIBLE", "node_id": node_id,
+                        "reason": explicit_placement.reason,
+                        "excluded": [list(item) for item in explicit_placement.excluded]}
 
-        client = self._clients.get(node_id)
-        if client is None:
-            return {"error": "NODE_UNREACHABLE", "node_id": node_id}
-        node_row = self.registry.get(node_id)
+        # Capacity in a heartbeat is only useful for the filesystem that the
+        # session will actually use.  Ask the authenticated node agent to
+        # resolve/allow the requested cwd and return fresh statvfs evidence
+        # before any create request.  Auto placement may try another already
+        # eligible node; an explicit target remains pinned and fails closed.
+        volume_excluded: list[str] = []
+        while True:
+            client = self._clients.get(node_id)
+            effective_cwd = cwd
+            target_volume = None
+            reason = "missing or invalid statvfs evidence"
+            if client is None:
+                reason = "node client unavailable"
+            else:
+                try:
+                    if effective_cwd is None:
+                        resolved = client.resolve_cwd()
+                        if isinstance(resolved, dict) and resolved.get("resolved") is True:
+                            path = resolved.get("cwd")
+                            if isinstance(path, str) and path:
+                                effective_cwd = path
+                        reason = "missing or invalid node cwd resolution"
+                    if effective_cwd is not None:
+                        target_volume = client.repo_evidence(effective_cwd)
+                except Exception as exc:
+                    reason = type(exc).__name__
+            valid_probe = (
+                effective_cwd is not None
+                and isinstance(target_volume, dict)
+                and target_volume.get("exists") is True
+                and target_volume.get("readable") is True
+                and target_volume.get("cwd") == effective_cwd
+                and isinstance(target_volume.get("device"), int)
+                and not isinstance(target_volume.get("device"), bool)
+                and isinstance(target_volume.get("statvfs_free_bytes"), int)
+                and not isinstance(target_volume.get("statvfs_free_bytes"), bool)
+                and target_volume.get("statvfs_free_bytes") >= 1024 * 1024 * 1024
+                and isinstance(target_volume.get("statvfs_free_inodes"), int)
+                and not isinstance(target_volume.get("statvfs_free_inodes"), bool)
+                and target_volume.get("statvfs_free_inodes") > 0
+            )
+            if valid_probe:
+                node_row = next((row for row in snapshot if row.id == node_id), None)
+                break
+            if node != "auto":
+                if client is None:
+                    return {"error": "NODE_UNREACHABLE", "node_id": node_id}
+                if isinstance(target_volume, dict):
+                    reason = target_volume.get("error", reason)
+                return {"error": "TARGET_VOLUME_UNVERIFIED", "node_id": node_id,
+                        "cwd": effective_cwd, "detail": reason}
+            volume_excluded.append(node_id)
+            placement = choose_node(snapshot, required_agent_type=agent_type,
+                                    required_platform=platform,
+                                    required_capabilities=required_tools,
+                                    excluded_node_ids=tuple(volume_excluded))
+            if placement.node_id is None:
+                return {"error": "NO_ELIGIBLE_NODE", "session": name, "reason": placement.reason,
+                        "excluded": list(placement.excluded)}
+            node_id = placement.node_id
         capacity_snapshot = {
             "node_id": node_id,
             "status": node_row.status if node_row else "unknown",
@@ -1817,6 +1897,13 @@ class ControllerService:
             "max_sessions": node_row.max_sessions if node_row else None,
             "overload_reasons": list(node_row.overload_reasons) if node_row else [],
         }
+        if target_volume is not None:
+            capacity_snapshot["target_volume"] = {
+                "cwd": target_volume.get("cwd", effective_cwd),
+                "device": target_volume.get("device"),
+                "statvfs_free_bytes": target_volume.get("statvfs_free_bytes"),
+                "statvfs_free_inodes": target_volume.get("statvfs_free_inodes"),
+            }
         audit_terminal = getattr(self.local_client, "terminal", None)
         audit = getattr(audit_terminal, "audit", None)
         if audit is not None:
@@ -1830,7 +1917,7 @@ class ControllerService:
                 return {"error": "CAPACITY_AUDIT_FAILED", "session": name, "node_id": node_id,
                         "detail": type(exc).__name__}
         try:
-            result = client.create_session(name, agent_type, cwd, initial_prompt=initial_prompt,
+            result = client.create_session(name, agent_type, effective_cwd, initial_prompt=initial_prompt,
                                            grant_mode=grant_mode, binding=binding, requested_by=requested_by,
                                            show_on_desktop=show_on_desktop)
         except NodeClientError as exc:
