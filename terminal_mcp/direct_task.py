@@ -302,12 +302,14 @@ def agent_of(observed: dict[str, Any]) -> str | None:
 
 def _error_hop(observed: dict[str, Any]) -> str:
     code = str(observed.get("error") or "").upper()
-    if code == "SESSION_NOT_FOUND" or observed.get("exists") is False:
-        return "session"
     if code == "STATUS_PROBE_TIMEOUT":
         return "controller->node"
     if any(word in code for word in _NODE_ERRORS):
         return "node"
+    if code in {"SESSION_NOT_FOUND", "SESSION_DELETED", "SESSION_RUNTIME_MISSING"}:
+        return "session"
+    if not code and observed.get("exists") is False:
+        return "session"
     return "controller"
 
 
@@ -690,6 +692,35 @@ class DirectTaskSupervisor:
     def _view(self, task: dict[str, Any]) -> dict[str, Any]:
         state = task["state"]
         next_action = _NEXT_ACTIONS.get(state, "inspect")
+        alternate_executor_eligible = (
+            state == "FAILED"
+            and task.get("completed_at") is not None
+            and task.get("wait_reason") == "TARGET_GONE_BEFORE_DISPATCH"
+            and task.get("dispatches") == 0
+            and task.get("receipt") == RECEIPT_PERSISTED
+            and task.get("input_sent_at") is None
+            and task.get("submit_confirmed_at") is None
+            and task.get("accepted_at") is None
+            and task.get("last_error_hop") == "session"
+            and task.get("observe_failures", 0) >= MAX_OBSERVE_FAILURES // 4
+        )
+        if alternate_executor_eligible:
+            next_action = (
+                "Target absence was confirmed before any dispatch; do not revive or replay this "
+                "task. An authorized operator may verify a separate executor's identity, scope, "
+                "permissions, toolchain and capacity, then create a separate task with a new "
+                "idempotency key if approved."
+            )
+        elif (state == "FAILED"
+              and task.get("last_error_hop") == "session"
+              and task.get("observe_failures", 0) >= MAX_OBSERVE_FAILURES // 4
+              and (task.get("dispatches", 0) > 0
+                   or task.get("receipt") in {
+                       RECEIPT_INPUT_SENT, RECEIPT_SUBMIT_CONFIRMED, RECEIPT_UNCERTAIN})):
+            next_action = (
+                "The target disappeared after dispatch; reconcile the durable receipt and execution "
+                "evidence with an operator. Do not replay or start a replacement task."
+            )
         if state == "STUCK_COMPOSER" and (task.get("recovery_attempts") or 0) >= MAX_RECOVERY_ATTEMPTS:
             next_action = ("bounded Enter-only recovery is exhausted: press Enter in the session "
                            "or supervise_cancel. Never resend the text.")
@@ -712,9 +743,12 @@ class DirectTaskSupervisor:
             "continuations": task["continuations"],
             "max_continuations": task["max_continuations"],
             "dispatches": task["dispatches"],
+            "observe_failures": task["observe_failures"],
             "recovery_attempts": task.get("recovery_attempts") or 0,
             "reason": task.get("reason"),
             "last_error": task.get("last_error"), "last_error_hop": task.get("last_error_hop"),
+            "alternate_executor_eligible": alternate_executor_eligible,
+            "requires_operator_authorization": True,
             "late_completion": bool(task.get("late_completion")),
             "created_at": task["created_at"], "updated_at": task["updated_at"],
             "completed_at": task["completed_at"],
@@ -870,6 +904,19 @@ class DirectTaskSupervisor:
                   "next_observe_at": now + backoff}
         if hop == "session":
             if failures >= MAX_OBSERVE_FAILURES // 4:
+                if (task["dispatches"] == 0
+                        and task.get("receipt") == RECEIPT_PERSISTED
+                        and task.get("input_sent_at") is None
+                        and task.get("submit_confirmed_at") is None
+                        and task.get("accepted_at") is None
+                        and task["state"] not in {"CANCELLED", "DONE"}):
+                    fields.update(
+                        wait_reason="TARGET_GONE_BEFORE_DISPATCH",
+                        reason=_clip(
+                            "TARGET_GONE_BEFORE_DISPATCH: authoritative bounded status "
+                            f"observations ({failures}) confirmed the bound target absent; "
+                            "no dispatch occurred and no replacement was started"),
+                    )
                 return self.store.update(task["task_id"], **fields, state="FAILED", completed_at=now)
             return self.store.update(task["task_id"], **fields)
         since = task.get("unreachable_since") or now
