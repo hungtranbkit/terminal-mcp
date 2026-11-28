@@ -216,6 +216,10 @@ def test_create_claude_and_codex_use_server_side_allowlisted_launcher(
     # a regression in launcher dispatch.
     if resolve_launcher(agent_type) is None:
         pytest.skip(f"{agent_type!r} is not installed on this host")
+    from terminal_mcp.host_metrics import local_agent_disk_block_reason
+    capacity_block = local_agent_disk_block_reason(str(tmp_path))
+    if capacity_block:
+        pytest.skip(f"BLOCKED_ENVIRONMENT: real local capacity: {capacity_block}")
     config = _lifecycle_config(tmp_path, timeout=8.0)
     service = TerminalService(config)
     name = lifecycle_session_factory("1", prefix=session_prefix.rstrip("-"))
@@ -234,11 +238,13 @@ def test_create_claude_and_codex_use_server_side_allowlisted_launcher(
     assert info is not None
 
 
-def test_create_reports_launcher_not_configured_for_a_missing_binary(tmp_path, lifecycle_session_factory):
+def test_create_reports_launcher_not_configured_for_a_missing_binary(tmp_path, lifecycle_session_factory, monkeypatch):
     # A known agent_type whose configured launcher is not present on this
     # host. Pointing codex at a binary that cannot exist keeps the case
     # host-independent -- it asserts the same thing whether or not the real
     # codex is installed here.
+    from tests.capacity_fixtures import supply_positive_local_capacity
+    supply_positive_local_capacity(monkeypatch, tmp_path)
     config = _lifecycle_config(tmp_path, timeout=8.0,
                                launch_commands=(("claude", "claude"),
                                                 ("codex", "terminal-mcp-no-such-binary")))
@@ -301,13 +307,15 @@ def test_session_lifecycle_disabled_blocks_create(tmp_path):
     assert service.tmux.get_session("lifecycle-disabled") is None
 
 
-def test_create_launch_fail_cleans_up_disposable_session(tmp_path, lifecycle_session_factory):
+def test_create_launch_fail_cleans_up_disposable_session(tmp_path, lifecycle_session_factory, monkeypatch):
     # A launcher configured to a command that exits immediately -- tmux's
     # default remain-on-exit=off tears the session down with it, so this
     # exercises the "session already gone" branch of the FAILED path
     # (LAUNCH_FAILED, never left behind as a zombie session either way).
     # Use a script so tmux observes the shell interpreter during startup,
     # not a fleeting process named "false" that satisfies the READY check.
+    from tests.capacity_fixtures import supply_positive_local_capacity
+    supply_positive_local_capacity(monkeypatch, tmp_path)
     launcher = tmp_path / "immediate-failure"
     launcher.write_text("#!/bin/sh\nexit 1\n")
     launcher.chmod(0o755)
@@ -323,6 +331,8 @@ def test_create_launch_fail_cleans_up_disposable_session(tmp_path, lifecycle_ses
 def test_codex_startup_menu_is_blocked_instead_of_ready(tmp_path, lifecycle_session_factory, monkeypatch):
     """A live Codex process can still be waiting on its first-run menu."""
     from types import SimpleNamespace
+    from tests.capacity_fixtures import supply_positive_local_capacity
+    supply_positive_local_capacity(monkeypatch, tmp_path)
     monkeypatch.setattr("terminal_mcp.lifecycle.resolve_launcher", lambda command: command)
 
     config = _lifecycle_config(tmp_path, timeout=0.01)
@@ -367,6 +377,8 @@ def test_codex_startup_menu_is_blocked_instead_of_ready(tmp_path, lifecycle_sess
 def test_codex_selects_only_visible_authorized_non_granting_startup_choice(
         tmp_path, lifecycle_session_factory, monkeypatch, menu):
     from types import SimpleNamespace
+    from tests.capacity_fixtures import supply_positive_local_capacity
+    supply_positive_local_capacity(monkeypatch, tmp_path)
     monkeypatch.setattr("terminal_mcp.lifecycle.resolve_launcher", lambda command: command)
 
     service = TerminalService(_lifecycle_config(tmp_path, timeout=0.4))
@@ -425,6 +437,8 @@ def test_codex_only_becomes_ready_at_its_composer():
 
 def test_codex_readiness_deadline_returns_structured_blocker(tmp_path, lifecycle_session_factory, monkeypatch):
     from types import SimpleNamespace
+    from tests.capacity_fixtures import supply_positive_local_capacity
+    supply_positive_local_capacity(monkeypatch, tmp_path)
     monkeypatch.setattr("terminal_mcp.lifecycle.resolve_launcher", lambda command: command)
 
     service = TerminalService(_lifecycle_config(tmp_path, timeout=0.01))
@@ -836,7 +850,7 @@ def anyio_backend():
 
 
 def test_a_created_session_records_both_provenance_and_its_real_launcher(
-    tmp_path, lifecycle_session_factory,
+    tmp_path, lifecycle_session_factory, monkeypatch,
 ):
     """End-to-end through the real create path, passing nothing by hand.
 
@@ -849,6 +863,10 @@ def test_a_created_session_records_both_provenance_and_its_real_launcher(
     """
     if resolve_launcher("claude") is None:
         pytest.skip("claude is not installed on this host")
+    from terminal_mcp.host_metrics import local_agent_disk_block_reason
+    capacity_block = local_agent_disk_block_reason(str(tmp_path))
+    if capacity_block:
+        pytest.skip(f"BLOCKED_ENVIRONMENT: real local capacity: {capacity_block}")
     config = _lifecycle_config(tmp_path, timeout=8.0)
     service = TerminalService(config)
     name = lifecycle_session_factory("claude-lc-provenance")
