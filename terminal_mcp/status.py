@@ -301,6 +301,9 @@ def classify_status(session: SessionInfo, output: str, now: int | None = None) -
         return "WAITING_INPUT", True, f"{reason}; current command is {command or 'unknown'!r}"
     if session.pane_dead:
         return "IDLE", False, "tmux reports the active pane is dead"
+    if command == "codex" and adapters.codex_pending_question(output.splitlines()):
+        return ("WAITING_INPUT", True,
+                "Codex pending question requires an answer; preserve session, do not infer progress")
     # Claude is visibly unusable until its owner completes /login.  This
     # is an authentication blocker, not a running task or an empty composer.
     # Only trust the CLI's exact status chrome close to the pane footer.

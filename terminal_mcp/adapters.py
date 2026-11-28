@@ -513,6 +513,30 @@ def _shows_genuine_progress(before: list[str], after: list[str]) -> bool:
     return before[:-1] != after[:-1]
 
 
+def codex_pending_question(lines: list[str]) -> bool:
+    """Recognize the actionable Codex question chip above its live composer.
+
+    A pending question is a dispatch/cleanup hold, not evidence that every
+    background process has stopped. Require both exact adjacent chrome lines,
+    followed by the ready-looking composer near the pane bottom. Do not infer
+    a question from prose, the shortcuts footer, or stale scrollback.
+    """
+    recent = [line.strip() for line in lines if line.strip()][-8:]
+    for index in range(len(recent) - 2):
+        if not re.fullmatch(r"\?\s+[1-9]\d*\s+questions?", recent[index], re.IGNORECASE):
+            continue
+        if not re.fullmatch(r"shift\s*\+\s*←\s+to answer", recent[index + 1], re.IGNORECASE):
+            continue
+        composer_index = index + 2
+        if (len(recent) - composer_index <= 3
+                and re.fullmatch(r"[›>]\s*Ask Codex to do anything",
+                                 recent[composer_index], re.IGNORECASE)
+                and not any(re.search(r"esc to interrupt", line, re.IGNORECASE)
+                            for line in recent[composer_index + 1:])):
+            return True
+    return False
+
+
 class CodexAdapter(AgentAdapter):
     """Codex CLI: reproduced, disposable-pane-verified composer-swallow
     failure mode (see tests/fixtures/laggy_line_reader.py and the existing
@@ -526,7 +550,7 @@ class CodexAdapter(AgentAdapter):
     def identify_target_state(self, lines: list[str]) -> str:
         if tool_permission_prompt(lines):
             return TARGET_WAITING
-        if codex_folder_trust_prompt(lines):
+        if codex_folder_trust_prompt(lines) or codex_pending_question(lines):
             return TARGET_WAITING
         tail = _tail(lines, 6)
         if any(self._IDLE_COMPOSER.search(line) for line in tail.splitlines()):
@@ -538,7 +562,8 @@ class CodexAdapter(AgentAdapter):
         return TARGET_UNKNOWN
 
     def can_submit_now(self, lines: list[str]) -> bool:
-        return not _match_any(_WORKING_PATTERNS, _tail(lines, 6))
+        return (not codex_pending_question(lines)
+                and not _match_any(_WORKING_PATTERNS, _tail(lines, 6)))
 
     def submit_ack_evidence(self, before: list[str], after: list[str], sent_text: str) -> bool:
         # Genuine line-count growth, not a bare diff -- a live-redrawing
@@ -579,7 +604,8 @@ class CodexAdapter(AgentAdapter):
         return not _shows_genuine_progress(before, after)
 
     def safe_recovery_allowed(self, lines: list[str]) -> bool:
-        return not _match_any(_WORKING_PATTERNS, _tail(lines, 6))
+        return (not codex_pending_question(lines)
+                and not _match_any(_WORKING_PATTERNS, _tail(lines, 6)))
 
 
 def _normalize_for_match(lines: list[str]) -> str:

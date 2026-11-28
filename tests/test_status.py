@@ -424,7 +424,7 @@ def test_codex_busy_with_background_terminal_and_composer_is_not_idle():
     )
 
 
-def test_codex_queued_followup_with_composer_is_not_idle():
+def test_codex_queued_followup_with_pending_question_requires_input():
     pane = "\n".join((
         "• Working (2m 36s • esc to interrupt)",
         "• Queued follow-up inputs",
@@ -434,8 +434,52 @@ def test_codex_queued_followup_with_composer_is_not_idle():
         "  GPT-6-Luna medium · ~/workspace · Main [default]",
     ))
     assert classify_status(info("codex", activity=1), pane, now=191758)[:2] == (
-        "RUNNING", False
+        "WAITING_INPUT", True
     )
+
+
+def test_codex_question_chip_supersedes_stale_busy_and_blocks_dispatch():
+    from terminal_mcp.adapters import select_adapter, TARGET_WAITING
+    for question in ("? 1 question", "? 2 questions"):
+        pane = "\n".join((
+            "  Working (esc to interrupt)",
+            "  " + question,
+            "    shift + ← to answer",
+            "",
+            "› Ask Codex to do anything",
+            "  gpt-6-astra high · ~/workspace · Main [default]",
+        ))
+        state, required, reason = classify_status(info("codex", activity=1), pane, now=191758)
+        assert (state, required) == ("WAITING_INPUT", True)
+        assert "pending question" in reason
+        adapter = select_adapter("codex")
+        assert adapter.identify_target_state(pane.splitlines()) == TARGET_WAITING
+        assert not adapter.can_submit_now(pane.splitlines())
+        assert not adapter.safe_recovery_allowed(pane.splitlines())
+
+
+def test_codex_question_chip_without_busy_is_not_idle():
+    pane = "? 1 question\nshift + ← to answer\n› Ask Codex to do anything\nMain [default]"
+    assert classify_status(info("codex", activity=1), pane, now=191758)[:2] == (
+        "WAITING_INPUT", True
+    )
+
+
+def test_codex_question_chrome_requires_current_pair_and_composer():
+    from terminal_mcp.adapters import codex_pending_question
+    incomplete = [
+        "? 1 question\n› Ask Codex to do anything",
+        "shift + ← to answer\n› Ask Codex to do anything",
+        "? 1 question\nshift + ← to answer\nno composer",
+        "? 1 question\nshift + ← to answer\n" + "\n".join("old output" for _ in range(10))
+        + "\n› Ask Codex to do anything",
+        "? 1 question\nshift + ← to answer\n› Ask Codex to do anything\nWorking (esc to interrupt)",
+        "? for shortcuts\n› Ask Codex to do anything",
+    ]
+    for pane in incomplete:
+        assert not codex_pending_question(pane.splitlines())
+    pane = "? 1 question\nshift + ← to answer\n› Ask Codex to do anything"
+    assert classify_status(info("bash", activity=1), pane, now=191758)[0] != "WAITING_INPUT"
 
 
 def test_codex_newer_busy_footer_still_wins_over_older_composer():
