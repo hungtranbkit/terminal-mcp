@@ -6,6 +6,11 @@
   `d6a84ff9f6f7feab5bb4435c7c828165773d5dde`; feature branch
   `agent/codex/autonomy-first-policy-v1-20261128`. The local checkout's
   `config.yaml` WIP is untouched.
+- Published as PR #144, based on current main; policy commits are
+  `c738cc052103627bf479638c8ce0d0594d72a0d5` and
+  `2b6b977d568e02f8c72aece9835d02d06a3755b4`. Its source policy is consumed by
+  ProjectFlow follow-up PR #106, stacked on PR #105 head
+  `3a363bc7ceb6af95fd6a843719df0ebf8b47039a`.
 - `terminal_mcp/orchestration_policy.py` is the canonical shared policy
   source (`AUTONOMY_FIRST_VERSION=1`, orchestration policy `1.6.0`), included
   in MCP server instructions. The generated `docs/CHATGPT_ORCHESTRATION_POLICY.md`
@@ -19,6 +24,9 @@
   Independent review/CI and explicit production release authority remain intact.
 - No dispatch, queue/config, provider, permission, service, schema or runtime
   behavior changed. Running Work tasks keep their existing version-bound policy.
+- Supervised task `dt_80d21c9312414e22` is the replacement implementation task;
+  prior receipt `dt_6bf695d228eb4c6b` remains CANCELLED/PERSISTED with zero
+  dispatches and SESSION_DELETED. Neither was re-dispatched by this change.
 - Focused verification: `tests/test_orchestration_policy.py`,
   `tests/test_work_policy.py`, `tests/test_work_policy_integration.py`,
   `tests/test_transports.py`, `tests/test_work_spec.py` — **116 passed** in
