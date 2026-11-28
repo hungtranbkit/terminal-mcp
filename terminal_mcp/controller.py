@@ -20,6 +20,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -140,6 +141,67 @@ def _fanout(work, *, budget_seconds: float | None, label: str):
     return results
 
 
+class _SessionReadFanout:
+    """Bound overlapping fleet listings without sharing results or write capacity."""
+
+    def __init__(self) -> None:
+        self._pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=_MAX_FANOUT_WORKERS, thread_name_prefix="fleet-read")
+        self._ready = threading.Condition()
+        self._active: set[str] = set()
+
+    def _released(self, node_id: str) -> None:
+        with self._ready:
+            self._active.remove(node_id)
+            self._ready.notify_all()
+
+    def _available(self, node_id: str) -> bool:
+        return node_id not in self._active and len(self._active) < _MAX_FANOUT_WORKERS
+
+    @staticmethod
+    def _read(call, deadline: float):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("fleet session read deadline expired before RPC")
+        return call(remaining)
+
+    def list(self, work, *, budget_seconds: float):
+        deadline = time.monotonic() + budget_seconds
+        queued = dict(work)
+        pending = {}
+        results = {}
+        with self._ready:
+            while queued or pending:
+                for node_id, future in list(pending.items()):
+                    if future.done():
+                        try:
+                            results[node_id] = (True, future.result())
+                        except Exception as exc:  # noqa: BLE001 -- keep partial fleet results
+                            results[node_id] = (False, exc)
+                        del pending[node_id]
+                if time.monotonic() >= deadline or not (queued or pending):
+                    break
+                for node_id in list(queued):
+                    if not self._available(node_id):
+                        continue
+                    if time.monotonic() >= deadline:
+                        break
+                    future = self._pool.submit(self._read, queued.pop(node_id), deadline)
+                    self._active.add(node_id)
+                    pending[node_id] = future
+                    future.add_done_callback(lambda _, key=node_id: self._released(key))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if not any(future.done() for future in pending.values()):
+                    self._ready.wait(remaining)
+        for node_id in queued:
+            results[node_id] = (False, TimeoutError("fleet session read admission deadline expired"))
+        for node_id in pending:
+            results[node_id] = (False, TimeoutError("node did not answer within the fleet session read budget"))
+        return results
+
+
 @dataclass
 class SessionLocation:
     node_id: str
@@ -218,6 +280,7 @@ class ControllerService:
         self.local_node_id = local_node_id
         self.local_workspace_root = local_workspace_root
         self._clients: dict[str, NodeClient] = {}
+        self._session_reads = _SessionReadFanout()
         self._session_location_cache: dict[str, SessionLocation] = {}
         # Rename Session feature: old_bare_name -> current_bare_name, so a
         # stale caller (an old dashboard tab, a bookmarked binding call)
@@ -1911,10 +1974,9 @@ class ControllerService:
         session isn't listed needs to see "that node is offline", not an
         empty list indistinguishable from "no sessions exist there").
 
-        CONCURRENT AND BOUNDED. Every online node is asked at the same time
-        under ONE wall clock, so the cost is the slowest node rather than the
-        sum of them, and a node that does not answer inside the budget is
-        reported `status: "timeout"` instead of extending the caller's call.
+        CONCURRENT AND BOUNDED. Independent online nodes run in parallel.
+        Overlapping requests wait for admission under their own deadline;
+        an unadmitted or unanswered node is reported as `status: "timeout"`.
         Found live on hp-linux (2026-09-20): the serial form took 3.6s-25.4s
         across a five-node fleet and consumed the task router's entire 12s
         synchronous budget before a single dispatch tick could run.
@@ -1947,9 +2009,14 @@ class ControllerService:
                 continue
             askable.append((node.id, client))
         remaining = max(MIN_BOUNDED_NODE_PROBE_SECONDS, budget - (time.monotonic() - started))
-        answers = _fanout(
-            [(node_id, self._session_lister(client, remaining)) for node_id, client in askable],
-            budget_seconds=remaining, label="sessions")
+        if len(askable) == 1 and isinstance(askable[0][1], LocalNodeClient):
+            node_id, client = askable[0]
+            answers = _fanout([(node_id, self._session_lister(client, remaining))],
+                              budget_seconds=remaining, label="sessions")
+        else:
+            answers = self._session_reads.list(
+                [(node_id, lambda seconds, client=client: self._session_lister(client, seconds)())
+                 for node_id, client in askable], budget_seconds=remaining)
         for node_id, _client in askable:
             node = by_id[node_id]
             ok, value = answers.get(node_id, (False, TimeoutError("no answer")))
